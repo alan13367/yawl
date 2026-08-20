@@ -2,7 +2,7 @@
 name = "yawl"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97.1"
 description = "A minimal, self-extending AI agent harness"
 license = "MIT"
 repository = "https://github.com/alan13367/yawl"

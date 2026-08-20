@@ -8,7 +8,7 @@ Yawl is one Rust crate with blocking I/O and four direct dependencies: `ureq`, `
 
 ## Install
 
-Yawl requires Rust 1.88 or newer.
+Yawl requires Rust 1.97.1 or newer.
 
 ```sh
 git clone https://github.com/alan13367/yawl.git
@@ -73,10 +73,12 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 
 ## Slash commands
 
+`/model` and `/settings` open lightweight keyboard pickers. Use the arrow keys and Enter to choose, or Escape to close.
+
 | Command | Effect |
 | --- | --- |
-| `/model [MODEL]` | List configured models or switch the model for the current session |
-| `/settings [KEY ...]` | Show or change persistent settings |
+| `/model [MODEL]` | Open a model picker, or switch the current session directly when `MODEL` is given |
+| `/settings [KEY ...]` | Open the settings picker, or change a setting directly when arguments are given |
 | `/clear` | Start a new session |
 | `/compact` | Summarize older messages now |
 | `/tools` | List builtin and discovered tools |

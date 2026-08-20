@@ -20,8 +20,8 @@ use self::input::{EditAction, Editor};
 
 const HELP: &str = "\
 Commands
-  /model [MODEL]       list configured models or switch the current model
-  /settings [KEY ...]  show or change persistent settings
+  /model [MODEL]       open the model picker or switch directly
+  /settings [KEY ...]  open the settings picker or change directly
   /clear               start a new session
   /compact             summarize older messages now
   /tools               list builtin and discovered tools
@@ -43,6 +43,30 @@ Input
 struct Completion {
     command: String,
     description: String,
+}
+
+#[derive(Clone)]
+enum PickerAction {
+    SwitchModel(String),
+    SaveModel(String),
+    OpenModels { save: bool },
+    EditSetting(String),
+    ToggleAutoCompact,
+    Reload,
+    ShowSettings,
+}
+
+struct PickerItem {
+    label: String,
+    description: String,
+    action: PickerAction,
+}
+
+struct Picker {
+    title: String,
+    hint: String,
+    items: Vec<PickerItem>,
+    selected: usize,
 }
 
 enum Entry {
@@ -71,6 +95,7 @@ struct ViewState {
     queued_inputs: std::collections::VecDeque<String>,
     completions: Vec<Completion>,
     completion_index: usize,
+    picker: Option<Picker>,
 }
 
 impl ViewState {
@@ -88,6 +113,7 @@ impl ViewState {
             queued_inputs: std::collections::VecDeque::new(),
             completions: command_completions(agent),
             completion_index: 0,
+            picker: None,
         }
     }
 
@@ -293,6 +319,15 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
         }
 
         let event = events.read_event()?;
+        if state.picker.is_some() {
+            match event {
+                Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
+                Event::Key(key) => handle_picker_key(agent, &mut state, &mut editor, key),
+                Event::Tick | Event::MouseScroll(_) | Event::Paste(_) => {}
+            }
+            terminal.draw(&mut state, &editor)?;
+            continue;
+        }
         match event {
             Event::Tick => {
                 if crate::interrupted() {
@@ -370,7 +405,7 @@ fn handle_submission<R: Read>(
         match name {
             "quit" | "q" => return Ok(true),
             "help" => state.notice(HELP),
-            "model" if argument.is_empty() => show_models(agent, state),
+            "model" if argument.is_empty() => open_model_picker(agent, state, false),
             "model" => {
                 agent.model = argument.to_string();
                 state.model.clone_from(&agent.model);
@@ -378,6 +413,7 @@ fn handle_submission<R: Read>(
                 state.context_tokens = 0;
                 state.notice(format!("Switched to {}.", agent.model));
             }
+            "settings" if argument.is_empty() => open_settings_picker(agent, state),
             "settings" => {
                 settings(agent, argument, state);
                 state.refresh_completions(agent);
@@ -546,19 +582,196 @@ fn expand_user_path(path: &str) -> std::path::PathBuf {
     path.into()
 }
 
-fn show_models(agent: &Agent, state: &mut ViewState) {
-    let models = agent.config.available_models();
-    let mut text = format!("Current model: `{}`", agent.model);
-    if models.is_empty() {
-        text.push_str("\n\nNo model IDs are listed in the provider configuration.");
+fn open_model_picker(agent: &Agent, state: &mut ViewState, save: bool) {
+    let selected_model = if save {
+        agent.config.model.as_deref().unwrap_or(&agent.model)
     } else {
-        text.push_str("\n\nKnown models\n\n");
-        for (model, name) in models {
-            text.push_str(&format!("- `{model}`: {name}\n"));
-        }
+        &agent.model
+    };
+    let mut models = agent.config.available_models();
+    if !models.iter().any(|(model, _)| model == selected_model) {
+        models.push((
+            selected_model.to_string(),
+            if save {
+                "Current default"
+            } else {
+                "Current model"
+            }
+            .into(),
+        ));
+        models.sort_by(|left, right| left.0.cmp(&right.0));
     }
-    text.push_str("\nUnlisted OpenAI-compatible model IDs also work, for example `/model ollama:qwen2.5-coder:7b`.");
-    state.notice(text);
+    let mut items = models
+        .into_iter()
+        .map(|(model, name)| PickerItem {
+            label: name,
+            description: model.clone(),
+            action: if save {
+                PickerAction::SaveModel(model)
+            } else {
+                PickerAction::SwitchModel(model)
+            },
+        })
+        .collect::<Vec<_>>();
+    items.push(PickerItem {
+        label: "Use another model ID…".into(),
+        description: "Enter a model not listed above".into(),
+        action: PickerAction::EditSetting(if save {
+            "/settings model ".into()
+        } else {
+            "/model ".into()
+        }),
+    });
+    let selected = items
+        .iter()
+        .position(|item| item.description == selected_model)
+        .unwrap_or(0);
+    state.picker = Some(Picker {
+        title: if save {
+            "Default model".into()
+        } else {
+            "Choose model".into()
+        },
+        hint: "↑/↓ move  Enter select  Esc cancel".into(),
+        items,
+        selected,
+    });
+}
+
+fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
+    let on_off = if agent.config.auto_compact {
+        "On"
+    } else {
+        "Off"
+    };
+    state.picker = Some(Picker {
+        title: "Settings".into(),
+        hint: "↑/↓ move  Enter change  Esc close".into(),
+        selected: 0,
+        items: vec![
+            PickerItem {
+                label: "Default model".into(),
+                description: agent
+                    .config
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| agent.model.clone()),
+                action: PickerAction::OpenModels { save: true },
+            },
+            PickerItem {
+                label: "Max output tokens".into(),
+                description: agent.config.max_tokens.to_string(),
+                action: PickerAction::EditSetting("/settings max_tokens ".into()),
+            },
+            PickerItem {
+                label: "Automatic compaction".into(),
+                description: format!("{on_off} · Enter to toggle"),
+                action: PickerAction::ToggleAutoCompact,
+            },
+            PickerItem {
+                label: "Compaction threshold".into(),
+                description: format!("{:.0}%", agent.config.compact_threshold * 100.0),
+                action: PickerAction::EditSetting("/settings compact_threshold ".into()),
+            },
+            PickerItem {
+                label: "Current model context window".into(),
+                description: agent.context_window().to_string(),
+                action: PickerAction::EditSetting("/settings context_window ".into()),
+            },
+            PickerItem {
+                label: "Skill directories".into(),
+                description: format!(
+                    "{} configured · add or remove",
+                    agent.config.skill_dirs.len()
+                ),
+                action: PickerAction::EditSetting("/settings skills ".into()),
+            },
+            PickerItem {
+                label: "OpenAI-compatible provider".into(),
+                description: "Add or update a provider".into(),
+                action: PickerAction::EditSetting("/settings provider ".into()),
+            },
+            PickerItem {
+                label: "OpenAI endpoint".into(),
+                description: agent.config.openai_base_url.clone(),
+                action: PickerAction::EditSetting("/settings openai_base_url ".into()),
+            },
+            PickerItem {
+                label: "Anthropic endpoint".into(),
+                description: agent.config.anthropic_base_url.clone(),
+                action: PickerAction::EditSetting("/settings anthropic_base_url ".into()),
+            },
+            PickerItem {
+                label: "Reload configuration".into(),
+                description: "Read global and project files again".into(),
+                action: PickerAction::Reload,
+            },
+            PickerItem {
+                label: "Configuration details".into(),
+                description: "Show paths, providers, and all commands".into(),
+                action: PickerAction::ShowSettings,
+            },
+        ],
+    });
+}
+
+fn handle_picker_key(agent: &mut Agent, state: &mut ViewState, editor: &mut Editor, key: Key) {
+    let Some(picker) = state.picker.as_mut() else {
+        return;
+    };
+    match key {
+        Key::Escape | Key::Ctrl('c') => state.picker = None,
+        Key::Up | Key::Char('k') => picker.selected = picker.selected.saturating_sub(1),
+        Key::Down | Key::Char('j') => {
+            picker.selected = (picker.selected + 1).min(picker.items.len().saturating_sub(1));
+        }
+        Key::PageUp => picker.selected = picker.selected.saturating_sub(5),
+        Key::PageDown => {
+            picker.selected = (picker.selected + 5).min(picker.items.len().saturating_sub(1));
+        }
+        Key::Enter => {
+            let action = picker
+                .items
+                .get(picker.selected)
+                .map(|item| item.action.clone());
+            state.picker = None;
+            if let Some(action) = action {
+                activate_picker_action(agent, state, editor, action);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn activate_picker_action(
+    agent: &mut Agent,
+    state: &mut ViewState,
+    editor: &mut Editor,
+    action: PickerAction,
+) {
+    match action {
+        PickerAction::SwitchModel(model) => {
+            agent.model = model;
+            state.model.clone_from(&agent.model);
+            state.context_window = agent.context_window();
+            state.context_tokens = 0;
+            state.notice(format!("Switched to {}.", agent.model));
+        }
+        PickerAction::SaveModel(model) => settings(agent, &format!("model {model}"), state),
+        PickerAction::OpenModels { save } => open_model_picker(agent, state, save),
+        PickerAction::EditSetting(command) => editor.paste(&command),
+        PickerAction::ToggleAutoCompact => {
+            let value = if agent.config.auto_compact {
+                "off"
+            } else {
+                "on"
+            };
+            settings(agent, &format!("auto_compact {value}"), state);
+        }
+        PickerAction::Reload => settings(agent, "reload", state),
+        PickerAction::ShowSettings => show_settings(agent, state),
+    }
+    state.refresh_completions(agent);
 }
 
 fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) {
@@ -1221,6 +1434,62 @@ fn terminal_size() -> (u16, u16) {
     }
 }
 
+fn render_picker(picker: &Picker, columns: usize, height: usize) -> Vec<String> {
+    if height == 0 {
+        return Vec::new();
+    }
+    let box_width = columns.saturating_sub(4).clamp(16, 76);
+    let inner = box_width.saturating_sub(2);
+    let capacity = height
+        .saturating_sub(5)
+        .max(1)
+        .min(picker.items.len().max(1));
+    let mut start = picker.selected.saturating_sub(capacity / 2);
+    start = start.min(picker.items.len().saturating_sub(capacity));
+    let end = (start + capacity).min(picker.items.len());
+    let left = " ".repeat(columns.saturating_sub(box_width) / 2);
+    let boxed = |content: &str| format!("{left}│{}│", markdown::fit_width(content, inner));
+    let mut panel = vec![format!("{left}┌{}┐", "─".repeat(inner))];
+    panel.push(boxed(&format!(" \x1b[1m{}\x1b[0m", picker.title)));
+    panel.push(format!("{left}├{}┤", "─".repeat(inner)));
+    for (index, item) in picker.items[start..end].iter().enumerate() {
+        let absolute = start + index;
+        let marker = if absolute == picker.selected {
+            "›"
+        } else {
+            " "
+        };
+        let text = format!(" {marker} {}  ·  {}", item.label, item.description);
+        if absolute == picker.selected {
+            panel.push(boxed(&format!(
+                "\x1b[7m{}\x1b[0m",
+                markdown::fit_width(&text, inner)
+            )));
+        } else {
+            panel.push(boxed(&text));
+        }
+    }
+    panel.push(boxed(&format!(" \x1b[2m{}\x1b[0m", picker.hint)));
+    panel.push(format!("{left}└{}┘", "─".repeat(inner)));
+
+    if panel.len() > height {
+        panel.truncate(height);
+    }
+    let top = height.saturating_sub(panel.len()) / 2;
+    let mut lines = Vec::with_capacity(height);
+    lines.extend(std::iter::repeat_n(" ".repeat(columns), top));
+    lines.extend(
+        panel
+            .into_iter()
+            .map(|line| markdown::fit_width(&line, columns)),
+    );
+    lines.extend(std::iter::repeat_n(
+        " ".repeat(columns),
+        height.saturating_sub(lines.len()),
+    ));
+    lines
+}
+
 fn build_frame(
     state: &mut ViewState,
     editor: &Editor,
@@ -1242,23 +1511,31 @@ fn build_frame(
     let cursor_input_row = layout.cursor_row.saturating_sub(input_start);
     let input_height = input_lines.len() + 2;
     let menu_capacity = rows.saturating_sub(input_height + 1);
-    let match_count = matching_completions(state, editor).len().min(menu_capacity);
+    let match_count = if state.picker.is_none() {
+        matching_completions(state, editor).len().min(menu_capacity)
+    } else {
+        0
+    };
     if match_count > 0 {
         state.completion_index = state.completion_index.min(match_count - 1);
     }
-    let menu = matching_completions(state, editor)
-        .iter()
-        .take(menu_capacity)
-        .enumerate()
-        .map(|(index, completion)| {
-            let line = format!("  {:<18} {}", completion.command, completion.description);
-            if index == state.completion_index {
-                format!("\x1b[7m{}\x1b[0m", markdown::fit_width(&line, columns))
-            } else {
-                markdown::fit_width(&line, columns)
-            }
-        })
-        .collect::<Vec<_>>();
+    let menu = if state.picker.is_none() {
+        matching_completions(state, editor)
+            .iter()
+            .take(menu_capacity)
+            .enumerate()
+            .map(|(index, completion)| {
+                let line = format!("  {:<18} {}", completion.command, completion.description);
+                if index == state.completion_index {
+                    format!("\x1b[7m{}\x1b[0m", markdown::fit_width(&line, columns))
+                } else {
+                    markdown::fit_width(&line, columns)
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let menu_height = menu.len();
     let transcript_height = rows.saturating_sub(input_height + menu_height + 1);
     let transcript = render_entries(&state.entries, columns, state.tools_expanded);
@@ -1269,15 +1546,19 @@ fn build_frame(
     let visible = &transcript[start..end];
 
     let mut frame = Vec::with_capacity(rows);
-    frame.extend(std::iter::repeat_n(
-        " ".repeat(columns),
-        transcript_height.saturating_sub(visible.len()),
-    ));
-    frame.extend(
-        visible
-            .iter()
-            .map(|line| markdown::fit_width(line, columns)),
-    );
+    if let Some(picker) = &state.picker {
+        frame.extend(render_picker(picker, columns, transcript_height));
+    } else {
+        frame.extend(std::iter::repeat_n(
+            " ".repeat(columns),
+            transcript_height.saturating_sub(visible.len()),
+        ));
+        frame.extend(
+            visible
+                .iter()
+                .map(|line| markdown::fit_width(line, columns)),
+        );
+    }
     frame.extend(menu);
     frame.push(format!("┌{}┐", "─".repeat(inner_width)));
     for line in input_lines {
@@ -1327,12 +1608,46 @@ mod tests {
             queued_inputs: std::collections::VecDeque::new(),
             completions: Vec::new(),
             completion_index: 0,
+            picker: None,
         };
         let editor = Editor::default();
         let (frame, cursor) = build_frame(&mut state, &editor, 40, 12);
         assert_eq!(frame.len(), 12);
         assert!(markdown::strip_ansi(frame.last().unwrap()).contains("test"));
         assert_eq!(cursor.0, 10);
+    }
+
+    #[test]
+    fn picker_is_bounded_and_highlights_selection() {
+        let picker = Picker {
+            title: "Choose model".into(),
+            hint: "Enter select".into(),
+            selected: 1,
+            items: vec![
+                PickerItem {
+                    label: "First".into(),
+                    description: "provider:first".into(),
+                    action: PickerAction::SwitchModel("provider:first".into()),
+                },
+                PickerItem {
+                    label: "Second".into(),
+                    description: "provider:second".into(),
+                    action: PickerAction::SwitchModel("provider:second".into()),
+                },
+            ],
+        };
+        let rendered = render_picker(&picker, 50, 10);
+        assert_eq!(rendered.len(), 10);
+        assert!(
+            rendered
+                .iter()
+                .all(|line| markdown::visible_width(line) == 50)
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| { line.contains("Second") && line.contains("\x1b[7m") })
+        );
     }
 
     #[test]
