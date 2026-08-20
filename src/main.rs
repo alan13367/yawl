@@ -3,6 +3,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use yawl::agent::{Agent, TurnEvent};
 use yawl::config::Config;
 use yawl::error::Error;
+use yawl::provider::{Reasoning, ReasoningKind};
 use yawl::session::Session;
 use yawl::tools::{DescribeCache, Registry};
 
@@ -221,10 +222,13 @@ fn list_tools(config: &Config) {
 
 fn run_print_mode(agent: &mut Agent, prompt: String) -> Result<i32, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout().lock();
+    let hide_reasoning = agent.config.hide_reasoning;
+    let mut pending_reasoning = Vec::new();
     let mut response_has_text = false;
     let mut output_error = None;
     let completed = agent.run_turn(Some(prompt), &mut |event| match event {
         TurnEvent::TextDelta(text) => {
+            print_reasoning(&mut pending_reasoning);
             if output_error.is_none() {
                 match stdout
                     .write_all(text.as_bytes())
@@ -238,8 +242,14 @@ fn run_print_mode(agent: &mut Agent, prompt: String) -> Result<i32, Box<dyn std:
                 }
             }
         }
+        TurnEvent::ReasoningDelta { kind, text } => {
+            if !hide_reasoning {
+                append_reasoning(&mut pending_reasoning, kind, text);
+            }
+        }
         TurnEvent::RetryReset => {
             eprintln!("\nretry restarted the response; earlier partial text may repeat");
+            pending_reasoning.clear();
             response_has_text = false;
         }
         TurnEvent::Retrying {
@@ -248,6 +258,7 @@ fn run_print_mode(agent: &mut Agent, prompt: String) -> Result<i32, Box<dyn std:
             error,
         } => eprintln!("\nrequest attempt {attempt} failed ({error}); retrying in {delay_ms}ms"),
         TurnEvent::AssistantDone => {
+            print_reasoning(&mut pending_reasoning);
             if response_has_text && output_error.is_none() {
                 if let Err(error) = stdout.write_all(b"\n").and_then(|()| stdout.flush()) {
                     output_error = Some(error);
@@ -271,6 +282,35 @@ fn run_print_mode(agent: &mut Agent, prompt: String) -> Result<i32, Box<dyn std:
     } else {
         eprintln!("turn interrupted");
         Ok(130)
+    }
+}
+
+fn append_reasoning(reasoning: &mut Vec<Reasoning>, kind: ReasoningKind, text: &str) {
+    if let Some(current) = reasoning.last_mut()
+        && current.kind == kind
+    {
+        current.content.push_str(text);
+    } else {
+        reasoning.push(Reasoning {
+            kind,
+            content: text.to_string(),
+        });
+    }
+}
+
+fn print_reasoning(reasoning: &mut Vec<Reasoning>) {
+    for block in reasoning.drain(..) {
+        match block.kind {
+            ReasoningKind::Summary => {
+                let summary = block
+                    .content
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!("{summary}");
+            }
+            ReasoningKind::Full => eprintln!("{}", block.content.trim()),
+        }
     }
 }
 

@@ -100,6 +100,7 @@ Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`
   "openai_base_url": "https://api.openai.com/v1",
   "max_tokens": 8192,
   "reasoning_effort": "high",
+  "hide_reasoning": false,
   "auto_compact": true,
   "compact_threshold": 0.85,
   "context_windows": {
@@ -129,7 +130,7 @@ Choose "OpenAI Codex" during onboarding to use a ChatGPT Plus or Pro subscriptio
 yawl --login openai-codex
 ```
 
-The provider uses the ChatGPT Codex Responses endpoint with SSE streaming, tool calls, token usage, and encrypted reasoning replay for multi-step tool runs. Supported model IDs are listed by `/model`. After choosing a Codex model, Yawl opens a second picker containing the reasoning efforts supported by that model. The selection is sent as the Responses API `reasoning.effort`; OAuth authenticates the account but does not itself return model capability metadata.
+The provider uses the ChatGPT Codex Responses endpoint with SSE streaming, tool calls, token usage, and encrypted reasoning replay for multi-step tool runs. When Codex returns a reasoning summary, Yawl displays it as one muted line before the answer. Supported model IDs are listed by `/model`. After choosing a Codex model, Yawl opens a second picker containing the reasoning efforts supported by that model. The selection is sent as the Responses API `reasoning.effort`; OAuth authenticates the account but does not itself return model capability metadata.
 
 ### Add an OpenAI-compatible provider
 
@@ -157,7 +158,9 @@ Add providers under `providers`. This uses the same field names as pi's `models.
 }
 ```
 
-`models` is optional. It supplies labels and token limits for `/model`; Yawl still accepts an unlisted model ID. Custom providers currently use streaming OpenAI Chat Completions at `BASE_URL/chat/completions` and support text plus tool calls.
+`models` is optional. It supplies labels and token limits for `/model`; Yawl still accepts an unlisted model ID. Custom providers use streaming OpenAI Chat Completions at `BASE_URL/chat/completions` and support text, tool calls, and full reasoning from `reasoning_content`, `reasoning`, or `reasoning_text` deltas. Yawl displays full reasoning as a separate multi-line block. The OMLX preset also sends saved full reasoning back as `reasoning_content` during tool loops.
+
+Set `hide_reasoning` to `true`, choose "Reasoning display" in `/settings`, or run `/settings hide_reasoning on` to remove both summary and full reasoning from the TUI and print-mode output. Yawl still records the reasoning in the session so it reappears if the setting is turned off. In print mode, visible reasoning goes to standard error and the answer remains on standard output.
 
 Provider keys and header values accept `$ENV_VAR` and `${ENV_VAR}` references. If `apiKey` is omitted, Yawl also checks an environment variable derived from the provider name, such as `OMLX_API_KEY` or `LMSTUDIO_API_KEY`. Keyless local servers need no placeholder key. Extra pi model fields such as `cost`, `input`, and `reasoning` are ignored.
 
@@ -169,6 +172,7 @@ These compatibility fields are supported at provider or model level:
     "supportsUsageInStreaming": false,
     "supportsFinishReason": false,
     "requiresToolResultName": true,
+    "requiresReasoningContentOnAssistantMessages": true,
     "maxTokensField": "max_tokens"
   }
 }
@@ -181,11 +185,11 @@ You can configure an endpoint from the TUI without editing JSON:
 /settings model omlx:Qwen3-Coder
 ```
 
-Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; `./.yawl/config.json` can still override it. It also changes `max_tokens`, Codex reasoning effort, automatic compaction, the compaction threshold, context windows, and built-in endpoint URLs.
+Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; `./.yawl/config.json` can still override it. It also changes `max_tokens`, Codex reasoning effort, reasoning visibility, automatic compaction, the compaction threshold, context windows, and built-in endpoint URLs.
 
 ## Sessions and compaction
 
-Yawl stores append-only JSONL session files in `~/.yawl/sessions/`. Each user message, assistant response, tool result, and compaction event is written as it happens. The original history remains in the log after compaction. `/new` starts a blank session without changing the current working directory.
+Yawl stores append-only JSONL session files in `~/.yawl/sessions/`. Each user message, assistant response, reasoning block, tool result, and compaction event is written as it happens. The original history remains in the log after compaction. `/new` starts a blank session without changing the current working directory.
 
 Yawl checks the last provider-reported token usage before each request. At the configured threshold, 85 percent by default, it asks the current model to summarize the older conversation and keeps roughly the last ten messages unchanged. Use `/compact` to do this manually.
 

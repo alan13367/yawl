@@ -10,7 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{Event, Provider, Request, Role, SseReader, ToolCall, error_body, http_agent};
+use super::{
+    Event, Provider, ReasoningKind, Request, Role, SseReader, ToolCall, error_body, http_agent,
+};
 use crate::config::Config;
 use crate::error::Error;
 
@@ -557,6 +559,7 @@ impl Provider for Codex {
         let reader = BufReader::new(response.into_body().into_reader());
         let mut emitted_calls = HashSet::new();
         let mut reasoning_items: HashMap<String, Value> = HashMap::new();
+        let mut emitted_summary = false;
         for event in SseReader::new(reader) {
             let event = event?;
             if event.data.is_empty() || event.data == "[DONE]" {
@@ -571,6 +574,23 @@ impl Provider for Codex {
                         on_event(Event::TextDelta(delta.to_string()));
                     }
                 }
+                "response.reasoning_summary_text.delta" => {
+                    if let Some(delta) = value["delta"].as_str()
+                        && !delta.is_empty()
+                    {
+                        emitted_summary = true;
+                        on_event(Event::ReasoningDelta {
+                            kind: ReasoningKind::Summary,
+                            text: delta.to_string(),
+                        });
+                    }
+                }
+                "response.reasoning_summary_part.done" if emitted_summary => {
+                    on_event(Event::ReasoningDelta {
+                        kind: ReasoningKind::Summary,
+                        text: "\n\n".into(),
+                    });
+                }
                 "response.output_item.done" => {
                     let item = &value["item"];
                     if item["type"] == "function_call" {
@@ -578,6 +598,7 @@ impl Provider for Codex {
                     } else if item["type"] == "reasoning"
                         && let Some(id) = item["id"].as_str()
                     {
+                        emit_reasoning_summary(item, &mut emitted_summary, on_event);
                         reasoning_items.insert(id.to_string(), item.clone());
                     }
                 }
@@ -590,6 +611,7 @@ impl Provider for Codex {
                             } else if item["type"] == "reasoning"
                                 && let Some(id) = item["id"].as_str()
                             {
+                                emit_reasoning_summary(item, &mut emitted_summary, on_event);
                                 reasoning_items.insert(id.to_string(), item.clone());
                             }
                         }
@@ -634,6 +656,28 @@ impl Provider for Codex {
             std::io::ErrorKind::UnexpectedEof,
             "Codex stream ended before completion",
         )))
+    }
+}
+
+fn emit_reasoning_summary(item: &Value, emitted: &mut bool, on_event: &mut dyn FnMut(Event)) {
+    if *emitted {
+        return;
+    }
+    let Some(parts) = item["summary"].as_array() else {
+        return;
+    };
+    let summary = parts
+        .iter()
+        .filter_map(|part| part["text"].as_str())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !summary.is_empty() {
+        on_event(Event::ReasoningDelta {
+            kind: ReasoningKind::Summary,
+            text: summary,
+        });
+        *emitted = true;
     }
 }
 
@@ -714,6 +758,29 @@ mod tests {
             "low"
         );
         assert!(build_body(&request, None).get("reasoning").is_none());
+    }
+
+    #[test]
+    fn completed_reasoning_item_emits_summary_once() {
+        let item = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "Inspecting the request"}]
+        });
+        let mut emitted = false;
+        let mut summaries = Vec::new();
+        emit_reasoning_summary(&item, &mut emitted, &mut |event| {
+            if let Event::ReasoningDelta { kind, text } = event {
+                summaries.push((kind, text));
+            }
+        });
+        emit_reasoning_summary(&item, &mut emitted, &mut |_| {});
+
+        assert_eq!(
+            summaries,
+            [(ReasoningKind::Summary, "Inspecting the request".into())]
+        );
+        assert!(emitted);
     }
 
     #[test]

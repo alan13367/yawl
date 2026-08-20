@@ -23,9 +23,10 @@ cargo fmt --all --check
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo run -- --help
+cargo install --path .
 ```
 
-Run `cargo fmt --all` after editing Rust. Do not edit generated files under `target/`.
+Run `cargo fmt --all` after editing Rust. After making code changes, run `cargo install --path .` before manual testing so the local `yawl` command uses the new build. Do not edit generated files under `target/`.
 
 ## Code rules
 

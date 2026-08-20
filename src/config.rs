@@ -27,6 +27,8 @@ pub struct OpenAiCompatibility {
     pub supports_finish_reason: Option<bool>,
     #[serde(alias = "requiresToolResultName")]
     pub requires_tool_result_name: Option<bool>,
+    #[serde(alias = "requiresReasoningContentOnAssistantMessages")]
+    pub requires_reasoning_content_on_assistant_messages: Option<bool>,
     #[serde(alias = "maxTokensField")]
     pub max_tokens_field: Option<String>,
 }
@@ -41,6 +43,13 @@ impl OpenAiCompatibility {
         }
         if other.requires_tool_result_name.is_some() {
             self.requires_tool_result_name = other.requires_tool_result_name;
+        }
+        if other
+            .requires_reasoning_content_on_assistant_messages
+            .is_some()
+        {
+            self.requires_reasoning_content_on_assistant_messages =
+                other.requires_reasoning_content_on_assistant_messages;
         }
         if other.max_tokens_field.is_some() {
             self.max_tokens_field = other.max_tokens_field;
@@ -57,6 +66,11 @@ impl OpenAiCompatibility {
 
     pub fn tool_result_name_required(&self) -> bool {
         self.requires_tool_result_name.unwrap_or(false)
+    }
+
+    pub fn reasoning_content_on_assistant_messages(&self) -> bool {
+        self.requires_reasoning_content_on_assistant_messages
+            .unwrap_or(false)
     }
 
     pub fn max_tokens_field(&self) -> &str {
@@ -138,6 +152,8 @@ struct ConfigFile {
     openai_base_url: Option<String>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
+    /// Whether reasoning content is omitted from terminal output.
+    hide_reasoning: Option<bool>,
     /// Per-model context window overrides, e.g. {"my-local-model": 32768}.
     context_windows: Option<HashMap<String, u64>>,
     /// Whether automatic context compaction is enabled.
@@ -174,6 +190,7 @@ pub struct Config {
     /// Reasoning effort sent to OpenAI Codex (`minimal` through `max`).
     /// `None` leaves the provider default unchanged.
     pub reasoning_effort: Option<String>,
+    pub hide_reasoning: bool,
     pub context_windows: HashMap<String, u64>,
     pub auto_compact: bool,
     pub compact_threshold: f64,
@@ -200,6 +217,7 @@ impl Config {
             openai_base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
             max_tokens: DEFAULT_MAX_TOKENS,
             reasoning_effort: None,
+            hide_reasoning: false,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
@@ -239,6 +257,9 @@ impl Config {
         }
         if let Some(value) = file.reasoning_effort {
             self.reasoning_effort = normalize_reasoning_effort(&value).map(str::to_string);
+        }
+        if let Some(value) = file.hide_reasoning {
+            self.hide_reasoning = value;
         }
         if let Some(map) = file.context_windows {
             self.context_windows.extend(map);
@@ -378,6 +399,7 @@ impl Config {
                 | "openai_base_url"
                 | "max_tokens"
                 | "reasoning_effort"
+                | "hide_reasoning"
                 | "auto_compact"
                 | "compact_threshold"
         ) {
@@ -486,14 +508,18 @@ fn expand_home_path(value: &str, yawl_home: &Path) -> PathBuf {
 }
 
 fn default_local_providers() -> HashMap<String, ProviderConfig> {
-    [
+    let mut providers = [
         ("ollama", "http://127.0.0.1:11434/v1"),
         ("lmstudio", "http://127.0.0.1:1234/v1"),
         ("omlx", "http://127.0.0.1:8000/v1"),
     ]
     .into_iter()
     .map(|(name, url)| (name.to_string(), ProviderConfig::openai_compatible(url)))
-    .collect()
+    .collect::<HashMap<_, _>>();
+    if let Some(omlx) = providers.get_mut("omlx") {
+        omlx.compat.requires_reasoning_content_on_assistant_messages = Some(true);
+    }
+    providers
 }
 
 /// Valid OpenAI Codex reasoning efforts. `default` and `off` omit the
@@ -641,6 +667,7 @@ mod tests {
             openai_base_url: String::new(),
             max_tokens: 8192,
             reasoning_effort: None,
+            hide_reasoning: false,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: 0.85,
@@ -704,6 +731,7 @@ mod tests {
         assert_eq!(provider.api_key.as_deref(), Some("local-key"));
         assert_eq!(provider.models[0].id, "qwen");
         assert!(!provider.compat.usage_in_stream());
+        assert!(provider.compat.reasoning_content_on_assistant_messages());
     }
 
     #[test]
@@ -714,6 +742,15 @@ mod tests {
 
         cfg.apply(serde_json::from_value(json!({"reasoning_effort": "default"})).unwrap());
         assert_eq!(cfg.reasoning_effort, None);
+    }
+
+    #[test]
+    fn reasoning_is_visible_unless_hidden() {
+        let mut cfg = test_config();
+        assert!(!cfg.hide_reasoning);
+
+        cfg.apply(serde_json::from_value(json!({"hide_reasoning": true})).unwrap());
+        assert!(cfg.hide_reasoning);
     }
 
     #[test]

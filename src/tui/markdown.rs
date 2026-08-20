@@ -4,6 +4,7 @@
 use super::highlight;
 
 const RESET: &str = "\x1b[0m";
+const INLINE_CODE: &str = "\x1b[38;2;155;188;198m";
 
 pub fn render(markdown: &str, width: usize) -> Vec<String> {
     let width = width.max(8);
@@ -180,7 +181,7 @@ fn render_inline(text: &str) -> String {
                 .position(|character| *character == '`')
         {
             let end = index + 1 + end;
-            output.push_str("\x1b[30;47m");
+            output.push_str(INLINE_CODE);
             output.extend(&chars[index + 1..end]);
             output.push_str(RESET);
             index = end + 1;
@@ -480,7 +481,11 @@ mod tests {
         let lines = render("hello **bold** and `code`", 12);
         assert!(lines.len() >= 2);
         assert!(lines.iter().all(|line| visible_width(line) <= 12));
-        assert!(lines.join("").contains("\x1b[1mbold\x1b[0m"));
+        let rendered = lines.join("");
+        assert!(rendered.contains("\x1b[1mbold\x1b[0m"));
+        assert!(rendered.contains(&format!("{INLINE_CODE}code{RESET}")));
+        assert!(!rendered.contains("\x1b[30;47m"));
+        assert!(!rendered.contains("\x1b[7m"));
     }
 
     #[test]

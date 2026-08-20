@@ -24,6 +24,22 @@ pub enum Role {
     Tool,
 }
 
+/// How much of a model's reasoning a provider exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningKind {
+    /// A short provider-generated description, such as a Codex summary.
+    Summary,
+    /// The model's full reasoning stream, as exposed by local models.
+    Full,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reasoning {
+    pub kind: ReasoningKind,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -43,6 +59,9 @@ pub struct Message {
     pub content: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    /// Displayable reasoning returned alongside this assistant message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning: Vec<Reasoning>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,6 +80,7 @@ impl Message {
             role: Role::User,
             content: content.into(),
             tool_calls: Vec::new(),
+            reasoning: Vec::new(),
             tool_call_id: None,
             tool_name: None,
             is_error: false,
@@ -73,6 +93,7 @@ impl Message {
             role: Role::Assistant,
             content,
             tool_calls,
+            reasoning: Vec::new(),
             tool_call_id: None,
             tool_name: None,
             is_error: false,
@@ -90,6 +111,7 @@ impl Message {
             role: Role::Tool,
             content,
             tool_calls: Vec::new(),
+            reasoning: Vec::new(),
             tool_call_id: Some(call_id.into()),
             tool_name: Some(name.into()),
             is_error,
@@ -118,6 +140,10 @@ pub struct Request<'a> {
 #[derive(Debug)]
 pub enum Event {
     TextDelta(String),
+    ReasoningDelta {
+        kind: ReasoningKind,
+        text: String,
+    },
     /// A complete tool call (emitted once its arguments finished streaming).
     ToolCall(ToolCall),
     Usage {
@@ -138,6 +164,7 @@ pub trait Provider {
 #[derive(Debug, Default)]
 pub struct TurnOutput {
     pub text: String,
+    pub reasoning: Vec<Reasoning>,
     pub tool_calls: Vec<ToolCall>,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -147,6 +174,10 @@ pub struct TurnOutput {
 /// Out-of-band notices from the retry wrapper, for display.
 pub enum StreamNotice<'a> {
     TextDelta(&'a str),
+    ReasoningDelta {
+        kind: ReasoningKind,
+        text: &'a str,
+    },
     /// A retry is about to restart the request from scratch; the consumer
     /// must discard any partial text it displayed.
     RetryReset,
@@ -177,6 +208,10 @@ pub fn stream_turn(
                 sink(StreamNotice::TextDelta(&t));
                 out.text.push_str(&t);
             }
+            Event::ReasoningDelta { kind, text } => {
+                sink(StreamNotice::ReasoningDelta { kind, text: &text });
+                append_reasoning(&mut out.reasoning, kind, &text);
+            }
             Event::ToolCall(tc) => out.tool_calls.push(tc),
             Event::Usage {
                 input_tokens,
@@ -206,6 +241,19 @@ pub fn stream_turn(
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+pub(crate) fn append_reasoning(reasoning: &mut Vec<Reasoning>, kind: ReasoningKind, text: &str) {
+    if let Some(current) = reasoning.last_mut()
+        && current.kind == kind
+    {
+        current.content.push_str(text);
+    } else {
+        reasoning.push(Reasoning {
+            kind,
+            content: text.to_string(),
+        });
     }
 }
 
@@ -434,12 +482,15 @@ mod tests {
 
     #[test]
     fn message_roundtrips_through_json() {
-        let m = Message::tool_result("id1", "shell", "ok".into(), false);
+        let mut m = Message::assistant("ok".into(), Vec::new());
+        m.reasoning.push(Reasoning {
+            kind: ReasoningKind::Summary,
+            content: "Checked the result".into(),
+        });
         let text = serde_json::to_string(&m).unwrap();
         let back: Message = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.role, Role::Tool);
-        assert_eq!(back.tool_call_id.as_deref(), Some("id1"));
-        assert!(!back.is_error);
+        assert_eq!(back.role, Role::Assistant);
+        assert_eq!(back.reasoning, m.reasoning);
     }
 
     struct FlakyProvider {
@@ -455,12 +506,20 @@ mod tests {
             let call = self.calls.get() + 1;
             self.calls.set(call);
             if call == 1 {
+                on_event(Event::ReasoningDelta {
+                    kind: ReasoningKind::Full,
+                    text: "partial thought".into(),
+                });
                 on_event(Event::TextDelta("partial".into()));
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "disconnected",
                 )));
             }
+            on_event(Event::ReasoningDelta {
+                kind: ReasoningKind::Full,
+                text: "complete thought".into(),
+            });
             on_event(Event::TextDelta("complete".into()));
             on_event(Event::Usage {
                 input_tokens: 10,
@@ -487,6 +546,9 @@ mod tests {
         let mut notices = Vec::new();
         let output = stream_turn(&provider, &request, &mut |notice| match notice {
             StreamNotice::TextDelta(text) => notices.push(format!("text:{text}")),
+            StreamNotice::ReasoningDelta { kind, text } => {
+                notices.push(format!("reasoning:{kind:?}:{text}"));
+            }
             StreamNotice::RetryReset => notices.push("reset".into()),
             StreamNotice::Retrying { attempt, .. } => {
                 notices.push(format!("retry:{attempt}"));
@@ -495,9 +557,17 @@ mod tests {
         .expect("second attempt should succeed");
         assert_eq!(provider.calls.get(), 2);
         assert_eq!(output.text, "complete");
+        assert_eq!(output.reasoning[0].content, "complete thought");
         assert_eq!(
             notices,
-            ["text:partial", "retry:1", "reset", "text:complete"]
+            [
+                "reasoning:Full:partial thought",
+                "text:partial",
+                "retry:1",
+                "reset",
+                "reasoning:Full:complete thought",
+                "text:complete"
+            ]
         );
         assert_eq!((output.input_tokens, output.output_tokens), (10, 2));
     }

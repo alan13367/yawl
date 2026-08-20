@@ -5,13 +5,17 @@
 use crate::compaction;
 use crate::config::Config;
 use crate::error::Error;
-use crate::provider::{self, Message, StreamNotice, ToolCall, stream_turn};
+use crate::provider::{self, Message, ReasoningKind, StreamNotice, ToolCall, stream_turn};
 use crate::session::Session;
 use crate::tools::{DescribeCache, Registry};
 
 /// Progress events surfaced to the UI (print mode or TUI) during a turn.
 pub enum TurnEvent<'a> {
     TextDelta(&'a str),
+    ReasoningDelta {
+        kind: ReasoningKind,
+        text: &'a str,
+    },
     /// Discard any partial text shown so far; a retry restarts the response.
     RetryReset,
     Retrying {
@@ -143,6 +147,7 @@ impl Agent {
             });
 
             let mut assistant = Message::assistant(out.text, out.tool_calls.clone());
+            assistant.reasoning = out.reasoning;
             assistant.provider_data = out.provider_data;
             self.session.append_message(&assistant)?;
             self.messages.push(assistant);
@@ -244,6 +249,9 @@ impl Agent {
 fn forward<'s>(sink: &'s mut dyn FnMut(TurnEvent<'_>)) -> impl FnMut(StreamNotice<'_>) + 's {
     move |notice| match notice {
         StreamNotice::TextDelta(t) => sink(TurnEvent::TextDelta(t)),
+        StreamNotice::ReasoningDelta { kind, text } => {
+            sink(TurnEvent::ReasoningDelta { kind, text })
+        }
         StreamNotice::RetryReset => sink(TurnEvent::RetryReset),
         StreamNotice::Retrying {
             attempt,

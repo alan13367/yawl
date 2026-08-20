@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use crate::agent::{Agent, TurnEvent};
 use crate::error::Error;
-use crate::provider::{Message, Role};
+use crate::provider::{Message, ReasoningKind, Role};
 
 use self::events::{Event, EventReader, Key};
 use self::input::{EditAction, Editor};
@@ -56,6 +56,7 @@ enum PickerAction {
     OpenModels { save: bool },
     OpenReasoning { save: bool },
     SetReasoning { effort: Option<String>, save: bool },
+    ToggleHideReasoning,
     ResumeSession(String),
     EditSetting(String),
     ToggleAutoCompact,
@@ -79,6 +80,10 @@ struct Picker {
 enum Entry {
     User(String),
     Assistant(String),
+    Reasoning {
+        kind: ReasoningKind,
+        content: String,
+    },
     Tool {
         name: String,
         args: String,
@@ -91,11 +96,14 @@ enum Entry {
 
 struct ViewState {
     entries: Vec<Entry>,
+    streaming_entries_start: Option<usize>,
     streaming_assistant: Option<usize>,
+    streaming_reasoning: Option<(ReasoningKind, usize)>,
     running_tool: Option<usize>,
     tools_expanded: bool,
     model: String,
     reasoning_effort: Option<String>,
+    hide_reasoning: bool,
     context_tokens: u64,
     context_window: u64,
     activity: String,
@@ -110,11 +118,14 @@ impl ViewState {
     fn from_agent(agent: &Agent) -> Self {
         Self {
             entries: entries_from_messages(&agent.messages),
+            streaming_entries_start: None,
             streaming_assistant: None,
+            streaming_reasoning: None,
             running_tool: None,
             tools_expanded: false,
             model: agent.model.clone(),
             reasoning_effort: agent.config.reasoning_effort.clone(),
+            hide_reasoning: agent.config.hide_reasoning,
             context_tokens: agent.context_tokens,
             context_window: agent.context_window(),
             activity: String::new(),
@@ -140,6 +151,9 @@ impl ViewState {
         let follow_bottom = self.scroll_offset == 0;
         match update {
             Update::TextDelta(text) => {
+                self.streaming_entries_start
+                    .get_or_insert(self.entries.len());
+                self.streaming_reasoning = None;
                 let index = match self.streaming_assistant {
                     Some(index) => index,
                     None => {
@@ -154,12 +168,37 @@ impl ViewState {
                 }
                 self.activity = "responding".into();
             }
-            Update::RetryReset => {
-                if let Some(index) = self.streaming_assistant
-                    && let Some(Entry::Assistant(content)) = self.entries.get_mut(index)
-                {
-                    content.clear();
+            Update::ReasoningDelta { kind, text } => {
+                self.streaming_entries_start
+                    .get_or_insert(self.entries.len());
+                self.streaming_assistant = None;
+                let index = match self.streaming_reasoning {
+                    Some((current_kind, index)) if current_kind == kind => index,
+                    _ => {
+                        self.entries.push(Entry::Reasoning {
+                            kind,
+                            content: String::new(),
+                        });
+                        let index = self.entries.len() - 1;
+                        self.streaming_reasoning = Some((kind, index));
+                        index
+                    }
+                };
+                if let Some(Entry::Reasoning { content, .. }) = self.entries.get_mut(index) {
+                    content.push_str(&text);
                 }
+                self.activity = if self.hide_reasoning {
+                    "responding".into()
+                } else {
+                    "reasoning".into()
+                };
+            }
+            Update::RetryReset => {
+                if let Some(start) = self.streaming_entries_start {
+                    self.entries.truncate(start);
+                }
+                self.streaming_assistant = None;
+                self.streaming_reasoning = None;
             }
             Update::Retrying {
                 attempt,
@@ -172,7 +211,9 @@ impl ViewState {
                 );
             }
             Update::AssistantDone => {
+                self.streaming_entries_start = None;
                 self.streaming_assistant = None;
+                self.streaming_reasoning = None;
                 self.activity.clear();
             }
             Update::ToolStart { name, args } => {
@@ -228,6 +269,10 @@ impl ViewState {
 
 enum Update {
     TextDelta(String),
+    ReasoningDelta {
+        kind: ReasoningKind,
+        text: String,
+    },
     RetryReset,
     Retrying {
         attempt: u32,
@@ -258,6 +303,10 @@ impl Update {
     fn from_event(event: TurnEvent<'_>) -> Self {
         match event {
             TurnEvent::TextDelta(text) => Self::TextDelta(text.to_string()),
+            TurnEvent::ReasoningDelta { kind, text } => Self::ReasoningDelta {
+                kind,
+                text: text.to_string(),
+            },
             TurnEvent::RetryReset => Self::RetryReset,
             TurnEvent::Retrying {
                 attempt,
@@ -663,6 +712,11 @@ fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
     } else {
         "Off"
     };
+    let reasoning_visibility = if agent.config.hide_reasoning {
+        "Hidden"
+    } else {
+        "Visible"
+    };
     state.picker = Some(Picker {
         title: "Settings".into(),
         hint: "↑/↓ move  Enter change  Esc close".into(),
@@ -694,6 +748,11 @@ fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
                 } else {
                     PickerAction::EditSetting("/settings reasoning_effort ".into())
                 },
+            },
+            PickerItem {
+                label: "Reasoning display".into(),
+                description: format!("{reasoning_visibility} · Enter to toggle"),
+                action: PickerAction::ToggleHideReasoning,
             },
             PickerItem {
                 label: "Automatic compaction".into(),
@@ -876,6 +935,14 @@ fn activate_picker_action(
                 state.notice(format!("Using {} with {label} reasoning.", agent.model));
             }
         }
+        PickerAction::ToggleHideReasoning => {
+            let value = if agent.config.hide_reasoning {
+                "off"
+            } else {
+                "on"
+            };
+            settings(agent, &format!("hide_reasoning {value}"), state);
+        }
         PickerAction::ResumeSession(id) => load_session(agent, &id, state),
         PickerAction::EditSetting(command) => editor.paste(&command),
         PickerAction::ToggleAutoCompact => {
@@ -946,6 +1013,14 @@ fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) {
                 .save_global_setting("reasoning_effort", serde_json::json!(value))?;
             reload_config(agent, state, true)
         }),
+        "hide_reasoning" => one_value(&mut parts, "usage: /settings hide_reasoning on|off")
+            .and_then(|value| {
+                let hidden = parse_on_off(value)?;
+                agent
+                    .config
+                    .save_global_setting("hide_reasoning", serde_json::json!(hidden))?;
+                reload_config(agent, state, true)
+            }),
         "auto_compact" => {
             one_value(&mut parts, "usage: /settings auto_compact on|off").and_then(|value| {
                 let enabled = parse_on_off(value)?;
@@ -1059,7 +1134,7 @@ fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config.providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nSkill directories\n\n",
         agent.model,
         agent.config.max_tokens,
         agent
@@ -1067,6 +1142,7 @@ fn show_settings(agent: &Agent, state: &mut ViewState) {
             .reasoning_effort
             .as_deref()
             .unwrap_or("provider default"),
+        agent.config.hide_reasoning,
         if agent.config.auto_compact {
             "on"
         } else {
@@ -1094,7 +1170,7 @@ fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
         agent.config.global_config_path().display()
     ));
     state.notice(text);
@@ -1162,6 +1238,7 @@ fn reload_config(agent: &mut Agent, state: &mut ViewState, keep_model: bool) -> 
     }
     state.model.clone_from(&agent.model);
     state.reasoning_effort = agent.config.reasoning_effort.clone();
+    state.hide_reasoning = agent.config.hide_reasoning;
     state.context_window = agent.context_window();
     Ok(())
 }
@@ -1411,6 +1488,14 @@ fn entries_from_messages(messages: &[Message]) -> Vec<Entry> {
             }
             Role::User => entries.push(Entry::User(message.content.clone())),
             Role::Assistant => {
+                for reasoning in &message.reasoning {
+                    if !reasoning.content.is_empty() {
+                        entries.push(Entry::Reasoning {
+                            kind: reasoning.kind,
+                            content: reasoning.content.clone(),
+                        });
+                    }
+                }
                 if !message.content.is_empty() {
                     entries.push(Entry::Assistant(message.content.clone()));
                 }
@@ -1461,12 +1546,28 @@ fn entries_from_messages(messages: &[Message]) -> Vec<Entry> {
     entries
 }
 
-fn render_entries(entries: &[Entry], width: usize, tools_expanded: bool) -> Vec<String> {
+fn render_entries(
+    entries: &[Entry],
+    width: usize,
+    tools_expanded: bool,
+    hide_reasoning: bool,
+) -> Vec<String> {
     let mut lines = Vec::new();
     for entry in entries {
         match entry {
             Entry::User(content) => lines.extend(render_user_panel(content, width)),
-            Entry::Assistant(content) => lines.extend(markdown::render(content, width)),
+            Entry::Assistant(content) => {
+                if content.trim().is_empty() {
+                    continue;
+                }
+                lines.extend(markdown::render(content.trim(), width));
+            }
+            Entry::Reasoning { kind, content } => {
+                if hide_reasoning || content.trim().is_empty() {
+                    continue;
+                }
+                lines.extend(render_reasoning(*kind, content, width));
+            }
             Entry::Tool {
                 name,
                 args,
@@ -1490,6 +1591,22 @@ fn render_entries(entries: &[Entry], width: usize, tools_expanded: bool) -> Vec<
         lines.push(String::new());
     }
     lines
+}
+
+fn render_reasoning(kind: ReasoningKind, content: &str, width: usize) -> Vec<String> {
+    const STYLE: &str = "\x1b[2;3;38;2;148;148;158m";
+    let continuation = format!("\x1b[0m{STYLE}");
+    let style = |line: String| format!("{STYLE}{}\x1b[0m", line.replace("\x1b[0m", &continuation));
+    match kind {
+        ReasoningKind::Summary => {
+            let summary = content.split_whitespace().collect::<Vec<_>>().join(" ");
+            vec![style(markdown::fit_width(&summary, width))]
+        }
+        ReasoningKind::Full => markdown::render(content.trim(), width)
+            .into_iter()
+            .map(style)
+            .collect(),
+    }
 }
 
 fn render_user_panel(content: &str, width: usize) -> Vec<String> {
@@ -1733,7 +1850,12 @@ fn build_frame(
     };
     let menu_height = menu.len();
     let transcript_height = rows.saturating_sub(input_height + menu_height + 1);
-    let transcript = render_entries(&state.entries, columns, state.tools_expanded);
+    let transcript = render_entries(
+        &state.entries,
+        columns,
+        state.tools_expanded,
+        state.hide_reasoning,
+    );
     let max_scroll = transcript.len().saturating_sub(transcript_height);
     state.scroll_offset = state.scroll_offset.min(max_scroll);
     let end = transcript.len().saturating_sub(state.scroll_offset);
@@ -1801,7 +1923,7 @@ mod tests {
 
     #[test]
     fn user_messages_render_in_a_padded_panel() {
-        let rendered = render_entries(&[Entry::User("hello".into())], 24, false);
+        let rendered = render_entries(&[Entry::User("hello".into())], 24, false, false);
         let plain = markdown::strip_ansi(&rendered.join("\n"));
 
         assert_eq!(rendered.len(), 4);
@@ -1816,7 +1938,7 @@ mod tests {
 
     #[test]
     fn assistant_messages_do_not_show_a_title() {
-        let rendered = render_entries(&[Entry::Assistant("hello".into())], 24, false);
+        let rendered = render_entries(&[Entry::Assistant("hello".into())], 24, false, false);
         let plain = markdown::strip_ansi(&rendered.join("\n"));
 
         assert!(plain.contains("hello"));
@@ -1827,11 +1949,14 @@ mod tests {
     fn frame_keeps_input_and_status_pinned() {
         let mut state = ViewState {
             entries: vec![Entry::Assistant("hello".into())],
+            streaming_entries_start: None,
             streaming_assistant: None,
+            streaming_reasoning: None,
             running_tool: None,
             tools_expanded: false,
             model: "test".into(),
             reasoning_effort: None,
+            hide_reasoning: false,
             context_tokens: 12,
             context_window: 100,
             activity: String::new(),
@@ -1883,21 +2008,26 @@ mod tests {
 
     #[test]
     fn loaded_messages_become_transcript_entries() {
+        let mut assistant = Message::assistant(
+            "hello".into(),
+            vec![crate::provider::ToolCall {
+                id: "id".into(),
+                name: "shell".into(),
+                arguments: r#"{"command":"pwd"}"#.into(),
+            }],
+        );
+        assistant.reasoning.push(crate::provider::Reasoning {
+            kind: ReasoningKind::Summary,
+            content: "Checking the directory".into(),
+        });
         let messages = vec![
             Message::user("hi"),
-            Message::assistant(
-                "hello".into(),
-                vec![crate::provider::ToolCall {
-                    id: "id".into(),
-                    name: "shell".into(),
-                    arguments: r#"{"command":"pwd"}"#.into(),
-                }],
-            ),
+            assistant,
             Message::tool_result("id", "shell", "ok".into(), false),
         ];
         let entries = entries_from_messages(&messages);
-        assert_eq!(entries.len(), 3);
-        let Entry::Tool { args, output, .. } = &entries[2] else {
+        assert_eq!(entries.len(), 4);
+        let Entry::Tool { args, output, .. } = &entries[3] else {
             panic!("expected paired tool entry");
         };
         assert!(args.contains("pwd"));
@@ -1918,11 +2048,69 @@ mod tests {
             running: false,
         }];
 
-        let rendered = render_entries(&entries, 80, false);
+        let rendered = render_entries(&entries, 80, false, false);
         let plain = markdown::strip_ansi(&rendered.join("\n"));
         assert!(rendered.len() <= 16, "tool used {} lines", rendered.len());
         assert!(plain.contains("$ cargo test --all-targets"));
         assert!(plain.contains("lines, Ctrl+O to expand"));
         assert!(rendered.iter().any(|line| line.contains("\x1b[48;")));
+    }
+
+    #[test]
+    fn reasoning_summary_is_one_line_and_full_reasoning_is_not() {
+        let summary = Entry::Reasoning {
+            kind: ReasoningKind::Summary,
+            content: "Inspecting\n  the request".into(),
+        };
+        let full = Entry::Reasoning {
+            kind: ReasoningKind::Full,
+            content: "First step\n\nSecond step".into(),
+        };
+
+        let summary_lines = render_entries(&[summary], 80, false, false);
+        let full_lines = render_entries(&[full], 80, false, false);
+
+        assert_eq!(summary_lines.len(), 2);
+        let summary_text = markdown::strip_ansi(&summary_lines[0]);
+        assert!(summary_text.contains("Inspecting the request"));
+        assert!(!summary_text.contains("Reasoning"));
+        assert!(full_lines.len() > summary_lines.len());
+        assert!(!markdown::strip_ansi(&full_lines.join("\n")).contains("Reasoning"));
+    }
+
+    #[test]
+    fn hidden_reasoning_is_removed_from_the_transcript() {
+        let reasoning = Entry::Reasoning {
+            kind: ReasoningKind::Full,
+            content: "private thought".into(),
+        };
+
+        assert!(render_entries(&[reasoning], 80, false, true).is_empty());
+    }
+
+    #[test]
+    fn reasoning_has_one_blank_line_on_each_side() {
+        let entries = vec![
+            Entry::Assistant("Answer\n\n".into()),
+            Entry::Reasoning {
+                kind: ReasoningKind::Full,
+                content: "\nThinking\n\n".into(),
+            },
+            Entry::Tool {
+                name: "shell".into(),
+                args: r#"{"command":"true"}"#.into(),
+                output: String::new(),
+                is_error: false,
+                running: false,
+            },
+        ];
+
+        let rendered = render_entries(&entries, 40, false, false);
+        let plain = rendered
+            .iter()
+            .map(|line| markdown::strip_ansi(line).trim_end().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(plain, ["Answer", "", "Thinking", "", "$ true", ""]);
     }
 }

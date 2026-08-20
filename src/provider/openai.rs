@@ -5,7 +5,9 @@ use std::io::BufReader;
 
 use serde_json::{Value, json};
 
-use super::{Event, Provider, Request, Role, SseReader, ToolCall, error_body, http_agent};
+use super::{
+    Event, Provider, ReasoningKind, Request, Role, SseReader, ToolCall, error_body, http_agent,
+};
 use crate::config::OpenAiCompatibility;
 use crate::error::Error;
 
@@ -61,6 +63,16 @@ fn build_messages(
             Role::User => out.push(json!({"role": "user", "content": m.content})),
             Role::Assistant => {
                 let mut msg = json!({"role": "assistant", "content": m.content});
+                let reasoning = m
+                    .reasoning
+                    .iter()
+                    .filter(|reasoning| reasoning.kind == ReasoningKind::Full)
+                    .map(|reasoning| reasoning.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !reasoning.is_empty() && compat.reasoning_content_on_assistant_messages() {
+                    msg["reasoning_content"] = json!(reasoning);
+                }
                 if !m.tool_calls.is_empty() {
                     let calls: Vec<Value> = m
                         .tool_calls
@@ -232,6 +244,12 @@ impl Provider for OpenAi {
                 continue;
             };
             let delta = &choice["delta"];
+            if let Some(reasoning) = reasoning_delta(delta) {
+                on_event(Event::ReasoningDelta {
+                    kind: ReasoningKind::Full,
+                    text: reasoning.to_string(),
+                });
+            }
             if let Some(text) = delta["content"].as_str()
                 && !text.is_empty()
             {
@@ -280,6 +298,13 @@ impl Provider for OpenAi {
     }
 }
 
+fn reasoning_delta(delta: &Value) -> Option<&str> {
+    ["reasoning_content", "reasoning", "reasoning_text"]
+        .into_iter()
+        .filter_map(|field| delta[field].as_str())
+        .find(|text| !text.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,22 +312,35 @@ mod tests {
 
     #[test]
     fn history_translates_to_openai_shape() {
+        let mut assistant = Message::assistant(
+            "using a tool".into(),
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "shell".into(),
+                arguments: "{\"command\":\"ls\"}".into(),
+            }],
+        );
+        assistant.reasoning.push(super::super::Reasoning {
+            kind: ReasoningKind::Full,
+            content: "I should inspect the directory.".into(),
+        });
         let messages = vec![
             Message::user("hi"),
-            Message::assistant(
-                "using a tool".into(),
-                vec![ToolCall {
-                    id: "call_1".into(),
-                    name: "shell".into(),
-                    arguments: "{\"command\":\"ls\"}".into(),
-                }],
-            ),
+            assistant,
             Message::tool_result("call_1", "shell", "file.txt".into(), false),
         ];
-        let wire = build_messages("sys", &messages, &OpenAiCompatibility::default());
+        let compat = OpenAiCompatibility {
+            requires_reasoning_content_on_assistant_messages: Some(true),
+            ..OpenAiCompatibility::default()
+        };
+        let wire = build_messages("sys", &messages, &compat);
         assert_eq!(wire.len(), 4);
         assert_eq!(wire[0]["role"], "system");
         assert_eq!(wire[2]["tool_calls"][0]["function"]["name"], "shell");
+        assert_eq!(
+            wire[2]["reasoning_content"],
+            "I should inspect the directory."
+        );
         assert_eq!(wire[3]["role"], "tool");
         assert_eq!(wire[3]["tool_call_id"], "call_1");
 
@@ -316,6 +354,27 @@ mod tests {
         assert_eq!(
             build_body(&request, &OpenAiCompatibility::default())["max_tokens"],
             321
+        );
+    }
+
+    #[test]
+    fn reads_omlx_and_compatible_reasoning_deltas() {
+        assert_eq!(
+            reasoning_delta(&json!({"reasoning_content": "thinking"})),
+            Some("thinking")
+        );
+        assert_eq!(
+            reasoning_delta(&json!({"reasoning": "thinking"})),
+            Some("thinking")
+        );
+        assert_eq!(
+            reasoning_delta(&json!({"reasoning_text": "thinking"})),
+            Some("thinking")
+        );
+        assert_eq!(reasoning_delta(&json!({"reasoning_content": ""})), None);
+        assert_eq!(
+            reasoning_delta(&json!({"reasoning_content": "", "reasoning": "fallback"})),
+            Some("fallback")
         );
     }
 

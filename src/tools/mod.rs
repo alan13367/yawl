@@ -392,6 +392,7 @@ printf '%s:%s' "$YAWL_SESSION_ID" "$input"
             openai_base_url: String::new(),
             max_tokens: 1,
             reasoning_effort: None,
+            hide_reasoning: false,
             context_windows: std::collections::HashMap::new(),
             auto_compact: true,
             compact_threshold: 0.85,
