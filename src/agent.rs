@@ -69,7 +69,7 @@ impl Agent {
         self.config.context_window_for(&self.model)
     }
 
-    /// Starts a fresh session (used by `/clear`).
+    /// Starts a fresh session (used by `/new` and `/clear`).
     pub fn reset(&mut self) -> Result<(), Error> {
         self.session = Session::create(&self.config.sessions_dir())?;
         self.messages.clear();

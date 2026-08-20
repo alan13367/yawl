@@ -79,12 +79,13 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 | --- | --- |
 | `/model [MODEL]` | Open a model picker, or switch the current session directly when `MODEL` is given |
 | `/settings [KEY ...]` | Open the settings picker, or change a setting directly when arguments are given |
-| `/clear` | Start a new session |
+| `/new` | Start a new session without changing the current working directory |
+| `/clear` | Alias for `/new` |
 | `/compact` | Summarize older messages now |
 | `/tools` | List builtin and discovered tools |
 | `/skills` | List discovered skills and their search directories |
 | `/skill:NAME [ARGS]` | Run a discovered Markdown skill |
-| `/resume [ID\|NUMBER]` | List or resume saved sessions |
+| `/resume [ID\|NUMBER]` | Open the session picker, or resume directly by ID or number |
 | `/help` | Show terminal controls and commands |
 | `/quit` | Exit the terminal interface |
 
@@ -98,6 +99,7 @@ Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`
   "anthropic_base_url": "https://api.anthropic.com",
   "openai_base_url": "https://api.openai.com/v1",
   "max_tokens": 8192,
+  "reasoning_effort": "high",
   "auto_compact": true,
   "compact_threshold": 0.85,
   "context_windows": {
@@ -127,7 +129,7 @@ Choose "OpenAI Codex" during onboarding to use a ChatGPT Plus or Pro subscriptio
 yawl --login openai-codex
 ```
 
-The provider uses the ChatGPT Codex Responses endpoint with SSE streaming, tool calls, token usage, and encrypted reasoning replay for multi-step tool runs. Supported model IDs are listed by `/model`.
+The provider uses the ChatGPT Codex Responses endpoint with SSE streaming, tool calls, token usage, and encrypted reasoning replay for multi-step tool runs. Supported model IDs are listed by `/model`. After choosing a Codex model, Yawl opens a second picker containing the reasoning efforts supported by that model. The selection is sent as the Responses API `reasoning.effort`; OAuth authenticates the account but does not itself return model capability metadata.
 
 ### Add an OpenAI-compatible provider
 
@@ -179,11 +181,11 @@ You can configure an endpoint from the TUI without editing JSON:
 /settings model omlx:Qwen3-Coder
 ```
 
-Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; `./.yawl/config.json` can still override it. It also changes `max_tokens`, automatic compaction, the compaction threshold, context windows, and built-in endpoint URLs.
+Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; `./.yawl/config.json` can still override it. It also changes `max_tokens`, Codex reasoning effort, automatic compaction, the compaction threshold, context windows, and built-in endpoint URLs.
 
 ## Sessions and compaction
 
-Yawl stores append-only JSONL session files in `~/.yawl/sessions/`. Each user message, assistant response, tool result, and compaction event is written as it happens. The original history remains in the log after compaction.
+Yawl stores append-only JSONL session files in `~/.yawl/sessions/`. Each user message, assistant response, tool result, and compaction event is written as it happens. The original history remains in the log after compaction. `/new` starts a blank session without changing the current working directory.
 
 Yawl checks the last provider-reported token usage before each request. At the configured threshold, 85 percent by default, it asks the current model to summarize the older conversation and keeps roughly the last ten messages unchanged. Use `/compact` to do this manually.
 

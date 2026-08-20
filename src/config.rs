@@ -137,6 +137,7 @@ struct ConfigFile {
     anthropic_base_url: Option<String>,
     openai_base_url: Option<String>,
     max_tokens: Option<u32>,
+    reasoning_effort: Option<String>,
     /// Per-model context window overrides, e.g. {"my-local-model": 32768}.
     context_windows: Option<HashMap<String, u64>>,
     /// Whether automatic context compaction is enabled.
@@ -170,6 +171,9 @@ pub struct Config {
     pub anthropic_base_url: String,
     pub openai_base_url: String,
     pub max_tokens: u32,
+    /// Reasoning effort sent to OpenAI Codex (`minimal` through `max`).
+    /// `None` leaves the provider default unchanged.
+    pub reasoning_effort: Option<String>,
     pub context_windows: HashMap<String, u64>,
     pub auto_compact: bool,
     pub compact_threshold: f64,
@@ -195,6 +199,7 @@ impl Config {
             anthropic_base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
             openai_base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            reasoning_effort: None,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
@@ -231,6 +236,9 @@ impl Config {
         }
         if let Some(value) = file.max_tokens {
             self.max_tokens = value.max(1);
+        }
+        if let Some(value) = file.reasoning_effort {
+            self.reasoning_effort = normalize_reasoning_effort(&value).map(str::to_string);
         }
         if let Some(map) = file.context_windows {
             self.context_windows.extend(map);
@@ -369,6 +377,7 @@ impl Config {
                 | "anthropic_base_url"
                 | "openai_base_url"
                 | "max_tokens"
+                | "reasoning_effort"
                 | "auto_compact"
                 | "compact_threshold"
         ) {
@@ -485,6 +494,16 @@ fn default_local_providers() -> HashMap<String, ProviderConfig> {
     .into_iter()
     .map(|(name, url)| (name.to_string(), ProviderConfig::openai_compatible(url)))
     .collect()
+}
+
+/// Valid OpenAI Codex reasoning efforts. `default` and `off` omit the
+/// request field and let the service choose its default behavior.
+pub fn normalize_reasoning_effort(value: &str) -> Option<&str> {
+    match value {
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(value),
+        "default" | "off" => None,
+        _ => None,
+    }
 }
 
 fn validate_provider_name(name: &str) -> Result<(), Error> {
@@ -621,6 +640,7 @@ mod tests {
             anthropic_base_url: String::new(),
             openai_base_url: String::new(),
             max_tokens: 8192,
+            reasoning_effort: None,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: 0.85,
@@ -684,6 +704,16 @@ mod tests {
         assert_eq!(provider.api_key.as_deref(), Some("local-key"));
         assert_eq!(provider.models[0].id, "qwen");
         assert!(!provider.compat.usage_in_stream());
+    }
+
+    #[test]
+    fn reasoning_effort_accepts_levels_and_default() {
+        let mut cfg = test_config();
+        cfg.apply(serde_json::from_value(json!({"reasoning_effort": "high"})).unwrap());
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("high"));
+
+        cfg.apply(serde_json::from_value(json!({"reasoning_effort": "default"})).unwrap());
+        assert_eq!(cfg.reasoning_effort, None);
     }
 
     #[test]

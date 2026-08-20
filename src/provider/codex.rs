@@ -35,10 +35,26 @@ pub const MODELS: &[(&str, &str, u64)] = &[
     ("gpt-5.6-terra", "GPT-5.6 Terra", 272_000),
 ];
 
+const STANDARD_REASONING: &[&str] = &["minimal", "low", "medium", "high"];
+const XHIGH_REASONING: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+const MAX_REASONING: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Reasoning efforts accepted by the Codex Responses API for a listed model.
+/// OAuth authenticates the account but does not return model capabilities, so
+/// these are maintained alongside the model catalog.
+pub fn reasoning_efforts(model: &str) -> &'static [&'static str] {
+    match model {
+        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" => MAX_REASONING,
+        "gpt-5.3-codex-spark" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5" => XHIGH_REASONING,
+        _ => STANDARD_REASONING,
+    }
+}
+
 pub struct Codex {
     agent: ureq::Agent,
     access_token: String,
     account_id: String,
+    reasoning_effort: Option<String>,
 }
 
 impl Codex {
@@ -48,6 +64,7 @@ impl Codex {
             agent: http_agent(),
             access_token: credential.access,
             account_id: credential.account_id,
+            reasoning_effort: config.reasoning_effort.clone(),
         })
     }
 }
@@ -477,7 +494,7 @@ fn build_input(messages: &[super::Message]) -> Vec<Value> {
     input
 }
 
-fn build_body(request: &Request<'_>) -> Value {
+fn build_body(request: &Request<'_>, reasoning_effort: Option<&str>) -> Value {
     let mut body = json!({
         "model": request.model,
         "store": false,
@@ -489,6 +506,12 @@ fn build_body(request: &Request<'_>) -> Value {
         "tool_choice": "auto",
         "parallel_tool_calls": true,
     });
+    if let Some(effort) = reasoning_effort {
+        // Codex exposes a Minimal UI level but currently maps it to the
+        // service's lowest accepted wire value.
+        let effort = if effort == "minimal" { "low" } else { effort };
+        body["reasoning"] = json!({"effort": effort, "summary": "auto"});
+    }
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
             request
@@ -511,7 +534,7 @@ fn build_body(request: &Request<'_>) -> Value {
 
 impl Provider for Codex {
     fn stream_once(&self, req: &Request<'_>, on_event: &mut dyn FnMut(Event)) -> Result<(), Error> {
-        let body = build_body(req).to_string();
+        let body = build_body(req, self.reasoning_effort.as_deref()).to_string();
         let mut response = self
             .agent
             .post(CODEX_RESPONSES_URL)
@@ -672,6 +695,32 @@ mod tests {
         assert_eq!(input[2]["call_id"], "call_1");
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(input[3]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn request_includes_selected_reasoning_effort() {
+        let request = Request {
+            model: "gpt-5.6-sol",
+            system: "test",
+            messages: &[],
+            tools: &[],
+            max_tokens: 1024,
+        };
+        let body = build_body(&request, Some("max"));
+        assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(
+            build_body(&request, Some("minimal"))["reasoning"]["effort"],
+            "low"
+        );
+        assert!(build_body(&request, None).get("reasoning").is_none());
+    }
+
+    #[test]
+    fn model_reasoning_efforts_match_catalog_capabilities() {
+        assert!(reasoning_efforts("gpt-5.4").contains(&"xhigh"));
+        assert!(!reasoning_efforts("gpt-5.4").contains(&"max"));
+        assert!(reasoning_efforts("gpt-5.6-sol").contains(&"max"));
     }
 
     #[test]

@@ -6,6 +6,8 @@ use super::markdown;
 
 const OUTPUT_PREVIEW_LINES: usize = 10;
 const CALL_PREVIEW_LINES: usize = 6;
+const SUCCESS_BACKGROUND: &str = "\x1b[48;2;42;50;41m";
+const ERROR_BACKGROUND: &str = "\x1b[48;2;50;42;42m";
 
 #[derive(Clone, Copy)]
 enum Tone {
@@ -59,9 +61,9 @@ pub(super) fn render(
     let background = if running {
         "\x1b[48;5;58m"
     } else if is_error {
-        "\x1b[48;5;52m"
+        ERROR_BACKGROUND
     } else {
-        "\x1b[48;5;22m"
+        SUCCESS_BACKGROUND
     };
 
     lines
@@ -321,6 +323,31 @@ mod tests {
         assert!(plain.contains("10 earlier lines"));
         assert!(!plain.contains("line 1 "));
         assert!(plain.contains("line 20"));
+    }
+
+    #[test]
+    fn success_and_error_blocks_use_muted_backgrounds() {
+        let success = render(
+            "shell",
+            r#"{"command":"true"}"#,
+            "",
+            false,
+            false,
+            40,
+            false,
+        );
+        let error = render(
+            "shell",
+            r#"{"command":"false"}"#,
+            "failed",
+            true,
+            false,
+            40,
+            false,
+        );
+
+        assert!(success.iter().all(|line| line.contains(SUCCESS_BACKGROUND)));
+        assert!(error.iter().all(|line| line.contains(ERROR_BACKGROUND)));
     }
 
     #[test]
