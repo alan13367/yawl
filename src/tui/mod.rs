@@ -25,16 +25,25 @@ Commands
   /clear               start a new session
   /compact             summarize older messages now
   /tools               list builtin and discovered tools
+  /skills              list discovered skills and search directories
+  /skill:NAME [ARGS]   run a discovered skill
   /resume [ID|NUMBER]  list or resume saved sessions
   /help                show this help
   /quit                leave Yawl
 
 Input
   Enter submits. Shift+Enter or Alt+Enter inserts a newline.
-  Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
+  Type / for commands; Up/Down select and Tab completes a menu item.
+  Outside the menu, Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
   Ctrl+O expands or collapses tool output. Ctrl+C aborts the active turn.
   Mouse wheel and PageUp/PageDown scroll.
 ";
+
+#[derive(Clone)]
+struct Completion {
+    command: String,
+    description: String,
+}
 
 enum Entry {
     User(String),
@@ -60,6 +69,8 @@ struct ViewState {
     activity: String,
     scroll_offset: usize,
     queued_inputs: std::collections::VecDeque<String>,
+    completions: Vec<Completion>,
+    completion_index: usize,
 }
 
 impl ViewState {
@@ -75,7 +86,14 @@ impl ViewState {
             activity: String::new(),
             scroll_offset: 0,
             queued_inputs: std::collections::VecDeque::new(),
+            completions: command_completions(agent),
+            completion_index: 0,
         }
+    }
+
+    fn refresh_completions(&mut self, agent: &Agent) {
+        self.completions = command_completions(agent);
+        self.completion_index = 0;
     }
 
     fn notice(&mut self, text: impl Into<String>) {
@@ -299,7 +317,9 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
             Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
             Event::Key(Key::Ctrl('o')) => toggle_tool_expansion(&mut state),
             Event::Key(key) => {
-                if let EditAction::Submit(input) = editor.handle_key(key)
+                if handle_completion_key(&mut state, &mut editor, key) {
+                    // The completion menu consumed navigation or Tab.
+                } else if let EditAction::Submit(input) = editor.handle_key(key)
                     && handle_submission(
                         agent,
                         input,
@@ -326,6 +346,23 @@ fn handle_submission<R: Read>(
     events: &mut EventReader<R>,
 ) -> Result<bool, Error> {
     let command = input.trim();
+    if let Some(skill_command) = command.strip_prefix("/skill:") {
+        let (name, arguments) = skill_command
+            .split_once(char::is_whitespace)
+            .map_or((skill_command, ""), |(name, arguments)| {
+                (name, arguments.trim())
+            });
+        let skills = crate::skills::scan(&agent.config);
+        if let Some(skill) = skills.iter().find(|skill| skill.name == name) {
+            let expanded = crate::skills::expand(skill, arguments);
+            run_agent_submission(agent, input, expanded, state, editor, terminal, events)?;
+        } else {
+            state.notice(format!(
+                "Unknown skill '{name}'. Type /skills to list skills."
+            ));
+        }
+        return Ok(false);
+    }
     if let Some(command) = command.strip_prefix('/') {
         let (name, argument) = command
             .split_once(char::is_whitespace)
@@ -341,7 +378,10 @@ fn handle_submission<R: Read>(
                 state.context_tokens = 0;
                 state.notice(format!("Switched to {}.", agent.model));
             }
-            "settings" => settings(agent, argument, state),
+            "settings" => {
+                settings(agent, argument, state);
+                state.refresh_completions(agent);
+            }
             "clear" => match agent.reset() {
                 Ok(()) => {
                     let queued_inputs = std::mem::take(&mut state.queued_inputs);
@@ -370,6 +410,7 @@ fn handle_submission<R: Read>(
                 }
                 state.notice(text);
             }
+            "skills" => show_skills(agent, state),
             "resume" => resume(agent, argument, state),
             "" => {}
             other => state.notice(format!("Unknown command '/{other}'. Type /help.")),
@@ -377,18 +418,132 @@ fn handle_submission<R: Read>(
         return Ok(false);
     }
 
-    state.entries.push(Entry::User(input.clone()));
+    run_agent_submission(agent, input.clone(), input, state, editor, terminal, events)?;
+    Ok(false)
+}
+
+fn run_agent_submission<R: Read>(
+    agent: &mut Agent,
+    displayed_input: String,
+    agent_input: String,
+    state: &mut ViewState,
+    editor: &mut Editor,
+    terminal: &mut Terminal,
+    events: &mut EventReader<R>,
+) -> Result<(), Error> {
+    state.entries.push(Entry::User(displayed_input));
     state.activity = "sending".into();
     state.scroll_offset = 0;
     terminal.draw(state, editor)?;
-    match turn_interactive(agent, input, state, editor, terminal, events) {
+    match turn_interactive(agent, agent_input, state, editor, terminal, events) {
         Ok(true) => {}
         Ok(false) | Err(Error::Interrupted) => state.notice("Turn interrupted."),
         Err(error) => state.notice(format!("Request failed: {error}")),
     }
     crate::set_interrupted(false);
     state.activity.clear();
-    Ok(false)
+    Ok(())
+}
+
+fn command_completions(agent: &Agent) -> Vec<Completion> {
+    let mut completions = [
+        ("/model", "List or switch models"),
+        ("/settings", "Show or change settings"),
+        ("/clear", "Start a new session"),
+        ("/compact", "Summarize older messages"),
+        ("/tools", "List available tools"),
+        ("/skills", "List available skills"),
+        ("/resume", "List or resume sessions"),
+        ("/help", "Show help"),
+        ("/quit", "Exit Yawl"),
+    ]
+    .into_iter()
+    .map(|(command, description)| Completion {
+        command: command.into(),
+        description: description.into(),
+    })
+    .collect::<Vec<_>>();
+    completions.extend(
+        crate::skills::scan(&agent.config)
+            .into_iter()
+            .map(|skill| Completion {
+                command: format!("/skill:{}", skill.name),
+                description: skill.description,
+            }),
+    );
+    completions
+}
+
+fn matching_completions<'a>(state: &'a ViewState, editor: &Editor) -> Vec<&'a Completion> {
+    let Some(prefix) = editor.command_prefix() else {
+        return Vec::new();
+    };
+    state
+        .completions
+        .iter()
+        .filter(|completion| completion.command.starts_with(&prefix))
+        .take(8)
+        .collect()
+}
+
+fn handle_completion_key(state: &mut ViewState, editor: &mut Editor, key: Key) -> bool {
+    let matches = matching_completions(state, editor)
+        .into_iter()
+        .map(|completion| completion.command.clone())
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        state.completion_index = 0;
+        return false;
+    }
+    state.completion_index = state.completion_index.min(matches.len() - 1);
+    match key {
+        Key::Up => {
+            state.completion_index = state.completion_index.saturating_sub(1);
+            true
+        }
+        Key::Down => {
+            state.completion_index = (state.completion_index + 1).min(matches.len() - 1);
+            true
+        }
+        Key::Tab => {
+            editor.complete_command(&matches[state.completion_index]);
+            state.completion_index = 0;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn show_skills(agent: &Agent, state: &mut ViewState) {
+    let skills = crate::skills::scan(&agent.config);
+    let mut text = String::from("Skill directories\n\n");
+    for dir in &agent.config.skill_dirs {
+        text.push_str(&format!("- `{}`\n", dir.display()));
+    }
+    if skills.is_empty() {
+        text.push_str("\nNo skills found. Add one with `/settings skills add DIRECTORY`.");
+    } else {
+        text.push_str("\nAvailable skills\n\n");
+        for skill in skills {
+            text.push_str(&format!(
+                "- `/skill:{}`: {}\n",
+                skill.name, skill.description
+            ));
+        }
+    }
+    state.notice(text);
+}
+
+fn expand_user_path(path: &str) -> std::path::PathBuf {
+    if path == "~" {
+        return std::env::var_os("HOME").map_or_else(|| path.into(), Into::into);
+    }
+    if let Some(relative) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return std::path::PathBuf::from(home).join(relative);
+    }
+    path.into()
 }
 
 fn show_models(agent: &Agent, state: &mut ViewState) {
@@ -479,6 +634,35 @@ fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) {
                     .save_global_context_window(&agent.model, window)?;
                 reload_config(agent, state, true)
             }),
+        "skills" => {
+            let action = parts.next();
+            let path = parts.next();
+            if !matches!(action, Some("add" | "remove")) || path.is_none() || parts.next().is_some()
+            {
+                Err(Error::Config(
+                    "usage: /settings skills add|remove DIRECTORY".into(),
+                ))
+            } else {
+                let path = expand_user_path(path.unwrap_or_default());
+                let mut dirs = agent.config.skill_dirs.clone();
+                if action == Some("add") {
+                    if !dirs.contains(&path) {
+                        dirs.push(path);
+                    }
+                } else if let Some(index) = dirs.iter().position(|dir| dir == &path) {
+                    dirs.remove(index);
+                } else {
+                    return state.notice(format!(
+                        "Skill directory `{}` is not configured.",
+                        path.display()
+                    ));
+                }
+                agent
+                    .config
+                    .save_global_skill_dirs(&dirs)
+                    .and_then(|()| reload_config(agent, state, true))
+            }
+        }
         "anthropic_base_url" | "openai_base_url" => {
             one_value(&mut parts, "usage: /settings openai_base_url URL").and_then(|url| {
                 validate_http_url(url)?;
@@ -528,7 +712,7 @@ fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config.providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nOpenAI-compatible providers\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nSkill directories\n\n",
         agent.model,
         agent.config.max_tokens,
         if agent.config.auto_compact {
@@ -541,6 +725,10 @@ fn show_settings(agent: &Agent, state: &mut ViewState) {
         agent.config.anthropic_base_url,
         agent.config.openai_base_url,
     );
+    for dir in &agent.config.skill_dirs {
+        text.push_str(&format!("- `{}`\n", dir.display()));
+    }
+    text.push_str("\nOpenAI-compatible providers\n\n");
     for (name, provider) in providers {
         let auth = if provider.api_key.is_some() {
             "configured key"
@@ -554,7 +742,7 @@ fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
         agent.config.global_config_path().display()
     ));
     state.notice(text);
@@ -780,7 +968,9 @@ fn pump_events<R: Read, T>(
             Event::Key(Key::PageUp) => scroll(state, 10),
             Event::Key(Key::PageDown) => scroll(state, -10),
             Event::Key(key) => {
-                if let EditAction::Submit(input) = editor.handle_key(key) {
+                if handle_completion_key(state, editor, key) {
+                    // Keep accepting and completing input while the agent runs.
+                } else if let EditAction::Submit(input) = editor.handle_key(key) {
                     state.queued_inputs.push_back(input);
                 }
             }
@@ -1051,7 +1241,26 @@ fn build_frame(
     let input_lines = &layout.lines[input_start..input_end];
     let cursor_input_row = layout.cursor_row.saturating_sub(input_start);
     let input_height = input_lines.len() + 2;
-    let transcript_height = rows.saturating_sub(input_height + 1);
+    let menu_capacity = rows.saturating_sub(input_height + 1);
+    let match_count = matching_completions(state, editor).len().min(menu_capacity);
+    if match_count > 0 {
+        state.completion_index = state.completion_index.min(match_count - 1);
+    }
+    let menu = matching_completions(state, editor)
+        .iter()
+        .take(menu_capacity)
+        .enumerate()
+        .map(|(index, completion)| {
+            let line = format!("  {:<18} {}", completion.command, completion.description);
+            if index == state.completion_index {
+                format!("\x1b[7m{}\x1b[0m", markdown::fit_width(&line, columns))
+            } else {
+                markdown::fit_width(&line, columns)
+            }
+        })
+        .collect::<Vec<_>>();
+    let menu_height = menu.len();
+    let transcript_height = rows.saturating_sub(input_height + menu_height + 1);
     let transcript = render_entries(&state.entries, columns, state.tools_expanded);
     let max_scroll = transcript.len().saturating_sub(transcript_height);
     state.scroll_offset = state.scroll_offset.min(max_scroll);
@@ -1069,6 +1278,7 @@ fn build_frame(
             .iter()
             .map(|line| markdown::fit_width(line, columns)),
     );
+    frame.extend(menu);
     frame.push(format!("┌{}┐", "─".repeat(inner_width)));
     for line in input_lines {
         frame.push(format!("│{}│", markdown::fit_width(line, inner_width)));
@@ -1093,7 +1303,7 @@ fn build_frame(
         markdown::fit_width(&status, columns)
     ));
 
-    let cursor_row = transcript_height + 2 + cursor_input_row;
+    let cursor_row = transcript_height + menu_height + 2 + cursor_input_row;
     let cursor_col = (2 + layout.cursor_col).min(columns.saturating_sub(1));
     (frame, (cursor_row, cursor_col))
 }
@@ -1115,6 +1325,8 @@ mod tests {
             activity: String::new(),
             scroll_offset: 0,
             queued_inputs: std::collections::VecDeque::new(),
+            completions: Vec::new(),
+            completion_index: 0,
         };
         let editor = Editor::default();
         let (frame, cursor) = build_frame(&mut state, &editor, 40, 12);

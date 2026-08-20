@@ -62,7 +62,8 @@ Run `yawl --help` for the complete command-line reference.
 - `Shift+Enter` inserts a newline in terminals that support the kitty keyboard protocol.
 - `Alt+Enter` is the multiline fallback.
 - Pasted multiline text stays multiline through bracketed paste mode.
-- `Up` and `Down` browse input history.
+- Typing `/` opens a filtered command and skill menu. `Up`/`Down` select an item and `Tab` completes it.
+- Outside the completion menu, `Up` and `Down` browse input history.
 - `Ctrl+U`, `Ctrl+K`, and `Ctrl+W` delete text.
 - `Ctrl+O` expands or collapses tool arguments and output. Tool blocks start compact.
 - The mouse wheel and `PageUp` or `PageDown` move through Yawl's internal scrollback.
@@ -79,6 +80,8 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 | `/clear` | Start a new session |
 | `/compact` | Summarize older messages now |
 | `/tools` | List builtin and discovered tools |
+| `/skills` | List discovered skills and their search directories |
+| `/skill:NAME [ARGS]` | Run a discovered Markdown skill |
 | `/resume [ID\|NUMBER]` | List or resume saved sessions |
 | `/help` | Show terminal controls and commands |
 | `/quit` | Exit the terminal interface |
@@ -246,6 +249,19 @@ printf '{"text":"small useful core"}' | .yawl/tools/word_count
 ```
 
 The model can also create, mark executable, test, and call such a tool within one agent turn because Yawl rescans the registry after every tool batch.
+
+## Skills
+
+Yawl discovers Markdown skills from `~/.yawl/skills/` and `~/.agents/skills/` by default. A skill may be either `NAME/SKILL.md` or `NAME.md`; optional YAML frontmatter can provide `name` and `description`. Skills appear in the `/` completion menu as `/skill:NAME` and can receive trailing instructions, for example `/skill:review focus on security`.
+
+Manage search directories from the TUI:
+
+```text
+/settings skills add ~/shared/skills
+/settings skills remove ~/.agents/skills
+```
+
+The resulting `skill_dirs` array is stored in `~/.yawl/config.json`. Later directories override earlier directories when skill names collide.
 
 ## Project instructions
 

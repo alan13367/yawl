@@ -394,6 +394,7 @@ printf '%s:%s' "$YAWL_SESSION_ID" "$input"
             context_windows: std::collections::HashMap::new(),
             auto_compact: true,
             compact_threshold: 0.85,
+            skill_dirs: Vec::new(),
             providers: std::collections::HashMap::new(),
             home_dir,
             project_dir,

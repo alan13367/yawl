@@ -12,6 +12,7 @@ pub mod onboarding;
 pub mod prompt;
 pub mod provider;
 pub mod session;
+pub mod skills;
 pub mod tools;
 pub mod tui;
 

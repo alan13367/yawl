@@ -30,6 +30,34 @@ impl Editor {
         self.buffer.is_empty()
     }
 
+    /// Current slash-command token while the cursor is editing it.
+    pub fn command_prefix(&self) -> Option<String> {
+        if self.buffer.first() != Some(&'/') {
+            return None;
+        }
+        let end = self
+            .buffer
+            .iter()
+            .position(|character| character.is_whitespace())
+            .unwrap_or(self.buffer.len());
+        (self.cursor <= end).then(|| self.buffer[..end].iter().collect())
+    }
+
+    pub fn complete_command(&mut self, command: &str) {
+        let end = self
+            .buffer
+            .iter()
+            .position(|character| character.is_whitespace())
+            .unwrap_or(self.buffer.len());
+        self.buffer.splice(0..end, command.chars());
+        self.cursor = command.chars().count();
+        if self.buffer.get(self.cursor).is_none() {
+            self.buffer.push(' ');
+        }
+        self.cursor += 1;
+        self.leave_history();
+    }
+
     pub fn clear(&mut self) {
         self.buffer.clear();
         self.cursor = 0;
@@ -259,6 +287,16 @@ mod tests {
         assert_eq!(editor.layout(20).lines, ["> first"]);
         editor.handle_key(Key::Down);
         assert_eq!(editor.layout(20).lines, ["> draft"]);
+    }
+
+    #[test]
+    fn completes_only_the_command_token() {
+        let mut editor = Editor::default();
+        editor.paste("/ski argument");
+        editor.handle_key(Key::Home);
+        assert_eq!(editor.command_prefix().as_deref(), Some("/ski"));
+        editor.complete_command("/skill:review");
+        assert_eq!(editor.layout(40).lines, ["> /skill:review argument"]);
     }
 
     #[test]

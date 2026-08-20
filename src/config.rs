@@ -143,6 +143,7 @@ struct ConfigFile {
     auto_compact: Option<bool>,
     /// Fraction of the context window at which auto-compaction triggers.
     compact_threshold: Option<f64>,
+    skill_dirs: Option<Vec<String>>,
     providers: Option<HashMap<String, ProviderFile>>,
 }
 
@@ -172,6 +173,8 @@ pub struct Config {
     pub context_windows: HashMap<String, u64>,
     pub auto_compact: bool,
     pub compact_threshold: f64,
+    /// Directories containing `NAME/SKILL.md` or `NAME.md` skills.
+    pub skill_dirs: Vec<PathBuf>,
     pub providers: HashMap<String, ProviderConfig>,
     /// `~/.yawl`.
     pub home_dir: PathBuf,
@@ -195,6 +198,7 @@ impl Config {
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
+            skill_dirs: vec![home.join(".yawl/skills"), home.join(".agents/skills")],
             providers: default_local_providers(),
             home_dir,
             project_dir,
@@ -236,6 +240,13 @@ impl Config {
         }
         if let Some(value) = file.compact_threshold {
             self.compact_threshold = value.clamp(0.1, 0.99);
+        }
+        if let Some(dirs) = file.skill_dirs {
+            self.skill_dirs = dirs
+                .into_iter()
+                .filter(|dir| !dir.trim().is_empty())
+                .map(|dir| expand_home_path(&dir, &self.home_dir))
+                .collect();
         }
         if let Some(providers) = file.providers {
             for (name, provider) in providers {
@@ -369,6 +380,25 @@ impl Config {
         })
     }
 
+    /// Saves the complete skill search path to the global config.
+    pub fn save_global_skill_dirs(&self, dirs: &[PathBuf]) -> Result<(), Error> {
+        let home = self.home_dir.parent();
+        let values = dirs
+            .iter()
+            .map(|dir| {
+                home.and_then(|home| dir.strip_prefix(home).ok())
+                    .map_or_else(
+                        || dir.display().to_string(),
+                        |relative| format!("~/{}", relative.display()),
+                    )
+            })
+            .collect::<Vec<_>>();
+        self.update_global_json(|root| {
+            root.insert("skill_dirs".into(), json!(values));
+            Ok(())
+        })
+    }
+
     /// Saves a context-window override for one model to the global config.
     pub fn save_global_context_window(&self, model: &str, window: u64) -> Result<(), Error> {
         self.update_global_json(|root| {
@@ -434,6 +464,16 @@ impl Config {
         update(&mut root)?;
         write_json_object(&path, &root)
     }
+}
+
+fn expand_home_path(value: &str, yawl_home: &Path) -> PathBuf {
+    if value == "~" {
+        return yawl_home.parent().unwrap_or(yawl_home).to_path_buf();
+    }
+    if let Some(relative) = value.strip_prefix("~/") {
+        return yawl_home.parent().unwrap_or(yawl_home).join(relative);
+    }
+    PathBuf::from(value)
 }
 
 fn default_local_providers() -> HashMap<String, ProviderConfig> {
@@ -584,6 +624,7 @@ mod tests {
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: 0.85,
+            skill_dirs: Vec::new(),
             providers: default_local_providers(),
             home_dir: PathBuf::new(),
             project_dir: PathBuf::new(),
