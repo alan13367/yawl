@@ -285,42 +285,43 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn decodes_arrows_and_alt_enter() {
+    fn decodes_arrows_and_alt_enter() -> std::io::Result<()> {
         let mut reader = EventReader::new(Cursor::new(b"\x1b[A\x1b\r"));
-        assert_eq!(reader.read_event().unwrap(), Event::Key(Key::Up));
-        assert_eq!(reader.read_event().unwrap(), Event::Key(Key::Newline));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Up));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Newline));
+        Ok(())
     }
 
     #[test]
-    fn decodes_kitty_shift_enter() {
+    fn decodes_kitty_shift_enter() -> std::io::Result<()> {
         let mut reader = EventReader::new(Cursor::new(b"\x1b[13;2u"));
-        assert_eq!(reader.read_event().unwrap(), Event::Key(Key::Newline));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Newline));
+        Ok(())
     }
 
     #[test]
-    fn collects_bracketed_paste() {
+    fn collects_bracketed_paste() -> std::io::Result<()> {
         let input = b"\x1b[200~one\r\ntwo\x1b[201~";
         let mut reader = EventReader::new(Cursor::new(input));
-        assert_eq!(
-            reader.read_event().unwrap(),
-            Event::Paste("one\ntwo".into())
-        );
+        assert_eq!(reader.read_event()?, Event::Paste("one\ntwo".into()));
+        Ok(())
     }
 
     #[test]
-    fn decodes_mouse_wheel() {
+    fn decodes_mouse_wheel() -> std::io::Result<()> {
         let mut reader = EventReader::new(Cursor::new(b"\x1b[<64;10;4M\x1b[<65;10;4M"));
-        assert_eq!(reader.read_event().unwrap(), Event::MouseScroll(3));
-        assert_eq!(reader.read_event().unwrap(), Event::MouseScroll(-3));
+        assert_eq!(reader.read_event()?, Event::MouseScroll(3));
+        assert_eq!(reader.read_event()?, Event::MouseScroll(-3));
+        Ok(())
     }
 
     #[test]
-    fn decodes_mouse_press_drag_and_release() {
+    fn decodes_mouse_press_drag_and_release() -> std::io::Result<()> {
         let input = b"\x1b[<0;4;2M\x1b[<32;8;3M\x1b[<0;8;3m";
         let mut reader = EventReader::new(Cursor::new(input));
 
         assert_eq!(
-            reader.read_event().unwrap(),
+            reader.read_event()?,
             Event::Mouse(MouseEvent {
                 kind: MouseKind::Press,
                 column: 3,
@@ -328,7 +329,7 @@ mod tests {
             })
         );
         assert_eq!(
-            reader.read_event().unwrap(),
+            reader.read_event()?,
             Event::Mouse(MouseEvent {
                 kind: MouseKind::Drag,
                 column: 7,
@@ -336,12 +337,13 @@ mod tests {
             })
         );
         assert_eq!(
-            reader.read_event().unwrap(),
+            reader.read_event()?,
             Event::Mouse(MouseEvent {
                 kind: MouseKind::Release,
                 column: 7,
                 row: 2,
             })
         );
+        Ok(())
     }
 }

@@ -388,13 +388,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodes_url_safe_jwt_account_id() {
+    fn decodes_url_safe_jwt_account_id() -> Result<(), Error> {
         // {"https://api.openai.com/auth":{"chatgpt_account_id":"acc_test"}}
         let payload = "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjX3Rlc3QifX0";
         assert_eq!(
-            account_id_from_jwt(&format!("header.{payload}.signature")).unwrap(),
+            account_id_from_jwt(&format!("header.{payload}.signature"))?,
             "acc_test"
         );
+        Ok(())
     }
 
     #[test]

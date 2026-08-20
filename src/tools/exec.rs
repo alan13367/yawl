@@ -301,10 +301,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn run_with_timeout_captures_output_and_exit_code() {
+    fn run_with_timeout_captures_output_and_exit_code() -> std::io::Result<()> {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("echo out; echo err >&2; exit 3");
-        let r = run_with_timeout(cmd, None, Duration::from_secs(5)).unwrap();
+        let r = run_with_timeout(cmd, None, Duration::from_secs(5))?;
         assert_eq!(r.status, Some(3));
         assert_eq!(r.stdout.trim(), "out");
         assert_eq!(r.stderr.trim(), "err");
@@ -312,24 +312,27 @@ mod tests {
         assert!(is_error);
         assert!(text.contains("[stderr]"));
         assert!(text.contains("[exit code: 3]"));
+        Ok(())
     }
 
     #[test]
-    fn run_with_timeout_kills_hung_process() {
+    fn run_with_timeout_kills_hung_process() -> std::io::Result<()> {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("sleep 30 & wait");
         let start = Instant::now();
-        let r = run_with_timeout(cmd, None, Duration::from_millis(200)).unwrap();
+        let r = run_with_timeout(cmd, None, Duration::from_millis(200))?;
         assert!(r.timed_out);
         assert!(start.elapsed() < Duration::from_secs(5));
+        Ok(())
     }
 
     #[test]
-    fn stdin_is_delivered() {
+    fn stdin_is_delivered() -> std::io::Result<()> {
         let cmd = Command::new("cat");
-        let r = run_with_timeout(cmd, Some(b"{\"x\":1}"), Duration::from_secs(5)).unwrap();
+        let r = run_with_timeout(cmd, Some(b"{\"x\":1}"), Duration::from_secs(5))?;
         assert_eq!(r.stdout, "{\"x\":1}");
         assert_eq!(r.status, Some(0));
+        Ok(())
     }
 
     #[test]
@@ -341,11 +344,12 @@ mod tests {
     }
 
     #[test]
-    fn process_capture_is_bounded() {
+    fn process_capture_is_bounded() -> std::io::Result<()> {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("yes x | head -c 100000");
-        let result = run_with_timeout(cmd, None, Duration::from_secs(5)).unwrap();
+        let result = run_with_timeout(cmd, None, Duration::from_secs(5))?;
         assert!(result.stdout.len() < 70_000);
         assert!(result.stdout.ends_with("[process output truncated]"));
+        Ok(())
     }
 }

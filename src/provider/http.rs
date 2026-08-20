@@ -96,16 +96,23 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn sse_reader_parses_events_and_multiline_data() {
+    fn sse_reader_parses_events_and_multiline_data() -> Result<(), Error> {
         let input =
             "event: message_start\ndata: {\"a\":1}\n\n: comment\ndata: line1\ndata: line2\n\n";
         let mut r = SseReader::new(Cursor::new(input));
-        let e1 = r.next().unwrap().unwrap();
+        let Some(e1) = r.next() else {
+            panic!("fixture should contain a first SSE event");
+        };
+        let e1 = e1?;
         assert_eq!(e1.event, "message_start");
         assert_eq!(e1.data, "{\"a\":1}");
-        let e2 = r.next().unwrap().unwrap();
+        let Some(e2) = r.next() else {
+            panic!("fixture should contain a second SSE event");
+        };
+        let e2 = e2?;
         assert_eq!(e2.event, "");
         assert_eq!(e2.data, "line1\nline2");
         assert!(r.next().is_none());
+        Ok(())
     }
 }

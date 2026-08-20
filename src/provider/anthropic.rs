@@ -298,7 +298,11 @@ mod tests {
         let wire = build_messages(&messages);
         assert_eq!(wire.len(), 3);
         assert_eq!(wire[2]["role"], "user");
-        assert_eq!(wire[2]["content"].as_array().unwrap().len(), 2);
+        assert!(
+            wire[2]["content"]
+                .as_array()
+                .is_some_and(|content| content.len() == 2)
+        );
         assert_eq!(wire[2]["content"][1]["is_error"], true);
     }
 

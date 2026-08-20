@@ -493,7 +493,11 @@ mod tests {
         let lines = render("| Name | Value |\n| --- | --- |\n| yawl | small |", 40);
         assert!(strip_ansi(&lines[0]).starts_with('┌'));
         assert!(lines.iter().any(|line| strip_ansi(line).contains('┼')));
-        assert!(strip_ansi(lines.last().unwrap()).starts_with('└'));
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| strip_ansi(line).starts_with('└'))
+        );
     }
 
     #[test]

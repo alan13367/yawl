@@ -247,25 +247,25 @@ mod tests {
     }
 
     #[test]
-    fn session_roundtrip_with_compaction() {
+    fn session_roundtrip_with_compaction() -> Result<(), Error> {
         let dir = std::env::temp_dir().join(format!("yawl-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let mut s = Session::create(&dir).unwrap();
+        let mut s = Session::create(&dir)?;
         let id = s.id.clone();
-        s.append_message(&Message::user("one")).unwrap();
-        s.append_message(&Message::assistant("two".into(), vec![]))
-            .unwrap();
-        s.append_message(&Message::user("three")).unwrap();
-        s.append_compaction("summary of one+two", 2).unwrap();
-        s.append_message(&Message::user("four")).unwrap();
+        s.append_message(&Message::user("one"))?;
+        s.append_message(&Message::assistant("two".into(), vec![]))?;
+        s.append_message(&Message::user("three"))?;
+        s.append_compaction("summary of one+two", 2)?;
+        s.append_message(&Message::user("four"))?;
         drop(s);
 
-        let (_, messages) = Session::open(&dir, &id).unwrap();
+        let (_, messages) = Session::open(&dir, &id)?;
         assert_eq!(messages.len(), 3);
         assert!(messages[0].content.contains("summary of one+two"));
         assert_eq!(messages[1].content, "three");
         assert_eq!(messages[2].content, "four");
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]

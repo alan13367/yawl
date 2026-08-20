@@ -53,9 +53,12 @@ fn frame_keeps_input_and_status_pinned() {
     let editor = Editor::default();
     let (frame, cursor) = build_frame(&mut state, &editor, 40, 12);
     assert_eq!(frame.len(), 12);
-    assert!(markdown::strip_ansi(frame.last().unwrap()).contains("test"));
+    let status = frame
+        .last()
+        .expect("the frame length was asserted immediately above");
+    assert!(markdown::strip_ansi(status).contains("test"));
     assert_eq!(cursor.0, 10);
-    assert!(frame.last().unwrap().contains("48;2;238;238;238"));
+    assert!(status.contains("48;2;238;238;238"));
     assert!(frame[8].contains("38;2;238;238;238"));
 
     state.copy_toast_ticks = 1;

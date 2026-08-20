@@ -148,10 +148,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_value_escapes_literal_markers() {
-        assert_eq!(
-            resolve_config_value("$$money-$!bang").unwrap(),
-            "$money-!bang"
-        );
+    fn config_value_escapes_literal_markers() -> Result<(), Error> {
+        assert_eq!(resolve_config_value("$$money-$!bang")?, "$money-!bang");
+        Ok(())
     }
 }

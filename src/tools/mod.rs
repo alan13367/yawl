@@ -329,29 +329,31 @@ mod tests {
     }
 
     #[test]
-    fn edit_file_requires_unique_match() {
+    fn edit_file_requires_unique_match() -> std::io::Result<()> {
         let path = temp_path("edit.txt");
-        std::fs::write(&path, "aaa bbb aaa").unwrap();
-        let p = path.to_str().unwrap();
+        std::fs::write(&path, "aaa bbb aaa")?;
+        let p = path.to_string_lossy();
 
-        let dup = edit_file(&json!({"path": p, "old_string": "aaa", "new_string": "x"}));
+        let dup = edit_file(&json!({"path": &p, "old_string": "aaa", "new_string": "x"}));
         assert!(dup.is_error);
         assert!(dup.content.contains("2 times"));
 
-        let ok = edit_file(&json!({"path": p, "old_string": "bbb", "new_string": "yyy"}));
+        let ok = edit_file(&json!({"path": &p, "old_string": "bbb", "new_string": "yyy"}));
         assert!(!ok.is_error);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "aaa yyy aaa");
+        assert_eq!(std::fs::read_to_string(&path)?, "aaa yyy aaa");
         let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
-    fn write_file_creates_parent_dirs() {
+    fn write_file_creates_parent_dirs() -> std::io::Result<()> {
         let dir = temp_path("nested");
         let file = dir.join("a/b.txt");
-        let out = write_file(&json!({"path": file.to_str().unwrap(), "content": "hi"}));
+        let out = write_file(&json!({"path": file.to_string_lossy(), "content": "hi"}));
         assert!(!out.is_error, "{}", out.content);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hi");
+        assert_eq!(std::fs::read_to_string(&file)?, "hi");
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]
@@ -363,12 +365,12 @@ mod tests {
     }
 
     #[test]
-    fn registry_discovers_and_invokes_exec_tool() {
+    fn registry_discovers_and_invokes_exec_tool() -> std::io::Result<()> {
         let root = temp_path("exec-registry");
         let home_dir = root.join("home");
         let project_dir = root.join("project");
         let tools_dir = project_dir.join("tools");
-        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::create_dir_all(&tools_dir)?;
         let tool_path = tools_dir.join("echo_session");
         std::fs::write(
             &tool_path,
@@ -380,11 +382,10 @@ fi
 input=$(cat)
 printf '%s:%s' "$YAWL_SESSION_ID" "$input"
 "#,
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&tool_path).unwrap().permissions();
+        )?;
+        let mut permissions = std::fs::metadata(&tool_path)?.permissions();
         permissions.set_mode(0o755);
-        std::fs::set_permissions(&tool_path, permissions).unwrap();
+        std::fs::set_permissions(&tool_path, permissions)?;
 
         let config = Config {
             model: Some("test".into()),
@@ -414,5 +415,6 @@ printf '%s:%s' "$YAWL_SESSION_ID" "$input"
         assert!(!outcome.is_error, "{}", outcome.content);
         assert_eq!(outcome.content, r#"session-7:{"value":1}"#);
         let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 }

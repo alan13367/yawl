@@ -154,15 +154,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn message_roundtrips_through_json() {
+    fn message_roundtrips_through_json() -> Result<(), serde_json::Error> {
         let mut m = Message::assistant("ok".into(), Vec::new());
         m.reasoning.push(Reasoning {
             kind: ReasoningKind::Summary,
             content: "Checked the result".into(),
         });
-        let text = serde_json::to_string(&m).unwrap();
-        let back: Message = serde_json::from_str(&text).unwrap();
+        let text = serde_json::to_string(&m)?;
+        let back: Message = serde_json::from_str(&text)?;
         assert_eq!(back.role, Role::Assistant);
         assert_eq!(back.reasoning, m.reasoning);
+        Ok(())
     }
 }

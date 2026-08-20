@@ -168,7 +168,8 @@ mod tests {
     }
 
     #[test]
-    fn context_window_prefers_config_override_and_provider_metadata() {
+    fn context_window_prefers_config_override_and_provider_metadata()
+    -> Result<(), serde_json::Error> {
         let mut cfg = test_config();
         cfg.context_windows.insert("tiny".into(), 4096);
         let file: ConfigFile = serde_json::from_value(json!({
@@ -183,8 +184,7 @@ mod tests {
                     }]
                 }
             }
-        }))
-        .unwrap();
+        }))?;
         cfg.apply(file);
 
         assert_eq!(crate::model::context_window(&cfg, "tiny"), 4096);
@@ -199,10 +199,11 @@ mod tests {
             200_000
         );
         assert_eq!(crate::model::context_window(&cfg, "gpt-4o"), 128_000);
+        Ok(())
     }
 
     #[test]
-    fn pi_style_provider_config_is_accepted() {
+    fn pi_style_provider_config_is_accepted() -> Result<(), serde_json::Error> {
         let mut cfg = test_config();
         let file: ConfigFile = serde_json::from_value(json!({
             "providers": {
@@ -217,8 +218,7 @@ mod tests {
                     "models": [{"id": "qwen", "name": "Qwen local"}]
                 }
             }
-        }))
-        .unwrap();
+        }))?;
         cfg.apply(file);
 
         let provider = &cfg.providers["omlx"];
@@ -227,46 +227,56 @@ mod tests {
         assert_eq!(provider.models[0].id, "qwen");
         assert!(!provider.compat.usage_in_stream());
         assert!(provider.compat.reasoning_content_on_assistant_messages());
+        Ok(())
     }
 
     #[test]
-    fn reasoning_effort_accepts_levels_and_default() {
+    fn reasoning_effort_accepts_levels_and_default() -> Result<(), serde_json::Error> {
         let mut cfg = test_config();
-        cfg.apply(serde_json::from_value(json!({"reasoning_effort": "high"})).unwrap());
+        cfg.apply(serde_json::from_value(json!({"reasoning_effort": "high"}))?);
         assert_eq!(cfg.reasoning_effort.as_deref(), Some("high"));
 
-        cfg.apply(serde_json::from_value(json!({"reasoning_effort": "default"})).unwrap());
+        cfg.apply(serde_json::from_value(
+            json!({"reasoning_effort": "default"}),
+        )?);
         assert_eq!(cfg.reasoning_effort, None);
+        Ok(())
     }
 
     #[test]
-    fn reasoning_is_visible_unless_hidden() {
+    fn reasoning_is_visible_unless_hidden() -> Result<(), serde_json::Error> {
         let mut cfg = test_config();
         assert!(!cfg.hide_reasoning);
 
-        cfg.apply(serde_json::from_value(json!({"hide_reasoning": true})).unwrap());
+        cfg.apply(serde_json::from_value(json!({"hide_reasoning": true}))?);
         assert!(cfg.hide_reasoning);
+        Ok(())
     }
 
     #[test]
-    fn ui_colors_accept_palette_names_and_custom_rgb() {
-        assert_eq!(UiColor::parse("blue").unwrap().config_value(), "blue");
+    fn ui_colors_accept_palette_names_and_custom_rgb() -> Result<(), serde_json::Error> {
         assert_eq!(
-            UiColor::parse("#123aBc").unwrap(),
+            UiColor::parse("blue")
+                .expect("the built-in blue palette name should parse")
+                .config_value(),
+            "blue"
+        );
+        assert_eq!(
+            UiColor::parse("#123aBc").expect("the valid RGB fixture should parse"),
             UiColor::new(0x12, 0x3a, 0xbc)
         );
         assert!(UiColor::parse("not-a-color").is_err());
 
         let mut cfg = test_config();
-        cfg.apply(
-            serde_json::from_value(json!({
-                "accent_color": "#102030"
-            }))
-            .unwrap(),
-        );
+        cfg.apply(serde_json::from_value(json!({
+            "accent_color": "#102030"
+        }))?);
         assert_eq!(cfg.accent_color, UiColor::new(0x10, 0x20, 0x30));
 
-        cfg.apply(serde_json::from_value(json!({"status_bar_color": "green"})).unwrap());
+        cfg.apply(serde_json::from_value(
+            json!({"status_bar_color": "green"}),
+        )?);
         assert_eq!(cfg.accent_color.config_value(), "green");
+        Ok(())
     }
 }
