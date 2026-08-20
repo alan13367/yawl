@@ -185,7 +185,7 @@ You can configure an endpoint from the TUI without editing JSON:
 /settings model omlx:Qwen3-Coder
 ```
 
-Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; `./.yawl/config.json` can still override it. It also changes `max_tokens`, Codex reasoning effort, reasoning visibility, automatic compaction, the compaction threshold, context windows, and built-in endpoint URLs.
+Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; `./.yawl/config.json` can still override it. When that happens, Yawl reports that the global value was saved while the project value remains effective. `/settings` also changes `max_tokens`, Codex reasoning effort, reasoning visibility, automatic compaction, the compaction threshold, context windows, and built-in endpoint URLs.
 
 ## Sessions and compaction
 
@@ -273,7 +273,7 @@ The resulting `skill_dirs` array is stored in `~/.yawl/config.json`. Later direc
 
 ## Project instructions
 
-If `YAWL.md` exists in the current directory, Yawl appends it to the built-in system prompt. Use it for repository-specific commands, constraints, and context.
+Yawl reads global instructions from `~/.yawl/AGENTS.md` and project instructions from `AGENTS.md` in the current directory. It appends the global file first and the project file second, after the built-in system prompt. Empty or missing files are ignored. Use these files for commands, constraints, and context that should apply to every project or only the current repository.
 
 ## Development
 

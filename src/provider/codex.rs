@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    Event, Provider, ReasoningKind, Request, Role, SseReader, ToolCall, error_body, http_agent,
+    Event, Provider, ReasoningKind, Request, Role, SseEvent, SseReader, ToolCall, error_body,
+    http_agent,
 };
 use crate::config::Config;
 use crate::error::Error;
@@ -26,31 +27,6 @@ const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/respons
 const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const REFRESH_MARGIN_MS: u64 = 5 * 60 * 1000;
-
-pub const MODELS: &[(&str, &str, u64)] = &[
-    ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark", 128_000),
-    ("gpt-5.4", "GPT-5.4", 272_000),
-    ("gpt-5.4-mini", "GPT-5.4 mini", 272_000),
-    ("gpt-5.5", "GPT-5.5", 272_000),
-    ("gpt-5.6-luna", "GPT-5.6 Luna", 272_000),
-    ("gpt-5.6-sol", "GPT-5.6 Sol", 272_000),
-    ("gpt-5.6-terra", "GPT-5.6 Terra", 272_000),
-];
-
-const STANDARD_REASONING: &[&str] = &["minimal", "low", "medium", "high"];
-const XHIGH_REASONING: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
-const MAX_REASONING: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
-
-/// Reasoning efforts accepted by the Codex Responses API for a listed model.
-/// OAuth authenticates the account but does not return model capabilities, so
-/// these are maintained alongside the model catalog.
-pub fn reasoning_efforts(model: &str) -> &'static [&'static str] {
-    match model {
-        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" => MAX_REASONING,
-        "gpt-5.3-codex-spark" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5" => XHIGH_REASONING,
-        _ => STANDARD_REASONING,
-    }
-}
 
 pub struct Codex {
     agent: ureq::Agent,
@@ -534,6 +510,104 @@ fn build_body(request: &Request<'_>, reasoning_effort: Option<&str>) -> Value {
     body
 }
 
+#[derive(Default)]
+struct Decoder {
+    emitted_calls: HashSet<String>,
+    reasoning_items: HashMap<String, Value>,
+    emitted_summary: bool,
+}
+
+impl Decoder {
+    fn decode(&mut self, event: SseEvent, on_event: &mut dyn FnMut(Event)) -> Result<bool, Error> {
+        if event.data.is_empty() || event.data == "[DONE]" {
+            return Ok(false);
+        }
+        let value: Value = serde_json::from_str(&event.data)?;
+        match value["type"].as_str().unwrap_or("") {
+            "response.output_text.delta" => {
+                if let Some(delta) = value["delta"].as_str()
+                    && !delta.is_empty()
+                {
+                    on_event(Event::TextDelta(delta.to_string()));
+                }
+            }
+            "response.reasoning_summary_text.delta" => {
+                if let Some(delta) = value["delta"].as_str()
+                    && !delta.is_empty()
+                {
+                    self.emitted_summary = true;
+                    on_event(Event::ReasoningDelta {
+                        kind: ReasoningKind::Summary,
+                        text: delta.to_string(),
+                    });
+                }
+            }
+            "response.reasoning_summary_part.done" if self.emitted_summary => {
+                on_event(Event::ReasoningDelta {
+                    kind: ReasoningKind::Summary,
+                    text: "\n\n".into(),
+                });
+            }
+            "response.output_item.done" => self.output_item(&value["item"], on_event),
+            "response.completed" | "response.done" | "response.incomplete" => {
+                let terminal = &value["response"];
+                if let Some(output) = terminal["output"].as_array() {
+                    for item in output {
+                        self.output_item(item, on_event);
+                    }
+                }
+                let usage = &terminal["usage"];
+                on_event(Event::Usage {
+                    input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
+                    output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+                });
+                let mut reasoning = std::mem::take(&mut self.reasoning_items)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                reasoning.sort_by(|left, right| left.0.cmp(&right.0));
+                for (_, item) in reasoning {
+                    on_event(Event::ProviderData(item));
+                }
+                on_event(Event::Done);
+                return Ok(true);
+            }
+            "response.failed" => {
+                let error = &value["response"]["error"];
+                return Err(Error::Protocol(
+                    error["message"]
+                        .as_str()
+                        .or_else(|| error["code"].as_str())
+                        .unwrap_or("Codex response failed")
+                        .to_string(),
+                ));
+            }
+            "error" => {
+                let error = &value["error"];
+                return Err(Error::Protocol(
+                    error["message"]
+                        .as_str()
+                        .or_else(|| value["message"].as_str())
+                        .unwrap_or("Codex stream error")
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn output_item(&mut self, item: &Value, on_event: &mut dyn FnMut(Event)) {
+        if item["type"] == "function_call" {
+            emit_tool_call(item, &mut self.emitted_calls, on_event);
+        } else if item["type"] == "reasoning"
+            && let Some(id) = item["id"].as_str()
+        {
+            emit_reasoning_summary(item, &mut self.emitted_summary, on_event);
+            self.reasoning_items.insert(id.to_string(), item.clone());
+        }
+    }
+}
+
 impl Provider for Codex {
     fn stream_once(&self, req: &Request<'_>, on_event: &mut dyn FnMut(Event)) -> Result<(), Error> {
         let body = build_body(req, self.reasoning_effort.as_deref()).to_string();
@@ -557,99 +631,10 @@ impl Provider for Codex {
         }
 
         let reader = BufReader::new(response.into_body().into_reader());
-        let mut emitted_calls = HashSet::new();
-        let mut reasoning_items: HashMap<String, Value> = HashMap::new();
-        let mut emitted_summary = false;
+        let mut decoder = Decoder::default();
         for event in SseReader::new(reader) {
-            let event = event?;
-            if event.data.is_empty() || event.data == "[DONE]" {
-                continue;
-            }
-            let value: Value = serde_json::from_str(&event.data)?;
-            match value["type"].as_str().unwrap_or("") {
-                "response.output_text.delta" => {
-                    if let Some(delta) = value["delta"].as_str()
-                        && !delta.is_empty()
-                    {
-                        on_event(Event::TextDelta(delta.to_string()));
-                    }
-                }
-                "response.reasoning_summary_text.delta" => {
-                    if let Some(delta) = value["delta"].as_str()
-                        && !delta.is_empty()
-                    {
-                        emitted_summary = true;
-                        on_event(Event::ReasoningDelta {
-                            kind: ReasoningKind::Summary,
-                            text: delta.to_string(),
-                        });
-                    }
-                }
-                "response.reasoning_summary_part.done" if emitted_summary => {
-                    on_event(Event::ReasoningDelta {
-                        kind: ReasoningKind::Summary,
-                        text: "\n\n".into(),
-                    });
-                }
-                "response.output_item.done" => {
-                    let item = &value["item"];
-                    if item["type"] == "function_call" {
-                        emit_tool_call(item, &mut emitted_calls, on_event);
-                    } else if item["type"] == "reasoning"
-                        && let Some(id) = item["id"].as_str()
-                    {
-                        emit_reasoning_summary(item, &mut emitted_summary, on_event);
-                        reasoning_items.insert(id.to_string(), item.clone());
-                    }
-                }
-                "response.completed" | "response.done" | "response.incomplete" => {
-                    let terminal = &value["response"];
-                    if let Some(output) = terminal["output"].as_array() {
-                        for item in output {
-                            if item["type"] == "function_call" {
-                                emit_tool_call(item, &mut emitted_calls, on_event);
-                            } else if item["type"] == "reasoning"
-                                && let Some(id) = item["id"].as_str()
-                            {
-                                emit_reasoning_summary(item, &mut emitted_summary, on_event);
-                                reasoning_items.insert(id.to_string(), item.clone());
-                            }
-                        }
-                    }
-                    let usage = &terminal["usage"];
-                    on_event(Event::Usage {
-                        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
-                        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                    });
-                    let mut reasoning = reasoning_items.into_iter().collect::<Vec<_>>();
-                    reasoning.sort_by(|left, right| left.0.cmp(&right.0));
-                    for (_, item) in reasoning {
-                        on_event(Event::ProviderData(item));
-                    }
-                    on_event(Event::Done);
-                    return Ok(());
-                }
-                "response.failed" => {
-                    let error = &value["response"]["error"];
-                    return Err(Error::Protocol(
-                        error["message"]
-                            .as_str()
-                            .or_else(|| error["code"].as_str())
-                            .unwrap_or("Codex response failed")
-                            .to_string(),
-                    ));
-                }
-                "error" => {
-                    let error = &value["error"];
-                    return Err(Error::Protocol(
-                        error["message"]
-                            .as_str()
-                            .or_else(|| value["message"].as_str())
-                            .unwrap_or("Codex stream error")
-                            .to_string(),
-                    ));
-                }
-                _ => {}
+            if decoder.decode(event?, on_event)? {
+                return Ok(());
             }
         }
         Err(Error::Io(std::io::Error::new(
@@ -703,6 +688,7 @@ fn emit_tool_call(item: &Value, emitted: &mut HashSet<String>, on_event: &mut dy
 mod tests {
     use super::*;
     use crate::provider::Message;
+    use std::io::Cursor;
 
     #[test]
     fn decodes_url_safe_jwt_account_id() {
@@ -784,14 +770,80 @@ mod tests {
     }
 
     #[test]
-    fn model_reasoning_efforts_match_catalog_capabilities() {
-        assert!(reasoning_efforts("gpt-5.4").contains(&"xhigh"));
-        assert!(!reasoning_efforts("gpt-5.4").contains(&"max"));
-        assert!(reasoning_efforts("gpt-5.6-sol").contains(&"max"));
+    fn percent_encodes_form_values() {
+        assert_eq!(percent_encode("a+b/c="), "a%2Bb%2Fc%3D");
     }
 
     #[test]
-    fn percent_encodes_form_values() {
-        assert_eq!(percent_encode("a+b/c="), "a%2Bb%2Fc%3D");
+    fn decoder_handles_deltas_deduplicates_items_and_preserves_reasoning() {
+        let function_call = r#"{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}"#;
+        let reasoning = r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Inspecting"}],"encrypted_content":"secret"}"#;
+        let fixture = format!(
+            concat!(
+                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}}\n\n",
+                "data: {{\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"think\"}}\n\n",
+                "data: {{\"type\":\"response.reasoning_summary_part.done\"}}\n\n",
+                "data: {{\"type\":\"response.output_item.done\",\"item\":{function_call}}}\n\n",
+                "data: {{\"type\":\"response.output_item.done\",\"item\":{reasoning}}}\n\n",
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{function_call},{reasoning}],\"usage\":{{\"input_tokens\":13,\"output_tokens\":6}}}}}}\n\n",
+            ),
+            function_call = function_call,
+            reasoning = reasoning,
+        );
+        let mut decoder = Decoder::default();
+        let mut events = Vec::new();
+        for sse in SseReader::new(Cursor::new(fixture)) {
+            if decoder
+                .decode(sse.expect("valid SSE fixture"), &mut |event| {
+                    events.push(event)
+                })
+                .expect("valid Codex fixture")
+            {
+                break;
+            }
+        }
+
+        assert!(matches!(&events[0], Event::TextDelta(text) if text == "hello"));
+        assert!(matches!(
+            &events[1],
+            Event::ReasoningDelta {
+                kind: ReasoningKind::Summary,
+                text
+            } if text == "think"
+        ));
+        assert!(matches!(
+            &events[2],
+            Event::ReasoningDelta {
+                kind: ReasoningKind::Summary,
+                text
+            } if text == "\n\n"
+        ));
+        assert!(matches!(
+            &events[3],
+            Event::ToolCall(call)
+                if call.id == "call_1|fc_1"
+                    && call.name == "shell"
+                    && call.arguments == r#"{"command":"pwd"}"#
+        ));
+        assert!(matches!(
+            events[4],
+            Event::Usage {
+                input_tokens: 13,
+                output_tokens: 6
+            }
+        ));
+        assert!(matches!(
+            &events[5],
+            Event::ProviderData(item)
+                if item["id"] == "rs_1" && item["encrypted_content"] == "secret"
+        ));
+        assert!(matches!(events[6], Event::Done));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::ToolCall(_)))
+                .count(),
+            1
+        );
     }
 }

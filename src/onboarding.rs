@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{Config, ConfigChange};
 use crate::error::Error;
 
 const MAX_DISCOVERED_MODELS: usize = 30;
@@ -75,7 +75,7 @@ pub fn run(config: &Config) -> Result<Config, Error> {
             config,
             "anthropic",
             &config.anthropic_base_url,
-            "anthropic_base_url",
+            ConfigChange::AnthropicBaseUrl,
             "ANTHROPIC_API_KEY",
             false,
         )?,
@@ -83,17 +83,16 @@ pub fn run(config: &Config) -> Result<Config, Error> {
             config,
             "openai",
             &config.openai_base_url,
-            "openai_base_url",
+            ConfigChange::OpenAiBaseUrl,
             "OPENAI_API_KEY",
             true,
         )?,
         ProviderChoice::OpenAiCodex => {
             crate::provider::codex::login(config)?;
-            let models = crate::provider::codex::MODELS
-                .iter()
-                .map(|(id, _, _)| (*id).to_string())
-                .collect();
-            format!("openai-codex:{}", choose_model(models)?)
+            format!(
+                "openai-codex:{}",
+                choose_model(crate::model::codex_model_ids())?
+            )
         }
         ProviderChoice::Ollama => configure_local(config, "ollama", "http://127.0.0.1:11434/v1")?,
         ProviderChoice::LmStudio => {
@@ -107,8 +106,7 @@ pub fn run(config: &Config) -> Result<Config, Error> {
         }
     };
 
-    config.save_global_setting("model", serde_json::json!(model))?;
-    let loaded = Config::load()?;
+    let loaded = config.change_global(ConfigChange::Model(model))?.config;
     if loaded.model.is_none() {
         return Err(Error::Config(
             "the model was saved globally but a project config overrides it; remove the empty project model setting"
@@ -126,13 +124,12 @@ fn configure_builtin(
     config: &Config,
     provider: &str,
     current_url: &str,
-    url_setting: &str,
+    url_change: fn(String) -> ConfigChange,
     key_environment: &str,
     discover: bool,
 ) -> Result<String, Error> {
     let url = prompt_with_default("API base URL", current_url)?;
-    validate_http_url(&url)?;
-    config.save_global_setting(url_setting, serde_json::json!(url))?;
+    config.change_global(url_change(url.clone()))?;
 
     let key = std::env::var(key_environment).unwrap_or_default();
     if key.is_empty() {
@@ -156,9 +153,12 @@ fn configure_local(config: &Config, provider: &str, default_url: &str) -> Result
         .get(provider)
         .map_or(default_url, |configured| configured.base_url.as_str());
     let url = prompt_with_default("API base URL", configured_url)?;
-    validate_http_url(&url)?;
     let authentication = choose_authentication()?;
-    config.save_global_provider(provider, &url, Some(authentication.config_value()))?;
+    config.change_global(ConfigChange::Provider {
+        name: provider.to_string(),
+        base_url: url.clone(),
+        api_key: Some(authentication.config_value().to_string()),
+    })?;
 
     let models = if matches!(authentication, Authentication::Environment { ref value, .. } if value.is_empty())
     {
@@ -324,16 +324,6 @@ fn nonempty(value: String, name: &str) -> Result<String, Error> {
     }
 }
 
-fn validate_http_url(url: &str) -> Result<(), Error> {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        Ok(())
-    } else {
-        Err(Error::Config(
-            "provider URL must start with http:// or https://".into(),
-        ))
-    }
-}
-
 fn validate_environment_name(name: &str) -> Result<(), Error> {
     let mut bytes = name.bytes();
     let valid_start = bytes
@@ -355,11 +345,5 @@ mod tests {
         assert!(validate_environment_name("OMLX_API_KEY").is_ok());
         assert!(validate_environment_name("2BAD").is_err());
         assert!(validate_environment_name("BAD-NAME").is_err());
-    }
-
-    #[test]
-    fn rejects_non_http_provider_urls() {
-        assert!(validate_http_url("http://127.0.0.1:8000/v1").is_ok());
-        assert!(validate_http_url("file:///tmp/socket").is_err());
     }
 }

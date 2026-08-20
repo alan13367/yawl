@@ -6,7 +6,8 @@ use std::io::BufReader;
 use serde_json::{Value, json};
 
 use super::{
-    Event, Provider, ReasoningKind, Request, Role, SseReader, ToolCall, error_body, http_agent,
+    Event, Provider, ReasoningKind, Request, Role, SseEvent, SseReader, ToolCall, error_body,
+    http_agent,
 };
 use crate::config::OpenAiCompatibility;
 use crate::error::Error;
@@ -142,6 +143,154 @@ struct PendingCall {
     arguments: String,
 }
 
+struct Decoder {
+    pending: Vec<(u64, PendingCall)>,
+    input_tokens: u64,
+    output_tokens: u64,
+    finished: bool,
+    finish_reason_required: bool,
+}
+
+impl Decoder {
+    fn new(compat: &OpenAiCompatibility) -> Self {
+        Self {
+            pending: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            finished: false,
+            finish_reason_required: compat.finish_reason_in_stream(),
+        }
+    }
+
+    fn decode(&mut self, sse: SseEvent, on_event: &mut dyn FnMut(Event)) -> Result<bool, Error> {
+        if sse.data == "[DONE]" {
+            self.complete(on_event);
+            return Ok(true);
+        }
+        if sse.data.is_empty() {
+            return Ok(false);
+        }
+        let value: Value = serde_json::from_str(&sse.data)?;
+        if let Some(error) = value.get("error")
+            && !error.is_null()
+        {
+            let message = error["message"].as_str().unwrap_or("unknown error");
+            let kind = error["type"]
+                .as_str()
+                .or_else(|| error["code"].as_str())
+                .unwrap_or("error");
+            if kind.contains("rate_limit") {
+                return Err(Error::Http {
+                    status: 429,
+                    body: message.to_string(),
+                });
+            }
+            if kind.contains("server_error") || kind.contains("overloaded") {
+                return Err(Error::Http {
+                    status: 500,
+                    body: message.to_string(),
+                });
+            }
+            return Err(Error::Protocol(format!("server error: {message}")));
+        }
+        if let Some(usage) = value.get("usage")
+            && usage.is_object()
+        {
+            if let Some(prompt_tokens) = usage["prompt_tokens"].as_u64() {
+                self.input_tokens = prompt_tokens;
+            }
+            if let Some(completion_tokens) = usage["completion_tokens"].as_u64() {
+                self.output_tokens = completion_tokens;
+            }
+        }
+        let Some(choice) = value["choices"].get(0) else {
+            return Ok(false);
+        };
+        let delta = &choice["delta"];
+        if let Some(reasoning) = reasoning_delta(delta) {
+            on_event(Event::ReasoningDelta {
+                kind: ReasoningKind::Full,
+                text: reasoning.to_string(),
+            });
+        }
+        if let Some(text) = delta["content"].as_str()
+            && !text.is_empty()
+        {
+            on_event(Event::TextDelta(text.to_string()));
+        }
+        if let Some(calls) = delta["tool_calls"].as_array() {
+            for call in calls {
+                let index = call["index"].as_u64().unwrap_or(0);
+                let entry = self.pending_call(index);
+                if let Some(id) = call["id"].as_str() {
+                    entry.id.push_str(id);
+                }
+                if let Some(name) = call["function"]["name"].as_str() {
+                    entry.name.push_str(name);
+                }
+                if let Some(arguments) = call["function"]["arguments"].as_str() {
+                    entry.arguments.push_str(arguments);
+                }
+            }
+        }
+        if !choice["finish_reason"].is_null() {
+            self.finished = true;
+        }
+        Ok(false)
+    }
+
+    fn finish(mut self, on_event: &mut dyn FnMut(Event)) -> Result<(), Error> {
+        // Some compatible servers close the stream without a [DONE] sentinel;
+        // that is fine as long as a finish_reason arrived, or their configured
+        // compatibility says not to require one.
+        if self.finished || !self.finish_reason_required {
+            self.complete(on_event);
+            Ok(())
+        } else {
+            Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "stream ended before completion",
+            )))
+        }
+    }
+
+    fn pending_call(&mut self, index: u64) -> &mut PendingCall {
+        let position = match self
+            .pending
+            .iter()
+            .position(|(pending_index, _)| *pending_index == index)
+        {
+            Some(position) => position,
+            None => {
+                self.pending.push((index, PendingCall::default()));
+                self.pending.len() - 1
+            }
+        };
+        &mut self.pending[position].1
+    }
+
+    fn complete(&mut self, on_event: &mut dyn FnMut(Event)) {
+        self.pending.sort_by_key(|(index, _)| *index);
+        for (_, call) in self.pending.drain(..) {
+            let arguments = if call.arguments.trim().is_empty() {
+                "{}".to_string()
+            } else {
+                call.arguments
+            };
+            on_event(Event::ToolCall(ToolCall {
+                id: call.id,
+                name: call.name,
+                arguments,
+            }));
+        }
+        on_event(Event::Usage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+        });
+        on_event(Event::Done);
+    }
+}
+
 impl Provider for OpenAi {
     fn stream_once(&self, req: &Request<'_>, on_event: &mut dyn FnMut(Event)) -> Result<(), Error> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -171,130 +320,13 @@ impl Provider for OpenAi {
         }
 
         let reader = BufReader::new(response.into_body().into_reader());
-        // Indexed by the wire `index` field; calls stream as fragments.
-        let mut pending: Vec<(u64, PendingCall)> = Vec::new();
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
-        let mut finished = false;
-
-        let flush = |pending: &mut Vec<(u64, PendingCall)>, on_event: &mut dyn FnMut(Event)| {
-            pending.sort_by_key(|(i, _)| *i);
-            for (_, call) in pending.drain(..) {
-                let arguments = if call.arguments.trim().is_empty() {
-                    "{}".to_string()
-                } else {
-                    call.arguments
-                };
-                on_event(Event::ToolCall(ToolCall {
-                    id: call.id,
-                    name: call.name,
-                    arguments,
-                }));
-            }
-        };
-
+        let mut decoder = Decoder::new(&self.compat);
         for sse in SseReader::new(reader) {
-            let sse = sse?;
-            if sse.data == "[DONE]" {
-                flush(&mut pending, on_event);
-                on_event(Event::Usage {
-                    input_tokens,
-                    output_tokens,
-                });
-                on_event(Event::Done);
+            if decoder.decode(sse?, on_event)? {
                 return Ok(());
             }
-            if sse.data.is_empty() {
-                continue;
-            }
-            let v: Value = serde_json::from_str(&sse.data)?;
-            if let Some(err) = v.get("error")
-                && !err.is_null()
-            {
-                let msg = err["message"].as_str().unwrap_or("unknown error");
-                let kind = err["type"]
-                    .as_str()
-                    .or_else(|| err["code"].as_str())
-                    .unwrap_or("error");
-                if kind.contains("rate_limit") {
-                    return Err(Error::Http {
-                        status: 429,
-                        body: msg.to_string(),
-                    });
-                }
-                if kind.contains("server_error") || kind.contains("overloaded") {
-                    return Err(Error::Http {
-                        status: 500,
-                        body: msg.to_string(),
-                    });
-                }
-                return Err(Error::Protocol(format!("server error: {msg}")));
-            }
-            if let Some(usage) = v.get("usage")
-                && usage.is_object()
-            {
-                if let Some(p) = usage["prompt_tokens"].as_u64() {
-                    input_tokens = p;
-                }
-                if let Some(c) = usage["completion_tokens"].as_u64() {
-                    output_tokens = c;
-                }
-            }
-            let Some(choice) = v["choices"].get(0) else {
-                continue;
-            };
-            let delta = &choice["delta"];
-            if let Some(reasoning) = reasoning_delta(delta) {
-                on_event(Event::ReasoningDelta {
-                    kind: ReasoningKind::Full,
-                    text: reasoning.to_string(),
-                });
-            }
-            if let Some(text) = delta["content"].as_str()
-                && !text.is_empty()
-            {
-                on_event(Event::TextDelta(text.to_string()));
-            }
-            if let Some(calls) = delta["tool_calls"].as_array() {
-                for c in calls {
-                    let index = c["index"].as_u64().unwrap_or(0);
-                    let entry = match pending.iter_mut().find(|(i, _)| *i == index) {
-                        Some((_, e)) => e,
-                        None => {
-                            pending.push((index, PendingCall::default()));
-                            &mut pending.last_mut().expect("just pushed").1
-                        }
-                    };
-                    if let Some(id) = c["id"].as_str() {
-                        entry.id.push_str(id);
-                    }
-                    if let Some(name) = c["function"]["name"].as_str() {
-                        entry.name.push_str(name);
-                    }
-                    if let Some(args) = c["function"]["arguments"].as_str() {
-                        entry.arguments.push_str(args);
-                    }
-                }
-            }
-            if !choice["finish_reason"].is_null() {
-                finished = true;
-            }
         }
-        // Some compatible servers close the stream without a [DONE] sentinel;
-        // that is fine as long as a finish_reason arrived.
-        if finished || !self.compat.finish_reason_in_stream() {
-            flush(&mut pending, on_event);
-            on_event(Event::Usage {
-                input_tokens,
-                output_tokens,
-            });
-            on_event(Event::Done);
-            return Ok(());
-        }
-        Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "stream ended before completion",
-        )))
+        decoder.finish(on_event)
     }
 }
 
@@ -309,6 +341,7 @@ fn reasoning_delta(delta: &Value) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::provider::Message;
+    use std::io::Cursor;
 
     #[test]
     fn history_translates_to_openai_shape() {
@@ -398,5 +431,53 @@ mod tests {
         assert!(body.get("stream_options").is_none());
         assert_eq!(body["max_completion_tokens"], 123);
         assert_eq!(body["messages"][0]["name"], "shell");
+    }
+
+    #[test]
+    fn decoder_handles_reasoning_text_fragmented_tools_usage_and_done() {
+        let fixture = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut decoder = Decoder::new(&OpenAiCompatibility::default());
+        let mut events = Vec::new();
+        for sse in SseReader::new(Cursor::new(fixture)) {
+            if decoder
+                .decode(sse.expect("valid SSE fixture"), &mut |event| {
+                    events.push(event)
+                })
+                .expect("valid OpenAI fixture")
+            {
+                break;
+            }
+        }
+
+        assert!(matches!(
+            &events[0],
+            Event::ReasoningDelta {
+                kind: ReasoningKind::Full,
+                text
+            } if text == "think"
+        ));
+        assert!(matches!(&events[1], Event::TextDelta(text) if text == "hello"));
+        assert!(matches!(
+            &events[2],
+            Event::ToolCall(call)
+                if call.id == "call_1"
+                    && call.name == "shell"
+                    && call.arguments == r#"{"command":"pwd"}"#
+        ));
+        assert!(matches!(
+            events[3],
+            Event::Usage {
+                input_tokens: 11,
+                output_tokens: 5
+            }
+        ));
+        assert!(matches!(events[4], Event::Done));
     }
 }

@@ -7,16 +7,19 @@ pub mod highlight;
 pub mod input;
 pub mod markdown;
 mod tool_view;
+mod transcript;
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use crate::agent::{Agent, TurnEvent};
+use crate::config::{ConfigChange, ConfigChangeEffect, SkillDirectoryAction};
 use crate::error::Error;
-use crate::provider::{Message, ReasoningKind, Role};
+use crate::provider::ReasoningKind;
 
 use self::events::{Event, EventReader, Key};
 use self::input::{EditAction, Editor};
+use self::transcript::{Entry, Transcript, TranscriptEvent};
 
 const USER_BACKGROUND: &str = "\x1b[48;2;52;53;64m";
 const USER_TEXT: &str = "\x1b[38;2;208;208;214m";
@@ -77,29 +80,8 @@ struct Picker {
     selected: usize,
 }
 
-enum Entry {
-    User(String),
-    Assistant(String),
-    Reasoning {
-        kind: ReasoningKind,
-        content: String,
-    },
-    Tool {
-        name: String,
-        args: String,
-        output: String,
-        is_error: bool,
-        running: bool,
-    },
-    Notice(String),
-}
-
 struct ViewState {
-    entries: Vec<Entry>,
-    streaming_entries_start: Option<usize>,
-    streaming_assistant: Option<usize>,
-    streaming_reasoning: Option<(ReasoningKind, usize)>,
-    running_tool: Option<usize>,
+    transcript: Transcript,
     tools_expanded: bool,
     model: String,
     reasoning_effort: Option<String>,
@@ -117,16 +99,12 @@ struct ViewState {
 impl ViewState {
     fn from_agent(agent: &Agent) -> Self {
         Self {
-            entries: entries_from_messages(&agent.messages),
-            streaming_entries_start: None,
-            streaming_assistant: None,
-            streaming_reasoning: None,
-            running_tool: None,
+            transcript: Transcript::from_messages(agent.messages()),
             tools_expanded: false,
-            model: agent.model.clone(),
-            reasoning_effort: agent.config.reasoning_effort.clone(),
-            hide_reasoning: agent.config.hide_reasoning,
-            context_tokens: agent.context_tokens,
+            model: agent.model().to_string(),
+            reasoning_effort: agent.config().reasoning_effort.clone(),
+            hide_reasoning: agent.config().hide_reasoning,
+            context_tokens: agent.context_tokens(),
             context_window: agent.context_window(),
             activity: String::new(),
             scroll_offset: 0,
@@ -143,62 +121,27 @@ impl ViewState {
     }
 
     fn notice(&mut self, text: impl Into<String>) {
-        self.entries.push(Entry::Notice(text.into()));
+        self.transcript.notice(text.into());
         self.scroll_offset = 0;
     }
 
     fn apply(&mut self, update: Update) {
         let follow_bottom = self.scroll_offset == 0;
         match update {
-            Update::TextDelta(text) => {
-                self.streaming_entries_start
-                    .get_or_insert(self.entries.len());
-                self.streaming_reasoning = None;
-                let index = match self.streaming_assistant {
-                    Some(index) => index,
-                    None => {
-                        self.entries.push(Entry::Assistant(String::new()));
-                        let index = self.entries.len() - 1;
-                        self.streaming_assistant = Some(index);
-                        index
+            Update::Transcript(event) => {
+                self.activity = match &event {
+                    TranscriptEvent::TextDelta(_) => "responding".into(),
+                    TranscriptEvent::ReasoningDelta { .. } if !self.hide_reasoning => {
+                        "reasoning".into()
                     }
-                };
-                if let Some(Entry::Assistant(content)) = self.entries.get_mut(index) {
-                    content.push_str(&text);
-                }
-                self.activity = "responding".into();
-            }
-            Update::ReasoningDelta { kind, text } => {
-                self.streaming_entries_start
-                    .get_or_insert(self.entries.len());
-                self.streaming_assistant = None;
-                let index = match self.streaming_reasoning {
-                    Some((current_kind, index)) if current_kind == kind => index,
-                    _ => {
-                        self.entries.push(Entry::Reasoning {
-                            kind,
-                            content: String::new(),
-                        });
-                        let index = self.entries.len() - 1;
-                        self.streaming_reasoning = Some((kind, index));
-                        index
+                    TranscriptEvent::ReasoningDelta { .. } => "responding".into(),
+                    TranscriptEvent::ToolStart { .. } => "running tool".into(),
+                    TranscriptEvent::AssistantDone | TranscriptEvent::ToolEnd { .. } => {
+                        String::new()
                     }
+                    TranscriptEvent::RetryReset => self.activity.clone(),
                 };
-                if let Some(Entry::Reasoning { content, .. }) = self.entries.get_mut(index) {
-                    content.push_str(&text);
-                }
-                self.activity = if self.hide_reasoning {
-                    "responding".into()
-                } else {
-                    "reasoning".into()
-                };
-            }
-            Update::RetryReset => {
-                if let Some(start) = self.streaming_entries_start {
-                    self.entries.truncate(start);
-                }
-                self.streaming_assistant = None;
-                self.streaming_reasoning = None;
+                self.transcript.apply(event);
             }
             Update::Retrying {
                 attempt,
@@ -209,44 +152,6 @@ impl ViewState {
                     "attempt {attempt} failed, retrying in {delay_ms}ms: {}",
                     crate::error::truncate(&error, 80)
                 );
-            }
-            Update::AssistantDone => {
-                self.streaming_entries_start = None;
-                self.streaming_assistant = None;
-                self.streaming_reasoning = None;
-                self.activity.clear();
-            }
-            Update::ToolStart { name, args } => {
-                self.entries.push(Entry::Tool {
-                    name,
-                    args,
-                    output: String::new(),
-                    is_error: false,
-                    running: true,
-                });
-                self.running_tool = Some(self.entries.len() - 1);
-                self.activity = "running tool".into();
-            }
-            Update::ToolEnd {
-                name,
-                output,
-                is_error,
-            } => {
-                let index = self.running_tool.take();
-                if let Some(Entry::Tool {
-                    name: entry_name,
-                    output: entry_output,
-                    is_error: entry_error,
-                    running,
-                    ..
-                }) = index.and_then(|index| self.entries.get_mut(index))
-                {
-                    *entry_name = name;
-                    *entry_output = output;
-                    *entry_error = is_error;
-                    *running = false;
-                }
-                self.activity.clear();
             }
             Update::Compacting => self.activity = "compacting conversation".into(),
             Update::Compacted { replaced } => {
@@ -268,26 +173,11 @@ impl ViewState {
 }
 
 enum Update {
-    TextDelta(String),
-    ReasoningDelta {
-        kind: ReasoningKind,
-        text: String,
-    },
-    RetryReset,
+    Transcript(TranscriptEvent),
     Retrying {
         attempt: u32,
         delay_ms: u64,
         error: String,
-    },
-    AssistantDone,
-    ToolStart {
-        name: String,
-        args: String,
-    },
-    ToolEnd {
-        name: String,
-        output: String,
-        is_error: bool,
     },
     Compacting,
     Compacted {
@@ -302,12 +192,16 @@ enum Update {
 impl Update {
     fn from_event(event: TurnEvent<'_>) -> Self {
         match event {
-            TurnEvent::TextDelta(text) => Self::TextDelta(text.to_string()),
-            TurnEvent::ReasoningDelta { kind, text } => Self::ReasoningDelta {
-                kind,
-                text: text.to_string(),
-            },
-            TurnEvent::RetryReset => Self::RetryReset,
+            TurnEvent::TextDelta(text) => {
+                Self::Transcript(TranscriptEvent::TextDelta(text.to_string()))
+            }
+            TurnEvent::ReasoningDelta { kind, text } => {
+                Self::Transcript(TranscriptEvent::ReasoningDelta {
+                    kind,
+                    text: text.to_string(),
+                })
+            }
+            TurnEvent::RetryReset => Self::Transcript(TranscriptEvent::RetryReset),
             TurnEvent::Retrying {
                 attempt,
                 delay_ms,
@@ -317,20 +211,20 @@ impl Update {
                 delay_ms,
                 error,
             },
-            TurnEvent::AssistantDone => Self::AssistantDone,
-            TurnEvent::ToolStart { name, args } => Self::ToolStart {
+            TurnEvent::AssistantDone => Self::Transcript(TranscriptEvent::AssistantDone),
+            TurnEvent::ToolStart { name, args } => Self::Transcript(TranscriptEvent::ToolStart {
                 name: name.to_string(),
                 args: args.to_string(),
-            },
+            }),
             TurnEvent::ToolEnd {
                 name,
                 output,
                 is_error,
-            } => Self::ToolEnd {
+            } => Self::Transcript(TranscriptEvent::ToolEnd {
                 name: name.to_string(),
                 output: output.to_string(),
                 is_error,
-            },
+            }),
             TurnEvent::Compacting => Self::Compacting,
             TurnEvent::Compacted { replaced } => Self::Compacted { replaced },
             TurnEvent::Usage {
@@ -356,7 +250,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
     let mut events = EventReader::new(stdin.lock());
     let mut editor = Editor::default();
     let mut state = ViewState::from_agent(agent);
-    if state.entries.is_empty() {
+    if state.transcript.is_empty() {
         state.notice("Yawl is ready. Type /help for commands.");
     }
     terminal.draw(&mut state, &editor)?;
@@ -445,7 +339,7 @@ fn handle_submission<R: Read>(
             .map_or((skill_command, ""), |(name, arguments)| {
                 (name, arguments.trim())
             });
-        let skills = crate::skills::scan(&agent.config);
+        let skills = crate::skills::scan(agent.config());
         if let Some(skill) = skills.iter().find(|skill| skill.name == name) {
             let expanded = crate::skills::expand(skill, arguments);
             run_agent_submission(agent, input, expanded, state, editor, terminal, events)?;
@@ -465,14 +359,14 @@ fn handle_submission<R: Read>(
             "help" => state.notice(HELP),
             "model" if argument.is_empty() => open_model_picker(agent, state, false),
             "model" => {
-                agent.model = argument.to_string();
-                state.model.clone_from(&agent.model);
+                agent.switch_model(argument.to_string());
+                state.model = agent.model().to_string();
                 state.context_window = agent.context_window();
                 state.context_tokens = 0;
-                if agent.model.starts_with("openai-codex:") {
+                if crate::model::is_codex(agent.config(), agent.model()) {
                     open_reasoning_picker(agent, state, false);
                 } else {
-                    state.notice(format!("Switched to {}.", agent.model));
+                    state.notice(format!("Switched to {}.", agent.model()));
                 }
             }
             "settings" if argument.is_empty() => open_settings_picker(agent, state),
@@ -530,7 +424,7 @@ fn run_agent_submission<R: Read>(
     terminal: &mut Terminal,
     events: &mut EventReader<R>,
 ) -> Result<(), Error> {
-    state.entries.push(Entry::User(displayed_input));
+    state.transcript.push_user(displayed_input);
     state.activity = "sending".into();
     state.scroll_offset = 0;
     terminal.draw(state, editor)?;
@@ -568,7 +462,7 @@ fn command_completions(agent: &Agent) -> Vec<Completion> {
     })
     .collect::<Vec<_>>();
     completions.extend(
-        crate::skills::scan(&agent.config)
+        crate::skills::scan(agent.config())
             .into_iter()
             .map(|skill| Completion {
                 command: format!("/skill:{}", skill.name),
@@ -619,9 +513,9 @@ fn handle_completion_key(state: &mut ViewState, editor: &mut Editor, key: Key) -
 }
 
 fn show_skills(agent: &Agent, state: &mut ViewState) {
-    let skills = crate::skills::scan(&agent.config);
+    let skills = crate::skills::scan(agent.config());
     let mut text = String::from("Skill directories\n\n");
-    for dir in &agent.config.skill_dirs {
+    for dir in &agent.config().skill_dirs {
         text.push_str(&format!("- `{}`\n", dir.display()));
     }
     if skills.is_empty() {
@@ -638,25 +532,13 @@ fn show_skills(agent: &Agent, state: &mut ViewState) {
     state.notice(text);
 }
 
-fn expand_user_path(path: &str) -> std::path::PathBuf {
-    if path == "~" {
-        return std::env::var_os("HOME").map_or_else(|| path.into(), Into::into);
-    }
-    if let Some(relative) = path.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
-    {
-        return std::path::PathBuf::from(home).join(relative);
-    }
-    path.into()
-}
-
 fn open_model_picker(agent: &Agent, state: &mut ViewState, save: bool) {
     let selected_model = if save {
-        agent.config.model.as_deref().unwrap_or(&agent.model)
+        agent.config().model.as_deref().unwrap_or(agent.model())
     } else {
-        &agent.model
+        agent.model()
     };
-    let mut models = agent.config.available_models();
+    let mut models = crate::model::available_models(agent.config());
     if !models.iter().any(|(model, _)| model == selected_model) {
         models.push((
             selected_model.to_string(),
@@ -707,12 +589,12 @@ fn open_model_picker(agent: &Agent, state: &mut ViewState, save: bool) {
 }
 
 fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
-    let on_off = if agent.config.auto_compact {
+    let on_off = if agent.config().auto_compact {
         "On"
     } else {
         "Off"
     };
-    let reasoning_visibility = if agent.config.hide_reasoning {
+    let reasoning_visibility = if agent.config().hide_reasoning {
         "Hidden"
     } else {
         "Visible"
@@ -725,25 +607,25 @@ fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
             PickerItem {
                 label: "Default model".into(),
                 description: agent
-                    .config
+                    .config()
                     .model
                     .clone()
-                    .unwrap_or_else(|| agent.model.clone()),
+                    .unwrap_or_else(|| agent.model().to_string()),
                 action: PickerAction::OpenModels { save: true },
             },
             PickerItem {
                 label: "Max output tokens".into(),
-                description: agent.config.max_tokens.to_string(),
+                description: agent.config().max_tokens.to_string(),
                 action: PickerAction::EditSetting("/settings max_tokens ".into()),
             },
             PickerItem {
                 label: "Codex reasoning effort".into(),
                 description: agent
-                    .config
+                    .config()
                     .reasoning_effort
                     .clone()
                     .unwrap_or_else(|| "provider default".into()),
-                action: if agent.model.starts_with("openai-codex:") {
+                action: if crate::model::is_codex(agent.config(), agent.model()) {
                     PickerAction::OpenReasoning { save: true }
                 } else {
                     PickerAction::EditSetting("/settings reasoning_effort ".into())
@@ -761,7 +643,7 @@ fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
             },
             PickerItem {
                 label: "Compaction threshold".into(),
-                description: format!("{:.0}%", agent.config.compact_threshold * 100.0),
+                description: format!("{:.0}%", agent.config().compact_threshold * 100.0),
                 action: PickerAction::EditSetting("/settings compact_threshold ".into()),
             },
             PickerItem {
@@ -773,7 +655,7 @@ fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
                 label: "Skill directories".into(),
                 description: format!(
                     "{} configured · add or remove",
-                    agent.config.skill_dirs.len()
+                    agent.config().skill_dirs.len()
                 ),
                 action: PickerAction::EditSetting("/settings skills ".into()),
             },
@@ -784,12 +666,12 @@ fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
             },
             PickerItem {
                 label: "OpenAI endpoint".into(),
-                description: agent.config.openai_base_url.clone(),
+                description: agent.config().openai_base_url.clone(),
                 action: PickerAction::EditSetting("/settings openai_base_url ".into()),
             },
             PickerItem {
                 label: "Anthropic endpoint".into(),
-                description: agent.config.anthropic_base_url.clone(),
+                description: agent.config().anthropic_base_url.clone(),
                 action: PickerAction::EditSetting("/settings anthropic_base_url ".into()),
             },
             PickerItem {
@@ -807,18 +689,16 @@ fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
 }
 
 fn open_reasoning_picker(agent: &Agent, state: &mut ViewState, save: bool) {
-    let model = agent
-        .model
-        .strip_prefix("openai-codex:")
-        .unwrap_or(&agent.model);
-    let current = agent.config.reasoning_effort.as_deref();
+    let target = crate::model::ModelTarget::parse(agent.model(), agent.config());
+    let model = target.model();
+    let current = agent.config().reasoning_effort.as_deref();
     let mut items = vec![PickerItem {
         label: "Provider default".into(),
         description: "Do not request a specific effort".into(),
         action: PickerAction::SetReasoning { effort: None, save },
     }];
     items.extend(
-        crate::provider::codex::reasoning_efforts(model)
+        crate::model::reasoning_efforts(agent.config(), agent.model())
             .iter()
             .map(|effort| PickerItem {
                 label: title_case_effort(effort),
@@ -903,19 +783,19 @@ fn activate_picker_action(
 ) {
     match action {
         PickerAction::SwitchModel(model) => {
-            agent.model = model;
-            state.model.clone_from(&agent.model);
+            agent.switch_model(model);
+            state.model = agent.model().to_string();
             state.context_window = agent.context_window();
             state.context_tokens = 0;
-            if agent.model.starts_with("openai-codex:") {
+            if crate::model::is_codex(agent.config(), agent.model()) {
                 open_reasoning_picker(agent, state, false);
             } else {
-                state.notice(format!("Switched to {}.", agent.model));
+                state.notice(format!("Switched to {}.", agent.model()));
             }
         }
         PickerAction::SaveModel(model) => {
             settings(agent, &format!("model {model}"), state);
-            if agent.model.starts_with("openai-codex:") {
+            if crate::model::is_codex(agent.config(), agent.model()) {
                 open_reasoning_picker(agent, state, true);
             }
         }
@@ -926,17 +806,17 @@ fn activate_picker_action(
                 let value = effort.as_deref().unwrap_or("default");
                 settings(agent, &format!("reasoning_effort {value}"), state);
             } else {
-                agent.config.reasoning_effort.clone_from(&effort);
+                agent.set_reasoning_effort(effort.clone());
                 state.reasoning_effort = effort;
                 let label = state
                     .reasoning_effort
                     .as_deref()
                     .unwrap_or("provider default");
-                state.notice(format!("Using {} with {label} reasoning.", agent.model));
+                state.notice(format!("Using {} with {label} reasoning.", agent.model()));
             }
         }
         PickerAction::ToggleHideReasoning => {
-            let value = if agent.config.hide_reasoning {
+            let value = if agent.config().hide_reasoning {
                 "off"
             } else {
                 "on"
@@ -946,7 +826,7 @@ fn activate_picker_action(
         PickerAction::ResumeSession(id) => load_session(agent, &id, state),
         PickerAction::EditSetting(command) => editor.paste(&command),
         PickerAction::ToggleAutoCompact => {
-            let value = if agent.config.auto_compact {
+            let value = if agent.config().auto_compact {
                 "off"
             } else {
                 "on"
@@ -967,95 +847,40 @@ fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) {
 
     let mut parts = argument.split_whitespace();
     let key = parts.next().unwrap_or_default();
-    let result = match key {
+    let change = match key {
         "reload" => {
             if parts.next().is_some() {
                 Err(Error::Config("usage: /settings reload".into()))
             } else {
-                reload_config(agent, state, true)
+                Ok(ConfigChange::Reload)
             }
         }
-        "model" => one_value(&mut parts, "usage: /settings model MODEL").and_then(|model| {
-            agent
-                .config
-                .save_global_setting("model", serde_json::json!(model))?;
-            reload_config(agent, state, false)
-        }),
-        "max_tokens" => {
-            one_value(&mut parts, "usage: /settings max_tokens NUMBER").and_then(|value| {
-                let tokens = value
-                    .parse::<u32>()
-                    .map_err(|_| Error::Config("max_tokens must be a positive integer".into()))?;
-                if tokens == 0 {
-                    return Err(Error::Config(
-                        "max_tokens must be a positive integer".into(),
-                    ));
-                }
-                agent
-                    .config
-                    .save_global_setting("max_tokens", serde_json::json!(tokens))?;
-                reload_config(agent, state, true)
-            })
-        }
+        "model" => one_value(&mut parts, "usage: /settings model MODEL")
+            .map(|model| ConfigChange::Model(model.to_string())),
+        "max_tokens" => one_value(&mut parts, "usage: /settings max_tokens NUMBER")
+            .map(|value| ConfigChange::MaxTokens(value.to_string())),
         "reasoning_effort" => one_value(
             &mut parts,
             "usage: /settings reasoning_effort default|minimal|low|medium|high|xhigh|max",
         )
-        .and_then(|value| {
-            if !matches!(
-                value,
-                "default" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-            ) {
-                return Err(Error::Config("unsupported reasoning effort".into()));
-            }
-            agent
-                .config
-                .save_global_setting("reasoning_effort", serde_json::json!(value))?;
-            reload_config(agent, state, true)
-        }),
+        .map(|value| ConfigChange::ReasoningEffort(value.to_string())),
         "hide_reasoning" => one_value(&mut parts, "usage: /settings hide_reasoning on|off")
-            .and_then(|value| {
-                let hidden = parse_on_off(value)?;
-                agent
-                    .config
-                    .save_global_setting("hide_reasoning", serde_json::json!(hidden))?;
-                reload_config(agent, state, true)
-            }),
-        "auto_compact" => {
-            one_value(&mut parts, "usage: /settings auto_compact on|off").and_then(|value| {
-                let enabled = parse_on_off(value)?;
-                agent
-                    .config
-                    .save_global_setting("auto_compact", serde_json::json!(enabled))?;
-                reload_config(agent, state, true)
-            })
-        }
+            .map(|value| ConfigChange::HideReasoning(value.to_string())),
+        "auto_compact" => one_value(&mut parts, "usage: /settings auto_compact on|off")
+            .map(|value| ConfigChange::AutoCompact(value.to_string())),
         "compact_threshold" => one_value(
             &mut parts,
             "usage: /settings compact_threshold FRACTION|PERCENT%",
         )
-        .and_then(|value| {
-            let threshold = parse_threshold(value)?;
-            agent
-                .config
-                .save_global_setting("compact_threshold", serde_json::json!(threshold))?;
-            reload_config(agent, state, true)
-        }),
-        "context_window" => one_value(&mut parts, "usage: /settings context_window TOKENS")
-            .and_then(|value| {
-                let window = value.parse::<u64>().map_err(|_| {
-                    Error::Config("context_window must be a positive integer".into())
-                })?;
-                if window == 0 {
-                    return Err(Error::Config(
-                        "context_window must be a positive integer".into(),
-                    ));
+        .map(|value| ConfigChange::CompactThreshold(value.to_string())),
+        "context_window" => {
+            one_value(&mut parts, "usage: /settings context_window TOKENS").map(|value| {
+                ConfigChange::ContextWindow {
+                    model: agent.model().to_string(),
+                    value: value.to_string(),
                 }
-                agent
-                    .config
-                    .save_global_context_window(&agent.model, window)?;
-                reload_config(agent, state, true)
-            }),
+            })
+        }
         "skills" => {
             let action = parts.next();
             let path = parts.next();
@@ -1065,33 +890,23 @@ fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) {
                     "usage: /settings skills add|remove DIRECTORY".into(),
                 ))
             } else {
-                let path = expand_user_path(path.unwrap_or_default());
-                let mut dirs = agent.config.skill_dirs.clone();
-                if action == Some("add") {
-                    if !dirs.contains(&path) {
-                        dirs.push(path);
-                    }
-                } else if let Some(index) = dirs.iter().position(|dir| dir == &path) {
-                    dirs.remove(index);
-                } else {
-                    return state.notice(format!(
-                        "Skill directory `{}` is not configured.",
-                        path.display()
-                    ));
-                }
-                agent
-                    .config
-                    .save_global_skill_dirs(&dirs)
-                    .and_then(|()| reload_config(agent, state, true))
+                Ok(ConfigChange::SkillDirectory {
+                    action: if action == Some("add") {
+                        SkillDirectoryAction::Add
+                    } else {
+                        SkillDirectoryAction::Remove
+                    },
+                    path: path.unwrap_or_default().to_string(),
+                })
             }
         }
         "anthropic_base_url" | "openai_base_url" => {
-            one_value(&mut parts, "usage: /settings openai_base_url URL").and_then(|url| {
-                validate_http_url(url)?;
-                agent
-                    .config
-                    .save_global_setting(key, serde_json::json!(url))?;
-                reload_config(agent, state, true)
+            one_value(&mut parts, "usage: /settings openai_base_url URL").map(|url| {
+                if key == "anthropic_base_url" {
+                    ConfigChange::AnthropicBaseUrl(url.to_string())
+                } else {
+                    ConfigChange::OpenAiBaseUrl(url.to_string())
+                }
             })
         }
         "provider" => {
@@ -1103,14 +918,11 @@ fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) {
                     "usage: /settings provider NAME BASE_URL [API_KEY|-]".into(),
                 ))
             } else {
-                agent
-                    .config
-                    .save_global_provider(
-                        name.unwrap_or_default(),
-                        url.unwrap_or_default(),
-                        api_key,
-                    )
-                    .and_then(|()| reload_config(agent, state, true))
+                Ok(ConfigChange::Provider {
+                    name: name.unwrap_or_default().to_string(),
+                    base_url: url.unwrap_or_default().to_string(),
+                    api_key: api_key.map(str::to_string),
+                })
             }
         }
         _ => Err(Error::Config(format!(
@@ -1118,42 +930,58 @@ fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) {
         ))),
     };
 
+    let result = change.and_then(|change| agent.change_global_config(change));
+
     match result {
-        Ok(()) => {
+        Ok(effect) => {
+            state.model = agent.model().to_string();
+            state.reasoning_effort = agent.config().reasoning_effort.clone();
+            state.hide_reasoning = agent.config().hide_reasoning;
             state.context_window = agent.context_window();
-            state.notice(format!(
-                "Saved to `{}` and applied.",
-                agent.config.global_config_path().display()
-            ));
+            match effect {
+                ConfigChangeEffect::Applied => state.notice(format!(
+                    "Saved to `{}` and applied.",
+                    agent.config().global_config_path().display()
+                )),
+                ConfigChangeEffect::Overridden => state.notice(format!(
+                    "Saved to `{}`, but project settings in `{}` remain effective.",
+                    agent.config().global_config_path().display(),
+                    agent.config().project_config_path().display()
+                )),
+                ConfigChangeEffect::SkillDirectoryNotConfigured(path) => state.notice(format!(
+                    "Skill directory `{}` is not configured.",
+                    path.display()
+                )),
+            }
         }
         Err(error) => state.notice(format!("Could not change setting: {error}")),
     }
 }
 
 fn show_settings(agent: &Agent, state: &mut ViewState) {
-    let mut providers = agent.config.providers.iter().collect::<Vec<_>>();
+    let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
         "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nSkill directories\n\n",
-        agent.model,
-        agent.config.max_tokens,
+        agent.model(),
+        agent.config().max_tokens,
         agent
-            .config
+            .config()
             .reasoning_effort
             .as_deref()
             .unwrap_or("provider default"),
-        agent.config.hide_reasoning,
-        if agent.config.auto_compact {
+        agent.config().hide_reasoning,
+        if agent.config().auto_compact {
             "on"
         } else {
             "off"
         },
-        agent.config.compact_threshold * 100.0,
+        agent.config().compact_threshold * 100.0,
         agent.context_window(),
-        agent.config.anthropic_base_url,
-        agent.config.openai_base_url,
+        agent.config().anthropic_base_url,
+        agent.config().openai_base_url,
     );
-    for dir in &agent.config.skill_dirs {
+    for dir in &agent.config().skill_dirs {
         text.push_str(&format!("- `{}`\n", dir.display()));
     }
     text.push_str("\nOpenAI-compatible providers\n\n");
@@ -1171,7 +999,7 @@ fn show_settings(agent: &Agent, state: &mut ViewState) {
     }
     text.push_str(&format!(
         "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
-        agent.config.global_config_path().display()
+        agent.config().global_config_path().display()
     ));
     state.notice(text);
 }
@@ -1186,65 +1014,8 @@ fn one_value<'a>(parts: &mut impl Iterator<Item = &'a str>, usage: &str) -> Resu
     Ok(value)
 }
 
-fn parse_on_off(value: &str) -> Result<bool, Error> {
-    match value {
-        "on" | "true" => Ok(true),
-        "off" | "false" => Ok(false),
-        _ => Err(Error::Config("expected on or off".into())),
-    }
-}
-
-fn parse_threshold(value: &str) -> Result<f64, Error> {
-    let threshold = if let Some(percent) = value.strip_suffix('%') {
-        percent
-            .parse::<f64>()
-            .map_err(|_| Error::Config("invalid compaction percentage".into()))?
-            / 100.0
-    } else {
-        value
-            .parse::<f64>()
-            .map_err(|_| Error::Config("invalid compaction threshold".into()))?
-    };
-    if !threshold.is_finite() || !(0.1..=0.99).contains(&threshold) {
-        return Err(Error::Config(
-            "compact_threshold must be between 0.1 and 0.99".into(),
-        ));
-    }
-    Ok(threshold)
-}
-
-fn validate_http_url(url: &str) -> Result<(), Error> {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        Ok(())
-    } else {
-        Err(Error::Config(
-            "provider URL must start with http:// or https://".into(),
-        ))
-    }
-}
-
-fn reload_config(agent: &mut Agent, state: &mut ViewState, keep_model: bool) -> Result<(), Error> {
-    let current_model = agent.model.clone();
-    agent.config = crate::config::Config::load()?;
-    if keep_model {
-        agent.model = current_model;
-    } else {
-        agent.model = agent
-            .config
-            .model
-            .clone()
-            .ok_or_else(|| Error::Config("no model configured".into()))?;
-        agent.context_tokens = 0;
-    }
-    state.model.clone_from(&agent.model);
-    state.reasoning_effort = agent.config.reasoning_effort.clone();
-    state.hide_reasoning = agent.config.hide_reasoning;
-    state.context_window = agent.context_window();
-    Ok(())
-}
-
 fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
-    let sessions = match crate::session::list(&agent.config.sessions_dir()) {
+    let sessions = match crate::session::list(&agent.config().sessions_dir()) {
         Ok(sessions) => sessions,
         Err(error) => {
             state.notice(format!("Could not list sessions: {error}"));
@@ -1276,7 +1047,7 @@ fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
 }
 
 fn resume(agent: &mut Agent, selector: &str, state: &mut ViewState) {
-    let sessions = match crate::session::list(&agent.config.sessions_dir()) {
+    let sessions = match crate::session::list(&agent.config().sessions_dir()) {
         Ok(sessions) => sessions,
         Err(error) => {
             state.notice(format!("Could not list sessions: {error}"));
@@ -1476,74 +1247,6 @@ fn toggle_tool_expansion(state: &mut ViewState) {
     } else {
         "tool output compact".into()
     };
-}
-
-fn entries_from_messages(messages: &[Message]) -> Vec<Entry> {
-    let mut entries = Vec::new();
-    let mut pending_tools = std::collections::VecDeque::new();
-    for message in messages {
-        match message.role {
-            Role::User if message.content.starts_with("[conversation summary]") => {
-                entries.push(Entry::Notice(message.content.clone()));
-            }
-            Role::User => entries.push(Entry::User(message.content.clone())),
-            Role::Assistant => {
-                for reasoning in &message.reasoning {
-                    if !reasoning.content.is_empty() {
-                        entries.push(Entry::Reasoning {
-                            kind: reasoning.kind,
-                            content: reasoning.content.clone(),
-                        });
-                    }
-                }
-                if !message.content.is_empty() {
-                    entries.push(Entry::Assistant(message.content.clone()));
-                }
-                for call in &message.tool_calls {
-                    entries.push(Entry::Tool {
-                        name: call.name.clone(),
-                        args: call.arguments.clone(),
-                        output: String::new(),
-                        is_error: false,
-                        running: false,
-                    });
-                    pending_tools.push_back((call.id.as_str(), entries.len() - 1));
-                }
-            }
-            Role::Tool => {
-                let pending_position = message.tool_call_id.as_deref().and_then(|id| {
-                    pending_tools
-                        .iter()
-                        .position(|(pending_id, _)| *pending_id == id)
-                });
-                let pending_index = pending_position
-                    .and_then(|position| pending_tools.remove(position))
-                    .map(|(_, index)| index);
-                if let Some(Entry::Tool {
-                    name,
-                    output,
-                    is_error,
-                    ..
-                }) = pending_index.and_then(|index| entries.get_mut(index))
-                {
-                    if let Some(tool_name) = &message.tool_name {
-                        name.clone_from(tool_name);
-                    }
-                    output.clone_from(&message.content);
-                    *is_error = message.is_error;
-                } else {
-                    entries.push(Entry::Tool {
-                        name: message.tool_name.clone().unwrap_or_else(|| "tool".into()),
-                        args: String::new(),
-                        output: message.content.clone(),
-                        is_error: message.is_error,
-                        running: false,
-                    });
-                }
-            }
-        }
-    }
-    entries
 }
 
 fn render_entries(
@@ -1851,7 +1554,7 @@ fn build_frame(
     let menu_height = menu.len();
     let transcript_height = rows.saturating_sub(input_height + menu_height + 1);
     let transcript = render_entries(
-        &state.entries,
+        state.transcript.entries(),
         columns,
         state.tools_expanded,
         state.hide_reasoning,
@@ -1948,11 +1651,10 @@ mod tests {
     #[test]
     fn frame_keeps_input_and_status_pinned() {
         let mut state = ViewState {
-            entries: vec![Entry::Assistant("hello".into())],
-            streaming_entries_start: None,
-            streaming_assistant: None,
-            streaming_reasoning: None,
-            running_tool: None,
+            transcript: Transcript::from_messages(&[crate::provider::Message::assistant(
+                "hello".into(),
+                Vec::new(),
+            )]),
             tools_expanded: false,
             model: "test".into(),
             reasoning_effort: None,
@@ -2004,34 +1706,6 @@ mod tests {
                 .iter()
                 .any(|line| { line.contains("Second") && line.contains("\x1b[7m") })
         );
-    }
-
-    #[test]
-    fn loaded_messages_become_transcript_entries() {
-        let mut assistant = Message::assistant(
-            "hello".into(),
-            vec![crate::provider::ToolCall {
-                id: "id".into(),
-                name: "shell".into(),
-                arguments: r#"{"command":"pwd"}"#.into(),
-            }],
-        );
-        assistant.reasoning.push(crate::provider::Reasoning {
-            kind: ReasoningKind::Summary,
-            content: "Checking the directory".into(),
-        });
-        let messages = vec![
-            Message::user("hi"),
-            assistant,
-            Message::tool_result("id", "shell", "ok".into(), false),
-        ];
-        let entries = entries_from_messages(&messages);
-        assert_eq!(entries.len(), 4);
-        let Entry::Tool { args, output, .. } = &entries[3] else {
-            panic!("expected paired tool entry");
-        };
-        assert!(args.contains("pwd"));
-        assert_eq!(output, "ok");
     }
 
     #[test]

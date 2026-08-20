@@ -4,9 +4,16 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
+
+#[cfg(test)]
+use serde_json::json;
 
 use crate::error::Error;
+
+mod change;
+
+pub(crate) use change::{ConfigChange, ConfigChangeEffect, SkillDirectoryAction};
 
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -208,9 +215,11 @@ impl Config {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| Error::Config("HOME is not set".into()))?;
-        let home_dir = home.join(".yawl");
-        let project_dir = PathBuf::from(".yawl");
+        Self::load_from(home.join(".yawl"), PathBuf::from(".yawl"))
+    }
 
+    fn load_from(home_dir: PathBuf, project_dir: PathBuf) -> Result<Config, Error> {
+        let home = home_dir.parent().unwrap_or(&home_dir);
         let mut cfg = Config {
             model: None,
             anthropic_base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
@@ -240,6 +249,10 @@ impl Config {
             }
         }
         Ok(cfg)
+    }
+
+    pub(crate) fn reload(&self) -> Result<Config, Error> {
+        Self::load_from(self.home_dir.clone(), self.project_dir.clone())
     }
 
     fn apply(&mut self, file: ConfigFile) {
@@ -291,6 +304,10 @@ impl Config {
         self.home_dir.join("config.json")
     }
 
+    pub fn project_config_path(&self) -> PathBuf {
+        self.project_dir.join("config.json")
+    }
+
     pub fn sessions_dir(&self) -> PathBuf {
         self.home_dir.join("sessions")
     }
@@ -299,191 +316,6 @@ impl Config {
     /// collisions, so project tools win over global tools.
     pub fn tool_dirs(&self) -> [PathBuf; 2] {
         [self.home_dir.join("tools"), self.project_dir.join("tools")]
-    }
-
-    /// Returns a configured custom provider and the model ID after its
-    /// `provider:` prefix. Model IDs may themselves contain colons.
-    pub fn custom_provider_for<'cfg, 'model>(
-        &'cfg self,
-        model_spec: &'model str,
-    ) -> Option<(&'model str, &'cfg ProviderConfig, &'model str)> {
-        let (name, model) = model_spec.split_once(':')?;
-        self.providers
-            .get(name)
-            .map(|provider| (name, provider, model))
-    }
-
-    pub fn configured_model(&self, model_spec: &str) -> Option<&ModelConfig> {
-        let (_, provider, model) = self.custom_provider_for(model_spec)?;
-        provider
-            .models
-            .iter()
-            .find(|candidate| candidate.id == model)
-    }
-
-    /// Context window for a model: explicit override, custom-provider model
-    /// metadata, then a name-based heuristic.
-    pub fn context_window_for(&self, model: &str) -> u64 {
-        let bare = model
-            .strip_prefix("anthropic:")
-            .or_else(|| model.strip_prefix("openai:"))
-            .or_else(|| model.strip_prefix("openai-codex:"))
-            .or_else(|| self.custom_provider_for(model).map(|(_, _, model)| model))
-            .unwrap_or(model);
-        if let Some(&window) = self
-            .context_windows
-            .get(model)
-            .or_else(|| self.context_windows.get(bare))
-        {
-            return window;
-        }
-        if let Some(window) = self
-            .configured_model(model)
-            .and_then(|configured| configured.context_window)
-        {
-            return window;
-        }
-        if model.starts_with("openai-codex:")
-            && let Some((_, _, window)) = crate::provider::codex::MODELS
-                .iter()
-                .find(|(id, _, _)| *id == bare)
-        {
-            return *window;
-        }
-        if bare.starts_with("claude") {
-            200_000
-        } else {
-            128_000
-        }
-    }
-
-    /// Applies a model's output limit without allowing it to raise the
-    /// user-configured global limit.
-    pub fn max_tokens_for(&self, model: &str) -> u32 {
-        self.configured_model(model)
-            .and_then(|configured| configured.max_tokens)
-            .filter(|limit| *limit > 0)
-            .map_or(self.max_tokens, |limit| self.max_tokens.min(limit))
-    }
-
-    /// Configured custom models as `(provider:model, display name)` pairs.
-    pub fn available_models(&self) -> Vec<(String, String)> {
-        let mut models = self
-            .providers
-            .iter()
-            .flat_map(|(provider_name, provider)| {
-                provider.models.iter().map(move |model| {
-                    (
-                        format!("{provider_name}:{}", model.id),
-                        model.name.clone().unwrap_or_else(|| model.id.clone()),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        models.extend(
-            crate::provider::codex::MODELS
-                .iter()
-                .map(|(id, name, _)| (format!("openai-codex:{id}"), (*name).to_string())),
-        );
-        models.sort_by(|left, right| left.0.cmp(&right.0));
-        models
-    }
-
-    /// Saves a scalar setting to the global config while preserving all
-    /// unrelated JSON fields.
-    pub fn save_global_setting(&self, key: &str, value: Value) -> Result<(), Error> {
-        if !matches!(
-            key,
-            "model"
-                | "anthropic_base_url"
-                | "openai_base_url"
-                | "max_tokens"
-                | "reasoning_effort"
-                | "hide_reasoning"
-                | "auto_compact"
-                | "compact_threshold"
-        ) {
-            return Err(Error::Config(format!("unsupported setting '{key}'")));
-        }
-        self.update_global_json(|root| {
-            root.insert(key.to_string(), value);
-            Ok(())
-        })
-    }
-
-    /// Saves the complete skill search path to the global config.
-    pub fn save_global_skill_dirs(&self, dirs: &[PathBuf]) -> Result<(), Error> {
-        let home = self.home_dir.parent();
-        let values = dirs
-            .iter()
-            .map(|dir| {
-                home.and_then(|home| dir.strip_prefix(home).ok())
-                    .map_or_else(
-                        || dir.display().to_string(),
-                        |relative| format!("~/{}", relative.display()),
-                    )
-            })
-            .collect::<Vec<_>>();
-        self.update_global_json(|root| {
-            root.insert("skill_dirs".into(), json!(values));
-            Ok(())
-        })
-    }
-
-    /// Saves a context-window override for one model to the global config.
-    pub fn save_global_context_window(&self, model: &str, window: u64) -> Result<(), Error> {
-        self.update_global_json(|root| {
-            let windows = object_field(root, "context_windows")?;
-            windows.insert(model.to_string(), json!(window));
-            Ok(())
-        })
-    }
-
-    /// Adds or updates an OpenAI-compatible provider in the global config.
-    /// Omitting `api_key` preserves an existing key. `"-"` removes it.
-    pub fn save_global_provider(
-        &self,
-        name: &str,
-        base_url: &str,
-        api_key: Option<&str>,
-    ) -> Result<(), Error> {
-        validate_provider_name(name)?;
-        if matches!(name, "anthropic" | "openai") {
-            return Err(Error::Config(format!(
-                "'{name}' is built in; use anthropic_base_url or openai_base_url"
-            )));
-        }
-        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
-            return Err(Error::Config(
-                "provider URL must start with http:// or https://".into(),
-            ));
-        }
-        self.update_global_json(|root| {
-            let providers = object_field(root, "providers")?;
-            let provider = providers
-                .entry(name.to_string())
-                .or_insert_with(|| Value::Object(Map::new()));
-            let Value::Object(provider) = provider else {
-                return Err(Error::Config(format!(
-                    "providers.{name} must be a JSON object"
-                )));
-            };
-            provider.insert("base_url".into(), json!(base_url));
-            provider.insert("api".into(), json!(OPENAI_COMPLETIONS_API));
-            provider.remove("baseUrl");
-            if let Some(api_key) = api_key {
-                provider.remove("apiKey");
-                if api_key == "-" {
-                    provider.remove("api_key");
-                    provider.remove("auth_header");
-                    provider.remove("authHeader");
-                } else {
-                    provider.insert("api_key".into(), json!(api_key));
-                    provider.insert("auth_header".into(), json!(true));
-                }
-            }
-            Ok(())
-        })
     }
 
     fn update_global_json(
@@ -698,12 +530,18 @@ mod tests {
         .unwrap();
         cfg.apply(file);
 
-        assert_eq!(cfg.context_window_for("tiny"), 4096);
-        assert_eq!(cfg.context_window_for("openai:tiny"), 4096);
-        assert_eq!(cfg.context_window_for("omlx:local-model"), 65_536);
-        assert_eq!(cfg.max_tokens_for("omlx:local-model"), 4096);
-        assert_eq!(cfg.context_window_for("claude-sonnet-4-5"), 200_000);
-        assert_eq!(cfg.context_window_for("gpt-4o"), 128_000);
+        assert_eq!(crate::model::context_window(&cfg, "tiny"), 4096);
+        assert_eq!(crate::model::context_window(&cfg, "openai:tiny"), 4096);
+        assert_eq!(
+            crate::model::context_window(&cfg, "omlx:local-model"),
+            65_536
+        );
+        assert_eq!(crate::model::max_tokens(&cfg, "omlx:local-model"), 4096);
+        assert_eq!(
+            crate::model::context_window(&cfg, "claude-sonnet-4-5"),
+            200_000
+        );
+        assert_eq!(crate::model::context_window(&cfg, "gpt-4o"), 128_000);
     }
 
     #[test]
@@ -751,16 +589,6 @@ mod tests {
 
         cfg.apply(serde_json::from_value(json!({"hide_reasoning": true})).unwrap());
         assert!(cfg.hide_reasoning);
-    }
-
-    #[test]
-    fn custom_prefix_leaves_colons_inside_model_id() {
-        let cfg = test_config();
-        let (name, _, model) = cfg
-            .custom_provider_for("ollama:llama3.1:8b")
-            .expect("preset should exist");
-        assert_eq!(name, "ollama");
-        assert_eq!(model, "llama3.1:8b");
     }
 
     #[test]

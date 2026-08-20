@@ -222,7 +222,7 @@ fn list_tools(config: &Config) {
 
 fn run_print_mode(agent: &mut Agent, prompt: String) -> Result<i32, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout().lock();
-    let hide_reasoning = agent.config.hide_reasoning;
+    let hide_reasoning = agent.config().hide_reasoning;
     let mut pending_reasoning = Vec::new();
     let mut response_has_text = false;
     let mut output_error = None;

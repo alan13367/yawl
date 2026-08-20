@@ -264,67 +264,75 @@ pub(crate) fn append_reasoning(reasoning: &mut Vec<Reasoning>, kind: ReasoningKi
 /// provider. Otherwise, names starting with `claude` use Anthropic and all
 /// other names use the built-in OpenAI endpoint.
 pub fn resolve(model_spec: &str, cfg: &Config) -> Result<(Box<dyn Provider>, String), Error> {
-    if let Some(bare) = model_spec.strip_prefix("anthropic:") {
-        return anthropic_provider(cfg, bare);
-    }
-    if let Some(bare) = model_spec.strip_prefix("openai:") {
-        return openai_provider(cfg, bare);
-    }
-    if let Some(bare) = model_spec.strip_prefix("openai-codex:") {
-        return Ok((Box::new(codex::Codex::from_config(cfg)?), bare.to_string()));
-    }
-    if let Some((name, provider, bare)) = cfg.custom_provider_for(model_spec) {
-        if provider.api != "openai-completions" {
-            return Err(Error::Config(format!(
-                "provider '{name}' uses unsupported API '{}'; Yawl supports openai-completions",
-                provider.api
-            )));
+    let target = crate::model::ModelTarget::parse(model_spec, cfg);
+    let bare = target.model();
+    match target.provider() {
+        crate::model::ProviderSelection::Anthropic => anthropic_provider(cfg, bare),
+        crate::model::ProviderSelection::OpenAi => openai_provider(cfg, bare),
+        crate::model::ProviderSelection::Codex => {
+            Ok((Box::new(codex::Codex::from_config(cfg)?), bare.to_string()))
         }
-        if provider.base_url.trim().is_empty() {
-            return Err(Error::Config(format!("provider '{name}' has no base_url")));
-        }
+        crate::model::ProviderSelection::Custom {
+            name,
+            config: provider,
+        } => custom_provider(name, provider, bare),
+    }
+}
 
-        let key = match &provider.api_key {
-            Some(value) => crate::config::resolve_config_value(value)?,
-            None => std::env::var(provider_key_environment_name(name)).unwrap_or_default(),
-        };
-        let mut headers = Vec::with_capacity(provider.headers.len());
-        for (header_name, value) in &provider.headers {
-            let value = crate::config::resolve_config_value(value)?;
-            validate_header(header_name, &value)?;
-            headers.push((header_name.clone(), value));
-        }
-        headers.sort_by(|left, right| left.0.cmp(&right.0));
+fn custom_provider(
+    name: &str,
+    provider: &crate::config::ProviderConfig,
+    model: &str,
+) -> Result<(Box<dyn Provider>, String), Error> {
+    if provider.api != "openai-completions" {
+        return Err(Error::Config(format!(
+            "provider '{name}' uses unsupported API '{}'; Yawl supports openai-completions",
+            provider.api
+        )));
+    }
+    if provider.base_url.trim().is_empty() {
+        return Err(Error::Config(format!("provider '{name}' has no base_url")));
+    }
 
-        let mut compat = provider.compat.clone();
-        if let Some(model) = provider.models.iter().find(|model| model.id == bare) {
-            compat.apply(model.compat.clone());
-        }
-        if !matches!(
-            compat.max_tokens_field(),
-            "max_tokens" | "max_completion_tokens"
-        ) {
-            return Err(Error::Config(format!(
-                "provider '{name}' has unsupported maxTokensField '{}'",
-                compat.max_tokens_field()
-            )));
-        }
-        return Ok((
-            Box::new(openai::OpenAi::configured(
-                provider.base_url.clone(),
-                key,
-                provider.auth_header.unwrap_or(true),
-                headers,
-                compat,
-            )),
-            bare.to_string(),
-        ));
+    let key = match &provider.api_key {
+        Some(value) => crate::config::resolve_config_value(value)?,
+        None => std::env::var(provider_key_environment_name(name)).unwrap_or_default(),
+    };
+    let mut headers = Vec::with_capacity(provider.headers.len());
+    for (header_name, value) in &provider.headers {
+        let value = crate::config::resolve_config_value(value)?;
+        validate_header(header_name, &value)?;
+        headers.push((header_name.clone(), value));
     }
-    if model_spec.starts_with("claude") {
-        anthropic_provider(cfg, model_spec)
-    } else {
-        openai_provider(cfg, model_spec)
+    headers.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut compat = provider.compat.clone();
+    if let Some(model) = provider
+        .models
+        .iter()
+        .find(|candidate| candidate.id == model)
+    {
+        compat.apply(model.compat.clone());
     }
+    if !matches!(
+        compat.max_tokens_field(),
+        "max_tokens" | "max_completion_tokens"
+    ) {
+        return Err(Error::Config(format!(
+            "provider '{name}' has unsupported maxTokensField '{}'",
+            compat.max_tokens_field()
+        )));
+    }
+    Ok((
+        Box::new(openai::OpenAi::configured(
+            provider.base_url.clone(),
+            key,
+            provider.auth_header.unwrap_or(true),
+            headers,
+            compat,
+        )),
+        model.to_string(),
+    ))
 }
 
 fn anthropic_provider(cfg: &Config, model: &str) -> Result<(Box<dyn Provider>, String), Error> {
