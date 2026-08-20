@@ -101,6 +101,11 @@ impl Agent {
         self.config.reasoning_effort = effort;
     }
 
+    pub(crate) fn sync_display_config(&mut self, config: &Config) {
+        self.config.hide_reasoning = config.hide_reasoning;
+        self.config.accent_color = config.accent_color;
+    }
+
     /// Starts a fresh session (used by `/new` and `/clear`).
     pub fn reset(&mut self) -> Result<(), Error> {
         self.session = Session::create(&self.config.sessions_dir())?;

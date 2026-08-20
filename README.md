@@ -74,7 +74,7 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 
 ## Slash commands
 
-`/model` and `/settings` open lightweight keyboard pickers, including while a model response is still running. Use the arrow keys and Enter to choose, or Escape to close. Editable settings stay in the picker: Enter starts editing the current value, Enter again saves it, and the refreshed value is shown in the menu. A model or setting chosen during an active response is applied as soon as that response releases the agent, before the next message starts.
+`/model` and `/settings` open lightweight keyboard pickers, including while a model response is still running. Use the arrow keys and Enter to choose, or Escape to close. Editable settings stay in the picker: Enter starts editing the current value, Enter again saves it, and the refreshed value is shown in the menu. Reasoning visibility and accent color changes apply immediately during an active response. Settings that can affect generation, including the model and reasoning effort, apply as soon as the response releases the agent and before the next message starts.
 
 Messages submitted during an active response are queued automatically. Each pending message is shown below the live transcript with a `Queued` label, and the status bar shows the queue length. Run `/unqueue` to choose a pending message to remove, `/unqueue NUMBER` to remove one directly, or `/unqueue all` to clear the queue.
 

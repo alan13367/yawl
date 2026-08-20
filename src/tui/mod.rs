@@ -13,7 +13,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use crate::agent::{Agent, TurnEvent};
-use crate::config::{ConfigChange, ConfigChangeEffect, SkillDirectoryAction, UiColor};
+use crate::config::{Config, ConfigChange, ConfigChangeEffect, SkillDirectoryAction, UiColor};
 use crate::error::Error;
 use crate::provider::ReasoningKind;
 
@@ -23,6 +23,7 @@ use self::transcript::{Entry, Transcript, TranscriptEvent};
 
 const USER_BACKGROUND: &str = "\x1b[48;2;52;53;64m";
 const USER_TEXT: &str = "\x1b[38;2;208;208;214m";
+const SETTINGS_REASONING_DISPLAY_INDEX: usize = 3;
 const SETTINGS_ACCENT_COLOR_INDEX: usize = 4;
 const SETTINGS_AUTO_COMPACT_INDEX: usize = 5;
 const SETTINGS_RELOAD_INDEX: usize = 12;
@@ -122,6 +123,26 @@ impl ActivePickers {
             accent_color: color_picker(agent.config().accent_color),
         }
     }
+
+    fn refresh_display_settings(&mut self, config: &Config) {
+        let visibility = if config.hide_reasoning {
+            "Hidden"
+        } else {
+            "Visible"
+        };
+        if let Some(item) = self
+            .settings
+            .items
+            .get_mut(SETTINGS_REASONING_DISPLAY_INDEX)
+        {
+            item.description = format!("{visibility} · Enter to toggle");
+            item.action = PickerAction::SetHideReasoning(!config.hide_reasoning);
+        }
+        if let Some(item) = self.settings.items.get_mut(SETTINGS_ACCENT_COLOR_INDEX) {
+            item.description = config.accent_color.config_value();
+        }
+        self.accent_color = color_picker(config.accent_color);
+    }
 }
 
 struct ViewState {
@@ -132,6 +153,7 @@ struct ViewState {
     hide_reasoning: bool,
     accent_color: UiColor,
     copy_toast_ticks: u8,
+    spinner_tick: usize,
     context_tokens: u64,
     context_window: u64,
     activity: String,
@@ -153,6 +175,7 @@ impl ViewState {
             hide_reasoning: agent.config().hide_reasoning,
             accent_color: agent.config().accent_color,
             copy_toast_ticks: 0,
+            spinner_tick: 0,
             context_tokens: agent.context_tokens(),
             context_window: agent.context_window(),
             activity: String::new(),
@@ -186,9 +209,8 @@ impl ViewState {
                     }
                     TranscriptEvent::ReasoningDelta { .. } => "responding".into(),
                     TranscriptEvent::ToolStart { .. } => "running tool".into(),
-                    TranscriptEvent::AssistantDone | TranscriptEvent::ToolEnd { .. } => {
-                        String::new()
-                    }
+                    TranscriptEvent::AssistantDone => String::new(),
+                    TranscriptEvent::ToolEnd { .. } => "sending".into(),
                     TranscriptEvent::RetryReset => self.activity.clone(),
                 };
                 self.transcript.apply(event);
@@ -338,7 +360,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                 }
                 Event::Paste(text) if picker_is_editing(&state) => editor.paste(&text),
                 Event::Mouse(mouse) => handle_mouse_selection(&mut terminal, &mut state, mouse)?,
-                Event::Tick => advance_copy_toast(&mut state),
+                Event::Tick => advance_ticks(&mut state),
                 Event::MouseScroll(_) | Event::Paste(_) => {}
             }
             terminal.draw(&mut state, &editor)?;
@@ -346,7 +368,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
         }
         match event {
             Event::Tick => {
-                advance_copy_toast(&mut state);
+                advance_ticks(&mut state);
                 if crate::interrupted() {
                     crate::set_interrupted(false);
                     if !editor.is_empty() {
@@ -1310,27 +1332,31 @@ fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) -> bool {
             state.hide_reasoning = agent.config().hide_reasoning;
             state.accent_color = agent.config().accent_color;
             state.context_window = agent.context_window();
-            match effect {
-                ConfigChangeEffect::Applied => state.notice(format!(
-                    "Saved to `{}` and applied.",
-                    agent.config().global_config_path().display()
-                )),
-                ConfigChangeEffect::Overridden => state.notice(format!(
-                    "Saved to `{}`, but project settings in `{}` remain effective.",
-                    agent.config().global_config_path().display(),
-                    agent.config().project_config_path().display()
-                )),
-                ConfigChangeEffect::SkillDirectoryNotConfigured(path) => state.notice(format!(
-                    "Skill directory `{}` is not configured.",
-                    path.display()
-                )),
-            }
+            notice_config_effect(agent.config(), effect, state);
             true
         }
         Err(error) => {
             state.notice(format!("Could not change setting: {error}"));
             false
         }
+    }
+}
+
+fn notice_config_effect(config: &Config, effect: ConfigChangeEffect, state: &mut ViewState) {
+    match effect {
+        ConfigChangeEffect::Applied => state.notice(format!(
+            "Saved to `{}` and applied.",
+            config.global_config_path().display()
+        )),
+        ConfigChangeEffect::Overridden => state.notice(format!(
+            "Saved to `{}`, but project settings in `{}` remain effective.",
+            config.global_config_path().display(),
+            config.project_config_path().display()
+        )),
+        ConfigChangeEffect::SkillDirectoryNotConfigured(path) => state.notice(format!(
+            "Skill directory `{}` is not configured.",
+            path.display()
+        )),
     }
 }
 
@@ -1481,14 +1507,16 @@ fn turn_interactive<R: Read>(
     terminal: &mut Terminal,
     events: &mut EventReader<R>,
 ) -> Result<bool, Error> {
-    let active_pickers = ActivePickers::from_agent(agent);
-    std::thread::scope(|scope| {
+    let mut active_pickers = ActivePickers::from_agent(agent);
+    let mut active_config = agent.config().clone();
+    let active_agent = &mut *agent;
+    let result = std::thread::scope(|scope| {
         let (updates_tx, updates_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let (thread_tx, thread_rx) = mpsc::channel();
         scope.spawn(move || {
             let _ = thread_tx.send(native_thread_id());
-            let result = agent.run_turn(Some(input), &mut |event| {
+            let result = active_agent.run_turn(Some(input), &mut |event| {
                 let _ = updates_tx.send(Update::from_event(event));
             });
             let _ = done_tx.send(result);
@@ -1506,9 +1534,12 @@ fn turn_interactive<R: Read>(
             editor,
             terminal,
             events,
-            &active_pickers,
+            &mut active_pickers,
+            &mut active_config,
         )
-    })
+    });
+    agent.sync_display_config(&active_config);
+    result
 }
 
 fn compact_interactive<R: Read>(
@@ -1518,14 +1549,16 @@ fn compact_interactive<R: Read>(
     terminal: &mut Terminal,
     events: &mut EventReader<R>,
 ) -> Result<(), Error> {
-    let active_pickers = ActivePickers::from_agent(agent);
-    std::thread::scope(|scope| {
+    let mut active_pickers = ActivePickers::from_agent(agent);
+    let mut active_config = agent.config().clone();
+    let active_agent = &mut *agent;
+    let result = std::thread::scope(|scope| {
         let (updates_tx, updates_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let (thread_tx, thread_rx) = mpsc::channel();
         scope.spawn(move || {
             let _ = thread_tx.send(native_thread_id());
-            let result = agent.compact_now(&mut |event| {
+            let result = active_agent.compact_now(&mut |event| {
                 let _ = updates_tx.send(Update::from_event(event));
             });
             let _ = done_tx.send(result);
@@ -1543,9 +1576,12 @@ fn compact_interactive<R: Read>(
             editor,
             terminal,
             events,
-            &active_pickers,
+            &mut active_pickers,
+            &mut active_config,
         )
-    })
+    });
+    agent.sync_display_config(&active_config);
+    result
 }
 
 struct WorkerChannels<T> {
@@ -1560,7 +1596,8 @@ fn pump_events<R: Read, T>(
     editor: &mut Editor,
     terminal: &mut Terminal,
     events: &mut EventReader<R>,
-    active_pickers: &ActivePickers,
+    active_pickers: &mut ActivePickers,
+    active_config: &mut Config,
 ) -> Result<T, Error> {
     loop {
         while let Ok(update) = worker.updates.try_recv() {
@@ -1583,26 +1620,27 @@ fn pump_events<R: Read, T>(
         let event = events.read_event()?;
         if state.picker.is_some() {
             match event {
-                Event::Key(key) if is_cancel_key(key) => {
-                    state.picker = None;
-                    cancel_worker(worker.thread, state);
-                }
                 Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
                 Event::Key(key) => {
                     if let Some(action) = take_picker_action(state, editor, key) {
-                        activate_picker_action_while_busy(state, action, active_pickers);
+                        activate_picker_action_while_busy(
+                            state,
+                            action,
+                            active_pickers,
+                            active_config,
+                        );
                     }
                 }
                 Event::Paste(text) if picker_is_editing(state) => editor.paste(&text),
                 Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
-                Event::Tick => advance_copy_toast(state),
+                Event::Tick => advance_ticks(state),
                 Event::MouseScroll(_) | Event::Paste(_) => {}
             }
             continue;
         }
         match event {
             Event::Tick => {
-                advance_copy_toast(state);
+                advance_ticks(state);
                 if crate::interrupted() {
                     state.activity = "canceling turn".into();
                 }
@@ -1637,8 +1675,9 @@ fn handle_mouse_selection(
     Ok(())
 }
 
-fn advance_copy_toast(state: &mut ViewState) {
+fn advance_ticks(state: &mut ViewState) {
     state.copy_toast_ticks = state.copy_toast_ticks.saturating_sub(1);
+    state.spinner_tick = state.spinner_tick.wrapping_add(1);
 }
 
 fn is_cancel_key(key: Key) -> bool {
@@ -1690,11 +1729,16 @@ fn busy_command(input: &str) -> Option<BusyCommand> {
 fn activate_picker_action_while_busy(
     state: &mut ViewState,
     action: PickerAction,
-    active_pickers: &ActivePickers,
+    active_pickers: &mut ActivePickers,
+    active_config: &mut Config,
 ) {
     let Some(action) = handle_queue_picker_action(state, action) else {
         return;
     };
+    if let Some((change, selected)) = display_config_change(&action) {
+        apply_display_config_while_busy(active_config, state, active_pickers, change, selected);
+        return;
+    }
     match action {
         PickerAction::OpenModels { save: true } => {
             state.picker = Some(active_pickers.default_model.clone());
@@ -1717,6 +1761,44 @@ fn activate_picker_action_while_busy(
             state.pending_actions.push_back(action);
             state.activity = "change queued until the active response finishes".into();
         }
+    }
+}
+
+fn display_config_change(action: &PickerAction) -> Option<(ConfigChange, usize)> {
+    match action {
+        PickerAction::SetHideReasoning(enabled) => Some((
+            ConfigChange::HideReasoning(if *enabled { "on" } else { "off" }.into()),
+            SETTINGS_REASONING_DISPLAY_INDEX,
+        )),
+        PickerAction::SetAccentColor(color) => Some((
+            ConfigChange::AccentColor(color.config_value()),
+            SETTINGS_ACCENT_COLOR_INDEX,
+        )),
+        PickerAction::ApplySetting { argument, selected } => argument
+            .strip_prefix("accent_color ")
+            .map(|value| (ConfigChange::AccentColor(value.to_string()), *selected)),
+        _ => None,
+    }
+}
+
+fn apply_display_config_while_busy(
+    config: &mut Config,
+    state: &mut ViewState,
+    active_pickers: &mut ActivePickers,
+    change: ConfigChange,
+    selected: usize,
+) {
+    match config.change_global(change) {
+        Ok(outcome) => {
+            *config = outcome.config;
+            state.hide_reasoning = config.hide_reasoning;
+            state.accent_color = config.accent_color;
+            notice_config_effect(config, outcome.effect, state);
+            active_pickers.refresh_display_settings(config);
+            state.picker = Some(active_pickers.settings.clone());
+            select_picker_item(state, selected);
+        }
+        Err(error) => state.notice(format!("Could not change setting: {error}")),
     }
 }
 
@@ -1878,6 +1960,40 @@ fn render_copy_toast(frame: &mut [String], columns: usize, accent: UiColor) {
     for (line, toast_line) in frame.iter_mut().zip(toast) {
         *line = format!("{}{toast_line}", markdown::fit_width(line, left_width));
     }
+}
+
+fn has_visible_in_flight_content(state: &ViewState) -> bool {
+    let Some(last) = state.transcript.entries().last() else {
+        return false;
+    };
+    match last {
+        Entry::User(_) | Entry::Notice(_) => false,
+        Entry::Tool { running, .. } => *running,
+        Entry::Reasoning { content, .. } => !state.hide_reasoning && !content.trim().is_empty(),
+        Entry::Assistant(content) => !content.trim().is_empty(),
+    }
+}
+
+fn loading_label(activity: &str) -> Option<&str> {
+    match activity {
+        "sending" | "responding" | "reasoning" => Some("Waiting…"),
+        "compacting conversation" => Some("Compacting conversation…"),
+        "canceling turn" => Some("Canceling turn…"),
+        other if other.starts_with("attempt") => Some(other),
+        _ => None,
+    }
+}
+
+fn render_loading_state(state: &ViewState, width: usize) -> Option<String> {
+    let label = loading_label(&state.activity)?;
+    if has_visible_in_flight_content(state) {
+        return None;
+    }
+    const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let frame = SPINNER_FRAMES[state.spinner_tick % SPINNER_FRAMES.len()];
+    let accent = foreground_color(state.accent_color);
+    let rendered = format!(" {accent}{frame}\x1b[0m \x1b[2m{label}\x1b[0m");
+    Some(markdown::fit_width(&rendered, width))
 }
 
 struct Terminal {
@@ -2367,6 +2483,10 @@ fn build_frame(
         state.tools_expanded,
         state.hide_reasoning,
     );
+    if let Some(loading) = render_loading_state(state, columns) {
+        transcript.push(loading);
+        transcript.push(String::new());
+    }
     for (index, input) in state.queued_inputs.iter().enumerate() {
         transcript.extend(render_queued_panel(input, index + 1, columns));
     }
@@ -2493,6 +2613,7 @@ mod tests {
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
             copy_toast_ticks: 0,
+            spinner_tick: 0,
             context_tokens: 12,
             context_window: 100,
             activity: String::new(),
@@ -2519,7 +2640,7 @@ mod tests {
                 .iter()
                 .all(|line| markdown::visible_width(line) == 40)
         );
-        advance_copy_toast(&mut state);
+        advance_ticks(&mut state);
         let (frame, _) = build_frame(&mut state, &editor, 40, 12);
         assert!(!markdown::strip_ansi(&frame.join("\n")).contains("Copied!"));
     }
@@ -2604,6 +2725,7 @@ mod tests {
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
             copy_toast_ticks: 0,
+            spinner_tick: 0,
             context_tokens: 0,
             context_window: 100,
             activity: String::new(),
@@ -2647,6 +2769,58 @@ mod tests {
     }
 
     #[test]
+    fn escape_cancels_picker_editing_and_dismisses_picker() {
+        let mut state = ViewState {
+            transcript: Transcript::from_messages(&[]),
+            tools_expanded: false,
+            model: "test".into(),
+            reasoning_effort: None,
+            hide_reasoning: false,
+            accent_color: UiColor::WHITE,
+            copy_toast_ticks: 0,
+            spinner_tick: 0,
+            context_tokens: 0,
+            context_window: 100,
+            activity: String::new(),
+            scroll_offset: 0,
+            queued_inputs: std::collections::VecDeque::new(),
+            pending_actions: std::collections::VecDeque::new(),
+            completions: Vec::new(),
+            completion_index: 0,
+            picker: Some(Picker {
+                title: "Settings".into(),
+                hint: "Enter change".into(),
+                selected: 0,
+                items: vec![PickerItem {
+                    label: "Max output tokens".into(),
+                    description: "8192".into(),
+                    action: PickerAction::EditSetting {
+                        key: "max_tokens".into(),
+                        initial: "8192".into(),
+                    },
+                }],
+                editing: None,
+            }),
+        };
+        let mut editor = Editor::default();
+
+        // Enter starts editing
+        assert!(take_picker_action(&mut state, &mut editor, Key::Enter).is_none());
+        assert!(picker_is_editing(&state));
+        assert_eq!(editor.text(), "8192");
+
+        // Esc cancels editing, clears text, but keeps the picker open
+        assert!(take_picker_action(&mut state, &mut editor, Key::Escape).is_none());
+        assert!(!picker_is_editing(&state));
+        assert!(editor.is_empty());
+        assert!(state.picker.is_some());
+
+        // Second Esc dismisses the picker
+        assert!(take_picker_action(&mut state, &mut editor, Key::Escape).is_none());
+        assert!(state.picker.is_none());
+    }
+
+    #[test]
     fn settings_and_model_pickers_are_recognized_during_an_active_turn() {
         assert_eq!(busy_command(" /settings "), Some(BusyCommand::Settings));
         assert_eq!(busy_command("/model"), Some(BusyCommand::Model));
@@ -2656,6 +2830,106 @@ mod tests {
         );
         assert_eq!(busy_command("/settings max_tokens 1"), None);
         assert_eq!(busy_command("hello"), None);
+    }
+
+    #[test]
+    fn display_settings_apply_during_an_active_turn() {
+        let picker = Picker {
+            title: "Settings".into(),
+            hint: String::new(),
+            selected: 0,
+            items: Vec::new(),
+            editing: None,
+        };
+        let mut active_pickers = ActivePickers {
+            model: picker.clone(),
+            default_model: picker.clone(),
+            settings: picker.clone(),
+            reasoning: picker.clone(),
+            default_reasoning: picker.clone(),
+            accent_color: picker,
+        };
+        let mut state = ViewState {
+            transcript: Transcript::from_messages(&[]),
+            tools_expanded: false,
+            model: "test".into(),
+            reasoning_effort: None,
+            hide_reasoning: false,
+            accent_color: UiColor::WHITE,
+            copy_toast_ticks: 0,
+            spinner_tick: 0,
+            context_tokens: 0,
+            context_window: 100,
+            activity: String::new(),
+            scroll_offset: 0,
+            queued_inputs: std::collections::VecDeque::new(),
+            pending_actions: std::collections::VecDeque::new(),
+            completions: Vec::new(),
+            completion_index: 0,
+            picker: None,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "yawl-tui-live-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut config = Config {
+            model: Some("test".into()),
+            anthropic_base_url: String::new(),
+            openai_base_url: String::new(),
+            max_tokens: 8192,
+            reasoning_effort: None,
+            hide_reasoning: false,
+            accent_color: UiColor::WHITE,
+            context_windows: std::collections::HashMap::new(),
+            auto_compact: true,
+            compact_threshold: 0.85,
+            skill_dirs: Vec::new(),
+            providers: std::collections::HashMap::new(),
+            home_dir: root.join("home/.yawl"),
+            project_dir: root.join("project/.yawl"),
+        };
+
+        activate_picker_action_while_busy(
+            &mut state,
+            PickerAction::SetHideReasoning(true),
+            &mut active_pickers,
+            &mut config,
+        );
+
+        assert!(state.hide_reasoning);
+        assert!(config.hide_reasoning);
+        assert!(state.pending_actions.is_empty());
+        assert!(config.global_config_path().exists());
+
+        let blue = UiColor::new(117, 169, 255);
+        activate_picker_action_while_busy(
+            &mut state,
+            PickerAction::SetAccentColor(blue),
+            &mut active_pickers,
+            &mut config,
+        );
+
+        assert_eq!(state.accent_color, blue);
+        assert_eq!(config.accent_color, blue);
+        assert!(state.pending_actions.is_empty());
+
+        activate_picker_action_while_busy(
+            &mut state,
+            PickerAction::SetReasoning {
+                effort: Some("high".into()),
+                save: true,
+            },
+            &mut active_pickers,
+            &mut config,
+        );
+
+        assert_eq!(state.pending_actions.len(), 1);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2675,6 +2949,7 @@ mod tests {
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
             copy_toast_ticks: 0,
+            spinner_tick: 0,
             context_tokens: 0,
             context_window: 100,
             activity: String::new(),
@@ -2708,6 +2983,7 @@ mod tests {
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
             copy_toast_ticks: 0,
+            spinner_tick: 0,
             context_tokens: 0,
             context_window: 100,
             activity: String::new(),
@@ -2820,5 +3096,125 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(plain, ["Answer", "", "Thinking", "", "", "$ true", "", ""]);
+    }
+
+    #[test]
+    fn loading_state_appears_under_user_prompt_and_animates() {
+        let mut state = ViewState {
+            transcript: Transcript::from_messages(&[crate::provider::Message::user("hello")]),
+            tools_expanded: false,
+            model: "test".into(),
+            reasoning_effort: None,
+            hide_reasoning: false,
+            accent_color: UiColor::WHITE,
+            copy_toast_ticks: 0,
+            spinner_tick: 0,
+            context_tokens: 0,
+            context_window: 100,
+            activity: "sending".into(),
+            scroll_offset: 0,
+            queued_inputs: std::collections::VecDeque::new(),
+            pending_actions: std::collections::VecDeque::new(),
+            completions: Vec::new(),
+            completion_index: 0,
+            picker: None,
+        };
+
+        let loading = render_loading_state(&state, 80).expect("loading state should be present");
+        assert!(markdown::strip_ansi(&loading).contains("⠋ Waiting…"));
+
+        advance_ticks(&mut state);
+        let loading = render_loading_state(&state, 80).expect("loading state should animate");
+        assert!(markdown::strip_ansi(&loading).contains("⠙ Waiting…"));
+
+        // When assistant text arrives, loading state disappears
+        state.apply(Update::Transcript(TranscriptEvent::TextDelta(
+            "Hello!".into(),
+        )));
+        assert!(render_loading_state(&state, 80).is_none());
+    }
+
+    #[test]
+    fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
+        let mut state = ViewState {
+            transcript: Transcript::from_messages(&[crate::provider::Message::user("hello")]),
+            tools_expanded: false,
+            model: "test".into(),
+            reasoning_effort: None,
+            hide_reasoning: true,
+            accent_color: UiColor::WHITE,
+            copy_toast_ticks: 0,
+            spinner_tick: 0,
+            context_tokens: 0,
+            context_window: 100,
+            activity: "sending".into(),
+            scroll_offset: 0,
+            queued_inputs: std::collections::VecDeque::new(),
+            pending_actions: std::collections::VecDeque::new(),
+            completions: Vec::new(),
+            completion_index: 0,
+            picker: None,
+        };
+
+        // Hidden reasoning delta arrives: loading state stays visible
+        state.apply(Update::Transcript(TranscriptEvent::ReasoningDelta {
+            kind: ReasoningKind::Full,
+            text: "private thought".into(),
+        }));
+        assert!(render_loading_state(&state, 80).is_some());
+
+        // Tool starts running: loading indicator is hidden while tool is active
+        state.apply(Update::Transcript(TranscriptEvent::ToolStart {
+            name: "shell".into(),
+            args: "{}".into(),
+        }));
+        assert!(render_loading_state(&state, 80).is_none());
+
+        // Tool finishes: loading indicator appears again while the next request is in flight
+        state.apply(Update::Transcript(TranscriptEvent::ToolEnd {
+            name: "shell".into(),
+            output: "done".into(),
+            is_error: false,
+        }));
+        assert_eq!(state.activity, "sending");
+        let loading = render_loading_state(&state, 80).expect("waiting after tools");
+        assert!(markdown::strip_ansi(&loading).contains("Waiting…"));
+    }
+
+    #[test]
+    fn loading_state_ignores_status_activity() {
+        let mut state = ViewState {
+            transcript: Transcript::from_messages(&[]),
+            tools_expanded: false,
+            model: "test".into(),
+            reasoning_effort: None,
+            hide_reasoning: false,
+            accent_color: UiColor::WHITE,
+            copy_toast_ticks: 0,
+            spinner_tick: 0,
+            context_tokens: 0,
+            context_window: 100,
+            activity: String::new(),
+            scroll_offset: 0,
+            queued_inputs: std::collections::VecDeque::new(),
+            pending_actions: std::collections::VecDeque::new(),
+            completions: Vec::new(),
+            completion_index: 0,
+            picker: None,
+        };
+        state.notice("Yawl is ready. Type /help for commands.");
+
+        for activity in [
+            "input cleared",
+            "tool output expanded",
+            "no queued messages",
+            "change queued until the active response finishes",
+        ] {
+            state.activity = activity.into();
+            assert!(
+                render_loading_state(&state, 80).is_none(),
+                "status {activity:?} should not show a spinner"
+            );
+        }
     }
 }
