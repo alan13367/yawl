@@ -1,0 +1,20 @@
+[package]
+name = "yawl"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A minimal, self-extending AI agent harness"
+license = "MIT"
+repository = "https://github.com/alan13367/yawl"
+
+[dependencies]
+ureq = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
