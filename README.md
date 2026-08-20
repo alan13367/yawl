@@ -4,7 +4,7 @@ Yawl is a small AI agent runner for macOS and Linux. It has a full-screen termin
 
 The model can add tools without recompiling Yawl. Any executable in `~/.yawl/tools/` or `./.yawl/tools/` becomes a callable tool when it implements the exec-tool contract below.
 
-Yawl is one Rust crate with blocking I/O and four direct dependencies: `ureq`, `serde`, `serde_json`, and `libc`.
+Yawl is one Cargo package with library and binary targets, blocking I/O, and four direct dependencies: `ureq`, `serde`, `serde_json`, and `libc`.
 
 ## Install
 
@@ -282,6 +282,17 @@ The resulting `skill_dirs` array is stored in `~/.yawl/config.json`. Later direc
 Yawl reads global instructions from `~/.yawl/AGENTS.md` and project instructions from `AGENTS.md` in the current directory. It appends the global file first and the project file second, after the built-in system prompt. Empty or missing files are ignored. Use these files for commands, constraints, and context that should apply to every project or only the current repository.
 
 ## Development
+
+Yawl stays in one Cargo package. Stable facade modules keep callers independent of the internal file layout:
+
+- `src/main.rs` coordinates startup. `src/cli.rs` and `src/print_mode.rs` contain the two binary frontends.
+- `src/agent.rs` coordinates provider turns, tool execution, sessions, and compaction.
+- `src/provider/mod.rs` re-exports the provider-neutral protocol. Private modules contain streaming retries, provider resolution, and SSE/HTTP support. Codex OAuth and Responses handling live separately under `src/provider/codex/`.
+- `src/config.rs` exposes the effective configuration. Its child modules separate runtime types, persisted schema, loading and merging, storage, and validated changes.
+- `src/tui/mod.rs` exposes `tui::run` and coordinates the event loop. Commands, completion, pickers, state, workers, rendering, and terminal handling live in focused sibling modules.
+- `src/onboarding.rs` coordinates setup while its child modules own terminal prompts and model discovery.
+
+Internal module moves must preserve existing public paths through facade re-exports. Files are split when they own unrelated responsibilities, not when they cross an arbitrary line count.
 
 ```sh
 cargo fmt --all --check
