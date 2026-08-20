@@ -3,6 +3,7 @@
 //! lives in `anthropic.rs` and `openai.rs`.
 
 pub mod anthropic;
+pub mod codex;
 pub mod openai;
 
 use std::io::BufRead;
@@ -48,6 +49,10 @@ pub struct Message {
     pub tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// Provider-specific replay data. Codex stores encrypted reasoning items
+    /// here so `store: false` tool loops remain valid.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_data: Vec<Value>,
 }
 
 impl Message {
@@ -59,6 +64,7 @@ impl Message {
             tool_call_id: None,
             tool_name: None,
             is_error: false,
+            provider_data: Vec::new(),
         }
     }
 
@@ -70,6 +76,7 @@ impl Message {
             tool_call_id: None,
             tool_name: None,
             is_error: false,
+            provider_data: Vec::new(),
         }
     }
 
@@ -86,6 +93,7 @@ impl Message {
             tool_call_id: Some(call_id.into()),
             tool_name: Some(name.into()),
             is_error,
+            provider_data: Vec::new(),
         }
     }
 }
@@ -116,6 +124,8 @@ pub enum Event {
         input_tokens: u64,
         output_tokens: u64,
     },
+    /// Opaque data needed to replay a provider response on the next request.
+    ProviderData(Value),
     Done,
 }
 
@@ -131,6 +141,7 @@ pub struct TurnOutput {
     pub tool_calls: Vec<ToolCall>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub provider_data: Vec<Value>,
 }
 
 /// Out-of-band notices from the retry wrapper, for display.
@@ -174,6 +185,7 @@ pub fn stream_turn(
                 out.input_tokens = input_tokens;
                 out.output_tokens = output_tokens;
             }
+            Event::ProviderData(value) => out.provider_data.push(value),
             Event::Done => {}
         });
         match result {
@@ -199,35 +211,118 @@ pub fn stream_turn(
 
 /// Resolves a model spec to a provider instance and the bare model name.
 ///
-/// Routing: explicit `anthropic:`/`openai:` prefixes win; otherwise names
-/// starting with `claude` go to Anthropic and everything else to the
-/// OpenAI-compatible endpoint (OpenAI, Ollama, llama.cpp, OpenRouter via
-/// `openai_base_url`).
+/// Explicit `anthropic:` and `openai:` prefixes select the built-ins. Any
+/// prefix found in `config.providers` selects that OpenAI-compatible
+/// provider. Otherwise, names starting with `claude` use Anthropic and all
+/// other names use the built-in OpenAI endpoint.
 pub fn resolve(model_spec: &str, cfg: &Config) -> Result<(Box<dyn Provider>, String), Error> {
-    let (is_anthropic, bare) = if let Some(m) = model_spec.strip_prefix("anthropic:") {
-        (true, m)
-    } else if let Some(m) = model_spec.strip_prefix("openai:") {
-        (false, m)
-    } else {
-        (model_spec.starts_with("claude"), model_spec)
-    };
-    if is_anthropic {
-        let key = std::env::var("ANTHROPIC_API_KEY")
-            .map_err(|_| Error::Config("ANTHROPIC_API_KEY is not set".into()))?;
-        Ok((
-            Box::new(anthropic::Anthropic::new(
-                cfg.anthropic_base_url.clone(),
+    if let Some(bare) = model_spec.strip_prefix("anthropic:") {
+        return anthropic_provider(cfg, bare);
+    }
+    if let Some(bare) = model_spec.strip_prefix("openai:") {
+        return openai_provider(cfg, bare);
+    }
+    if let Some(bare) = model_spec.strip_prefix("openai-codex:") {
+        return Ok((Box::new(codex::Codex::from_config(cfg)?), bare.to_string()));
+    }
+    if let Some((name, provider, bare)) = cfg.custom_provider_for(model_spec) {
+        if provider.api != "openai-completions" {
+            return Err(Error::Config(format!(
+                "provider '{name}' uses unsupported API '{}'; Yawl supports openai-completions",
+                provider.api
+            )));
+        }
+        if provider.base_url.trim().is_empty() {
+            return Err(Error::Config(format!("provider '{name}' has no base_url")));
+        }
+
+        let key = match &provider.api_key {
+            Some(value) => crate::config::resolve_config_value(value)?,
+            None => std::env::var(provider_key_environment_name(name)).unwrap_or_default(),
+        };
+        let mut headers = Vec::with_capacity(provider.headers.len());
+        for (header_name, value) in &provider.headers {
+            let value = crate::config::resolve_config_value(value)?;
+            validate_header(header_name, &value)?;
+            headers.push((header_name.clone(), value));
+        }
+        headers.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut compat = provider.compat.clone();
+        if let Some(model) = provider.models.iter().find(|model| model.id == bare) {
+            compat.apply(model.compat.clone());
+        }
+        if !matches!(
+            compat.max_tokens_field(),
+            "max_tokens" | "max_completion_tokens"
+        ) {
+            return Err(Error::Config(format!(
+                "provider '{name}' has unsupported maxTokensField '{}'",
+                compat.max_tokens_field()
+            )));
+        }
+        return Ok((
+            Box::new(openai::OpenAi::configured(
+                provider.base_url.clone(),
                 key,
+                provider.auth_header.unwrap_or(true),
+                headers,
+                compat,
             )),
             bare.to_string(),
-        ))
-    } else {
-        let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-        Ok((
-            Box::new(openai::OpenAi::new(cfg.openai_base_url.clone(), key)),
-            bare.to_string(),
-        ))
+        ));
     }
+    if model_spec.starts_with("claude") {
+        anthropic_provider(cfg, model_spec)
+    } else {
+        openai_provider(cfg, model_spec)
+    }
+}
+
+fn anthropic_provider(cfg: &Config, model: &str) -> Result<(Box<dyn Provider>, String), Error> {
+    let key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| Error::Config("ANTHROPIC_API_KEY is not set".into()))?;
+    Ok((
+        Box::new(anthropic::Anthropic::new(
+            cfg.anthropic_base_url.clone(),
+            key,
+        )),
+        model.to_string(),
+    ))
+}
+
+fn openai_provider(cfg: &Config, model: &str) -> Result<(Box<dyn Provider>, String), Error> {
+    let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+    Ok((
+        Box::new(openai::OpenAi::new(cfg.openai_base_url.clone(), key)),
+        model.to_string(),
+    ))
+}
+
+fn provider_key_environment_name(provider: &str) -> String {
+    let mut name = provider
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    name.push_str("_API_KEY");
+    name
+}
+
+fn validate_header(name: &str, value: &str) -> Result<(), Error> {
+    name.parse::<ureq::http::HeaderName>()
+        .map_err(|error| Error::Config(format!("invalid provider header '{name}': {error}")))?;
+    value.parse::<ureq::http::HeaderValue>().map_err(|error| {
+        Error::Config(format!(
+            "invalid value for provider header '{name}': {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 /// Shared ureq agent config for streaming: no global timeout (streams are

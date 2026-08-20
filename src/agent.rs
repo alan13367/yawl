@@ -126,7 +126,7 @@ impl Agent {
                 system: &system,
                 messages: &self.messages,
                 tools: &specs,
-                max_tokens: self.config.max_tokens,
+                max_tokens: self.config.max_tokens_for(&self.model),
             };
             let out = match stream_turn(provider.as_ref(), &request, &mut forward(sink)) {
                 Ok(out) => out,
@@ -142,7 +142,8 @@ impl Agent {
                 context_window: self.context_window(),
             });
 
-            let assistant = Message::assistant(out.text, out.tool_calls.clone());
+            let mut assistant = Message::assistant(out.text, out.tool_calls.clone());
+            assistant.provider_data = out.provider_data;
             self.session.append_message(&assistant)?;
             self.messages.push(assistant);
             sink(TurnEvent::AssistantDone);
@@ -199,11 +200,13 @@ impl Agent {
     }
 
     fn maybe_compact(&mut self, sink: &mut dyn FnMut(TurnEvent<'_>)) -> Result<(), Error> {
-        if !compaction::should_compact(
-            self.context_tokens,
-            self.context_window(),
-            self.config.compact_threshold,
-        ) {
+        if !self.config.auto_compact
+            || !compaction::should_compact(
+                self.context_tokens,
+                self.context_window(),
+                self.config.compact_threshold,
+            )
+        {
             return Ok(());
         }
         match self.compact_now(sink) {
@@ -223,7 +226,7 @@ impl Agent {
         let (summary, replaced) = compaction::compact(
             provider.as_ref(),
             &bare_model,
-            self.config.max_tokens,
+            self.config.max_tokens_for(&self.model),
             &mut self.messages,
             // Summarizer output is not user-facing; swallow its deltas.
             &mut |_| {},

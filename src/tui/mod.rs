@@ -6,6 +6,7 @@ pub mod events;
 pub mod highlight;
 pub mod input;
 pub mod markdown;
+mod tool_view;
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -19,7 +20,8 @@ use self::input::{EditAction, Editor};
 
 const HELP: &str = "\
 Commands
-  /model [MODEL]       show or switch the current model
+  /model [MODEL]       list configured models or switch the current model
+  /settings [KEY ...]  show or change persistent settings
   /clear               start a new session
   /compact             summarize older messages now
   /tools               list builtin and discovered tools
@@ -30,7 +32,8 @@ Commands
 Input
   Enter submits. Shift+Enter or Alt+Enter inserts a newline.
   Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
-  Mouse wheel and PageUp/PageDown scroll. Ctrl+C aborts the active turn.
+  Ctrl+O expands or collapses tool output. Ctrl+C aborts the active turn.
+  Mouse wheel and PageUp/PageDown scroll.
 ";
 
 enum Entry {
@@ -50,6 +53,7 @@ struct ViewState {
     entries: Vec<Entry>,
     streaming_assistant: Option<usize>,
     running_tool: Option<usize>,
+    tools_expanded: bool,
     model: String,
     context_tokens: u64,
     context_window: u64,
@@ -64,6 +68,7 @@ impl ViewState {
             entries: entries_from_messages(&agent.messages),
             streaming_assistant: None,
             running_tool: None,
+            tools_expanded: false,
             model: agent.model.clone(),
             context_tokens: agent.context_tokens,
             context_window: agent.context_window(),
@@ -292,6 +297,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                 state.activity = "input cleared".into();
             }
             Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
+            Event::Key(Key::Ctrl('o')) => toggle_tool_expansion(&mut state),
             Event::Key(key) => {
                 if let EditAction::Submit(input) = editor.handle_key(key)
                     && handle_submission(
@@ -327,9 +333,7 @@ fn handle_submission<R: Read>(
         match name {
             "quit" | "q" => return Ok(true),
             "help" => state.notice(HELP),
-            "model" if argument.is_empty() => {
-                state.notice(format!("Current model: {}", agent.model));
-            }
+            "model" if argument.is_empty() => show_models(agent, state),
             "model" => {
                 agent.model = argument.to_string();
                 state.model.clone_from(&agent.model);
@@ -337,6 +341,7 @@ fn handle_submission<R: Read>(
                 state.context_tokens = 0;
                 state.notice(format!("Switched to {}.", agent.model));
             }
+            "settings" => settings(agent, argument, state),
             "clear" => match agent.reset() {
                 Ok(()) => {
                     let queued_inputs = std::mem::take(&mut state.queued_inputs);
@@ -384,6 +389,240 @@ fn handle_submission<R: Read>(
     crate::set_interrupted(false);
     state.activity.clear();
     Ok(false)
+}
+
+fn show_models(agent: &Agent, state: &mut ViewState) {
+    let models = agent.config.available_models();
+    let mut text = format!("Current model: `{}`", agent.model);
+    if models.is_empty() {
+        text.push_str("\n\nNo model IDs are listed in the provider configuration.");
+    } else {
+        text.push_str("\n\nKnown models\n\n");
+        for (model, name) in models {
+            text.push_str(&format!("- `{model}`: {name}\n"));
+        }
+    }
+    text.push_str("\nUnlisted OpenAI-compatible model IDs also work, for example `/model ollama:qwen2.5-coder:7b`.");
+    state.notice(text);
+}
+
+fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) {
+    if argument.is_empty() {
+        show_settings(agent, state);
+        return;
+    }
+
+    let mut parts = argument.split_whitespace();
+    let key = parts.next().unwrap_or_default();
+    let result = match key {
+        "reload" => {
+            if parts.next().is_some() {
+                Err(Error::Config("usage: /settings reload".into()))
+            } else {
+                reload_config(agent, state, true)
+            }
+        }
+        "model" => one_value(&mut parts, "usage: /settings model MODEL").and_then(|model| {
+            agent
+                .config
+                .save_global_setting("model", serde_json::json!(model))?;
+            reload_config(agent, state, false)
+        }),
+        "max_tokens" => {
+            one_value(&mut parts, "usage: /settings max_tokens NUMBER").and_then(|value| {
+                let tokens = value
+                    .parse::<u32>()
+                    .map_err(|_| Error::Config("max_tokens must be a positive integer".into()))?;
+                if tokens == 0 {
+                    return Err(Error::Config(
+                        "max_tokens must be a positive integer".into(),
+                    ));
+                }
+                agent
+                    .config
+                    .save_global_setting("max_tokens", serde_json::json!(tokens))?;
+                reload_config(agent, state, true)
+            })
+        }
+        "auto_compact" => {
+            one_value(&mut parts, "usage: /settings auto_compact on|off").and_then(|value| {
+                let enabled = parse_on_off(value)?;
+                agent
+                    .config
+                    .save_global_setting("auto_compact", serde_json::json!(enabled))?;
+                reload_config(agent, state, true)
+            })
+        }
+        "compact_threshold" => one_value(
+            &mut parts,
+            "usage: /settings compact_threshold FRACTION|PERCENT%",
+        )
+        .and_then(|value| {
+            let threshold = parse_threshold(value)?;
+            agent
+                .config
+                .save_global_setting("compact_threshold", serde_json::json!(threshold))?;
+            reload_config(agent, state, true)
+        }),
+        "context_window" => one_value(&mut parts, "usage: /settings context_window TOKENS")
+            .and_then(|value| {
+                let window = value.parse::<u64>().map_err(|_| {
+                    Error::Config("context_window must be a positive integer".into())
+                })?;
+                if window == 0 {
+                    return Err(Error::Config(
+                        "context_window must be a positive integer".into(),
+                    ));
+                }
+                agent
+                    .config
+                    .save_global_context_window(&agent.model, window)?;
+                reload_config(agent, state, true)
+            }),
+        "anthropic_base_url" | "openai_base_url" => {
+            one_value(&mut parts, "usage: /settings openai_base_url URL").and_then(|url| {
+                validate_http_url(url)?;
+                agent
+                    .config
+                    .save_global_setting(key, serde_json::json!(url))?;
+                reload_config(agent, state, true)
+            })
+        }
+        "provider" => {
+            let name = parts.next();
+            let url = parts.next();
+            let api_key = parts.next();
+            if name.is_none() || url.is_none() || parts.next().is_some() {
+                Err(Error::Config(
+                    "usage: /settings provider NAME BASE_URL [API_KEY|-]".into(),
+                ))
+            } else {
+                agent
+                    .config
+                    .save_global_provider(
+                        name.unwrap_or_default(),
+                        url.unwrap_or_default(),
+                        api_key,
+                    )
+                    .and_then(|()| reload_config(agent, state, true))
+            }
+        }
+        _ => Err(Error::Config(format!(
+            "unknown setting '{key}'; run /settings to list settings"
+        ))),
+    };
+
+    match result {
+        Ok(()) => {
+            state.context_window = agent.context_window();
+            state.notice(format!(
+                "Saved to `{}` and applied.",
+                agent.config.global_config_path().display()
+            ));
+        }
+        Err(error) => state.notice(format!("Could not change setting: {error}")),
+    }
+}
+
+fn show_settings(agent: &Agent, state: &mut ViewState) {
+    let mut providers = agent.config.providers.iter().collect::<Vec<_>>();
+    providers.sort_by_key(|(name, _)| name.as_str());
+    let mut text = format!(
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nOpenAI-compatible providers\n\n",
+        agent.model,
+        agent.config.max_tokens,
+        if agent.config.auto_compact {
+            "on"
+        } else {
+            "off"
+        },
+        agent.config.compact_threshold * 100.0,
+        agent.context_window(),
+        agent.config.anthropic_base_url,
+        agent.config.openai_base_url,
+    );
+    for (name, provider) in providers {
+        let auth = if provider.api_key.is_some() {
+            "configured key"
+        } else {
+            "no configured key"
+        };
+        text.push_str(&format!(
+            "- `{name}`: `{}` ({auth}, {} listed models)\n",
+            provider.base_url,
+            provider.models.len()
+        ));
+    }
+    text.push_str(&format!(
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
+        agent.config.global_config_path().display()
+    ));
+    state.notice(text);
+}
+
+fn one_value<'a>(parts: &mut impl Iterator<Item = &'a str>, usage: &str) -> Result<&'a str, Error> {
+    let value = parts
+        .next()
+        .ok_or_else(|| Error::Config(usage.to_string()))?;
+    if parts.next().is_some() {
+        return Err(Error::Config(usage.to_string()));
+    }
+    Ok(value)
+}
+
+fn parse_on_off(value: &str) -> Result<bool, Error> {
+    match value {
+        "on" | "true" => Ok(true),
+        "off" | "false" => Ok(false),
+        _ => Err(Error::Config("expected on or off".into())),
+    }
+}
+
+fn parse_threshold(value: &str) -> Result<f64, Error> {
+    let threshold = if let Some(percent) = value.strip_suffix('%') {
+        percent
+            .parse::<f64>()
+            .map_err(|_| Error::Config("invalid compaction percentage".into()))?
+            / 100.0
+    } else {
+        value
+            .parse::<f64>()
+            .map_err(|_| Error::Config("invalid compaction threshold".into()))?
+    };
+    if !threshold.is_finite() || !(0.1..=0.99).contains(&threshold) {
+        return Err(Error::Config(
+            "compact_threshold must be between 0.1 and 0.99".into(),
+        ));
+    }
+    Ok(threshold)
+}
+
+fn validate_http_url(url: &str) -> Result<(), Error> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(Error::Config(
+            "provider URL must start with http:// or https://".into(),
+        ))
+    }
+}
+
+fn reload_config(agent: &mut Agent, state: &mut ViewState, keep_model: bool) -> Result<(), Error> {
+    let current_model = agent.model.clone();
+    agent.config = crate::config::Config::load()?;
+    if keep_model {
+        agent.model = current_model;
+    } else {
+        agent.model = agent
+            .config
+            .model
+            .clone()
+            .ok_or_else(|| Error::Config("no model configured".into()))?;
+        agent.context_tokens = 0;
+    }
+    state.model.clone_from(&agent.model);
+    state.context_window = agent.context_window();
+    Ok(())
 }
 
 fn resume(agent: &mut Agent, selector: &str, state: &mut ViewState) {
@@ -537,6 +776,7 @@ fn pump_events<R: Read, T>(
                 state.activity = "canceling turn".into();
             }
             Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
+            Event::Key(Key::Ctrl('o')) => toggle_tool_expansion(state),
             Event::Key(Key::PageUp) => scroll(state, 10),
             Event::Key(Key::PageDown) => scroll(state, -10),
             Event::Key(key) => {
@@ -572,8 +812,19 @@ fn scroll(state: &mut ViewState, amount: i32) {
     }
 }
 
+fn toggle_tool_expansion(state: &mut ViewState) {
+    state.tools_expanded = !state.tools_expanded;
+    state.scroll_offset = 0;
+    state.activity = if state.tools_expanded {
+        "tool output expanded".into()
+    } else {
+        "tool output compact".into()
+    };
+}
+
 fn entries_from_messages(messages: &[Message]) -> Vec<Entry> {
     let mut entries = Vec::new();
+    let mut pending_tools = std::collections::VecDeque::new();
     for message in messages {
         match message.role {
             Role::User if message.content.starts_with("[conversation summary]") => {
@@ -584,20 +835,54 @@ fn entries_from_messages(messages: &[Message]) -> Vec<Entry> {
                 if !message.content.is_empty() {
                     entries.push(Entry::Assistant(message.content.clone()));
                 }
+                for call in &message.tool_calls {
+                    entries.push(Entry::Tool {
+                        name: call.name.clone(),
+                        args: call.arguments.clone(),
+                        output: String::new(),
+                        is_error: false,
+                        running: false,
+                    });
+                    pending_tools.push_back((call.id.as_str(), entries.len() - 1));
+                }
             }
-            Role::Tool => entries.push(Entry::Tool {
-                name: message.tool_name.clone().unwrap_or_else(|| "tool".into()),
-                args: String::new(),
-                output: message.content.clone(),
-                is_error: message.is_error,
-                running: false,
-            }),
+            Role::Tool => {
+                let pending_position = message.tool_call_id.as_deref().and_then(|id| {
+                    pending_tools
+                        .iter()
+                        .position(|(pending_id, _)| *pending_id == id)
+                });
+                let pending_index = pending_position
+                    .and_then(|position| pending_tools.remove(position))
+                    .map(|(_, index)| index);
+                if let Some(Entry::Tool {
+                    name,
+                    output,
+                    is_error,
+                    ..
+                }) = pending_index.and_then(|index| entries.get_mut(index))
+                {
+                    if let Some(tool_name) = &message.tool_name {
+                        name.clone_from(tool_name);
+                    }
+                    output.clone_from(&message.content);
+                    *is_error = message.is_error;
+                } else {
+                    entries.push(Entry::Tool {
+                        name: message.tool_name.clone().unwrap_or_else(|| "tool".into()),
+                        args: String::new(),
+                        output: message.content.clone(),
+                        is_error: message.is_error,
+                        running: false,
+                    });
+                }
+            }
         }
     }
     entries
 }
 
-fn render_entries(entries: &[Entry], width: usize) -> Vec<String> {
+fn render_entries(entries: &[Entry], width: usize, tools_expanded: bool) -> Vec<String> {
     let mut lines = Vec::new();
     for entry in entries {
         match entry {
@@ -615,27 +900,15 @@ fn render_entries(entries: &[Entry], width: usize) -> Vec<String> {
                 output,
                 is_error,
                 running,
-            } => {
-                let state = if *running {
-                    "running"
-                } else if *is_error {
-                    "error"
-                } else {
-                    "done"
-                };
-                let color = if *is_error { 31 } else { 33 };
-                lines.push(format!("\x1b[1;{color}mTool: {name} [{state}]\x1b[0m"));
-                if !args.is_empty() {
-                    let pretty = serde_json::from_str::<serde_json::Value>(args)
-                        .ok()
-                        .and_then(|value| serde_json::to_string_pretty(&value).ok())
-                        .unwrap_or_else(|| args.clone());
-                    lines.extend(markdown::render(&format!("```json\n{pretty}\n```"), width));
-                }
-                if !output.is_empty() {
-                    lines.extend(markdown::render(output, width));
-                }
-            }
+            } => lines.extend(tool_view::render(
+                name,
+                args,
+                output,
+                *is_error,
+                *running,
+                width,
+                tools_expanded,
+            )),
             Entry::Notice(content) => {
                 lines.push("\x1b[1;33mYawl\x1b[0m".into());
                 lines.extend(markdown::render(content, width));
@@ -779,7 +1052,7 @@ fn build_frame(
     let cursor_input_row = layout.cursor_row.saturating_sub(input_start);
     let input_height = input_lines.len() + 2;
     let transcript_height = rows.saturating_sub(input_height + 1);
-    let transcript = render_entries(&state.entries, columns);
+    let transcript = render_entries(&state.entries, columns, state.tools_expanded);
     let max_scroll = transcript.len().saturating_sub(transcript_height);
     state.scroll_offset = state.scroll_offset.min(max_scroll);
     let end = transcript.len().saturating_sub(state.scroll_offset);
@@ -835,6 +1108,7 @@ mod tests {
             entries: vec![Entry::Assistant("hello".into())],
             streaming_assistant: None,
             running_tool: None,
+            tools_expanded: false,
             model: "test".into(),
             context_tokens: 12,
             context_window: 100,
@@ -853,9 +1127,44 @@ mod tests {
     fn loaded_messages_become_transcript_entries() {
         let messages = vec![
             Message::user("hi"),
-            Message::assistant("hello".into(), vec![]),
+            Message::assistant(
+                "hello".into(),
+                vec![crate::provider::ToolCall {
+                    id: "id".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"pwd"}"#.into(),
+                }],
+            ),
             Message::tool_result("id", "shell", "ok".into(), false),
         ];
-        assert_eq!(entries_from_messages(&messages).len(), 3);
+        let entries = entries_from_messages(&messages);
+        assert_eq!(entries.len(), 3);
+        let Entry::Tool { args, output, .. } = &entries[2] else {
+            panic!("expected paired tool entry");
+        };
+        assert!(args.contains("pwd"));
+        assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn tool_entries_are_compact_and_visually_separated() {
+        let output = (1..=30)
+            .map(|line| format!("output line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entries = vec![Entry::Tool {
+            name: "shell".into(),
+            args: r#"{"command":"cargo test --all-targets"}"#.into(),
+            output,
+            is_error: false,
+            running: false,
+        }];
+
+        let rendered = render_entries(&entries, 80, false);
+        let plain = markdown::strip_ansi(&rendered.join("\n"));
+        assert!(rendered.len() <= 16, "tool used {} lines", rendered.len());
+        assert!(plain.contains("$ cargo test --all-targets"));
+        assert!(plain.contains("lines, Ctrl+O to expand"));
+        assert!(rendered.iter().any(|line| line.contains("\x1b[48;5;")));
     }
 }

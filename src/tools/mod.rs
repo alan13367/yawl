@@ -387,12 +387,14 @@ printf '%s:%s' "$YAWL_SESSION_ID" "$input"
         std::fs::set_permissions(&tool_path, permissions).unwrap();
 
         let config = Config {
-            model: "test".into(),
+            model: Some("test".into()),
             anthropic_base_url: String::new(),
             openai_base_url: String::new(),
             max_tokens: 1,
             context_windows: std::collections::HashMap::new(),
+            auto_compact: true,
             compact_threshold: 0.85,
+            providers: std::collections::HashMap::new(),
             home_dir,
             project_dir,
         };

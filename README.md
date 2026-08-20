@@ -16,14 +16,14 @@ cd yawl
 cargo install --path .
 ```
 
-Set the API key for the provider you use:
+Run `yawl` after installation. On first use it asks you to choose a provider, configure its endpoint and authentication, and select a model. Yawl does not assume a default model. Run `yawl --setup` to repeat onboarding later.
+
+API-key providers read their usual environment variables:
 
 ```sh
 export ANTHROPIC_API_KEY="..."
 export OPENAI_API_KEY="..."
 ```
-
-`OPENAI_API_KEY` may be empty for a local server that does not require authentication.
 
 ## Use it
 
@@ -64,16 +64,18 @@ Run `yawl --help` for the complete command-line reference.
 - Pasted multiline text stays multiline through bracketed paste mode.
 - `Up` and `Down` browse input history.
 - `Ctrl+U`, `Ctrl+K`, and `Ctrl+W` delete text.
+- `Ctrl+O` expands or collapses tool arguments and output. Tool blocks start compact.
 - The mouse wheel and `PageUp` or `PageDown` move through Yawl's internal scrollback.
 - `Ctrl+C` aborts the active model response or tool. It does not exit Yawl.
 
-The terminal interface renders headings, emphasis, inline code, lists, blockquotes, tables, and fenced code. Fenced blocks have lightweight highlighting for Rust, Python, JavaScript, TypeScript, Go, C, C++, Bash, JSON, TOML, HTML, and CSS.
+The terminal interface renders headings, emphasis, inline code, lists, blockquotes, tables, and fenced code. Fenced blocks have lightweight highlighting for Rust, Python, JavaScript, TypeScript, Go, C, C++, Bash, JSON, TOML, HTML, and CSS. Tool calls use separate full-width blocks with compact views for shell commands, file reads, writes, and edits.
 
 ## Slash commands
 
 | Command | Effect |
 | --- | --- |
-| `/model [MODEL]` | Show or switch the model for the current session |
+| `/model [MODEL]` | List configured models or switch the model for the current session |
+| `/settings [KEY ...]` | Show or change persistent settings |
 | `/clear` | Start a new session |
 | `/compact` | Summarize older messages now |
 | `/tools` | List builtin and discovered tools |
@@ -83,29 +85,96 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 
 ## Models and configuration
 
-Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`. Project values override global values. Every field is optional.
+Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`. Project values override global values. Every field is optional. If the merged config has no `model`, interactive startup runs onboarding; print mode requires `--model`.
 
 ```json
 {
-  "model": "claude-sonnet-4-5",
+  "model": "omlx:Qwen3-Coder",
   "anthropic_base_url": "https://api.anthropic.com",
-  "openai_base_url": "http://localhost:11434/v1",
+  "openai_base_url": "https://api.openai.com/v1",
   "max_tokens": 8192,
+  "auto_compact": true,
   "compact_threshold": 0.85,
   "context_windows": {
-    "openai:local-model": 32768
+    "omlx:Qwen3-Coder": 65536
   }
 }
 ```
 
-Model names beginning with `claude` use Anthropic. Other names use the OpenAI-compatible endpoint. Prefix a model with `anthropic:` or `openai:` to select the provider explicitly:
+Yawl has built-in `anthropic:`, `openai:`, and `openai-codex:` routes. It also has local presets for Ollama, LM Studio, and OMLX:
 
 ```sh
 yawl -m anthropic:claude-sonnet-4-5
-yawl -m openai:local-model
+yawl -m openai:gpt-4o
+yawl -m openai-codex:gpt-5.6-sol
+yawl -m ollama:qwen2.5-coder:7b
+yawl -m lmstudio:local-model-id
+yawl -m omlx:local-model-id
 ```
 
-The OpenAI-compatible provider works with servers that expose streaming chat completions, including OpenAI, Ollama, llama.cpp, and OpenRouter. Set `openai_base_url` to the API root that contains `/chat/completions`.
+The preset endpoints are `http://127.0.0.1:11434/v1` for Ollama, `http://127.0.0.1:1234/v1` for LM Studio, and `http://127.0.0.1:8000/v1` for OMLX. A model ID may contain colons, so `ollama:llama3.1:8b` selects provider `ollama` and model `llama3.1:8b`.
+
+### Use a ChatGPT subscription
+
+Choose "OpenAI Codex" during onboarding to use a ChatGPT Plus or Pro subscription. Yawl starts OpenAI's device-code flow, stores the OAuth credential in `~/.yawl/auth.json` with mode `0600`, and refreshes it before expiry. You can log in again without changing the selected model:
+
+```sh
+yawl --login openai-codex
+```
+
+The provider uses the ChatGPT Codex Responses endpoint with SSE streaming, tool calls, token usage, and encrypted reasoning replay for multi-step tool runs. Supported model IDs are listed by `/model`.
+
+### Add an OpenAI-compatible provider
+
+Add providers under `providers`. This uses the same field names as pi's `models.json`, so an `openai-completions` provider block can be copied with little or no editing. Here is an OMLX configuration:
+
+```json
+{
+  "model": "omlx:Qwen3-Coder",
+  "providers": {
+    "omlx": {
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "$OMLX_API_KEY",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "Qwen3-Coder",
+          "name": "Qwen3 Coder (local)",
+          "contextWindow": 65536,
+          "maxTokens": 32768
+        }
+      ]
+    }
+  }
+}
+```
+
+`models` is optional. It supplies labels and token limits for `/model`; Yawl still accepts an unlisted model ID. Custom providers currently use streaming OpenAI Chat Completions at `BASE_URL/chat/completions` and support text plus tool calls.
+
+Provider keys and header values accept `$ENV_VAR` and `${ENV_VAR}` references. If `apiKey` is omitted, Yawl also checks an environment variable derived from the provider name, such as `OMLX_API_KEY` or `LMSTUDIO_API_KEY`. Keyless local servers need no placeholder key. Extra pi model fields such as `cost`, `input`, and `reasoning` are ignored.
+
+These compatibility fields are supported at provider or model level:
+
+```json
+{
+  "compat": {
+    "supportsUsageInStreaming": false,
+    "supportsFinishReason": false,
+    "requiresToolResultName": true,
+    "maxTokensField": "max_tokens"
+  }
+}
+```
+
+You can configure an endpoint from the TUI without editing JSON:
+
+```text
+/settings provider omlx http://127.0.0.1:8000/v1 $OMLX_API_KEY
+/settings model omlx:Qwen3-Coder
+```
+
+Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; `./.yawl/config.json` can still override it. It also changes `max_tokens`, automatic compaction, the compaction threshold, context windows, and built-in endpoint URLs.
 
 ## Sessions and compaction
 

@@ -8,6 +8,7 @@ pub mod agent;
 pub mod compaction;
 pub mod config;
 pub mod error;
+pub mod onboarding;
 pub mod prompt;
 pub mod provider;
 pub mod session;

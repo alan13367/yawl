@@ -19,6 +19,8 @@ Options:
   -c, --continue              Resume the most recent session
       --session ID            Resume a session by id
       --list-tools            List builtin and discovered exec tools
+      --login PROVIDER        Log into a subscription provider
+      --setup                 Run provider and model onboarding again
   -h, --help                  Show this help
   -V, --version               Show the version
 ";
@@ -29,6 +31,8 @@ struct Cli {
     continue_latest: bool,
     session_id: Option<String>,
     list_tools: bool,
+    login: Option<String>,
+    setup: bool,
     help: bool,
     version: bool,
     prompt: Vec<String>,
@@ -62,6 +66,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
                 );
             }
             "--list-tools" => cli.list_tools = true,
+            "--login" => {
+                cli.login = Some(
+                    args.next()
+                        .ok_or_else(|| "--login requires a provider".to_string())?,
+                );
+            }
+            "--setup" => cli.setup = true,
             "-h" | "--help" => cli.help = true,
             "-V" | "--version" => cli.version = true,
             _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'")),
@@ -70,6 +81,16 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     }
     if cli.continue_latest && cli.session_id.is_some() {
         return Err("--continue and --session cannot be used together".into());
+    }
+    if (cli.login.is_some() || cli.setup)
+        && (cli.model.is_some()
+            || cli.continue_latest
+            || cli.session_id.is_some()
+            || cli.list_tools
+            || !cli.prompt.is_empty()
+            || cli.login.is_some() && cli.setup)
+    {
+        return Err("--login and --setup must be used alone".into());
     }
     Ok(cli)
 }
@@ -102,18 +123,43 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     }
 
     let mut config = Config::load()?;
+    if let Some(provider) = &cli.login {
+        yawl::install_interrupt_handler()?;
+        match provider.as_str() {
+            "openai-codex" | "codex" => yawl::provider::codex::login(&config)?,
+            _ => {
+                return Err(Box::new(Error::Config(format!(
+                    "unsupported login provider '{provider}'; supported: openai-codex"
+                ))));
+            }
+        }
+        return Ok(0);
+    }
+    if cli.setup {
+        yawl::install_interrupt_handler()?;
+        let _ = yawl::onboarding::run(&config)?;
+        return Ok(0);
+    }
     if let Some(model) = &cli.model {
-        config.model.clone_from(model);
+        config.model = Some(model.clone());
     }
     if cli.list_tools {
         list_tools(&config);
         return Ok(0);
     }
 
-    let (session, messages) = open_session(&config, &cli)?;
-    let model = config.model.clone();
-    let mut agent = Agent::new(config, model, session, messages);
     let stdin_is_terminal = io::stdin().is_terminal();
+    if config.model.is_none() && cli.prompt.is_empty() && stdin_is_terminal {
+        yawl::install_interrupt_handler()?;
+        config = yawl::onboarding::run(&config)?;
+    }
+    let model = config.model.clone().ok_or_else(|| {
+        Error::Config(
+            "no model configured; run 'yawl' in a terminal for setup or pass --model".into(),
+        )
+    })?;
+    let (session, messages) = open_session(&config, &cli)?;
+    let mut agent = Agent::new(config, model, session, messages);
 
     if cli.prompt.is_empty() && stdin_is_terminal {
         yawl::tui::run(&mut agent)?;
@@ -255,6 +301,15 @@ mod tests {
     #[test]
     fn rejects_conflicting_session_flags() {
         assert!(parse(&["-c", "--session", "abc"]).is_err());
+    }
+
+    #[test]
+    fn parses_standalone_login() {
+        let cli = parse(&["--login", "openai-codex"]).expect("login should parse");
+        assert_eq!(cli.login.as_deref(), Some("openai-codex"));
+        assert!(parse(&["--login", "openai-codex", "prompt"]).is_err());
+        assert!(parse(&["--setup"]).is_ok());
+        assert!(parse(&["--setup", "--login", "openai-codex"]).is_err());
     }
 
     #[test]
