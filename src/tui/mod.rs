@@ -35,12 +35,15 @@ Commands
   /skills              list discovered skills and search directories
   /skill:NAME [ARGS]   run a discovered skill
   /resume [ID|NUMBER]  open the session picker or resume directly
+  /unqueue [N|all]     cancel queued messages
   /help                show this help
   /quit                leave Yawl
 
 Input
   Enter submits. Shift+Enter or Alt+Enter inserts a newline.
-  Type / for commands; Up/Down select and Tab completes a menu item.
+  Type / for commands; Up/Down select, Tab completes, and Enter accepts a sole match.
+  Model and settings pickers remain available during an active response.
+  Messages submitted during a response appear below it as queued.
   Outside the menu, Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
   Ctrl+O expands or collapses tool output. Ctrl+C aborts the active turn.
   Mouse wheel and PageUp/PageDown scroll.
@@ -59,25 +62,58 @@ enum PickerAction {
     OpenModels { save: bool },
     OpenReasoning { save: bool },
     SetReasoning { effort: Option<String>, save: bool },
-    ToggleHideReasoning,
+    SetHideReasoning(bool),
     ResumeSession(String),
-    EditSetting(String),
-    ToggleAutoCompact,
+    EditSetting { key: String, initial: String },
+    EditModel { save: bool, initial: String },
+    ApplySetting { argument: String, selected: usize },
+    SetAutoCompact(bool),
+    RemoveQueued(usize),
+    ClearQueued,
     Reload,
     ShowSettings,
 }
 
+#[derive(Clone)]
 struct PickerItem {
     label: String,
     description: String,
     action: PickerAction,
 }
 
+#[derive(Clone)]
 struct Picker {
     title: String,
     hint: String,
     items: Vec<PickerItem>,
     selected: usize,
+    editing: Option<PickerEdit>,
+}
+
+#[derive(Clone)]
+enum PickerEdit {
+    Setting(String),
+    Model { save: bool },
+}
+
+struct ActivePickers {
+    model: Picker,
+    default_model: Picker,
+    settings: Picker,
+    reasoning: Picker,
+    default_reasoning: Picker,
+}
+
+impl ActivePickers {
+    fn from_agent(agent: &Agent) -> Self {
+        Self {
+            model: model_picker(agent, false),
+            default_model: model_picker(agent, true),
+            settings: settings_picker(agent),
+            reasoning: reasoning_picker(agent, false),
+            default_reasoning: reasoning_picker(agent, true),
+        }
+    }
 }
 
 struct ViewState {
@@ -91,6 +127,7 @@ struct ViewState {
     activity: String,
     scroll_offset: usize,
     queued_inputs: std::collections::VecDeque<String>,
+    pending_actions: std::collections::VecDeque<PickerAction>,
     completions: Vec<Completion>,
     completion_index: usize,
     picker: Option<Picker>,
@@ -109,6 +146,7 @@ impl ViewState {
             activity: String::new(),
             scroll_offset: 0,
             queued_inputs: std::collections::VecDeque::new(),
+            pending_actions: std::collections::VecDeque::new(),
             completions: command_completions(agent),
             completion_index: 0,
             picker: None,
@@ -256,7 +294,14 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
     terminal.draw(&mut state, &editor)?;
 
     loop {
-        if let Some(input) = state.queued_inputs.pop_front() {
+        if let Some(action) = state.pending_actions.pop_front() {
+            activate_picker_action(agent, &mut state, action);
+            terminal.draw(&mut state, &editor)?;
+            continue;
+        }
+        if state.picker.is_none()
+            && let Some(input) = state.queued_inputs.pop_front()
+        {
             if handle_submission(
                 agent,
                 input,
@@ -274,7 +319,12 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
         if state.picker.is_some() {
             match event {
                 Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
-                Event::Key(key) => handle_picker_key(agent, &mut state, &mut editor, key),
+                Event::Key(key) => {
+                    if let Some(action) = take_picker_action(&mut state, &mut editor, key) {
+                        activate_picker_action(agent, &mut state, action);
+                    }
+                }
+                Event::Paste(text) if picker_is_editing(&state) => editor.paste(&text),
                 Event::Tick | Event::MouseScroll(_) | Event::Paste(_) => {}
             }
             terminal.draw(&mut state, &editor)?;
@@ -371,14 +421,16 @@ fn handle_submission<R: Read>(
             }
             "settings" if argument.is_empty() => open_settings_picker(agent, state),
             "settings" => {
-                settings(agent, argument, state);
+                let _ = settings(agent, argument, state);
                 state.refresh_completions(agent);
             }
             name if is_new_session_command(name) => match agent.reset() {
                 Ok(()) => {
                     let queued_inputs = std::mem::take(&mut state.queued_inputs);
+                    let pending_actions = std::mem::take(&mut state.pending_actions);
                     *state = ViewState::from_agent(agent);
                     state.queued_inputs = queued_inputs;
+                    state.pending_actions = pending_actions;
                     state.notice("Started a new session.");
                 }
                 Err(error) => state.notice(format!("Could not start a session: {error}")),
@@ -405,6 +457,7 @@ fn handle_submission<R: Read>(
             "skills" => show_skills(agent, state),
             "resume" if argument.is_empty() => open_resume_picker(agent, state),
             "resume" => resume(agent, argument, state),
+            "unqueue" => unqueue(argument, state),
             "" => {}
             other => state.notice(format!("Unknown command '/{other}'. Type /help.")),
         }
@@ -452,6 +505,7 @@ fn command_completions(agent: &Agent) -> Vec<Completion> {
         ("/tools", "List available tools"),
         ("/skills", "List available skills"),
         ("/resume", "List or resume sessions"),
+        ("/unqueue", "Cancel queued messages"),
         ("/help", "Show help"),
         ("/quit", "Exit Yawl"),
     ]
@@ -508,6 +562,11 @@ fn handle_completion_key(state: &mut ViewState, editor: &mut Editor, key: Key) -
             state.completion_index = 0;
             true
         }
+        Key::Enter if matches.len() == 1 => {
+            editor.complete_command(&matches[0]);
+            state.completion_index = 0;
+            false
+        }
         _ => false,
     }
 }
@@ -533,6 +592,10 @@ fn show_skills(agent: &Agent, state: &mut ViewState) {
 }
 
 fn open_model_picker(agent: &Agent, state: &mut ViewState, save: bool) {
+    state.picker = Some(model_picker(agent, save));
+}
+
+fn model_picker(agent: &Agent, save: bool) -> Picker {
     let selected_model = if save {
         agent.config().model.as_deref().unwrap_or(agent.model())
     } else {
@@ -566,17 +629,16 @@ fn open_model_picker(agent: &Agent, state: &mut ViewState, save: bool) {
     items.push(PickerItem {
         label: "Use another model ID…".into(),
         description: "Enter a model not listed above".into(),
-        action: PickerAction::EditSetting(if save {
-            "/settings model ".into()
-        } else {
-            "/model ".into()
-        }),
+        action: PickerAction::EditModel {
+            save,
+            initial: String::new(),
+        },
     });
     let selected = items
         .iter()
         .position(|item| item.description == selected_model)
         .unwrap_or(0);
-    state.picker = Some(Picker {
+    Picker {
         title: if save {
             "Default model".into()
         } else {
@@ -585,10 +647,15 @@ fn open_model_picker(agent: &Agent, state: &mut ViewState, save: bool) {
         hint: "↑/↓ move  Enter select  Esc cancel".into(),
         items,
         selected,
-    });
+        editing: None,
+    }
 }
 
 fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
+    state.picker = Some(settings_picker(agent));
+}
+
+fn settings_picker(agent: &Agent) -> Picker {
     let on_off = if agent.config().auto_compact {
         "On"
     } else {
@@ -599,7 +666,7 @@ fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
     } else {
         "Visible"
     };
-    state.picker = Some(Picker {
+    Picker {
         title: "Settings".into(),
         hint: "↑/↓ move  Enter change  Esc close".into(),
         selected: 0,
@@ -616,7 +683,10 @@ fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
             PickerItem {
                 label: "Max output tokens".into(),
                 description: agent.config().max_tokens.to_string(),
-                action: PickerAction::EditSetting("/settings max_tokens ".into()),
+                action: PickerAction::EditSetting {
+                    key: "max_tokens".into(),
+                    initial: agent.config().max_tokens.to_string(),
+                },
             },
             PickerItem {
                 label: "Codex reasoning effort".into(),
@@ -628,28 +698,41 @@ fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
                 action: if crate::model::is_codex(agent.config(), agent.model()) {
                     PickerAction::OpenReasoning { save: true }
                 } else {
-                    PickerAction::EditSetting("/settings reasoning_effort ".into())
+                    PickerAction::EditSetting {
+                        key: "reasoning_effort".into(),
+                        initial: agent
+                            .config()
+                            .reasoning_effort
+                            .clone()
+                            .unwrap_or_else(|| "default".into()),
+                    }
                 },
             },
             PickerItem {
                 label: "Reasoning display".into(),
                 description: format!("{reasoning_visibility} · Enter to toggle"),
-                action: PickerAction::ToggleHideReasoning,
+                action: PickerAction::SetHideReasoning(!agent.config().hide_reasoning),
             },
             PickerItem {
                 label: "Automatic compaction".into(),
                 description: format!("{on_off} · Enter to toggle"),
-                action: PickerAction::ToggleAutoCompact,
+                action: PickerAction::SetAutoCompact(!agent.config().auto_compact),
             },
             PickerItem {
                 label: "Compaction threshold".into(),
                 description: format!("{:.0}%", agent.config().compact_threshold * 100.0),
-                action: PickerAction::EditSetting("/settings compact_threshold ".into()),
+                action: PickerAction::EditSetting {
+                    key: "compact_threshold".into(),
+                    initial: format!("{:.0}%", agent.config().compact_threshold * 100.0),
+                },
             },
             PickerItem {
                 label: "Current model context window".into(),
                 description: agent.context_window().to_string(),
-                action: PickerAction::EditSetting("/settings context_window ".into()),
+                action: PickerAction::EditSetting {
+                    key: "context_window".into(),
+                    initial: agent.context_window().to_string(),
+                },
             },
             PickerItem {
                 label: "Skill directories".into(),
@@ -657,22 +740,34 @@ fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
                     "{} configured · add or remove",
                     agent.config().skill_dirs.len()
                 ),
-                action: PickerAction::EditSetting("/settings skills ".into()),
+                action: PickerAction::EditSetting {
+                    key: "skills".into(),
+                    initial: "add ".into(),
+                },
             },
             PickerItem {
                 label: "OpenAI-compatible provider".into(),
                 description: "Add or update a provider".into(),
-                action: PickerAction::EditSetting("/settings provider ".into()),
+                action: PickerAction::EditSetting {
+                    key: "provider".into(),
+                    initial: String::new(),
+                },
             },
             PickerItem {
                 label: "OpenAI endpoint".into(),
                 description: agent.config().openai_base_url.clone(),
-                action: PickerAction::EditSetting("/settings openai_base_url ".into()),
+                action: PickerAction::EditSetting {
+                    key: "openai_base_url".into(),
+                    initial: agent.config().openai_base_url.clone(),
+                },
             },
             PickerItem {
                 label: "Anthropic endpoint".into(),
                 description: agent.config().anthropic_base_url.clone(),
-                action: PickerAction::EditSetting("/settings anthropic_base_url ".into()),
+                action: PickerAction::EditSetting {
+                    key: "anthropic_base_url".into(),
+                    initial: agent.config().anthropic_base_url.clone(),
+                },
             },
             PickerItem {
                 label: "Reload configuration".into(),
@@ -685,10 +780,15 @@ fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
                 action: PickerAction::ShowSettings,
             },
         ],
-    });
+        editing: None,
+    }
 }
 
 fn open_reasoning_picker(agent: &Agent, state: &mut ViewState, save: bool) {
+    state.picker = Some(reasoning_picker(agent, save));
+}
+
+fn reasoning_picker(agent: &Agent, save: bool) -> Picker {
     let target = crate::model::ModelTarget::parse(agent.model(), agent.config());
     let model = target.model();
     let current = agent.config().reasoning_effort.as_deref();
@@ -719,12 +819,13 @@ fn open_reasoning_picker(agent: &Agent, state: &mut ViewState, save: bool) {
             })
         })
         .unwrap_or(0);
-    state.picker = Some(Picker {
+    Picker {
         title: format!("Reasoning · {model}"),
         hint: "↑/↓ move  Enter select  Esc cancel".into(),
         items,
         selected,
-    });
+        editing: None,
+    }
 }
 
 fn title_case_effort(effort: &str) -> String {
@@ -747,10 +848,53 @@ fn reasoning_description(effort: &str) -> &'static str {
     }
 }
 
-fn handle_picker_key(agent: &mut Agent, state: &mut ViewState, editor: &mut Editor, key: Key) {
-    let Some(picker) = state.picker.as_mut() else {
-        return;
-    };
+fn picker_is_editing(state: &ViewState) -> bool {
+    state
+        .picker
+        .as_ref()
+        .is_some_and(|picker| picker.editing.is_some())
+}
+
+fn take_picker_action(
+    state: &mut ViewState,
+    editor: &mut Editor,
+    key: Key,
+) -> Option<PickerAction> {
+    let picker = state.picker.as_mut()?;
+
+    if let Some(editing) = picker.editing.clone() {
+        match key {
+            Key::Escape | Key::Ctrl('c') => {
+                editor.clear();
+                picker.editing = None;
+            }
+            Key::Enter => {
+                if let Some(value) = editor.take_text() {
+                    let selected = picker.selected;
+                    state.picker = None;
+                    return Some(match editing {
+                        PickerEdit::Setting(key) => PickerAction::ApplySetting {
+                            argument: format!("{key} {}", value.trim()),
+                            selected,
+                        },
+                        PickerEdit::Model { save } => {
+                            if save {
+                                PickerAction::SaveModel(value.trim().to_string())
+                            } else {
+                                PickerAction::SwitchModel(value.trim().to_string())
+                            }
+                        }
+                    });
+                }
+            }
+            Key::Up | Key::Down => {}
+            _ => {
+                let _ = editor.handle_key(key);
+            }
+        }
+        return None;
+    }
+
     match key {
         Key::Escape | Key::Ctrl('c') => state.picker = None,
         Key::Up | Key::Char('k') => picker.selected = picker.selected.saturating_sub(1),
@@ -766,21 +910,129 @@ fn handle_picker_key(agent: &mut Agent, state: &mut ViewState, editor: &mut Edit
                 .items
                 .get(picker.selected)
                 .map(|item| item.action.clone());
-            state.picker = None;
-            if let Some(action) = action {
-                activate_picker_action(agent, state, editor, action);
+            match action {
+                Some(PickerAction::EditSetting { key, initial }) => {
+                    editor.clear();
+                    editor.paste(&initial);
+                    picker.editing = Some(PickerEdit::Setting(key));
+                }
+                Some(PickerAction::EditModel { save, initial }) => {
+                    editor.clear();
+                    editor.paste(&initial);
+                    picker.editing = Some(PickerEdit::Model { save });
+                }
+                Some(action) => {
+                    state.picker = None;
+                    return Some(action);
+                }
+                None => {}
             }
         }
         _ => {}
     }
+    None
 }
 
-fn activate_picker_action(
-    agent: &mut Agent,
-    state: &mut ViewState,
-    editor: &mut Editor,
-    action: PickerAction,
-) {
+fn select_picker_item(state: &mut ViewState, selected: usize) {
+    if let Some(picker) = state.picker.as_mut() {
+        picker.selected = selected.min(picker.items.len().saturating_sub(1));
+    }
+}
+
+fn queue_picker(state: &ViewState, selected: usize) -> Option<Picker> {
+    if state.queued_inputs.is_empty() {
+        return None;
+    }
+    let mut items = state
+        .queued_inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| PickerItem {
+            label: format!("Queued {}", index + 1),
+            description: input.replace('\n', " "),
+            action: PickerAction::RemoveQueued(index),
+        })
+        .collect::<Vec<_>>();
+    items.push(PickerItem {
+        label: "Clear all queued messages".into(),
+        description: format!("Remove all {} pending", state.queued_inputs.len()),
+        action: PickerAction::ClearQueued,
+    });
+    Some(Picker {
+        title: "Queued messages".into(),
+        hint: "↑/↓ move  Enter remove  Esc close".into(),
+        selected: selected.min(items.len().saturating_sub(1)),
+        items,
+        editing: None,
+    })
+}
+
+fn open_queue_picker(state: &mut ViewState) {
+    state.picker = queue_picker(state, 0);
+    if state.picker.is_none() {
+        state.activity = "no queued messages".into();
+    }
+}
+
+fn remove_queued(state: &mut ViewState, index: usize) -> bool {
+    if state.queued_inputs.remove(index).is_some() {
+        state.activity = format!("removed queued message {}", index + 1);
+        state.scroll_offset = 0;
+        true
+    } else {
+        state.activity = format!("queued message {} does not exist", index + 1);
+        false
+    }
+}
+
+fn clear_queued(state: &mut ViewState) {
+    let count = state.queued_inputs.len();
+    state.queued_inputs.clear();
+    state.activity = match count {
+        0 => "no queued messages".into(),
+        1 => "removed 1 queued message".into(),
+        _ => format!("removed {count} queued messages"),
+    };
+    state.scroll_offset = 0;
+}
+
+fn unqueue(argument: &str, state: &mut ViewState) {
+    match argument {
+        "" => open_queue_picker(state),
+        "all" => clear_queued(state),
+        number => match number
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+        {
+            Some(index) => {
+                let _ = remove_queued(state, index);
+            }
+            None => state.activity = "usage: /unqueue [NUMBER|all]".into(),
+        },
+    }
+}
+
+fn handle_queue_picker_action(state: &mut ViewState, action: PickerAction) -> Option<PickerAction> {
+    match action {
+        PickerAction::RemoveQueued(index) => {
+            if remove_queued(state, index) {
+                state.picker = queue_picker(state, index);
+            }
+            None
+        }
+        PickerAction::ClearQueued => {
+            clear_queued(state);
+            None
+        }
+        action => Some(action),
+    }
+}
+
+fn activate_picker_action(agent: &mut Agent, state: &mut ViewState, action: PickerAction) {
+    let Some(action) = handle_queue_picker_action(state, action) else {
+        return;
+    };
     match action {
         PickerAction::SwitchModel(model) => {
             agent.switch_model(model);
@@ -794,9 +1046,13 @@ fn activate_picker_action(
             }
         }
         PickerAction::SaveModel(model) => {
-            settings(agent, &format!("model {model}"), state);
-            if crate::model::is_codex(agent.config(), agent.model()) {
-                open_reasoning_picker(agent, state, true);
+            if settings(agent, &format!("model {model}"), state) {
+                if crate::model::is_codex(agent.config(), agent.model()) {
+                    open_reasoning_picker(agent, state, true);
+                } else {
+                    open_settings_picker(agent, state);
+                    select_picker_item(state, 0);
+                }
             }
         }
         PickerAction::OpenModels { save } => open_model_picker(agent, state, save),
@@ -804,7 +1060,10 @@ fn activate_picker_action(
         PickerAction::SetReasoning { effort, save } => {
             if save {
                 let value = effort.as_deref().unwrap_or("default");
-                settings(agent, &format!("reasoning_effort {value}"), state);
+                if settings(agent, &format!("reasoning_effort {value}"), state) {
+                    open_settings_picker(agent, state);
+                    select_picker_item(state, 2);
+                }
             } else {
                 agent.set_reasoning_effort(effort.clone());
                 state.reasoning_effort = effort;
@@ -815,34 +1074,50 @@ fn activate_picker_action(
                 state.notice(format!("Using {} with {label} reasoning.", agent.model()));
             }
         }
-        PickerAction::ToggleHideReasoning => {
-            let value = if agent.config().hide_reasoning {
-                "off"
-            } else {
-                "on"
-            };
-            settings(agent, &format!("hide_reasoning {value}"), state);
+        PickerAction::SetHideReasoning(enabled) => {
+            if settings(
+                agent,
+                &format!("hide_reasoning {}", if enabled { "on" } else { "off" }),
+                state,
+            ) {
+                open_settings_picker(agent, state);
+                select_picker_item(state, 3);
+            }
         }
         PickerAction::ResumeSession(id) => load_session(agent, &id, state),
-        PickerAction::EditSetting(command) => editor.paste(&command),
-        PickerAction::ToggleAutoCompact => {
-            let value = if agent.config().auto_compact {
-                "off"
-            } else {
-                "on"
-            };
-            settings(agent, &format!("auto_compact {value}"), state);
+        PickerAction::ApplySetting { argument, selected } => {
+            if settings(agent, &argument, state) {
+                open_settings_picker(agent, state);
+                select_picker_item(state, selected);
+            }
         }
-        PickerAction::Reload => settings(agent, "reload", state),
+        PickerAction::SetAutoCompact(enabled) => {
+            if settings(
+                agent,
+                &format!("auto_compact {}", if enabled { "on" } else { "off" }),
+                state,
+            ) {
+                open_settings_picker(agent, state);
+                select_picker_item(state, 4);
+            }
+        }
+        PickerAction::Reload => {
+            if settings(agent, "reload", state) {
+                open_settings_picker(agent, state);
+                select_picker_item(state, 11);
+            }
+        }
         PickerAction::ShowSettings => show_settings(agent, state),
+        PickerAction::EditSetting { .. } | PickerAction::EditModel { .. } => {}
+        PickerAction::RemoveQueued(_) | PickerAction::ClearQueued => {}
     }
     state.refresh_completions(agent);
 }
 
-fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) {
+fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) -> bool {
     if argument.is_empty() {
         show_settings(agent, state);
-        return;
+        return false;
     }
 
     let mut parts = argument.split_whitespace();
@@ -953,8 +1228,12 @@ fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) {
                     path.display()
                 )),
             }
+            true
         }
-        Err(error) => state.notice(format!("Could not change setting: {error}")),
+        Err(error) => {
+            state.notice(format!("Could not change setting: {error}"));
+            false
+        }
     }
 }
 
@@ -1043,6 +1322,7 @@ fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
                 action: PickerAction::ResumeSession(session.id),
             })
             .collect(),
+        editing: None,
     });
 }
 
@@ -1085,8 +1365,10 @@ fn load_session(agent: &mut Agent, id: &str, state: &mut ViewState) {
     match agent.load_session(id) {
         Ok(()) => {
             let queued_inputs = std::mem::take(&mut state.queued_inputs);
+            let pending_actions = std::mem::take(&mut state.pending_actions);
             *state = ViewState::from_agent(agent);
             state.queued_inputs = queued_inputs;
+            state.pending_actions = pending_actions;
             state.notice(format!("Resumed session {id}."));
         }
         Err(error) => state.notice(format!("Could not resume '{id}': {error}")),
@@ -1101,6 +1383,7 @@ fn turn_interactive<R: Read>(
     terminal: &mut Terminal,
     events: &mut EventReader<R>,
 ) -> Result<bool, Error> {
+    let active_pickers = ActivePickers::from_agent(agent);
     std::thread::scope(|scope| {
         let (updates_tx, updates_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
@@ -1116,13 +1399,16 @@ fn turn_interactive<R: Read>(
             .recv()
             .map_err(|_| Error::Protocol("agent worker did not start".into()))?;
         pump_events(
-            updates_rx,
-            done_rx,
-            worker_thread,
+            WorkerChannels {
+                updates: updates_rx,
+                done: done_rx,
+                thread: worker_thread,
+            },
             state,
             editor,
             terminal,
             events,
+            &active_pickers,
         )
     })
 }
@@ -1134,6 +1420,7 @@ fn compact_interactive<R: Read>(
     terminal: &mut Terminal,
     events: &mut EventReader<R>,
 ) -> Result<(), Error> {
+    let active_pickers = ActivePickers::from_agent(agent);
     std::thread::scope(|scope| {
         let (updates_tx, updates_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
@@ -1149,33 +1436,41 @@ fn compact_interactive<R: Read>(
             .recv()
             .map_err(|_| Error::Protocol("agent worker did not start".into()))?;
         pump_events(
-            updates_rx,
-            done_rx,
-            worker_thread,
+            WorkerChannels {
+                updates: updates_rx,
+                done: done_rx,
+                thread: worker_thread,
+            },
             state,
             editor,
             terminal,
             events,
+            &active_pickers,
         )
     })
 }
 
-fn pump_events<R: Read, T>(
+struct WorkerChannels<T> {
     updates: Receiver<Update>,
     done: Receiver<Result<T, Error>>,
-    worker_thread: usize,
+    thread: usize,
+}
+
+fn pump_events<R: Read, T>(
+    worker: WorkerChannels<T>,
     state: &mut ViewState,
     editor: &mut Editor,
     terminal: &mut Terminal,
     events: &mut EventReader<R>,
+    active_pickers: &ActivePickers,
 ) -> Result<T, Error> {
     loop {
-        while let Ok(update) = updates.try_recv() {
+        while let Ok(update) = worker.updates.try_recv() {
             state.apply(update);
         }
-        match done.try_recv() {
+        match worker.done.try_recv() {
             Ok(result) => {
-                while let Ok(update) = updates.try_recv() {
+                while let Ok(update) = worker.updates.try_recv() {
                     state.apply(update);
                 }
                 terminal.draw(state, editor)?;
@@ -1187,7 +1482,21 @@ fn pump_events<R: Read, T>(
             Err(TryRecvError::Empty) => {}
         }
         terminal.draw(state, editor)?;
-        match events.read_event()? {
+        let event = events.read_event()?;
+        if state.picker.is_some() {
+            match event {
+                Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
+                Event::Key(key) => {
+                    if let Some(action) = take_picker_action(state, editor, key) {
+                        activate_picker_action_while_busy(state, action, active_pickers);
+                    }
+                }
+                Event::Paste(text) if picker_is_editing(state) => editor.paste(&text),
+                Event::Tick | Event::MouseScroll(_) | Event::Paste(_) => {}
+            }
+            continue;
+        }
+        match event {
             Event::Tick => {
                 if crate::interrupted() {
                     state.activity = "canceling turn".into();
@@ -1197,7 +1506,7 @@ fn pump_events<R: Read, T>(
             Event::Paste(text) => editor.paste(&text),
             Event::Key(Key::Ctrl('c')) => {
                 crate::set_interrupted(true);
-                interrupt_thread(worker_thread);
+                interrupt_thread(worker.thread);
                 state.activity = "canceling turn".into();
             }
             Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
@@ -1208,9 +1517,75 @@ fn pump_events<R: Read, T>(
                 if handle_completion_key(state, editor, key) {
                     // Keep accepting and completing input while the agent runs.
                 } else if let EditAction::Submit(input) = editor.handle_key(key) {
-                    state.queued_inputs.push_back(input);
+                    handle_submission_while_busy(input, state, active_pickers);
                 }
             }
+        }
+    }
+}
+
+fn handle_submission_while_busy(
+    input: String,
+    state: &mut ViewState,
+    active_pickers: &ActivePickers,
+) {
+    match busy_command(&input) {
+        Some(BusyCommand::Settings) => state.picker = Some(active_pickers.settings.clone()),
+        Some(BusyCommand::Model) => state.picker = Some(active_pickers.model.clone()),
+        Some(BusyCommand::Unqueue(argument)) => unqueue(&argument, state),
+        None => {
+            state.queued_inputs.push_back(input);
+            state.scroll_offset = 0;
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BusyCommand {
+    Settings,
+    Model,
+    Unqueue(String),
+}
+
+fn busy_command(input: &str) -> Option<BusyCommand> {
+    let command = input.trim().strip_prefix('/')?;
+    let (name, argument) = command
+        .split_once(char::is_whitespace)
+        .map_or((command, ""), |(name, argument)| (name, argument.trim()));
+    match name {
+        "settings" if argument.is_empty() => Some(BusyCommand::Settings),
+        "model" if argument.is_empty() => Some(BusyCommand::Model),
+        "unqueue" => Some(BusyCommand::Unqueue(argument.to_string())),
+        _ => None,
+    }
+}
+
+fn activate_picker_action_while_busy(
+    state: &mut ViewState,
+    action: PickerAction,
+    active_pickers: &ActivePickers,
+) {
+    let Some(action) = handle_queue_picker_action(state, action) else {
+        return;
+    };
+    match action {
+        PickerAction::OpenModels { save: true } => {
+            state.picker = Some(active_pickers.default_model.clone());
+        }
+        PickerAction::OpenModels { save: false } => {
+            state.picker = Some(active_pickers.model.clone());
+        }
+        PickerAction::OpenReasoning { save: true } => {
+            state.picker = Some(active_pickers.default_reasoning.clone());
+        }
+        PickerAction::OpenReasoning { save: false } => {
+            state.picker = Some(active_pickers.reasoning.clone());
+        }
+        PickerAction::EditSetting { .. } | PickerAction::EditModel { .. } => {}
+        PickerAction::RemoveQueued(_) | PickerAction::ClearQueued => {}
+        action => {
+            state.pending_actions.push_back(action);
+            state.activity = "change queued until the active response finishes".into();
         }
     }
 }
@@ -1337,6 +1712,16 @@ fn render_user_panel(content: &str, width: usize) -> Vec<String> {
     lines
 }
 
+fn render_queued_panel(content: &str, position: usize, width: usize) -> Vec<String> {
+    let mut lines = vec![markdown::fit_width(
+        &format!("\x1b[2;33mQueued {position} · waiting for the active response\x1b[0m"),
+        width,
+    )];
+    lines.extend(render_user_panel(content, width));
+    lines.push(String::new());
+    lines
+}
+
 struct Terminal {
     original: libc::termios,
     stdout: io::Stdout,
@@ -1449,7 +1834,7 @@ fn terminal_size() -> (u16, u16) {
     }
 }
 
-fn render_picker(picker: &Picker, columns: usize, height: usize) -> Vec<String> {
+fn render_picker(picker: &Picker, editor: &Editor, columns: usize, height: usize) -> Vec<String> {
     if height == 0 {
         return Vec::new();
     }
@@ -1474,7 +1859,17 @@ fn render_picker(picker: &Picker, columns: usize, height: usize) -> Vec<String> 
         } else {
             " "
         };
-        let text = format!(" {marker} {}  ·  {}", item.label, item.description);
+        let description = if absolute == picker.selected && picker.editing.is_some() {
+            let value = editor.text();
+            if value.is_empty() {
+                "type a value below…".into()
+            } else {
+                value.replace('\n', " ")
+            }
+        } else {
+            item.description.clone()
+        };
+        let text = format!(" {marker} {}  ·  {description}", item.label);
         if absolute == picker.selected {
             panel.push(boxed(&format!(
                 "\x1b[7m{}\x1b[0m",
@@ -1484,7 +1879,12 @@ fn render_picker(picker: &Picker, columns: usize, height: usize) -> Vec<String> 
             panel.push(boxed(&text));
         }
     }
-    panel.push(boxed(&format!(" \x1b[2m{}\x1b[0m", picker.hint)));
+    let hint = if picker.editing.is_some() {
+        "Edit below  Enter save  Esc cancel edit"
+    } else {
+        &picker.hint
+    };
+    panel.push(boxed(&format!(" \x1b[2m{hint}\x1b[0m")));
     panel.push(format!("{left}└{}┘", "─".repeat(inner)));
 
     if panel.len() > height {
@@ -1553,12 +1953,15 @@ fn build_frame(
     };
     let menu_height = menu.len();
     let transcript_height = rows.saturating_sub(input_height + menu_height + 1);
-    let transcript = render_entries(
+    let mut transcript = render_entries(
         state.transcript.entries(),
         columns,
         state.tools_expanded,
         state.hide_reasoning,
     );
+    for (index, input) in state.queued_inputs.iter().enumerate() {
+        transcript.extend(render_queued_panel(input, index + 1, columns));
+    }
     let max_scroll = transcript.len().saturating_sub(transcript_height);
     state.scroll_offset = state.scroll_offset.min(max_scroll);
     let end = transcript.len().saturating_sub(state.scroll_offset);
@@ -1567,7 +1970,7 @@ fn build_frame(
 
     let mut frame = Vec::with_capacity(rows);
     if let Some(picker) = &state.picker {
-        frame.extend(render_picker(picker, columns, transcript_height));
+        frame.extend(render_picker(picker, editor, columns, transcript_height));
     } else {
         frame.extend(std::iter::repeat_n(
             " ".repeat(columns),
@@ -1602,6 +2005,12 @@ fn build_frame(
     if !state.activity.is_empty() {
         status.push_str("  ");
         status.push_str(&state.activity);
+    }
+    if !state.queued_inputs.is_empty() {
+        status.push_str(&format!("  {} queued", state.queued_inputs.len()));
+    }
+    if !state.pending_actions.is_empty() {
+        status.push_str(&format!("  {} change pending", state.pending_actions.len()));
     }
     frame.push(format!(
         "\x1b[7m{}\x1b[0m",
@@ -1664,6 +2073,7 @@ mod tests {
             activity: String::new(),
             scroll_offset: 0,
             queued_inputs: std::collections::VecDeque::new(),
+            pending_actions: std::collections::VecDeque::new(),
             completions: Vec::new(),
             completion_index: 0,
             picker: None,
@@ -1693,8 +2103,9 @@ mod tests {
                     action: PickerAction::SwitchModel("provider:second".into()),
                 },
             ],
+            editing: None,
         };
-        let rendered = render_picker(&picker, 50, 10);
+        let rendered = render_picker(&picker, &Editor::default(), 50, 10);
         assert_eq!(rendered.len(), 10);
         assert!(
             rendered
@@ -1706,6 +2117,141 @@ mod tests {
                 .iter()
                 .any(|line| { line.contains("Second") && line.contains("\x1b[7m") })
         );
+    }
+
+    #[test]
+    fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
+        let mut state = ViewState {
+            transcript: Transcript::from_messages(&[]),
+            tools_expanded: false,
+            model: "test".into(),
+            reasoning_effort: None,
+            hide_reasoning: false,
+            context_tokens: 0,
+            context_window: 100,
+            activity: String::new(),
+            scroll_offset: 0,
+            queued_inputs: std::collections::VecDeque::new(),
+            pending_actions: std::collections::VecDeque::new(),
+            completions: Vec::new(),
+            completion_index: 0,
+            picker: Some(Picker {
+                title: "Settings".into(),
+                hint: "Enter change".into(),
+                selected: 0,
+                items: vec![PickerItem {
+                    label: "Max output tokens".into(),
+                    description: "8192".into(),
+                    action: PickerAction::EditSetting {
+                        key: "max_tokens".into(),
+                        initial: "8192".into(),
+                    },
+                }],
+                editing: None,
+            }),
+        };
+        let mut editor = Editor::default();
+
+        assert!(take_picker_action(&mut state, &mut editor, Key::Enter).is_none());
+        assert!(picker_is_editing(&state));
+        assert_eq!(editor.text(), "8192");
+
+        editor.clear();
+        editor.paste("16384");
+        let action = take_picker_action(&mut state, &mut editor, Key::Enter);
+        assert!(matches!(
+            action,
+            Some(PickerAction::ApplySetting {
+                argument,
+                selected: 0
+            }) if argument == "max_tokens 16384"
+        ));
+        assert!(state.picker.is_none());
+    }
+
+    #[test]
+    fn settings_and_model_pickers_are_recognized_during_an_active_turn() {
+        assert_eq!(busy_command(" /settings "), Some(BusyCommand::Settings));
+        assert_eq!(busy_command("/model"), Some(BusyCommand::Model));
+        assert_eq!(
+            busy_command("/unqueue 2"),
+            Some(BusyCommand::Unqueue("2".into()))
+        );
+        assert_eq!(busy_command("/settings max_tokens 1"), None);
+        assert_eq!(busy_command("hello"), None);
+    }
+
+    #[test]
+    fn enter_submits_the_only_matching_command_completion() {
+        let mut state = ViewState {
+            transcript: Transcript::from_messages(&[]),
+            tools_expanded: false,
+            model: "test".into(),
+            reasoning_effort: None,
+            hide_reasoning: false,
+            context_tokens: 0,
+            context_window: 100,
+            activity: String::new(),
+            scroll_offset: 0,
+            queued_inputs: std::collections::VecDeque::new(),
+            pending_actions: std::collections::VecDeque::new(),
+            completions: vec![Completion {
+                command: "/quit".into(),
+                description: "Exit Yawl".into(),
+            }],
+            completion_index: 0,
+            picker: None,
+        };
+        let mut editor = Editor::default();
+        editor.paste("/qui");
+
+        assert!(!handle_completion_key(&mut state, &mut editor, Key::Enter));
+        assert_eq!(
+            editor.handle_key(Key::Enter),
+            EditAction::Submit("/quit ".into())
+        );
+    }
+
+    #[test]
+    fn queue_picker_removes_a_selected_message_and_keeps_the_rest() {
+        let mut state = ViewState {
+            transcript: Transcript::from_messages(&[]),
+            tools_expanded: false,
+            model: "test".into(),
+            reasoning_effort: None,
+            hide_reasoning: false,
+            context_tokens: 0,
+            context_window: 100,
+            activity: String::new(),
+            scroll_offset: 0,
+            queued_inputs: ["first".into(), "second".into()].into(),
+            pending_actions: std::collections::VecDeque::new(),
+            completions: Vec::new(),
+            completion_index: 0,
+            picker: None,
+        };
+        open_queue_picker(&mut state);
+        let mut editor = Editor::default();
+
+        let action = take_picker_action(&mut state, &mut editor, Key::Enter);
+        let remaining = action.and_then(|action| handle_queue_picker_action(&mut state, action));
+
+        assert!(remaining.is_none());
+        assert_eq!(
+            state.queued_inputs,
+            std::collections::VecDeque::from(["second".into()])
+        );
+        assert!(state.picker.is_some());
+        assert_eq!(state.activity, "removed queued message 1");
+    }
+
+    #[test]
+    fn queued_message_has_a_visible_waiting_label() {
+        let rendered = render_queued_panel("follow up", 2, 50);
+        let plain = markdown::strip_ansi(&rendered.join("\n"));
+
+        assert!(plain.contains("Queued 2 · waiting for the active response"));
+        assert!(plain.contains("follow up"));
     }
 
     #[test]

@@ -30,6 +30,19 @@ impl Editor {
         self.buffer.is_empty()
     }
 
+    pub fn text(&self) -> String {
+        self.buffer.iter().collect()
+    }
+
+    pub fn take_text(&mut self) -> Option<String> {
+        let text = self.text();
+        if text.trim().is_empty() {
+            return None;
+        }
+        self.clear();
+        Some(text)
+    }
+
     /// Current slash-command token while the cursor is editing it.
     pub fn command_prefix(&self) -> Option<String> {
         if self.buffer.first() != Some(&'/') {
@@ -306,5 +319,15 @@ mod tests {
         let layout = editor.layout(5);
         assert_eq!(layout.lines, ["> abc", "  def"]);
         assert_eq!((layout.cursor_row, layout.cursor_col), (1, 5));
+    }
+
+    #[test]
+    fn transient_text_does_not_enter_submission_history() {
+        let mut editor = Editor::default();
+        editor.paste("16384");
+
+        assert_eq!(editor.take_text().as_deref(), Some("16384"));
+        editor.handle_key(Key::Up);
+        assert_eq!(editor.layout(20).lines, ["> "]);
     }
 }

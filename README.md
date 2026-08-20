@@ -62,7 +62,7 @@ Run `yawl --help` for the complete command-line reference.
 - `Shift+Enter` inserts a newline in terminals that support the kitty keyboard protocol.
 - `Alt+Enter` is the multiline fallback.
 - Pasted multiline text stays multiline through bracketed paste mode.
-- Typing `/` opens a filtered command and skill menu. `Up`/`Down` select an item and `Tab` completes it.
+- Typing `/` opens a filtered command and skill menu. `Up`/`Down` select an item and `Tab` completes it. Enter completes and runs the command when only one match remains, so `/qui` runs `/quit`.
 - Outside the completion menu, `Up` and `Down` browse input history.
 - `Ctrl+U`, `Ctrl+K`, and `Ctrl+W` delete text.
 - `Ctrl+O` expands or collapses tool arguments and output. Tool blocks start compact.
@@ -73,7 +73,9 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 
 ## Slash commands
 
-`/model` and `/settings` open lightweight keyboard pickers. Use the arrow keys and Enter to choose, or Escape to close.
+`/model` and `/settings` open lightweight keyboard pickers, including while a model response is still running. Use the arrow keys and Enter to choose, or Escape to close. Editable settings stay in the picker: Enter starts editing the current value, Enter again saves it, and the refreshed value is shown in the menu. A model or setting chosen during an active response is applied as soon as that response releases the agent, before the next message starts.
+
+Messages submitted during an active response are queued automatically. Each pending message is shown below the live transcript with a `Queued` label, and the status bar shows the queue length. Run `/unqueue` to choose a pending message to remove, `/unqueue NUMBER` to remove one directly, or `/unqueue all` to clear the queue.
 
 | Command | Effect |
 | --- | --- |
@@ -86,6 +88,7 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 | `/skills` | List discovered skills and their search directories |
 | `/skill:NAME [ARGS]` | Run a discovered Markdown skill |
 | `/resume [ID\|NUMBER]` | Open the session picker, or resume directly by ID or number |
+| `/unqueue [NUMBER\|all]` | Open the queued-message picker, remove one pending message, or clear the queue |
 | `/help` | Show terminal controls and commands |
 | `/quit` | Exit the terminal interface |
 
