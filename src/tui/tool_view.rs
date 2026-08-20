@@ -66,10 +66,16 @@ pub(super) fn render(
         SUCCESS_BACKGROUND
     };
 
-    lines
-        .into_iter()
-        .flat_map(|line| render_line(line, width, expanded, background))
-        .collect()
+    let padding = format!("{background}{}\x1b[0m", " ".repeat(width));
+    let mut rendered = Vec::new();
+    rendered.push(padding.clone());
+    rendered.extend(
+        lines
+            .into_iter()
+            .flat_map(|line| render_line(line, width, expanded, background)),
+    );
+    rendered.push(padding);
+    rendered
 }
 
 fn render_call(
@@ -348,6 +354,24 @@ mod tests {
 
         assert!(success.iter().all(|line| line.contains(SUCCESS_BACKGROUND)));
         assert!(error.iter().all(|line| line.contains(ERROR_BACKGROUND)));
+    }
+
+    #[test]
+    fn tool_blocks_have_background_padding_above_and_below_the_text() {
+        let rendered = render(
+            "shell",
+            r#"{"command":"true"}"#,
+            "",
+            false,
+            false,
+            40,
+            false,
+        );
+
+        assert_eq!(rendered.len(), 3);
+        assert!(markdown::strip_ansi(&rendered[0]).trim().is_empty());
+        assert_eq!(markdown::strip_ansi(&rendered[1]).trim(), "$ true");
+        assert!(markdown::strip_ansi(&rendered[2]).trim().is_empty());
     }
 
     #[test]

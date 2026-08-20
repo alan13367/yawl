@@ -3,7 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use serde_json::{Map, Value};
 
 #[cfg(test)]
@@ -20,6 +20,84 @@ pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 pub const DEFAULT_COMPACT_THRESHOLD: f64 = 0.85;
 const OPENAI_COMPLETIONS_API: &str = "openai-completions";
+
+/// RGB color used by the terminal UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UiColor {
+    pub(crate) red: u8,
+    pub(crate) green: u8,
+    pub(crate) blue: u8,
+}
+
+impl UiColor {
+    pub(crate) const WHITE: Self = Self::new(238, 238, 238);
+
+    pub(crate) const fn new(red: u8, green: u8, blue: u8) -> Self {
+        Self { red, green, blue }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        let normalized = value.trim().to_ascii_lowercase();
+        let named = match normalized.as_str() {
+            "white" => Some(Self::WHITE),
+            "gray" | "grey" => Some(Self::new(148, 148, 158)),
+            "red" => Some(Self::new(235, 111, 146)),
+            "orange" => Some(Self::new(240, 160, 96)),
+            "yellow" => Some(Self::new(232, 202, 118)),
+            "green" => Some(Self::new(139, 213, 162)),
+            "cyan" => Some(Self::new(116, 199, 213)),
+            "blue" => Some(Self::new(117, 169, 255)),
+            "purple" => Some(Self::new(190, 149, 255)),
+            "pink" => Some(Self::new(238, 148, 200)),
+            _ => None,
+        };
+        if let Some(color) = named {
+            return Ok(color);
+        }
+        let hex = normalized.strip_prefix('#').unwrap_or(&normalized);
+        if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("color must be a palette name or #RRGGBB".into());
+        }
+        let component = |range| {
+            u8::from_str_radix(&hex[range], 16)
+                .map_err(|_| "color must be a palette name or #RRGGBB".to_string())
+        };
+        Ok(Self::new(
+            component(0..2)?,
+            component(2..4)?,
+            component(4..6)?,
+        ))
+    }
+
+    pub(crate) fn config_value(self) -> String {
+        let named = [
+            ("white", Self::WHITE),
+            ("gray", Self::new(148, 148, 158)),
+            ("red", Self::new(235, 111, 146)),
+            ("orange", Self::new(240, 160, 96)),
+            ("yellow", Self::new(232, 202, 118)),
+            ("green", Self::new(139, 213, 162)),
+            ("cyan", Self::new(116, 199, 213)),
+            ("blue", Self::new(117, 169, 255)),
+            ("purple", Self::new(190, 149, 255)),
+            ("pink", Self::new(238, 148, 200)),
+        ];
+        named
+            .into_iter()
+            .find_map(|(name, color)| (color == self).then_some(name.to_string()))
+            .unwrap_or_else(|| format!("#{:02x}{:02x}{:02x}", self.red, self.green, self.blue))
+    }
+}
+
+impl<'de> Deserialize<'de> for UiColor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(de::Error::custom)
+    }
+}
 
 /// OpenAI Chat Completions compatibility switches understood by Yawl.
 ///
@@ -161,6 +239,11 @@ struct ConfigFile {
     reasoning_effort: Option<String>,
     /// Whether reasoning content is omitted from terminal output.
     hide_reasoning: Option<bool>,
+    accent_color: Option<UiColor>,
+    /// Compatibility with the brief two-color settings format.
+    status_bar_color: Option<UiColor>,
+    /// Compatibility with the brief two-color settings format.
+    text_box_color: Option<UiColor>,
     /// Per-model context window overrides, e.g. {"my-local-model": 32768}.
     context_windows: Option<HashMap<String, u64>>,
     /// Whether automatic context compaction is enabled.
@@ -198,6 +281,7 @@ pub struct Config {
     /// `None` leaves the provider default unchanged.
     pub reasoning_effort: Option<String>,
     pub hide_reasoning: bool,
+    pub(crate) accent_color: UiColor,
     pub context_windows: HashMap<String, u64>,
     pub auto_compact: bool,
     pub compact_threshold: f64,
@@ -227,6 +311,7 @@ impl Config {
             max_tokens: DEFAULT_MAX_TOKENS,
             reasoning_effort: None,
             hide_reasoning: false,
+            accent_color: UiColor::WHITE,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
@@ -273,6 +358,13 @@ impl Config {
         }
         if let Some(value) = file.hide_reasoning {
             self.hide_reasoning = value;
+        }
+        if let Some(value) = file
+            .accent_color
+            .or(file.status_bar_color)
+            .or(file.text_box_color)
+        {
+            self.accent_color = value;
         }
         if let Some(map) = file.context_windows {
             self.context_windows.extend(map);
@@ -500,6 +592,7 @@ mod tests {
             max_tokens: 8192,
             reasoning_effort: None,
             hide_reasoning: false,
+            accent_color: UiColor::WHITE,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: 0.85,
@@ -589,6 +682,28 @@ mod tests {
 
         cfg.apply(serde_json::from_value(json!({"hide_reasoning": true})).unwrap());
         assert!(cfg.hide_reasoning);
+    }
+
+    #[test]
+    fn ui_colors_accept_palette_names_and_custom_rgb() {
+        assert_eq!(UiColor::parse("blue").unwrap().config_value(), "blue");
+        assert_eq!(
+            UiColor::parse("#123aBc").unwrap(),
+            UiColor::new(0x12, 0x3a, 0xbc)
+        );
+        assert!(UiColor::parse("not-a-color").is_err());
+
+        let mut cfg = test_config();
+        cfg.apply(
+            serde_json::from_value(json!({
+                "accent_color": "#102030"
+            }))
+            .unwrap(),
+        );
+        assert_eq!(cfg.accent_color, UiColor::new(0x10, 0x20, 0x30));
+
+        cfg.apply(serde_json::from_value(json!({"status_bar_color": "green"})).unwrap());
+        assert_eq!(cfg.accent_color.config_value(), "green");
     }
 
     #[test]

@@ -393,6 +393,7 @@ printf '%s:%s' "$YAWL_SESSION_ID" "$input"
             max_tokens: 1,
             reasoning_effort: None,
             hide_reasoning: false,
+            accent_color: crate::config::UiColor::WHITE,
             context_windows: std::collections::HashMap::new(),
             auto_compact: true,
             compact_threshold: 0.85,

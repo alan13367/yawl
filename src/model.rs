@@ -228,6 +228,7 @@ mod tests {
             max_tokens: DEFAULT_MAX_TOKENS,
             reasoning_effort: None,
             hide_reasoning: false,
+            accent_color: crate::config::UiColor::WHITE,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: 0.85,

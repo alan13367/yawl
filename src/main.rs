@@ -164,6 +164,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
 
     if cli.prompt.is_empty() && stdin_is_terminal {
         yawl::tui::run(&mut agent)?;
+        println!("{}", resume_command(agent.session_id()));
         return Ok(0);
     }
 
@@ -207,6 +208,10 @@ fn read_prompt(words: Vec<String>, stdin_is_terminal: bool) -> Result<String, io
     } else {
         Ok(prompt)
     }
+}
+
+fn resume_command(session_id: &str) -> String {
+    format!("yawl --session {session_id}")
 }
 
 fn list_tools(config: &Config) {
@@ -356,5 +361,13 @@ mod tests {
     fn double_dash_allows_dash_prefixed_prompt() {
         let cli = parse(&["--", "--explain"]).expect("arguments should parse");
         assert_eq!(cli.prompt, ["--explain"]);
+    }
+
+    #[test]
+    fn resume_command_is_copy_pasteable() {
+        assert_eq!(
+            resume_command("20260820-093301-1a2b"),
+            "yawl --session 20260820-093301-1a2b"
+        );
     }
 }

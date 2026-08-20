@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde_json::{Map, Value, json};
 
 use super::{
-    Config, OPENAI_COMPLETIONS_API, ProviderConfig, expand_home_path, object_field,
+    Config, OPENAI_COMPLETIONS_API, ProviderConfig, UiColor, expand_home_path, object_field,
     validate_provider_name,
 };
 use crate::error::Error;
@@ -15,6 +15,7 @@ pub(crate) enum ConfigChange {
     MaxTokens(String),
     ReasoningEffort(String),
     HideReasoning(String),
+    AccentColor(String),
     AutoCompact(String),
     CompactThreshold(String),
     ContextWindow {
@@ -61,6 +62,7 @@ enum ValidatedChange {
         effective: Option<String>,
     },
     HideReasoning(bool),
+    AccentColor(UiColor),
     AutoCompact(bool),
     CompactThreshold(f64),
     ContextWindow {
@@ -131,6 +133,9 @@ impl ValidatedChange {
                 })
             }
             ConfigChange::HideReasoning(value) => Ok(Self::HideReasoning(parse_on_off(&value)?)),
+            ConfigChange::AccentColor(value) => UiColor::parse(&value)
+                .map(Self::AccentColor)
+                .map_err(Error::Config),
             ConfigChange::AutoCompact(value) => Ok(Self::AutoCompact(parse_on_off(&value)?)),
             ConfigChange::CompactThreshold(value) => {
                 Ok(Self::CompactThreshold(parse_threshold(&value)?))
@@ -205,6 +210,12 @@ impl ValidatedChange {
                 insert_scalar(config, "reasoning_effort", json!(stored))
             }
             Self::HideReasoning(hidden) => insert_scalar(config, "hide_reasoning", json!(hidden)),
+            Self::AccentColor(color) => config.update_global_json(|root| {
+                root.insert("accent_color".into(), json!(color.config_value()));
+                root.remove("status_bar_color");
+                root.remove("text_box_color");
+                Ok(())
+            }),
             Self::AutoCompact(enabled) => insert_scalar(config, "auto_compact", json!(enabled)),
             Self::CompactThreshold(threshold) => {
                 insert_scalar(config, "compact_threshold", json!(threshold))
@@ -270,6 +281,7 @@ impl ValidatedChange {
             Self::MaxTokens(tokens) => config.max_tokens == *tokens,
             Self::ReasoningEffort { effective, .. } => config.reasoning_effort == *effective,
             Self::HideReasoning(hidden) => config.hide_reasoning == *hidden,
+            Self::AccentColor(color) => config.accent_color == *color,
             Self::AutoCompact(enabled) => config.auto_compact == *enabled,
             Self::CompactThreshold(threshold) => config.compact_threshold == *threshold,
             Self::ContextWindow { model, window } => {
@@ -443,6 +455,40 @@ mod tests {
 
         assert!(error.to_string().contains("between 0.1 and 0.99"));
         assert!(!dirs.home.join("config.json").exists());
+    }
+
+    #[test]
+    fn accent_color_change_is_validated_persisted_and_reloaded() {
+        let dirs = TestDirs::new("color");
+        fs::create_dir_all(&dirs.home).expect("home config directory should be created");
+        fs::write(
+            dirs.home.join("config.json"),
+            r#"{"status_bar_color":"white","text_box_color":"blue"}"#,
+        )
+        .expect("legacy colors should be written");
+        let config = dirs.config();
+
+        let outcome = config
+            .change_global(ConfigChange::AccentColor("#123abc".into()))
+            .expect("valid RGB color should apply");
+
+        assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
+        assert_eq!(outcome.config.accent_color, UiColor::new(0x12, 0x3a, 0xbc));
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(dirs.home.join("config.json"))
+                .expect("saved config should be readable"),
+        )
+        .expect("saved config should remain JSON");
+        assert_eq!(saved["accent_color"], "#123abc");
+        assert!(saved.get("status_bar_color").is_none());
+        assert!(saved.get("text_box_color").is_none());
+
+        assert!(
+            outcome
+                .config
+                .change_global(ConfigChange::AccentColor("transparent".into()))
+                .is_err()
+        );
     }
 
     #[test]

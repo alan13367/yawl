@@ -67,7 +67,8 @@ Run `yawl --help` for the complete command-line reference.
 - `Ctrl+U`, `Ctrl+K`, and `Ctrl+W` delete text.
 - `Ctrl+O` expands or collapses tool arguments and output. Tool blocks start compact.
 - The mouse wheel and `PageUp` or `PageDown` move through Yawl's internal scrollback.
-- `Ctrl+C` aborts the active model response or tool. It does not exit Yawl.
+- Drag with the left mouse button to select visible text. Releasing the button copies the selection to the clipboard and briefly shows a `Copied!` box in the top-right corner, including while a response is streaming.
+- `Escape` or `Ctrl+C` aborts the active model response or tool. Neither exits Yawl.
 
 The terminal interface renders headings, emphasis, inline code, lists, blockquotes, tables, and fenced code. Fenced blocks have lightweight highlighting for Rust, Python, JavaScript, TypeScript, Go, C, C++, Bash, JSON, TOML, HTML, and CSS. Tool calls use separate full-width blocks with compact views for shell commands, file reads, writes, and edits.
 
@@ -90,7 +91,7 @@ Messages submitted during an active response are queued automatically. Each pend
 | `/resume [ID\|NUMBER]` | Open the session picker, or resume directly by ID or number |
 | `/unqueue [NUMBER\|all]` | Open the queued-message picker, remove one pending message, or clear the queue |
 | `/help` | Show terminal controls and commands |
-| `/quit` | Exit the terminal interface |
+| `/quit` | Exit the terminal interface and print `yawl --session ID` |
 
 ## Models and configuration
 
@@ -165,6 +166,8 @@ Add providers under `providers`. This uses the same field names as pi's `models.
 
 Set `hide_reasoning` to `true`, choose "Reasoning display" in `/settings`, or run `/settings hide_reasoning on` to remove both summary and full reasoning from the TUI and print-mode output. Yawl still records the reasoning in the session so it reappears if the setting is turned off. In print mode, visible reasoning goes to standard error and the answer remains on standard output.
 
+Choose "Accent color" in `/settings` to set the status bar and text-box border from one palette. The same value can be set directly with `/settings accent_color blue` or `/settings accent_color '#7aa2f7'`. Palette names and `#RRGGBB` values are accepted; the default is white.
+
 Provider keys and header values accept `$ENV_VAR` and `${ENV_VAR}` references. If `apiKey` is omitted, Yawl also checks an environment variable derived from the provider name, such as `OMLX_API_KEY` or `LMSTUDIO_API_KEY`. Keyless local servers need no placeholder key. Extra pi model fields such as `cost`, `input`, and `reasoning` are ignored.
 
 These compatibility fields are supported at provider or model level:
@@ -188,11 +191,11 @@ You can configure an endpoint from the TUI without editing JSON:
 /settings model omlx:Qwen3-Coder
 ```
 
-Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; `./.yawl/config.json` can still override it. When that happens, Yawl reports that the global value was saved while the project value remains effective. `/settings` also changes `max_tokens`, Codex reasoning effort, reasoning visibility, automatic compaction, the compaction threshold, context windows, and built-in endpoint URLs.
+Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; `./.yawl/config.json` can still override it. When that happens, Yawl reports that the global value was saved while the project value remains effective. `/settings` also changes `max_tokens`, Codex reasoning effort, reasoning visibility, the TUI accent color, automatic compaction, the compaction threshold, context windows, and built-in endpoint URLs.
 
 ## Sessions and compaction
 
-Yawl stores append-only JSONL session files in `~/.yawl/sessions/`. Each user message, assistant response, reasoning block, tool result, and compaction event is written as it happens. The original history remains in the log after compaction. `/new` starts a blank session without changing the current working directory.
+Yawl stores append-only JSONL session files in `~/.yawl/sessions/`. Each user message, assistant response, reasoning block, tool result, and compaction event is written as it happens. The original history remains in the log after compaction. `/new` starts a blank session without changing the current working directory. Leaving the terminal interface prints `yawl --session ID` so you can resume that conversation.
 
 Yawl checks the last provider-reported token usage before each request. At the configured threshold, 85 percent by default, it asks the current model to summarize the older conversation and keeps roughly the last ten messages unchanged. Use `/compact` to do this manually.
 

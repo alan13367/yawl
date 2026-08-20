@@ -1,5 +1,5 @@
 //! Terminal input decoding for keys, bracketed paste, kitty CSI-u events,
-//! and SGR mouse-wheel reports.
+//! and SGR mouse reports.
 
 use std::collections::VecDeque;
 use std::io::{self, Read};
@@ -25,12 +25,29 @@ pub enum Key {
     Ctrl(char),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseKind {
+    Press,
+    Drag,
+    Release,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseEvent {
+    pub kind: MouseKind,
+    /// Zero-based terminal column.
+    pub column: usize,
+    /// Zero-based terminal row.
+    pub row: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Key(Key),
     Paste(String),
     /// Positive values scroll toward older content.
     MouseScroll(i32),
+    Mouse(MouseEvent),
     /// Raw mode uses a short read timeout, which also lets the UI notice
     /// terminal resizes and signal-handler state changes.
     Tick,
@@ -119,7 +136,7 @@ impl<R: Read> EventReader<R> {
             return self.read_paste();
         }
         if body.starts_with('<') && matches!(final_byte, b'M' | b'm') {
-            return Ok(parse_mouse(&body).unwrap_or(Event::Tick));
+            return Ok(parse_mouse(&body, final_byte).unwrap_or(Event::Tick));
         }
         if final_byte == b'u' {
             return Ok(Event::Key(parse_kitty_key(&body).unwrap_or(Key::Escape)));
@@ -234,17 +251,30 @@ fn parse_kitty_key(body: &str) -> Option<Key> {
     char::from_u32(code).map(Key::Char)
 }
 
-fn parse_mouse(body: &str) -> Option<Event> {
-    let button = body
-        .strip_prefix('<')?
-        .split(';')
-        .next()?
-        .parse::<u16>()
-        .ok()?;
+fn parse_mouse(body: &str, final_byte: u8) -> Option<Event> {
+    let mut fields = body.strip_prefix('<')?.split(';');
+    let button = fields.next()?.parse::<u16>().ok()?;
+    let column = fields.next()?.parse::<usize>().ok()?.checked_sub(1)?;
+    let row = fields.next()?.parse::<usize>().ok()?.checked_sub(1)?;
+    if fields.next().is_some() {
+        return None;
+    }
     // Ignore Shift/Alt/Ctrl modifier bits while preserving the wheel code.
-    match button & !0b1_1100 {
+    let button = button & !0b1_1100;
+    match button {
         64 => Some(Event::MouseScroll(3)),
         65 => Some(Event::MouseScroll(-3)),
+        0 | 32 => Some(Event::Mouse(MouseEvent {
+            kind: if final_byte == b'm' {
+                MouseKind::Release
+            } else if button & 32 != 0 {
+                MouseKind::Drag
+            } else {
+                MouseKind::Press
+            },
+            column,
+            row,
+        })),
         _ => None,
     }
 }
@@ -282,5 +312,36 @@ mod tests {
         let mut reader = EventReader::new(Cursor::new(b"\x1b[<64;10;4M\x1b[<65;10;4M"));
         assert_eq!(reader.read_event().unwrap(), Event::MouseScroll(3));
         assert_eq!(reader.read_event().unwrap(), Event::MouseScroll(-3));
+    }
+
+    #[test]
+    fn decodes_mouse_press_drag_and_release() {
+        let input = b"\x1b[<0;4;2M\x1b[<32;8;3M\x1b[<0;8;3m";
+        let mut reader = EventReader::new(Cursor::new(input));
+
+        assert_eq!(
+            reader.read_event().unwrap(),
+            Event::Mouse(MouseEvent {
+                kind: MouseKind::Press,
+                column: 3,
+                row: 1,
+            })
+        );
+        assert_eq!(
+            reader.read_event().unwrap(),
+            Event::Mouse(MouseEvent {
+                kind: MouseKind::Drag,
+                column: 7,
+                row: 2,
+            })
+        );
+        assert_eq!(
+            reader.read_event().unwrap(),
+            Event::Mouse(MouseEvent {
+                kind: MouseKind::Release,
+                column: 7,
+                row: 2,
+            })
+        );
     }
 }

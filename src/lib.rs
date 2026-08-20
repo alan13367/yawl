@@ -19,8 +19,8 @@ pub mod tui;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Global turn-abort flag. Set by Ctrl+C (signal handler in print mode,
-/// keyboard byte in the TUI); checked between stream events and during tool
+/// Global turn-abort flag. Set by Ctrl+C (signal handler in print mode) or by
+/// Escape/Ctrl+C in the TUI; checked between stream events and during tool
 /// execution. Aborts the in-flight turn, never the process.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 

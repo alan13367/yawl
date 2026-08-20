@@ -13,16 +13,20 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use crate::agent::{Agent, TurnEvent};
-use crate::config::{ConfigChange, ConfigChangeEffect, SkillDirectoryAction};
+use crate::config::{ConfigChange, ConfigChangeEffect, SkillDirectoryAction, UiColor};
 use crate::error::Error;
 use crate::provider::ReasoningKind;
 
-use self::events::{Event, EventReader, Key};
+use self::events::{Event, EventReader, Key, MouseEvent, MouseKind};
 use self::input::{EditAction, Editor};
 use self::transcript::{Entry, Transcript, TranscriptEvent};
 
 const USER_BACKGROUND: &str = "\x1b[48;2;52;53;64m";
 const USER_TEXT: &str = "\x1b[38;2;208;208;214m";
+const SETTINGS_ACCENT_COLOR_INDEX: usize = 4;
+const SETTINGS_AUTO_COMPACT_INDEX: usize = 5;
+const SETTINGS_RELOAD_INDEX: usize = 12;
+const COPY_TOAST_TICKS: u8 = 15;
 
 const HELP: &str = "\
 Commands
@@ -45,8 +49,8 @@ Input
   Model and settings pickers remain available during an active response.
   Messages submitted during a response appear below it as queued.
   Outside the menu, Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
-  Ctrl+O expands or collapses tool output. Ctrl+C aborts the active turn.
-  Mouse wheel and PageUp/PageDown scroll.
+  Ctrl+O expands or collapses tool output. Esc or Ctrl+C aborts the active turn.
+  Mouse wheel and PageUp/PageDown scroll. Drag selects text; release copies it.
 ";
 
 #[derive(Clone)]
@@ -63,6 +67,8 @@ enum PickerAction {
     OpenReasoning { save: bool },
     SetReasoning { effort: Option<String>, save: bool },
     SetHideReasoning(bool),
+    OpenAccentColor,
+    SetAccentColor(UiColor),
     ResumeSession(String),
     EditSetting { key: String, initial: String },
     EditModel { save: bool, initial: String },
@@ -102,6 +108,7 @@ struct ActivePickers {
     settings: Picker,
     reasoning: Picker,
     default_reasoning: Picker,
+    accent_color: Picker,
 }
 
 impl ActivePickers {
@@ -112,6 +119,7 @@ impl ActivePickers {
             settings: settings_picker(agent),
             reasoning: reasoning_picker(agent, false),
             default_reasoning: reasoning_picker(agent, true),
+            accent_color: color_picker(agent.config().accent_color),
         }
     }
 }
@@ -122,6 +130,8 @@ struct ViewState {
     model: String,
     reasoning_effort: Option<String>,
     hide_reasoning: bool,
+    accent_color: UiColor,
+    copy_toast_ticks: u8,
     context_tokens: u64,
     context_window: u64,
     activity: String,
@@ -141,6 +151,8 @@ impl ViewState {
             model: agent.model().to_string(),
             reasoning_effort: agent.config().reasoning_effort.clone(),
             hide_reasoning: agent.config().hide_reasoning,
+            accent_color: agent.config().accent_color,
+            copy_toast_ticks: 0,
             context_tokens: agent.context_tokens(),
             context_window: agent.context_window(),
             activity: String::new(),
@@ -325,13 +337,16 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                     }
                 }
                 Event::Paste(text) if picker_is_editing(&state) => editor.paste(&text),
-                Event::Tick | Event::MouseScroll(_) | Event::Paste(_) => {}
+                Event::Mouse(mouse) => handle_mouse_selection(&mut terminal, &mut state, mouse)?,
+                Event::Tick => advance_copy_toast(&mut state),
+                Event::MouseScroll(_) | Event::Paste(_) => {}
             }
             terminal.draw(&mut state, &editor)?;
             continue;
         }
         match event {
             Event::Tick => {
+                advance_copy_toast(&mut state);
                 if crate::interrupted() {
                     crate::set_interrupted(false);
                     if !editor.is_empty() {
@@ -341,6 +356,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                 }
             }
             Event::MouseScroll(amount) => scroll(&mut state, amount),
+            Event::Mouse(mouse) => handle_mouse_selection(&mut terminal, &mut state, mouse)?,
             Event::Paste(text) => {
                 editor.paste(&text);
                 state.scroll_offset = 0;
@@ -714,6 +730,11 @@ fn settings_picker(agent: &Agent) -> Picker {
                 action: PickerAction::SetHideReasoning(!agent.config().hide_reasoning),
             },
             PickerItem {
+                label: "Accent color".into(),
+                description: agent.config().accent_color.config_value(),
+                action: PickerAction::OpenAccentColor,
+            },
+            PickerItem {
                 label: "Automatic compaction".into(),
                 description: format!("{on_off} · Enter to toggle"),
                 action: PickerAction::SetAutoCompact(!agent.config().auto_compact),
@@ -780,6 +801,59 @@ fn settings_picker(agent: &Agent) -> Picker {
                 action: PickerAction::ShowSettings,
             },
         ],
+        editing: None,
+    }
+}
+
+fn color_picker(current: UiColor) -> Picker {
+    let choices = [
+        ("White", UiColor::WHITE),
+        ("Gray", UiColor::new(148, 148, 158)),
+        ("Red", UiColor::new(235, 111, 146)),
+        ("Orange", UiColor::new(240, 160, 96)),
+        ("Yellow", UiColor::new(232, 202, 118)),
+        ("Green", UiColor::new(139, 213, 162)),
+        ("Cyan", UiColor::new(116, 199, 213)),
+        ("Blue", UiColor::new(117, 169, 255)),
+        ("Purple", UiColor::new(190, 149, 255)),
+        ("Pink", UiColor::new(238, 148, 200)),
+    ];
+    let mut items = choices
+        .into_iter()
+        .map(|(label, color)| PickerItem {
+            label: label.into(),
+            description: format!(
+                "\x1b[48;2;{};{};{}m   \x1b[0m {}",
+                color.red,
+                color.green,
+                color.blue,
+                color.config_value()
+            ),
+            action: PickerAction::SetAccentColor(color),
+        })
+        .collect::<Vec<_>>();
+    items.push(PickerItem {
+        label: "Custom RGB…".into(),
+        description: "Enter #RRGGBB".into(),
+        action: PickerAction::EditSetting {
+            key: "accent_color".into(),
+            initial: current.config_value(),
+        },
+    });
+    let selected = items
+        .iter()
+        .position(|item| {
+            matches!(
+                item.action,
+                PickerAction::SetAccentColor(color) if color == current
+            )
+        })
+        .unwrap_or(items.len().saturating_sub(1));
+    Picker {
+        title: "Accent color".into(),
+        hint: "↑/↓ move  Enter select  Esc cancel".into(),
+        items,
+        selected,
         editing: None,
     }
 }
@@ -870,7 +944,12 @@ fn take_picker_action(
             }
             Key::Enter => {
                 if let Some(value) = editor.take_text() {
-                    let selected = picker.selected;
+                    let selected = match &editing {
+                        PickerEdit::Setting(key) if key == "accent_color" => {
+                            SETTINGS_ACCENT_COLOR_INDEX
+                        }
+                        _ => picker.selected,
+                    };
                     state.picker = None;
                     return Some(match editing {
                         PickerEdit::Setting(key) => PickerAction::ApplySetting {
@@ -1084,6 +1163,19 @@ fn activate_picker_action(agent: &mut Agent, state: &mut ViewState, action: Pick
                 select_picker_item(state, 3);
             }
         }
+        PickerAction::OpenAccentColor => {
+            state.picker = Some(color_picker(agent.config().accent_color));
+        }
+        PickerAction::SetAccentColor(color) => {
+            if settings(
+                agent,
+                &format!("accent_color {}", color.config_value()),
+                state,
+            ) {
+                open_settings_picker(agent, state);
+                select_picker_item(state, SETTINGS_ACCENT_COLOR_INDEX);
+            }
+        }
         PickerAction::ResumeSession(id) => load_session(agent, &id, state),
         PickerAction::ApplySetting { argument, selected } => {
             if settings(agent, &argument, state) {
@@ -1098,13 +1190,13 @@ fn activate_picker_action(agent: &mut Agent, state: &mut ViewState, action: Pick
                 state,
             ) {
                 open_settings_picker(agent, state);
-                select_picker_item(state, 4);
+                select_picker_item(state, SETTINGS_AUTO_COMPACT_INDEX);
             }
         }
         PickerAction::Reload => {
             if settings(agent, "reload", state) {
                 open_settings_picker(agent, state);
-                select_picker_item(state, 11);
+                select_picker_item(state, SETTINGS_RELOAD_INDEX);
             }
         }
         PickerAction::ShowSettings => show_settings(agent, state),
@@ -1141,6 +1233,10 @@ fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) -> bool {
         .map(|value| ConfigChange::ReasoningEffort(value.to_string())),
         "hide_reasoning" => one_value(&mut parts, "usage: /settings hide_reasoning on|off")
             .map(|value| ConfigChange::HideReasoning(value.to_string())),
+        "accent_color" | "status_bar_color" | "text_box_color" => {
+            one_value(&mut parts, "usage: /settings accent_color NAME|#RRGGBB")
+                .map(|value| ConfigChange::AccentColor(value.to_string()))
+        }
         "auto_compact" => one_value(&mut parts, "usage: /settings auto_compact on|off")
             .map(|value| ConfigChange::AutoCompact(value.to_string())),
         "compact_threshold" => one_value(
@@ -1212,6 +1308,7 @@ fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) -> bool {
             state.model = agent.model().to_string();
             state.reasoning_effort = agent.config().reasoning_effort.clone();
             state.hide_reasoning = agent.config().hide_reasoning;
+            state.accent_color = agent.config().accent_color;
             state.context_window = agent.context_window();
             match effect {
                 ConfigChangeEffect::Applied => state.notice(format!(
@@ -1241,7 +1338,7 @@ fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -1250,6 +1347,7 @@ fn show_settings(agent: &Agent, state: &mut ViewState) {
             .as_deref()
             .unwrap_or("provider default"),
         agent.config().hide_reasoning,
+        agent.config().accent_color.config_value(),
         if agent.config().auto_compact {
             "on"
         } else {
@@ -1277,7 +1375,7 @@ fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);
@@ -1485,6 +1583,10 @@ fn pump_events<R: Read, T>(
         let event = events.read_event()?;
         if state.picker.is_some() {
             match event {
+                Event::Key(key) if is_cancel_key(key) => {
+                    state.picker = None;
+                    cancel_worker(worker.thread, state);
+                }
                 Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
                 Event::Key(key) => {
                     if let Some(action) = take_picker_action(state, editor, key) {
@@ -1492,23 +1594,23 @@ fn pump_events<R: Read, T>(
                     }
                 }
                 Event::Paste(text) if picker_is_editing(state) => editor.paste(&text),
-                Event::Tick | Event::MouseScroll(_) | Event::Paste(_) => {}
+                Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
+                Event::Tick => advance_copy_toast(state),
+                Event::MouseScroll(_) | Event::Paste(_) => {}
             }
             continue;
         }
         match event {
             Event::Tick => {
+                advance_copy_toast(state);
                 if crate::interrupted() {
                     state.activity = "canceling turn".into();
                 }
             }
             Event::MouseScroll(amount) => scroll(state, amount),
+            Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
             Event::Paste(text) => editor.paste(&text),
-            Event::Key(Key::Ctrl('c')) => {
-                crate::set_interrupted(true);
-                interrupt_thread(worker.thread);
-                state.activity = "canceling turn".into();
-            }
+            Event::Key(key) if is_cancel_key(key) => cancel_worker(worker.thread, state),
             Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
             Event::Key(Key::Ctrl('o')) => toggle_tool_expansion(state),
             Event::Key(Key::PageUp) => scroll(state, 10),
@@ -1522,6 +1624,31 @@ fn pump_events<R: Read, T>(
             }
         }
     }
+}
+
+fn handle_mouse_selection(
+    terminal: &mut Terminal,
+    state: &mut ViewState,
+    event: MouseEvent,
+) -> Result<(), Error> {
+    if terminal.handle_mouse(event)? {
+        state.copy_toast_ticks = COPY_TOAST_TICKS;
+    }
+    Ok(())
+}
+
+fn advance_copy_toast(state: &mut ViewState) {
+    state.copy_toast_ticks = state.copy_toast_ticks.saturating_sub(1);
+}
+
+fn is_cancel_key(key: Key) -> bool {
+    matches!(key, Key::Escape | Key::Ctrl('c'))
+}
+
+fn cancel_worker(thread: usize, state: &mut ViewState) {
+    crate::set_interrupted(true);
+    interrupt_thread(thread);
+    state.activity = "canceling turn".into();
 }
 
 fn handle_submission_while_busy(
@@ -1580,6 +1707,9 @@ fn activate_picker_action_while_busy(
         }
         PickerAction::OpenReasoning { save: false } => {
             state.picker = Some(active_pickers.reasoning.clone());
+        }
+        PickerAction::OpenAccentColor => {
+            state.picker = Some(active_pickers.accent_color.clone());
         }
         PickerAction::EditSetting { .. } | PickerAction::EditModel { .. } => {}
         PickerAction::RemoveQueued(_) | PickerAction::ClearQueued => {}
@@ -1722,12 +1852,54 @@ fn render_queued_panel(content: &str, position: usize, width: usize) -> Vec<Stri
     lines
 }
 
+fn foreground_color(color: UiColor) -> String {
+    format!("\x1b[38;2;{};{};{}m", color.red, color.green, color.blue)
+}
+
+fn status_style(color: UiColor) -> String {
+    let luminance =
+        u32::from(color.red) * 299 + u32::from(color.green) * 587 + u32::from(color.blue) * 114;
+    let text = if luminance >= 150_000 { 24 } else { 245 };
+    format!(
+        "\x1b[38;2;{text};{text};{text};48;2;{};{};{}m",
+        color.red, color.green, color.blue
+    )
+}
+
+fn render_copy_toast(frame: &mut [String], columns: usize, accent: UiColor) {
+    const WIDTH: usize = 11;
+    let color = foreground_color(accent);
+    let toast = [
+        format!("{color}┌─────────┐\x1b[0m"),
+        format!("{color}│\x1b[0m Copied! {color}│\x1b[0m"),
+        format!("{color}└─────────┘\x1b[0m"),
+    ];
+    let left_width = columns.saturating_sub(WIDTH);
+    for (line, toast_line) in frame.iter_mut().zip(toast) {
+        *line = format!("{}{toast_line}", markdown::fit_width(line, left_width));
+    }
+}
+
 struct Terminal {
     original: libc::termios,
     stdout: io::Stdout,
     active: bool,
     last_frame: Vec<String>,
+    last_base_frame: Vec<String>,
     last_size: (u16, u16),
+    selection: Option<TextSelection>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ScreenPoint {
+    row: usize,
+    column: usize,
+}
+
+struct TextSelection {
+    anchor: ScreenPoint,
+    current: ScreenPoint,
+    frame: Vec<String>,
 }
 
 impl Terminal {
@@ -1765,23 +1937,75 @@ impl Terminal {
             stdout: io::stdout(),
             active: true,
             last_frame: Vec::new(),
+            last_base_frame: Vec::new(),
             last_size: (0, 0),
+            selection: None,
         };
-        terminal
-            .stdout
-            .write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[>1u")?;
+        terminal.stdout.write_all(
+            b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>1u",
+        )?;
         terminal.stdout.flush()?;
         Ok(terminal)
     }
 
     fn invalidate(&mut self) {
         self.last_frame.clear();
+        self.last_base_frame.clear();
         self.last_size = (0, 0);
+    }
+
+    fn handle_mouse(&mut self, event: MouseEvent) -> Result<bool, Error> {
+        let point = ScreenPoint {
+            row: event.row,
+            column: event.column,
+        };
+        match event.kind {
+            MouseKind::Press => {
+                if self.last_base_frame.is_empty() {
+                    return Ok(false);
+                }
+                let point = clamp_point(point, &self.last_base_frame);
+                self.selection = Some(TextSelection {
+                    anchor: point,
+                    current: point,
+                    frame: self.last_base_frame.clone(),
+                });
+                Ok(false)
+            }
+            MouseKind::Drag => {
+                if let Some(selection) = self.selection.as_mut() {
+                    selection.current = clamp_point(point, &selection.frame);
+                }
+                Ok(false)
+            }
+            MouseKind::Release => {
+                let Some(mut selection) = self.selection.take() else {
+                    return Ok(false);
+                };
+                selection.current = clamp_point(point, &selection.frame);
+                let text = selected_text(&selection);
+                if text.is_empty() {
+                    return Ok(false);
+                }
+                if !copy_with_platform_command(&text) {
+                    let encoded = base64_encode(text.as_bytes());
+                    write!(self.stdout, "\x1b]52;c;{encoded}\x07")?;
+                    self.stdout.flush()?;
+                }
+                Ok(true)
+            }
+        }
     }
 
     fn draw(&mut self, state: &mut ViewState, editor: &Editor) -> Result<(), Error> {
         let (columns, rows) = terminal_size();
-        let (frame, cursor) = build_frame(state, editor, usize::from(columns), usize::from(rows));
+        let (base_frame, cursor) =
+            build_frame(state, editor, usize::from(columns), usize::from(rows));
+        self.last_base_frame.clone_from(&base_frame);
+        let frame = self
+            .selection
+            .as_ref()
+            .map_or(base_frame, highlighted_selection);
         let force = self.last_size != (columns, rows) || self.last_frame.len() != frame.len();
         self.stdout.write_all(b"\x1b[?25l")?;
         if force {
@@ -1792,7 +2016,11 @@ impl Terminal {
                 write!(self.stdout, "\x1b[{};1H\x1b[2K{line}", index + 1)?;
             }
         }
-        write!(self.stdout, "\x1b[{};{}H\x1b[?25h", cursor.0, cursor.1)?;
+        if self.selection.is_some() {
+            self.stdout.write_all(b"\x1b[?25l")?;
+        } else {
+            write!(self.stdout, "\x1b[{};{}H\x1b[?25h", cursor.0, cursor.1)?;
+        }
         self.stdout.flush()?;
         self.last_frame = frame;
         self.last_size = (columns, rows);
@@ -1805,9 +2033,9 @@ impl Drop for Terminal {
         if !self.active {
             return;
         }
-        let _ = self
-            .stdout
-            .write_all(b"\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l");
+        let _ = self.stdout.write_all(
+            b"\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l",
+        );
         let _ = self.stdout.flush();
         // SAFETY: `original` came from a successful `tcgetattr` call for
         // STDIN_FILENO and remains initialized for the life of this guard.
@@ -1816,6 +2044,186 @@ impl Drop for Terminal {
         }
         self.active = false;
     }
+}
+
+fn clamp_point(point: ScreenPoint, frame: &[String]) -> ScreenPoint {
+    let row = point.row.min(frame.len().saturating_sub(1));
+    let width = frame
+        .get(row)
+        .map_or(1, |line| markdown::visible_width(line).max(1));
+    ScreenPoint {
+        row,
+        column: point.column.min(width.saturating_sub(1)),
+    }
+}
+
+fn selected_text(selection: &TextSelection) -> String {
+    if selection.anchor == selection.current {
+        return String::new();
+    }
+    let (start, end) = if selection.anchor <= selection.current {
+        (selection.anchor, selection.current)
+    } else {
+        (selection.current, selection.anchor)
+    };
+    selection.frame[start.row..=end.row]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            let plain = markdown::strip_ansi(line);
+            let line_length = plain.chars().count();
+            let row = start.row + offset;
+            let from = if row == start.row { start.column } else { 0 };
+            let through = if row == end.row {
+                end.column.saturating_add(1)
+            } else {
+                line_length
+            };
+            plain
+                .chars()
+                .skip(from.min(line_length))
+                .take(
+                    through
+                        .min(line_length)
+                        .saturating_sub(from.min(line_length)),
+                )
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end_matches('\n')
+        .to_string()
+}
+
+fn highlighted_selection(selection: &TextSelection) -> Vec<String> {
+    let (start, end) = if selection.anchor <= selection.current {
+        (selection.anchor, selection.current)
+    } else {
+        (selection.current, selection.anchor)
+    };
+    let mut frame = selection.frame.clone();
+    for (row, line) in frame
+        .iter_mut()
+        .enumerate()
+        .take(end.row + 1)
+        .skip(start.row)
+    {
+        let width = markdown::visible_width(line);
+        let from = if row == start.row { start.column } else { 0 };
+        let through = if row == end.row {
+            end.column.saturating_add(1)
+        } else {
+            width
+        };
+        *line = highlight_cells(line, from.min(width), through.min(width));
+    }
+    frame
+}
+
+fn highlight_cells(line: &str, from: usize, through: usize) -> String {
+    if from >= through {
+        return line.to_string();
+    }
+    let mut output = String::with_capacity(line.len() + 16);
+    let mut index = 0usize;
+    let mut column = 0usize;
+    let mut highlighted = false;
+    while index < line.len() {
+        if column == from && !highlighted {
+            output.push_str("\x1b[7m");
+            highlighted = true;
+        }
+        if column == through && highlighted {
+            output.push_str("\x1b[27m");
+            highlighted = false;
+        }
+        if line.as_bytes()[index] == 0x1b {
+            let search_start = (index + 2).min(line.len());
+            let end = line.as_bytes()[search_start..]
+                .iter()
+                .position(|byte| (0x40..=0x7e).contains(byte))
+                .map_or(line.len(), |relative| search_start + relative + 1);
+            output.push_str(&line[index..end]);
+            if highlighted && line.as_bytes().get(end.saturating_sub(1)) == Some(&b'm') {
+                output.push_str("\x1b[7m");
+            }
+            index = end;
+            continue;
+        }
+        let character = line[index..]
+            .chars()
+            .next()
+            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        output.push(character);
+        index += character.len_utf8();
+        column += 1;
+    }
+    if highlighted {
+        output.push_str("\x1b[27m");
+    }
+    output
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+        encoded.push(char::from(
+            ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)],
+        ));
+        encoded.push(if chunk.len() > 1 {
+            char::from(ALPHABET[usize::from((second & 0x0f) << 2 | third >> 6)])
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            char::from(ALPHABET[usize::from(third & 0x3f)])
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
+fn copy_command(program: &str, arguments: &[&str], text: &str) -> bool {
+    let Ok(mut child) = std::process::Command::new(program)
+        .args(arguments)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let wrote = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+    let succeeded = child.wait().is_ok_and(|status| status.success());
+    wrote && succeeded
+}
+
+#[cfg(target_os = "macos")]
+fn copy_with_platform_command(text: &str) -> bool {
+    copy_command("pbcopy", &[], text)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_with_platform_command(text: &str) -> bool {
+    copy_command("wl-copy", &[], text)
+        || copy_command("xclip", &["-selection", "clipboard"], text)
+        || copy_command("xsel", &["--clipboard", "--input"], text)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn copy_with_platform_command(_text: &str) -> bool {
+    false
 }
 
 fn terminal_size() -> (u16, u16) {
@@ -1983,11 +2391,21 @@ fn build_frame(
         );
     }
     frame.extend(menu);
-    frame.push(format!("┌{}┐", "─".repeat(inner_width)));
+    let text_box_color = foreground_color(state.accent_color);
+    frame.push(format!(
+        "{text_box_color}┌{}┐\x1b[0m",
+        "─".repeat(inner_width)
+    ));
     for line in input_lines {
-        frame.push(format!("│{}│", markdown::fit_width(line, inner_width)));
+        frame.push(format!(
+            "{text_box_color}│\x1b[0m{}{text_box_color}│\x1b[0m",
+            markdown::fit_width(line, inner_width)
+        ));
     }
-    frame.push(format!("└{}┘", "─".repeat(inner_width)));
+    frame.push(format!(
+        "{text_box_color}└{}┘\x1b[0m",
+        "─".repeat(inner_width)
+    ));
 
     let percentage = state
         .context_tokens
@@ -2013,9 +2431,14 @@ fn build_frame(
         status.push_str(&format!("  {} change pending", state.pending_actions.len()));
     }
     frame.push(format!(
-        "\x1b[7m{}\x1b[0m",
+        "{}{}\x1b[0m",
+        status_style(state.accent_color),
         markdown::fit_width(&status, columns)
     ));
+
+    if state.copy_toast_ticks > 0 {
+        render_copy_toast(&mut frame, columns, state.accent_color);
+    }
 
     let cursor_row = transcript_height + menu_height + 2 + cursor_input_row;
     let cursor_col = (2 + layout.cursor_col).min(columns.saturating_sub(1));
@@ -2068,6 +2491,8 @@ mod tests {
             model: "test".into(),
             reasoning_effort: None,
             hide_reasoning: false,
+            accent_color: UiColor::WHITE,
+            copy_toast_ticks: 0,
             context_tokens: 12,
             context_window: 100,
             activity: String::new(),
@@ -2083,6 +2508,43 @@ mod tests {
         assert_eq!(frame.len(), 12);
         assert!(markdown::strip_ansi(frame.last().unwrap()).contains("test"));
         assert_eq!(cursor.0, 10);
+        assert!(frame.last().unwrap().contains("48;2;238;238;238"));
+        assert!(frame[8].contains("38;2;238;238;238"));
+
+        state.copy_toast_ticks = 1;
+        let (frame, _) = build_frame(&mut state, &editor, 40, 12);
+        assert!(markdown::strip_ansi(&frame[1]).ends_with("│ Copied! │"));
+        assert!(
+            frame[..3]
+                .iter()
+                .all(|line| markdown::visible_width(line) == 40)
+        );
+        advance_copy_toast(&mut state);
+        let (frame, _) = build_frame(&mut state, &editor, 40, 12);
+        assert!(!markdown::strip_ansi(&frame.join("\n")).contains("Copied!"));
+    }
+
+    #[test]
+    fn screen_selection_extracts_styled_text_in_either_direction() {
+        let selection = TextSelection {
+            anchor: ScreenPoint { row: 1, column: 5 },
+            current: ScreenPoint { row: 0, column: 6 },
+            frame: vec![
+                "\x1b[31mhello world\x1b[0m   ".into(),
+                "second line   ".into(),
+            ],
+        };
+
+        assert_eq!(selected_text(&selection), "world\nsecond");
+        let highlighted = highlighted_selection(&selection);
+        assert_eq!(markdown::strip_ansi(&highlighted[0]), "hello world   ");
+        assert!(highlighted[0].contains("\x1b[7m"));
+    }
+
+    #[test]
+    fn clipboard_payload_uses_standard_base64() {
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+        assert_eq!(base64_encode("copy me".as_bytes()), "Y29weSBtZQ==");
     }
 
     #[test]
@@ -2120,6 +2582,19 @@ mod tests {
     }
 
     #[test]
+    fn accent_picker_selects_the_current_shared_color() {
+        let blue = UiColor::new(117, 169, 255);
+        let picker = color_picker(blue);
+
+        assert_eq!(picker.title, "Accent color");
+        assert!(matches!(
+            picker.items[picker.selected].action,
+            PickerAction::SetAccentColor(color) if color == blue
+        ));
+        assert!(picker.items.iter().any(|item| item.label == "Custom RGB…"));
+    }
+
+    #[test]
     fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         let mut state = ViewState {
             transcript: Transcript::from_messages(&[]),
@@ -2127,6 +2602,8 @@ mod tests {
             model: "test".into(),
             reasoning_effort: None,
             hide_reasoning: false,
+            accent_color: UiColor::WHITE,
+            copy_toast_ticks: 0,
             context_tokens: 0,
             context_window: 100,
             activity: String::new(),
@@ -2182,6 +2659,13 @@ mod tests {
     }
 
     #[test]
+    fn escape_and_ctrl_c_cancel_an_active_turn() {
+        assert!(is_cancel_key(Key::Escape));
+        assert!(is_cancel_key(Key::Ctrl('c')));
+        assert!(!is_cancel_key(Key::Enter));
+    }
+
+    #[test]
     fn enter_submits_the_only_matching_command_completion() {
         let mut state = ViewState {
             transcript: Transcript::from_messages(&[]),
@@ -2189,6 +2673,8 @@ mod tests {
             model: "test".into(),
             reasoning_effort: None,
             hide_reasoning: false,
+            accent_color: UiColor::WHITE,
+            copy_toast_ticks: 0,
             context_tokens: 0,
             context_window: 100,
             activity: String::new(),
@@ -2220,6 +2706,8 @@ mod tests {
             model: "test".into(),
             reasoning_effort: None,
             hide_reasoning: false,
+            accent_color: UiColor::WHITE,
+            copy_toast_ticks: 0,
             context_tokens: 0,
             context_window: 100,
             activity: String::new(),
@@ -2331,6 +2819,6 @@ mod tests {
             .map(|line| markdown::strip_ansi(line).trim_end().to_string())
             .collect::<Vec<_>>();
 
-        assert_eq!(plain, ["Answer", "", "Thinking", "", "$ true", ""]);
+        assert_eq!(plain, ["Answer", "", "Thinking", "", "", "$ true", "", ""]);
     }
 }

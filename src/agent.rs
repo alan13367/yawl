@@ -81,6 +81,10 @@ impl Agent {
         &self.model
     }
 
+    pub fn session_id(&self) -> &str {
+        &self.session.id
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
@@ -412,6 +416,7 @@ mod tests {
                 max_tokens: DEFAULT_MAX_TOKENS,
                 reasoning_effort: None,
                 hide_reasoning: false,
+                accent_color: crate::config::UiColor::WHITE,
                 context_windows: HashMap::new(),
                 auto_compact: false,
                 compact_threshold: 0.85,
