@@ -95,7 +95,7 @@ Messages submitted during an active response are queued automatically. Each pend
 
 ## Models and configuration
 
-Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`. Project values override global values. Every field is optional. If the merged config has no `model`, interactive startup runs onboarding; print mode requires `--model`.
+Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`. Project values override global values. Every field is optional. If the merged config has no `model`, interactive startup runs onboarding; print mode requires `--model`. Values are validated at load with the same rules `/settings` enforces: `max_tokens` and context windows must be positive integers, `compact_threshold` must be between 0.1 and 0.99, and `reasoning_effort` must be a supported level. An out-of-range value fails startup with the file and field named instead of being silently clamped.
 
 ```json
 {
@@ -105,6 +105,8 @@ Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`
   "max_tokens": 8192,
   "reasoning_effort": "high",
   "hide_reasoning": false,
+  "accent_color": "white",
+  "scroll_bar": true,
   "auto_compact": true,
   "compact_threshold": 0.85,
   "context_windows": {
@@ -168,6 +170,8 @@ Set `hide_reasoning` to `true`, choose "Reasoning display" in `/settings`, or ru
 
 Choose "Accent color" in `/settings` to set the status bar and text-box border from one palette. The same value can be set directly with `/settings accent_color blue` or `/settings accent_color '#7aa2f7'`. Palette names and `#RRGGBB` values are accepted; the default is white.
 
+When the transcript overflows the screen, Yawl draws a solid scroll bar along its right edge: a muted track in the accent color with a darker rectangle as the thumb. Click anywhere on it to jump, or press and drag to scrub through the history. Set `scroll_bar` to `false`, choose "Scroll bar" in `/settings`, or run `/settings scroll_bar off` to hide it. The default is on.
+
 Provider keys and header values accept `$ENV_VAR` and `${ENV_VAR}` references. If `apiKey` is omitted, Yawl also checks an environment variable derived from the provider name, such as `OMLX_API_KEY` or `LMSTUDIO_API_KEY`. Keyless local servers need no placeholder key. Extra pi model fields such as `cost`, `input`, and `reasoning` are ignored.
 
 These compatibility fields are supported at provider or model level:
@@ -197,18 +201,18 @@ Omit the key for a keyless server. Pass `-` in the key position to remove a save
 
 Yawl stores append-only JSONL session files in `~/.yawl/sessions/`. Each user message, assistant response, reasoning block, tool result, and compaction event is written as it happens. The original history remains in the log after compaction. `/new` starts a blank session without changing the current working directory. Leaving the terminal interface prints `yawl --session ID` so you can resume that conversation.
 
-Yawl checks the last provider-reported token usage before each request. At the configured threshold, 85 percent by default, it asks the current model to summarize the older conversation and keeps roughly the last ten messages unchanged. Use `/compact` to do this manually.
+Yawl checks the last provider-reported token usage before each request. At the configured threshold, 85 percent by default, it asks the current model to summarize the older conversation and keeps roughly the last ten messages unchanged. Use `/compact` to do this manually. If automatic compaction fails, Yawl shows a warning and continues without compacting; the next request may still fit.
 
 ## Builtin tools
 
 The model always has these tools:
 
 - `shell` runs `sh -c` in the current directory, with a 120-second default timeout.
-- `read_file` reads a UTF-8 file.
+- `read_file` reads a UTF-8 file up to 1 MiB; larger files are rejected so the model can request portions via `shell`.
 - `write_file` writes a file and creates missing parent directories.
 - `edit_file` performs one exact string replacement and rejects missing or repeated matches.
 
-Tool output sent back to the model is capped at 60,000 characters. A command timeout or `Ctrl+C` kills the command's process group so child processes do not remain behind.
+Tool output sent back to the model is capped at 60,000 characters. Streaming responses are capped at 64 MiB of SSE data per response and 4 MiB per event, so a runaway server fails with an error instead of growing without bound. A command timeout or `Ctrl+C` kills the command's process group so child processes do not remain behind.
 
 Yawl has no approval prompt or permission layer. Review the current model and working directory before giving it a task. Use `Ctrl+C` to stop the active turn.
 

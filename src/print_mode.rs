@@ -79,6 +79,7 @@ pub(super) fn run(agent: &mut Agent, prompt: String) -> Result<i32, Box<dyn std:
         TurnEvent::Compacted { replaced } => {
             eprintln!("compacted {replaced} messages")
         }
+        TurnEvent::Warning(text) => eprintln!("{text}"),
         TurnEvent::ToolStart { .. } | TurnEvent::ToolEnd { .. } | TurnEvent::Usage { .. } => {}
     });
     if let Some(error) = output_error {

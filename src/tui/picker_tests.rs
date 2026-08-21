@@ -2,7 +2,7 @@
 
 use super::picker::{
     SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_AUTO_COMPACT_INDEX, SETTINGS_REASONING_DISPLAY_INDEX,
-    SETTINGS_RELOAD_INDEX, settings_picker,
+    SETTINGS_RELOAD_INDEX, SETTINGS_SCROLL_BAR_INDEX, settings_picker,
 };
 use super::*;
 
@@ -62,6 +62,9 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        show_scroll_bar: true,
+        scroll_geometry: None,
+        scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         context_tokens: 0,
@@ -115,6 +118,9 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        show_scroll_bar: true,
+        scroll_geometry: None,
+        scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         context_tokens: 0,
@@ -176,6 +182,7 @@ fn settings_picker_indexes_keep_their_action_contracts() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        scroll_bar: true,
         context_windows: std::collections::HashMap::new(),
         auto_compact: true,
         compact_threshold: 0.85,
@@ -198,6 +205,11 @@ fn settings_picker_indexes_keep_their_action_contracts() {
         picker.items[SETTINGS_ACCENT_COLOR_INDEX].label,
         "Accent color"
     );
+    assert_eq!(picker.items[SETTINGS_SCROLL_BAR_INDEX].label, "Scroll bar");
+    assert!(matches!(
+        picker.items[SETTINGS_SCROLL_BAR_INDEX].action,
+        PickerAction::SetScrollBar(false)
+    ));
     assert_eq!(
         picker.items[SETTINGS_AUTO_COMPACT_INDEX].label,
         "Automatic compaction"

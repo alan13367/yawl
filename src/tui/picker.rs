@@ -10,8 +10,9 @@ use super::markdown;
 
 pub(super) const SETTINGS_REASONING_DISPLAY_INDEX: usize = 3;
 pub(super) const SETTINGS_ACCENT_COLOR_INDEX: usize = 4;
-pub(super) const SETTINGS_AUTO_COMPACT_INDEX: usize = 5;
-pub(super) const SETTINGS_RELOAD_INDEX: usize = 12;
+pub(super) const SETTINGS_SCROLL_BAR_INDEX: usize = 5;
+pub(super) const SETTINGS_AUTO_COMPACT_INDEX: usize = 6;
+pub(super) const SETTINGS_RELOAD_INDEX: usize = 13;
 
 #[derive(Clone)]
 pub(super) enum PickerAction {
@@ -23,6 +24,7 @@ pub(super) enum PickerAction {
     SetHideReasoning(bool),
     OpenAccentColor,
     SetAccentColor(UiColor),
+    SetScrollBar(bool),
     ResumeSession(String),
     EditSetting { key: String, initial: String },
     EditModel { save: bool, initial: String },
@@ -93,6 +95,15 @@ impl ActivePickers {
         }
         if let Some(item) = self.settings.items.get_mut(SETTINGS_ACCENT_COLOR_INDEX) {
             item.description = config.accent_color.config_value();
+        }
+        if let Some(item) = self.settings.items.get_mut(SETTINGS_SCROLL_BAR_INDEX) {
+            let visibility = if config.scroll_bar {
+                "Visible"
+            } else {
+                "Hidden"
+            };
+            item.description = format!("{visibility} · Enter to toggle");
+            item.action = PickerAction::SetScrollBar(!config.scroll_bar);
         }
         self.accent_color = color_picker(config.accent_color);
     }
@@ -173,6 +184,11 @@ pub(super) fn settings_picker(agent: &Agent) -> Picker {
     } else {
         "Visible"
     };
+    let scroll_bar_visibility = if agent.config().scroll_bar {
+        "Visible"
+    } else {
+        "Hidden"
+    };
     Picker {
         title: "Settings".into(),
         hint: "↑/↓ move  Enter change  Esc close".into(),
@@ -224,6 +240,11 @@ pub(super) fn settings_picker(agent: &Agent) -> Picker {
                 label: "Accent color".into(),
                 description: agent.config().accent_color.config_value(),
                 action: PickerAction::OpenAccentColor,
+            },
+            PickerItem {
+                label: "Scroll bar".into(),
+                description: format!("{scroll_bar_visibility} · Enter to toggle"),
+                action: PickerAction::SetScrollBar(!agent.config().scroll_bar),
             },
             PickerItem {
                 label: "Automatic compaction".into(),

@@ -2,6 +2,7 @@
 //! tables, and fenced-code highlighting.
 
 use super::highlight;
+use unicode_width::UnicodeWidthChar;
 
 const RESET: &str = "\x1b[0m";
 const INLINE_CODE: &str = "\x1b[38;2;155;188;198m";
@@ -356,6 +357,10 @@ fn table_border(left: char, join: char, right: char, widths: &[usize]) -> String
     line
 }
 
+fn terminal_character_width(character: char) -> usize {
+    UnicodeWidthChar::width(character).unwrap_or(0)
+}
+
 pub(crate) fn visible_width(text: &str) -> usize {
     let bytes = text.as_bytes();
     let mut width = 0;
@@ -364,12 +369,14 @@ pub(crate) fn visible_width(text: &str) -> usize {
         if let Some(end) = ansi_sequence_end(bytes, index) {
             index = end;
         } else {
-            let character = text[index..]
+            let start = index;
+            while index < bytes.len() && bytes[index] != 0x1b {
+                index += 1;
+            }
+            width += text[start..index]
                 .chars()
-                .next()
-                .unwrap_or(char::REPLACEMENT_CHARACTER);
-            width += 1;
-            index += character.len_utf8();
+                .map(terminal_character_width)
+                .sum::<usize>();
         }
     }
     width
@@ -444,24 +451,31 @@ fn wrap_ansi(text: &str, width: usize) -> Vec<String> {
             }
             continue;
         }
-        let character = text[index..]
-            .chars()
-            .next()
-            .unwrap_or(char::REPLACEMENT_CHARACTER);
-        if character == '\n' || column >= width {
+        if bytes[index] == b'\n' {
             if !active_style.is_empty() {
                 line.push_str(RESET);
             }
             lines.push(line);
             line = active_style.clone();
             column = 0;
-            if character == '\n' {
-                index += 1;
-                continue;
+            index += 1;
+            continue;
+        }
+        let character = text[index..]
+            .chars()
+            .next()
+            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        let character_width = terminal_character_width(character);
+        if column > 0 && column.saturating_add(character_width) > width {
+            if !active_style.is_empty() {
+                line.push_str(RESET);
             }
+            lines.push(line);
+            line = active_style.clone();
+            column = 0;
         }
         line.push(character);
-        column += 1;
+        column = column.saturating_add(character_width);
         index += character.len_utf8();
     }
     if !line.is_empty() || lines.is_empty() {
@@ -477,14 +491,15 @@ pub(super) fn split_chars(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut chunks = Vec::new();
     let mut start = 0;
-    let mut chunk_chars = 0;
-    for (index, _) in text.char_indices() {
-        if chunk_chars == width {
+    let mut chunk_width = 0usize;
+    for (index, character) in text.char_indices() {
+        let character_width = terminal_character_width(character);
+        if chunk_width > 0 && chunk_width.saturating_add(character_width) > width {
             chunks.push(text[start..index].to_string());
             start = index;
-            chunk_chars = 0;
+            chunk_width = 0;
         }
-        chunk_chars += 1;
+        chunk_width = chunk_width.saturating_add(character_width);
     }
     if start < text.len() {
         chunks.push(text[start..].to_string());
@@ -521,6 +536,40 @@ mod tests {
     }
 
     #[test]
+    fn wide_glyphs_use_their_terminal_cell_width() {
+        assert_eq!(visible_width("a✅b"), 4);
+
+        let lines = render("abcdefg✅hi", 8);
+
+        assert!(
+            lines.iter().all(|line| visible_width(line) <= 8),
+            "{:?}",
+            lines
+                .iter()
+                .map(|line| (strip_ansi(line), visible_width(line)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(strip_ansi(&lines.join("")), "abcdefg✅hi");
+    }
+
+    #[test]
+    fn variation_selectors_preserve_the_base_character_width() {
+        assert_eq!(visible_width("a⚠️b"), 3);
+
+        let lines = wrap_ansi("abcdefg⚠️hi", 8);
+
+        assert!(
+            lines.iter().all(|line| visible_width(line) <= 8),
+            "{:?}",
+            lines
+                .iter()
+                .map(|line| (strip_ansi(line), visible_width(line)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(strip_ansi(&lines.join("")), "abcdefg⚠️hi");
+    }
+
+    #[test]
     fn renders_box_drawing_table() {
         let lines = render("| Name | Value |\n| --- | --- |\n| yawl | small |", 40);
         assert!(strip_ansi(&lines[0]).starts_with('┌'));
@@ -529,6 +578,33 @@ mod tests {
             lines
                 .last()
                 .is_some_and(|line| strip_ansi(line).starts_with('└'))
+        );
+    }
+
+    #[test]
+    fn table_borders_align_with_emoji_presentation_sequences() {
+        fn terminal_fixture_width(line: &str) -> usize {
+            strip_ansi(line)
+                .chars()
+                .map(|character| unicode_width::UnicodeWidthChar::width(character).unwrap_or(0))
+                .sum()
+        }
+
+        let lines = render(
+            "| Interface | Status |\n| --- | --- |\n| en0 | ✅ Active |\n| en4 | ⚠️ No IP assigned |",
+            20,
+        );
+        let border_width = terminal_fixture_width(&lines[0]);
+
+        assert!(
+            lines
+                .iter()
+                .all(|line| terminal_fixture_width(line) == border_width),
+            "{:?}",
+            lines
+                .iter()
+                .map(|line| (strip_ansi(line), terminal_fixture_width(line)))
+                .collect::<Vec<_>>()
         );
     }
 

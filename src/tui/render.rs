@@ -6,6 +6,7 @@ use crate::provider::ReasoningKind;
 use super::completion::matching_completions;
 use super::input::Editor;
 use super::picker::render_picker;
+use super::state::{ScrollGeometry, scroll_bar_position, scroll_bar_span};
 use super::transcript::Entry;
 use super::{USER_BACKGROUND, USER_TEXT, ViewState, markdown, tool_view};
 
@@ -135,6 +136,80 @@ pub(super) fn render_copy_toast(frame: &mut [String], columns: usize, accent: Ui
     }
 }
 
+/// Track and thumb shading as a fraction of the accent color. The thumb stays
+/// brighter than the track so it cannot disappear into a dark background.
+const SCROLL_TRACK_INTENSITY: f32 = 0.38;
+const SCROLL_THUMB_INTENSITY: f32 = 0.65;
+
+fn shaded_background(color: UiColor, intensity: f32) -> String {
+    let channel = |value: u8| (f32::from(value) * intensity).round() as u8;
+    format!(
+        "\x1b[48;2;{};{};{}m",
+        channel(color.red),
+        channel(color.green),
+        channel(color.blue)
+    )
+}
+
+pub(super) fn apply_scroll_bar(
+    region: &mut [String],
+    state: &mut ViewState,
+    total_lines: usize,
+    max_scroll: usize,
+    columns: usize,
+) {
+    let height = region.len();
+    if !state.show_scroll_bar
+        || state.picker.is_some()
+        || max_scroll == 0
+        || height == 0
+        || total_lines <= height
+        || columns < 2
+    {
+        state.scroll_geometry = None;
+        return;
+    }
+    let (thumb_length, travel) = scroll_bar_span(height, total_lines);
+    state.scroll_geometry = Some(ScrollGeometry {
+        rows: height,
+        columns,
+        max_scroll,
+        travel,
+        thumb_length,
+    });
+    let start = scroll_bar_position(travel, max_scroll, state.scroll_offset);
+    let track = shaded_background(state.accent_color, SCROLL_TRACK_INTENSITY);
+    let thumb = shaded_background(state.accent_color, SCROLL_THUMB_INTENSITY);
+    for (row, line) in region.iter_mut().enumerate() {
+        let style = if row >= start && row < start + thumb_length {
+            &thumb
+        } else {
+            &track
+        };
+        debug_assert_eq!(markdown::visible_width(line), columns - 1);
+        line.push_str("\x1b[0m");
+        line.push_str(style);
+        line.push_str(" \x1b[0m");
+    }
+}
+
+fn render_transcript(state: &ViewState, width: usize) -> Vec<String> {
+    let mut transcript = render_entries(
+        state.transcript.entries(),
+        width,
+        state.tools_expanded,
+        state.hide_reasoning,
+    );
+    if let Some(loading) = render_loading_state(state, width) {
+        transcript.push(loading);
+        transcript.push(String::new());
+    }
+    for (index, input) in state.queued_inputs.iter().enumerate() {
+        transcript.extend(render_queued_panel(input, index + 1, width));
+    }
+    transcript
+}
+
 pub(super) fn has_visible_in_flight_content(state: &ViewState) -> bool {
     let Some(last) = state.transcript.entries().last() else {
         return false;
@@ -218,18 +293,18 @@ pub(super) fn build_frame(
     };
     let menu_height = menu.len();
     let transcript_height = rows.saturating_sub(input_height + menu_height + 1);
-    let mut transcript = render_entries(
-        state.transcript.entries(),
-        columns,
-        state.tools_expanded,
-        state.hide_reasoning,
-    );
-    if let Some(loading) = render_loading_state(state, columns) {
-        transcript.push(loading);
-        transcript.push(String::new());
-    }
-    for (index, input) in state.queued_inputs.iter().enumerate() {
-        transcript.extend(render_queued_panel(input, index + 1, columns));
+    let mut transcript = render_transcript(state, columns);
+    let show_scroll_bar = state.show_scroll_bar
+        && state.picker.is_none()
+        && columns >= 2
+        && transcript.len() > transcript_height;
+    let transcript_width = if show_scroll_bar {
+        columns - 1
+    } else {
+        columns
+    };
+    if show_scroll_bar {
+        transcript = render_transcript(state, transcript_width);
     }
     let max_scroll = transcript.len().saturating_sub(transcript_height);
     state.scroll_offset = state.scroll_offset.min(max_scroll);
@@ -237,20 +312,22 @@ pub(super) fn build_frame(
     let start = end.saturating_sub(transcript_height);
     let visible = &transcript[start..end];
 
-    let mut frame = Vec::with_capacity(rows);
+    let mut region = Vec::with_capacity(transcript_height);
     if let Some(picker) = &state.picker {
-        frame.extend(render_picker(picker, editor, columns, transcript_height));
+        region.extend(render_picker(picker, editor, columns, transcript_height));
     } else {
-        frame.extend(std::iter::repeat_n(
-            " ".repeat(columns),
+        region.extend(std::iter::repeat_n(
+            " ".repeat(transcript_width),
             transcript_height.saturating_sub(visible.len()),
         ));
-        frame.extend(
+        region.extend(
             visible
                 .iter()
-                .map(|line| markdown::fit_width(line, columns)),
+                .map(|line| markdown::fit_width(line, transcript_width)),
         );
     }
+    apply_scroll_bar(&mut region, state, transcript.len(), max_scroll, columns);
+    let mut frame = region;
     frame.extend(menu);
     let text_box_color = foreground_color(state.accent_color);
     frame.push(format!(

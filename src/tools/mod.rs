@@ -6,6 +6,7 @@
 
 pub mod exec;
 
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -18,6 +19,9 @@ pub use exec::DescribeCache;
 
 /// Cap on tool result size fed back to the model.
 const MAX_RESULT_CHARS: usize = 60_000;
+/// Cap on `read_file` input size. Anything larger truncates to
+/// `MAX_RESULT_CHARS` anyway, so reading it in full only wastes memory.
+const MAX_READ_FILE_BYTES: u64 = 1024 * 1024;
 const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 enum ToolImpl {
@@ -257,12 +261,29 @@ fn read_file(args: &Value) -> ToolOutcome {
         Ok(p) => p,
         Err(e) => return e,
     };
-    match std::fs::read(path) {
-        Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(text) => ToolOutcome::ok(text),
-            Err(_) => ToolOutcome::error(format!("{path} is not valid UTF-8 (binary file?)")),
-        },
+    match std::fs::File::open(path) {
+        Ok(file) => read_bounded_utf8(path, file),
         Err(e) => ToolOutcome::error(format!("cannot read {path}: {e}")),
+    }
+}
+
+fn read_bounded_utf8(path: &str, reader: impl Read) -> ToolOutcome {
+    let mut bytes = Vec::new();
+    if let Err(error) = reader
+        .take(MAX_READ_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+    {
+        return ToolOutcome::error(format!("cannot read {path}: {error}"));
+    }
+    if bytes.len() > MAX_READ_FILE_BYTES as usize {
+        return ToolOutcome::error(format!(
+            "{path} exceeds the {MAX_READ_FILE_BYTES}-byte read limit; \
+             use shell tools to read portions"
+        ));
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => ToolOutcome::ok(text),
+        Err(_) => ToolOutcome::error(format!("{path} is not valid UTF-8 (binary file?)")),
     }
 }
 
@@ -399,6 +420,7 @@ printf '%s:%s' "$YAWL_SESSION_ID" "$input"
             reasoning_effort: None,
             hide_reasoning: false,
             accent_color: crate::config::UiColor::WHITE,
+            scroll_bar: true,
             context_windows: std::collections::HashMap::new(),
             auto_compact: true,
             compact_threshold: 0.85,
@@ -420,6 +442,27 @@ printf '%s:%s' "$YAWL_SESSION_ID" "$input"
         assert_eq!(outcome.content, r#"session-7:{"value":1}"#);
         let _ = std::fs::remove_dir_all(root);
         Ok(())
+    }
+
+    #[test]
+    fn read_file_rejects_files_over_the_size_limit() -> std::io::Result<()> {
+        let path = temp_path("large.bin");
+        std::fs::write(&path, vec![b'a'; MAX_READ_FILE_BYTES as usize + 1])?;
+
+        let out = read_file(&json!({"path": path.to_string_lossy()}));
+
+        assert!(out.is_error);
+        assert!(out.content.contains("read limit"));
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn read_file_bounds_streams_without_relying_on_metadata() {
+        let out = read_bounded_utf8("endless", std::io::repeat(b'a'));
+
+        assert!(out.is_error);
+        assert!(out.content.contains("read limit"));
     }
 
     #[test]

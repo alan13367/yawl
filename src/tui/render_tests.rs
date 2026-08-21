@@ -38,6 +38,9 @@ fn frame_keeps_input_and_status_pinned() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        show_scroll_bar: true,
+        scroll_geometry: None,
+        scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         context_tokens: 12,
@@ -172,6 +175,9 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        show_scroll_bar: true,
+        scroll_geometry: None,
+        scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         context_tokens: 0,
@@ -208,6 +214,9 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         reasoning_effort: None,
         hide_reasoning: true,
         accent_color: UiColor::WHITE,
+        show_scroll_bar: true,
+        scroll_geometry: None,
+        scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         context_tokens: 0,
@@ -255,6 +264,9 @@ fn loading_state_ignores_status_activity() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        show_scroll_bar: true,
+        scroll_geometry: None,
+        scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         context_tokens: 0,
@@ -281,4 +293,205 @@ fn loading_state_ignores_status_activity() {
             "status {activity:?} should not show a spinner"
         );
     }
+}
+
+fn overflow_state() -> ViewState {
+    let messages = (0..30)
+        .map(|index| {
+            crate::provider::Message::assistant(format!("overflow line {index}"), Vec::new())
+        })
+        .collect::<Vec<_>>();
+    ViewState {
+        transcript: Transcript::from_messages(&messages),
+        tools_expanded: false,
+        model: "test".into(),
+        reasoning_effort: None,
+        hide_reasoning: false,
+        accent_color: UiColor::WHITE,
+        show_scroll_bar: true,
+        scroll_geometry: None,
+        scroll_bar_drag: None,
+        copy_toast_ticks: 0,
+        spinner_tick: 0,
+        context_tokens: 0,
+        context_window: 100,
+        activity: String::new(),
+        scroll_offset: 0,
+        queued_inputs: std::collections::VecDeque::new(),
+        pending_actions: std::collections::VecDeque::new(),
+        completions: Vec::new(),
+        completion_index: 0,
+        picker: None,
+    }
+}
+
+#[test]
+fn scroll_bar_follows_the_accent_color_when_content_overflows() {
+    let mut state = overflow_state();
+    let editor = Editor::default();
+    let columns = 40;
+    let (frame, _) = build_frame(&mut state, &editor, columns, 12);
+    let transcript_rows = &frame[..8];
+
+    // Every transcript row carries a solid background cell in the last
+    // column. The brighter thumb must remain distinct from both the muted
+    // track and the dark terminal background.
+    let track = "\x1b[48;2;90;90;90m";
+    let thumb = "\x1b[48;2;155;155;155m";
+    for line in transcript_rows {
+        assert_eq!(markdown::visible_width(line), columns);
+        assert!(line.ends_with(" \x1b[0m"), "{line:?}");
+        assert!(line.contains(track) || line.contains(thumb), "{line:?}");
+    }
+    // At the bottom the thumb sits on the last transcript row.
+    assert!(
+        transcript_rows[7].contains(thumb),
+        "{:?}",
+        transcript_rows[7]
+    );
+    assert!(
+        transcript_rows[..7].iter().all(|line| line.contains(track)),
+        "{transcript_rows:?}"
+    );
+}
+
+#[test]
+fn scroll_bar_thumb_tracks_the_viewport_position() {
+    let mut state = overflow_state();
+    let editor = Editor::default();
+    let track = "\x1b[48;2;90;90;90m";
+    let thumb = "\x1b[48;2;155;155;155m";
+    let (frame_bottom, _) = build_frame(&mut state, &editor, 40, 12);
+
+    // At the bottom the top transcript row is track.
+    assert!(frame_bottom[0].contains(track));
+
+    // Scrolling to the top moves the thumb to the first transcript row.
+    state.scroll_offset = usize::MAX;
+    let (frame_top, _) = build_frame(&mut state, &editor, 40, 12);
+    assert!(frame_top[0].contains(thumb));
+}
+
+#[test]
+fn scroll_bar_reflows_transcript_without_dropping_the_last_column() {
+    let mut state = overflow_state();
+    let content = format!("{}Z{}", "a".repeat(39), "b".repeat(400));
+    state.transcript =
+        Transcript::from_messages(&[crate::provider::Message::assistant(content, Vec::new())]);
+    state.scroll_offset = usize::MAX;
+    let editor = Editor::default();
+
+    let (frame, _) = build_frame(&mut state, &editor, 40, 12);
+    let visible = markdown::strip_ansi(&frame[..8].join("\n"));
+
+    assert!(visible.contains('Z'), "{visible:?}");
+}
+
+#[test]
+fn scroll_bar_stays_in_the_last_column_beside_tables_with_wide_glyphs() {
+    fn fixture_terminal_width(line: &str) -> usize {
+        markdown::strip_ansi(line)
+            .chars()
+            .map(|character| unicode_width::UnicodeWidthChar::width(character).unwrap_or(0))
+            .sum()
+    }
+
+    let content = "## Current peers\n\n\
+        | Device | IP | Status |\n\
+        | --- | --- | --- |\n\
+        | macbook | 100.64.0.1 | ✅ Online |\n\
+        | server | 100.64.0.2 | ⚠️ No IP assigned |\n\n\
+        ## Notes\n\n\
+        More content below the table so the transcript overflows.\n\n\
+        Another paragraph that keeps the scroll bar visible.";
+    let mut state = overflow_state();
+    state.transcript = Transcript::from_messages(&[crate::provider::Message::assistant(
+        content.into(),
+        Vec::new(),
+    )]);
+    state.scroll_offset = usize::MAX;
+    let editor = Editor::default();
+
+    let (frame, _) = build_frame(&mut state, &editor, 60, 12);
+    let geometry = state
+        .scroll_geometry
+        .expect("the fixture should overflow and draw a scroll bar");
+
+    assert!(
+        frame[..geometry.rows]
+            .iter()
+            .all(|line| fixture_terminal_width(line) == geometry.columns),
+        "{:?}",
+        frame[..geometry.rows]
+            .iter()
+            .map(|line| fixture_terminal_width(line))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn scroll_bar_setting_hides_the_bar_and_preserves_content() {
+    let mut state = overflow_state();
+    state.show_scroll_bar = false;
+    let editor = Editor::default();
+    let (frame, _) = build_frame(&mut state, &editor, 40, 12);
+
+    assert!(!frame.join("\n").contains("\x1b[48;2;"));
+    assert!(state.scroll_geometry.is_none());
+    assert!(
+        frame[..8]
+            .iter()
+            .all(|line| markdown::visible_width(line) == 40)
+    );
+}
+
+#[test]
+fn scroll_bar_is_absent_when_content_fits_the_transcript() {
+    let mut state = ViewState {
+        transcript: Transcript::from_messages(&[crate::provider::Message::assistant(
+            "short".into(),
+            Vec::new(),
+        )]),
+        tools_expanded: false,
+        model: "test".into(),
+        reasoning_effort: None,
+        hide_reasoning: false,
+        accent_color: UiColor::WHITE,
+        show_scroll_bar: true,
+        scroll_geometry: None,
+        scroll_bar_drag: None,
+        copy_toast_ticks: 0,
+        spinner_tick: 0,
+        context_tokens: 0,
+        context_window: 100,
+        activity: String::new(),
+        scroll_offset: 0,
+        queued_inputs: std::collections::VecDeque::new(),
+        pending_actions: std::collections::VecDeque::new(),
+        completions: Vec::new(),
+        completion_index: 0,
+        picker: None,
+    };
+    let editor = Editor::default();
+    let (frame, _) = build_frame(&mut state, &editor, 40, 12);
+
+    assert!(!frame.join("\n").contains("\x1b[48;2;"));
+    assert!(state.scroll_geometry.is_none());
+}
+
+#[test]
+fn scroll_bar_does_not_overlay_an_open_picker() {
+    let mut state = overflow_state();
+    state.picker = Some(Picker {
+        title: "Settings".into(),
+        hint: String::new(),
+        selected: 0,
+        items: Vec::new(),
+        editing: None,
+    });
+    let editor = Editor::default();
+    let (frame, _) = build_frame(&mut state, &editor, 40, 12);
+
+    assert!(!frame[..8].iter().any(|line| line.contains("\x1b[48;2;")));
+    assert!(state.scroll_geometry.is_none());
 }

@@ -6,8 +6,8 @@ use crate::error::Error;
 
 use super::picker::{
     Picker, PickerAction, PickerItem, SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_AUTO_COMPACT_INDEX,
-    SETTINGS_RELOAD_INDEX, color_picker, open_model_picker, open_reasoning_picker,
-    open_settings_picker, select_picker_item,
+    SETTINGS_RELOAD_INDEX, SETTINGS_SCROLL_BAR_INDEX, color_picker, open_model_picker,
+    open_reasoning_picker, open_settings_picker, select_picker_item,
 };
 use super::state::ViewState;
 
@@ -33,7 +33,8 @@ Input
   Messages submitted during a response appear below it as queued.
   Outside the menu, Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
   Ctrl+O expands or collapses tool output. Esc or Ctrl+C aborts the active turn.
-  Mouse wheel and PageUp/PageDown scroll. Drag selects text; release copies it.
+   Mouse wheel and PageUp/PageDown scroll. Click or drag the right-edge
+   scroll bar to move through the transcript. Drag selects text; release copies it.
 ";
 
 pub(super) fn is_new_session_command(name: &str) -> bool {
@@ -215,6 +216,16 @@ pub(super) fn activate_picker_action(
         PickerAction::OpenAccentColor => {
             state.picker = Some(color_picker(agent.config().accent_color));
         }
+        PickerAction::SetScrollBar(enabled) => {
+            if settings(
+                agent,
+                &format!("scroll_bar {}", if enabled { "on" } else { "off" }),
+                state,
+            ) {
+                open_settings_picker(agent, state);
+                select_picker_item(state, SETTINGS_SCROLL_BAR_INDEX);
+            }
+        }
         PickerAction::SetAccentColor(color) => {
             if settings(
                 agent,
@@ -286,6 +297,8 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
             one_value(&mut parts, "usage: /settings accent_color NAME|#RRGGBB")
                 .map(|value| ConfigChange::AccentColor(value.to_string()))
         }
+        "scroll_bar" => one_value(&mut parts, "usage: /settings scroll_bar on|off")
+            .map(|value| ConfigChange::ScrollBar(value.to_string())),
         "auto_compact" => one_value(&mut parts, "usage: /settings auto_compact on|off")
             .map(|value| ConfigChange::AutoCompact(value.to_string())),
         "compact_threshold" => one_value(
@@ -358,6 +371,7 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
             state.reasoning_effort = agent.config().reasoning_effort.clone();
             state.hide_reasoning = agent.config().hide_reasoning;
             state.accent_color = agent.config().accent_color;
+            state.show_scroll_bar = agent.config().scroll_bar;
             state.context_window = agent.context_window();
             notice_config_effect(agent.config(), effect, state);
             true
@@ -395,7 +409,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- scroll_bar: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -405,6 +419,11 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
             .unwrap_or("provider default"),
         agent.config().hide_reasoning,
         agent.config().accent_color.config_value(),
+        if agent.config().scroll_bar {
+            "on"
+        } else {
+            "off"
+        },
         if agent.config().auto_compact {
             "on"
         } else {
@@ -432,7 +451,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);

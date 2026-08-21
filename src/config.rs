@@ -35,6 +35,8 @@ pub struct Config {
     pub reasoning_effort: Option<String>,
     pub hide_reasoning: bool,
     pub(crate) accent_color: UiColor,
+    /// Whether the TUI draws a transcript scroll bar.
+    pub scroll_bar: bool,
     pub context_windows: HashMap<String, u64>,
     pub auto_compact: bool,
     pub compact_threshold: f64,

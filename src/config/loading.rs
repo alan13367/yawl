@@ -26,6 +26,7 @@ impl Config {
             reasoning_effort: None,
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
+            scroll_bar: true,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
@@ -41,7 +42,8 @@ impl Config {
                 Ok(text) => {
                     let file: ConfigFile = serde_json::from_str(&text)
                         .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
-                    cfg.apply(file);
+                    cfg.apply(file)
+                        .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(Error::Config(format!("{}: {e}", path.display()))),
@@ -54,7 +56,10 @@ impl Config {
         Self::load_from(self.home_dir.clone(), self.project_dir.clone())
     }
 
-    fn apply(&mut self, file: ConfigFile) {
+    /// Merges one on-disk file into the effective config. Values are held to
+    /// the same rules interactive changes enforce, so a hand-edited
+    /// config.json fails loudly instead of degrading silently.
+    fn apply(&mut self, file: ConfigFile) -> Result<(), Error> {
         if let Some(value) = file.model {
             self.model = (!value.trim().is_empty()).then_some(value);
         }
@@ -65,10 +70,21 @@ impl Config {
             self.openai_base_url = value;
         }
         if let Some(value) = file.max_tokens {
-            self.max_tokens = value.max(1);
+            if value == 0 {
+                return Err(Error::Config(
+                    "max_tokens must be a positive integer".into(),
+                ));
+            }
+            self.max_tokens = value;
         }
         if let Some(value) = file.reasoning_effort {
-            self.reasoning_effort = normalize_reasoning_effort(&value).map(str::to_string);
+            match value.as_str() {
+                "default" | "off" => self.reasoning_effort = None,
+                level @ ("minimal" | "low" | "medium" | "high" | "xhigh" | "max") => {
+                    self.reasoning_effort = Some(level.to_string());
+                }
+                _ => return Err(Error::Config("unsupported reasoning effort".into())),
+            }
         }
         if let Some(value) = file.hide_reasoning {
             self.hide_reasoning = value;
@@ -80,14 +96,29 @@ impl Config {
         {
             self.accent_color = value;
         }
+        if let Some(value) = file.scroll_bar {
+            self.scroll_bar = value;
+        }
         if let Some(map) = file.context_windows {
+            for (model, window) in &map {
+                if *window == 0 {
+                    return Err(Error::Config(format!(
+                        "context_windows.{model} must be a positive integer"
+                    )));
+                }
+            }
             self.context_windows.extend(map);
         }
         if let Some(value) = file.auto_compact {
             self.auto_compact = value;
         }
         if let Some(value) = file.compact_threshold {
-            self.compact_threshold = value.clamp(0.1, 0.99);
+            if !(0.1..=0.99).contains(&value) {
+                return Err(Error::Config(
+                    "compact_threshold must be between 0.1 and 0.99".into(),
+                ));
+            }
+            self.compact_threshold = value;
         }
         if let Some(dirs) = file.skill_dirs {
             self.skill_dirs = dirs
@@ -104,6 +135,17 @@ impl Config {
                     .apply(provider);
             }
         }
+        for (name, provider) in &self.providers {
+            for model in &provider.models {
+                if model.context_window == Some(0) {
+                    return Err(Error::Config(format!(
+                        "providers.{name}.models.{} contextWindow must be a positive integer",
+                        model.id
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -157,6 +199,7 @@ mod tests {
             reasoning_effort: None,
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
+            scroll_bar: true,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: 0.85,
@@ -168,8 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn context_window_prefers_config_override_and_provider_metadata()
-    -> Result<(), serde_json::Error> {
+    fn context_window_prefers_config_override_and_provider_metadata() -> Result<(), Error> {
         let mut cfg = test_config();
         cfg.context_windows.insert("tiny".into(), 4096);
         let file: ConfigFile = serde_json::from_value(json!({
@@ -185,7 +227,7 @@ mod tests {
                 }
             }
         }))?;
-        cfg.apply(file);
+        cfg.apply(file)?;
 
         assert_eq!(crate::model::context_window(&cfg, "tiny"), 4096);
         assert_eq!(crate::model::context_window(&cfg, "openai:tiny"), 4096);
@@ -203,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_style_provider_config_is_accepted() -> Result<(), serde_json::Error> {
+    fn pi_style_provider_config_is_accepted() -> Result<(), Error> {
         let mut cfg = test_config();
         let file: ConfigFile = serde_json::from_value(json!({
             "providers": {
@@ -219,7 +261,7 @@ mod tests {
                 }
             }
         }))?;
-        cfg.apply(file);
+        cfg.apply(file)?;
 
         let provider = &cfg.providers["omlx"];
         assert_eq!(provider.base_url, "http://localhost:9000/v1");
@@ -231,30 +273,40 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_accepts_levels_and_default() -> Result<(), serde_json::Error> {
+    fn reasoning_effort_accepts_levels_and_default() -> Result<(), Error> {
         let mut cfg = test_config();
-        cfg.apply(serde_json::from_value(json!({"reasoning_effort": "high"}))?);
+        cfg.apply(serde_json::from_value(json!({"reasoning_effort": "high"}))?)?;
         assert_eq!(cfg.reasoning_effort.as_deref(), Some("high"));
 
         cfg.apply(serde_json::from_value(
             json!({"reasoning_effort": "default"}),
-        )?);
+        )?)?;
         assert_eq!(cfg.reasoning_effort, None);
         Ok(())
     }
 
     #[test]
-    fn reasoning_is_visible_unless_hidden() -> Result<(), serde_json::Error> {
+    fn reasoning_is_visible_unless_hidden() -> Result<(), Error> {
         let mut cfg = test_config();
         assert!(!cfg.hide_reasoning);
 
-        cfg.apply(serde_json::from_value(json!({"hide_reasoning": true}))?);
+        cfg.apply(serde_json::from_value(json!({"hide_reasoning": true}))?)?;
         assert!(cfg.hide_reasoning);
         Ok(())
     }
 
     #[test]
-    fn ui_colors_accept_palette_names_and_custom_rgb() -> Result<(), serde_json::Error> {
+    fn scroll_bar_is_visible_unless_disabled() -> Result<(), Error> {
+        let mut cfg = test_config();
+        assert!(cfg.scroll_bar);
+
+        cfg.apply(serde_json::from_value(json!({"scroll_bar": false}))?)?;
+        assert!(!cfg.scroll_bar);
+        Ok(())
+    }
+
+    #[test]
+    fn ui_colors_accept_palette_names_and_custom_rgb() -> Result<(), Error> {
         assert_eq!(
             UiColor::parse("blue")
                 .expect("the built-in blue palette name should parse")
@@ -270,13 +322,75 @@ mod tests {
         let mut cfg = test_config();
         cfg.apply(serde_json::from_value(json!({
             "accent_color": "#102030"
-        }))?);
+        }))?)?;
         assert_eq!(cfg.accent_color, UiColor::new(0x10, 0x20, 0x30));
 
         cfg.apply(serde_json::from_value(
             json!({"status_bar_color": "green"}),
-        )?);
+        )?)?;
         assert_eq!(cfg.accent_color.config_value(), "green");
+        Ok(())
+    }
+
+    #[test]
+    fn loaded_values_meet_interactive_validation_rules() {
+        let cases = [
+            (
+                json!({"max_tokens": 0}),
+                "max_tokens must be a positive integer",
+            ),
+            (
+                json!({"compact_threshold": 1.5}),
+                "compact_threshold must be between 0.1 and 0.99",
+            ),
+            (
+                json!({"context_windows": {"tiny": 0}}),
+                "context_windows.tiny must be a positive integer",
+            ),
+            (
+                json!({"reasoning_effort": "extreme"}),
+                "unsupported reasoning effort",
+            ),
+            (
+                json!({"providers": {"omlx": {"models": [{"id": "m", "contextWindow": 0}]}}}),
+                "providers.omlx.models.m contextWindow must be a positive integer",
+            ),
+        ];
+        for (value, expected) in cases {
+            let mut cfg = test_config();
+            let file: ConfigFile =
+                serde_json::from_value(value).expect("the rejection fixtures should deserialize");
+            let error = cfg
+                .apply(file)
+                .expect_err("out-of-range values should fail validation");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_from_reports_the_file_that_failed_validation() -> Result<(), Error> {
+        let root =
+            std::env::temp_dir().join(format!("yawl-config-validation-{}", std::process::id()));
+        let home = root.join("home/.yawl");
+        std::fs::create_dir_all(&home)?;
+        std::fs::write(
+            home.join("config.json"),
+            r#"{"context_windows": {"tiny": 0}}"#,
+        )?;
+
+        let error = Config::load_from(home.clone(), root.join("project"))
+            .expect_err("invalid config should fail to load");
+
+        assert!(
+            error
+                .to_string()
+                .contains(&home.join("config.json").display().to_string())
+        );
+        assert!(error.to_string().contains("positive integer"));
+        let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
 }

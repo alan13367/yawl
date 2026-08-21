@@ -19,6 +19,8 @@ mod render;
 #[cfg(test)]
 mod render_tests;
 mod state;
+#[cfg(test)]
+mod state_tests;
 mod terminal;
 #[cfg(test)]
 mod terminal_tests;

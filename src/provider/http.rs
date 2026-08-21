@@ -1,4 +1,4 @@
-use std::io::BufRead;
+use std::io::{BufRead, Take};
 use std::time::Duration;
 
 use crate::error::Error;
@@ -22,15 +22,32 @@ pub(crate) struct SseEvent {
     pub data: String,
 }
 
+/// Ceiling for one SSE event's joined `data:` payload. Real provider events
+/// stay far below this; the cap stops a runaway server from ballooning
+/// memory.
+pub(crate) const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
+/// Ceiling for one streaming response's total SSE bytes.
+pub(crate) const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Hand-rolled SSE parser over a blocking reader. Yields one event per
 /// blank-line-terminated block; checks the interrupt flag between reads.
+/// Total bytes are bounded via `Take`, so even a single unterminated line
+/// cannot allocate past the response ceiling.
 pub(crate) struct SseReader<R> {
-    reader: R,
+    reader: Take<R>,
+    event_limit: usize,
 }
 
 impl<R: BufRead> SseReader<R> {
     pub fn new(reader: R) -> Self {
-        SseReader { reader }
+        Self::with_limits(reader, MAX_EVENT_BYTES, MAX_RESPONSE_BYTES)
+    }
+
+    pub(crate) fn with_limits(reader: R, event_limit: usize, response_limit: u64) -> Self {
+        SseReader {
+            reader: reader.take(response_limit),
+            event_limit,
+        }
     }
 }
 
@@ -49,6 +66,14 @@ impl<R: BufRead> Iterator for SseReader<R> {
             line.clear();
             match self.reader.read_line(&mut line) {
                 Ok(0) => {
+                    // `Take` reports EOF at the byte ceiling; distinguish
+                    // that from a genuine end of stream so oversized
+                    // responses fail loudly instead of truncating silently.
+                    if self.reader.limit() == 0 {
+                        return Some(Err(Error::Protocol(format!(
+                            "response exceeded {MAX_RESPONSE_BYTES} SSE bytes"
+                        ))));
+                    }
                     return if saw_field {
                         Some(Ok(SseEvent { event, data }))
                     } else {
@@ -69,10 +94,17 @@ impl<R: BufRead> Iterator for SseReader<R> {
                 event = rest.trim_start().to_string();
                 saw_field = true;
             } else if let Some(rest) = trimmed.strip_prefix("data:") {
+                let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                if data.len() + rest.len() > self.event_limit {
+                    return Some(Err(Error::Protocol(format!(
+                        "SSE event exceeded {} bytes",
+                        self.event_limit
+                    ))));
+                }
                 if !data.is_empty() {
                     data.push('\n');
                 }
-                data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+                data.push_str(rest);
                 saw_field = true;
             }
             // Comment lines (":...") and unknown fields are ignored.
@@ -114,5 +146,39 @@ mod tests {
         assert_eq!(e2.data, "line1\nline2");
         assert!(r.next().is_none());
         Ok(())
+    }
+
+    #[test]
+    fn sse_reader_rejects_oversized_events() {
+        let oversized = "x".repeat(64);
+        let input = format!("data: {oversized}\n\n");
+        let mut r = SseReader::with_limits(Cursor::new(input), 16, 1024);
+
+        let error = r.next().expect("oversized event should yield an error");
+
+        let Err(Error::Protocol(message)) = error else {
+            panic!("oversized event should be a protocol error");
+        };
+        assert!(message.contains("SSE event"));
+    }
+
+    #[test]
+    fn sse_reader_rejects_responses_over_the_byte_ceiling() {
+        let input = format!("data: one\n\ndata: {}\n\ndata: tail\n\n", "y".repeat(64));
+        let mut r = SseReader::with_limits(Cursor::new(input), 1024, 80);
+
+        let mut events = Vec::new();
+        loop {
+            match r.next() {
+                Some(Ok(event)) => events.push(event),
+                Some(Err(Error::Protocol(msg))) => {
+                    assert!(msg.contains("response exceeded"));
+                    break;
+                }
+                Some(Err(error)) => panic!("unexpected error: {error}"),
+                None => panic!("over-ceiling response should error, not end cleanly"),
+            }
+        }
+        assert_eq!(events.len(), 1);
     }
 }

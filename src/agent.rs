@@ -38,6 +38,8 @@ pub enum TurnEvent<'a> {
     Compacted {
         replaced: usize,
     },
+    /// Non-fatal problem the user should know about; the turn continues.
+    Warning(String),
     Usage {
         context_tokens: u64,
         context_window: u64,
@@ -104,6 +106,7 @@ impl Agent {
     pub(crate) fn sync_display_config(&mut self, config: &Config) {
         self.config.hide_reasoning = config.hide_reasoning;
         self.config.accent_color = config.accent_color;
+        self.config.scroll_bar = config.scroll_bar;
     }
 
     /// Starts a fresh session (used by `/new` and `/clear`).
@@ -185,7 +188,7 @@ impl Agent {
             let registry = self.scan_tools();
             let specs = registry.specs();
 
-            self.maybe_compact(sink)?;
+            self.maybe_compact(sink, resolve_provider)?;
 
             let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;
             let request = provider::Request {
@@ -277,7 +280,14 @@ impl Agent {
         Ok(aborted)
     }
 
-    fn maybe_compact(&mut self, sink: &mut dyn FnMut(TurnEvent<'_>)) -> Result<(), Error> {
+    fn maybe_compact<F>(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
         if !self.config.auto_compact
             || !compaction::should_compact(
                 self.context_tokens,
@@ -287,19 +297,36 @@ impl Agent {
         {
             return Ok(());
         }
-        match self.compact_now(sink) {
+        match self.compact_now_with(sink, resolve_provider) {
             // A failed auto-compaction shouldn't kill the turn; the request
             // may still fit. Manual /compact reports errors directly.
             Err(Error::Interrupted) => Err(Error::Interrupted),
-            Ok(()) | Err(_) => Ok(()),
+            Ok(()) => Ok(()),
+            Err(error) => {
+                sink(TurnEvent::Warning(format!(
+                    "Auto-compaction failed; continuing without compacting: {error}"
+                )));
+                Ok(())
+            }
         }
     }
 
     /// Summarizes the head of the conversation with the current model
     /// (also the `/compact` slash command).
     pub fn compact_now(&mut self, sink: &mut dyn FnMut(TurnEvent<'_>)) -> Result<(), Error> {
+        self.compact_now_with(sink, &mut provider::resolve)
+    }
+
+    fn compact_now_with<F>(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
         sink(TurnEvent::Compacting);
-        let (provider, bare_model) = provider::resolve(&self.model, &self.config)?;
+        let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;
         let (summary, replaced) = compaction::summarize(
             provider.as_ref(),
             &bare_model,
@@ -429,6 +456,7 @@ mod tests {
                 reasoning_effort: None,
                 hide_reasoning: false,
                 accent_color: crate::config::UiColor::WHITE,
+                scroll_bar: true,
                 context_windows: HashMap::new(),
                 auto_compact: false,
                 compact_threshold: 0.85,
@@ -570,6 +598,70 @@ mod tests {
 
         assert!(completed);
         assert_eq!(test.agent.context_tokens(), u64::MAX);
+    }
+
+    #[test]
+    fn failed_auto_compaction_warns_and_the_turn_continues() {
+        let mut test = TestAgent::new("compact-warning");
+        test.agent.config.auto_compact = true;
+        test.agent.config.context_windows.insert("test".into(), 10);
+        // Enough history that auto-compaction has something to summarize.
+        for index in 0..12 {
+            test.agent
+                .messages
+                .push(Message::user(format!("history {index}")));
+        }
+        let steps = Rc::new(RefCell::new(VecDeque::from([
+            ProviderStep::Output {
+                text: "",
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"true"}"#.into(),
+                }],
+                input_tokens: 100,
+                output_tokens: 0,
+            },
+            ProviderStep::Fail,
+            ProviderStep::Output {
+                text: "done",
+                tool_calls: Vec::new(),
+                input_tokens: 100,
+                output_tokens: 0,
+            },
+        ])));
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut resolve = |_: &str, _: &Config| {
+            Ok::<(Box<dyn Provider>, String), Error>((
+                Box::new(ScriptedProvider {
+                    steps: Rc::clone(&steps),
+                    requests: Rc::clone(&requests),
+                }),
+                "test".into(),
+            ))
+        };
+        let mut warnings = Vec::new();
+
+        let completed = test
+            .agent
+            .run_turn_with(
+                Some("hello".into()),
+                &mut |event| {
+                    if let TurnEvent::Warning(text) = event {
+                        warnings.push(text.to_string());
+                    }
+                },
+                &mut resolve,
+            )
+            .expect("turn should survive the compaction failure");
+
+        assert!(completed);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Auto-compaction failed"));
+        // The failed compaction left the conversation untouched.
+        assert_eq!(test.agent.messages.len(), 16);
+        assert_eq!(test.agent.messages[14].role, Role::Tool);
+        assert_eq!(test.agent.messages[15].content, "done");
     }
 
     #[test]

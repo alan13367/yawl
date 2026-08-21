@@ -229,6 +229,7 @@ mod tests {
             reasoning_effort: None,
             hide_reasoning: false,
             accent_color: crate::config::UiColor::WHITE,
+            scroll_bar: true,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: 0.85,

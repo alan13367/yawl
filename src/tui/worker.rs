@@ -13,10 +13,11 @@ use super::events::{Event, EventReader, Key, MouseEvent};
 use super::input::{EditAction, Editor};
 use super::picker::{
     ActivePickers, PickerAction, SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_REASONING_DISPLAY_INDEX,
-    picker_is_editing, select_picker_item, take_picker_action,
+    SETTINGS_SCROLL_BAR_INDEX, picker_is_editing, select_picker_item, take_picker_action,
 };
 use super::state::{
-    COPY_TOAST_TICKS, Update, ViewState, advance_ticks, scroll, toggle_tool_expansion,
+    COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, scroll,
+    toggle_tool_expansion,
 };
 use super::terminal::Terminal;
 
@@ -190,6 +191,9 @@ pub(super) fn handle_mouse_selection(
     state: &mut ViewState,
     event: MouseEvent,
 ) -> Result<(), Error> {
+    if handle_scroll_bar_mouse(state, event) {
+        return Ok(());
+    }
     if terminal.handle_mouse(event)? {
         state.copy_toast_ticks = COPY_TOAST_TICKS;
     }
@@ -290,6 +294,10 @@ pub(super) fn display_config_change(action: &PickerAction) -> Option<(ConfigChan
             ConfigChange::AccentColor(color.config_value()),
             SETTINGS_ACCENT_COLOR_INDEX,
         )),
+        PickerAction::SetScrollBar(enabled) => Some((
+            ConfigChange::ScrollBar(if *enabled { "on" } else { "off" }.into()),
+            SETTINGS_SCROLL_BAR_INDEX,
+        )),
         PickerAction::ApplySetting { argument, selected } => argument
             .strip_prefix("accent_color ")
             .map(|value| (ConfigChange::AccentColor(value.to_string()), *selected)),
@@ -309,6 +317,7 @@ pub(super) fn apply_display_config_while_busy(
             *config = outcome.config;
             state.hide_reasoning = config.hide_reasoning;
             state.accent_color = config.accent_color;
+            state.show_scroll_bar = config.scroll_bar;
             notice_config_effect(config, outcome.effect, state);
             active_pickers.refresh_display_settings(config);
             state.picker = Some(active_pickers.settings.clone());

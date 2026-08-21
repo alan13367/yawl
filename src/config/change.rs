@@ -16,6 +16,7 @@ pub(crate) enum ConfigChange {
     ReasoningEffort(String),
     HideReasoning(String),
     AccentColor(String),
+    ScrollBar(String),
     AutoCompact(String),
     CompactThreshold(String),
     ContextWindow {
@@ -63,6 +64,7 @@ enum ValidatedChange {
     },
     HideReasoning(bool),
     AccentColor(UiColor),
+    ScrollBar(bool),
     AutoCompact(bool),
     CompactThreshold(f64),
     ContextWindow {
@@ -136,6 +138,7 @@ impl ValidatedChange {
             ConfigChange::AccentColor(value) => UiColor::parse(&value)
                 .map(Self::AccentColor)
                 .map_err(Error::Config),
+            ConfigChange::ScrollBar(value) => Ok(Self::ScrollBar(parse_on_off(&value)?)),
             ConfigChange::AutoCompact(value) => Ok(Self::AutoCompact(parse_on_off(&value)?)),
             ConfigChange::CompactThreshold(value) => {
                 Ok(Self::CompactThreshold(parse_threshold(&value)?))
@@ -216,6 +219,7 @@ impl ValidatedChange {
                 root.remove("text_box_color");
                 Ok(())
             }),
+            Self::ScrollBar(enabled) => insert_scalar(config, "scroll_bar", json!(enabled)),
             Self::AutoCompact(enabled) => insert_scalar(config, "auto_compact", json!(enabled)),
             Self::CompactThreshold(threshold) => {
                 insert_scalar(config, "compact_threshold", json!(threshold))
@@ -282,6 +286,7 @@ impl ValidatedChange {
             Self::ReasoningEffort { effective, .. } => config.reasoning_effort == *effective,
             Self::HideReasoning(hidden) => config.hide_reasoning == *hidden,
             Self::AccentColor(color) => config.accent_color == *color,
+            Self::ScrollBar(enabled) => config.scroll_bar == *enabled,
             Self::AutoCompact(enabled) => config.auto_compact == *enabled,
             Self::CompactThreshold(threshold) => config.compact_threshold == *threshold,
             Self::ContextWindow { model, window } => {
@@ -489,6 +494,33 @@ mod tests {
                 .change_global(ConfigChange::AccentColor("transparent".into()))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn scroll_bar_change_is_validated_persisted_and_reloaded() {
+        let dirs = TestDirs::new("scroll-bar");
+        let config = dirs.config();
+        assert!(config.scroll_bar);
+
+        let outcome = config
+            .change_global(ConfigChange::ScrollBar("off".into()))
+            .expect("a valid on/off value should apply");
+
+        assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
+        assert!(!outcome.config.scroll_bar);
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(dirs.home.join("config.json"))
+                .expect("saved config should be readable"),
+        )
+        .expect("saved config should remain JSON");
+        assert_eq!(saved["scroll_bar"], false);
+
+        let error = outcome
+            .config
+            .change_global(ConfigChange::ScrollBar("maybe".into()))
+            .err()
+            .expect("non-boolean values should fail validation");
+        assert!(error.to_string().contains("on or off"));
     }
 
     #[test]

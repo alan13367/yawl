@@ -1,6 +1,8 @@
 //! Focused tests for the corresponding TUI responsibility.
 
-use super::picker::{SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_REASONING_DISPLAY_INDEX};
+use super::picker::{
+    SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_REASONING_DISPLAY_INDEX, SETTINGS_SCROLL_BAR_INDEX,
+};
 use super::*;
 
 #[test]
@@ -25,7 +27,7 @@ fn display_settings_apply_during_an_active_turn() {
         editing: None,
     };
     let settings = Picker {
-        items: (0..=SETTINGS_ACCENT_COLOR_INDEX)
+        items: (0..=SETTINGS_SCROLL_BAR_INDEX)
             .map(|index| PickerItem {
                 label: format!("Setting {index}"),
                 description: String::new(),
@@ -49,6 +51,9 @@ fn display_settings_apply_during_an_active_turn() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        show_scroll_bar: true,
+        scroll_geometry: None,
+        scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         context_tokens: 0,
@@ -77,6 +82,7 @@ fn display_settings_apply_during_an_active_turn() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        scroll_bar: true,
         context_windows: std::collections::HashMap::new(),
         auto_compact: true,
         compact_threshold: 0.85,
@@ -134,6 +140,29 @@ fn display_settings_apply_during_an_active_turn() {
     assert!(matches!(
         active_pickers.accent_color.items[active_pickers.accent_color.selected].action,
         PickerAction::SetAccentColor(color) if color == blue
+    ));
+
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::SetScrollBar(false),
+        &mut active_pickers,
+        &mut config,
+    );
+
+    assert!(!state.show_scroll_bar);
+    assert!(!config.scroll_bar);
+    let settings = state
+        .picker
+        .as_ref()
+        .expect("settings picker should reopen");
+    assert_eq!(settings.selected, SETTINGS_SCROLL_BAR_INDEX);
+    assert_eq!(
+        settings.items[SETTINGS_SCROLL_BAR_INDEX].description,
+        "Hidden · Enter to toggle"
+    );
+    assert!(matches!(
+        settings.items[SETTINGS_SCROLL_BAR_INDEX].action,
+        PickerAction::SetScrollBar(true)
     ));
 
     activate_picker_action_while_busy(

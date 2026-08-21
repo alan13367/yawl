@@ -4,10 +4,22 @@ use crate::agent::{Agent, TurnEvent};
 use crate::config::UiColor;
 
 use super::completion::{Completion, command_completions};
+use super::events::{MouseEvent, MouseKind};
 use super::picker::{Picker, PickerAction};
 use super::transcript::{Transcript, TranscriptEvent};
 
 pub(super) const COPY_TOAST_TICKS: u8 = 15;
+
+/// Layout facts the scroll bar needs to render and hit-test. Captured each
+/// frame while the bar is drawn.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ScrollGeometry {
+    pub(super) rows: usize,
+    pub(super) columns: usize,
+    pub(super) max_scroll: usize,
+    pub(super) travel: usize,
+    pub(super) thumb_length: usize,
+}
 
 pub(super) struct ViewState {
     pub(super) transcript: Transcript,
@@ -16,6 +28,9 @@ pub(super) struct ViewState {
     pub(super) reasoning_effort: Option<String>,
     pub(super) hide_reasoning: bool,
     pub(super) accent_color: UiColor,
+    pub(super) show_scroll_bar: bool,
+    pub(super) scroll_geometry: Option<ScrollGeometry>,
+    pub(super) scroll_bar_drag: Option<usize>,
     pub(super) copy_toast_ticks: u8,
     pub(super) spinner_tick: usize,
     pub(super) context_tokens: u64,
@@ -38,6 +53,9 @@ impl ViewState {
             reasoning_effort: agent.config().reasoning_effort.clone(),
             hide_reasoning: agent.config().hide_reasoning,
             accent_color: agent.config().accent_color,
+            show_scroll_bar: agent.config().scroll_bar,
+            scroll_geometry: None,
+            scroll_bar_drag: None,
             copy_toast_ticks: 0,
             spinner_tick: 0,
             context_tokens: agent.context_tokens(),
@@ -94,6 +112,10 @@ impl ViewState {
                 self.activity.clear();
                 self.notice(format!("Compacted {replaced} older messages."));
             }
+            Update::Warning(text) => {
+                self.activity.clear();
+                self.notice(text);
+            }
             Update::Usage {
                 context_tokens,
                 context_window,
@@ -119,6 +141,7 @@ pub(super) enum Update {
     Compacted {
         replaced: usize,
     },
+    Warning(String),
     Usage {
         context_tokens: u64,
         context_window: u64,
@@ -163,6 +186,7 @@ impl Update {
             }),
             TurnEvent::Compacting => Self::Compacting,
             TurnEvent::Compacted { replaced } => Self::Compacted { replaced },
+            TurnEvent::Warning(text) => Self::Warning(text),
             TurnEvent::Usage {
                 context_tokens,
                 context_window,
@@ -186,6 +210,65 @@ pub(super) fn scroll(state: &mut ViewState, amount: i32) {
             .scroll_offset
             .saturating_sub(amount.unsigned_abs() as usize);
     }
+}
+
+/// Thumb length and travel range for a viewport of `height` rows over
+/// `total_lines` of content.
+pub(super) fn scroll_bar_span(height: usize, total_lines: usize) -> (usize, usize) {
+    let length = (height * height / total_lines).clamp(1, height);
+    (length, height - length)
+}
+
+/// Thumb top row for the current scroll offset. `scroll_offset` counts from
+/// the bottom, so an offset of zero pins the thumb to the last row.
+pub(super) fn scroll_bar_position(travel: usize, max_scroll: usize, scroll_offset: usize) -> usize {
+    let viewport_top = max_scroll.saturating_sub(scroll_offset);
+    (viewport_top * travel / max_scroll).min(travel)
+}
+
+/// Handles presses and drags on the transcript scroll bar. Returns true when
+/// the event belongs to the bar so text selection leaves it alone.
+pub(super) fn handle_scroll_bar_mouse(state: &mut ViewState, event: MouseEvent) -> bool {
+    match event.kind {
+        MouseKind::Press => {
+            let Some(geometry) = state.scroll_geometry else {
+                return false;
+            };
+            if event.column + 1 != geometry.columns || event.row >= geometry.rows {
+                state.scroll_bar_drag = None;
+                return false;
+            }
+            let start =
+                scroll_bar_position(geometry.travel, geometry.max_scroll, state.scroll_offset);
+            let grab = if event.row >= start && event.row < start + geometry.thumb_length {
+                event.row - start
+            } else {
+                geometry.thumb_length / 2
+            };
+            state.scroll_bar_drag = Some(grab);
+            scroll_bar_jump(state, geometry, event.row, grab);
+            true
+        }
+        MouseKind::Drag => {
+            let Some(grab) = state.scroll_bar_drag else {
+                return false;
+            };
+            if let Some(geometry) = state.scroll_geometry {
+                scroll_bar_jump(state, geometry, event.row, grab);
+            }
+            true
+        }
+        MouseKind::Release => state.scroll_bar_drag.take().is_some(),
+    }
+}
+
+fn scroll_bar_jump(state: &mut ViewState, geometry: ScrollGeometry, row: usize, grab: usize) {
+    if geometry.travel == 0 || geometry.max_scroll == 0 {
+        return;
+    }
+    let wanted = row.saturating_sub(grab).min(geometry.travel);
+    let viewport_top = (wanted * geometry.max_scroll / geometry.travel).min(geometry.max_scroll);
+    state.scroll_offset = geometry.max_scroll - viewport_top;
 }
 pub(super) fn toggle_tool_expansion(state: &mut ViewState) {
     state.tools_expanded = !state.tools_expanded;
