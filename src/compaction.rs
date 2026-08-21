@@ -3,6 +3,8 @@
 //! system prompt and the last ~10 messages. The session JSONL keeps the full
 //! original history; compaction is recorded as an event.
 
+use std::fmt::Write as _;
+
 use crate::error::Error;
 use crate::provider::{Message, Provider, Request, Role, StreamNotice, stream_turn};
 
@@ -46,19 +48,23 @@ fn transcript(messages: &[Message]) -> String {
                 out.push_str("## assistant\n");
                 out.push_str(&m.content);
                 for tc in &m.tool_calls {
-                    out.push_str(&format!(
+                    write!(
+                        out,
                         "\n[called tool {} with {}]",
                         tc.name,
                         crate::error::truncate(&tc.arguments, 400)
-                    ));
+                    )
+                    .expect("writing to a String cannot fail");
                 }
             }
             Role::Tool => {
-                out.push_str(&format!(
-                    "## tool result ({}{})\n",
+                writeln!(
+                    out,
+                    "## tool result ({}{})",
                     m.tool_name.as_deref().unwrap_or("?"),
                     if m.is_error { ", error" } else { "" }
-                ));
+                )
+                .expect("writing to a String cannot fail");
                 out.push_str(&crate::error::truncate(&m.content, 2_000));
             }
         }
@@ -83,6 +89,20 @@ pub fn compact(
     messages: &mut Vec<Message>,
     sink: &mut dyn FnMut(StreamNotice<'_>),
 ) -> Result<(String, usize), Error> {
+    let (summary, split) = summarize(provider, model, max_tokens, messages, sink)?;
+    apply_summary(messages, &summary, split);
+    Ok((summary, split))
+}
+
+/// Produces a compaction summary without changing the conversation. The
+/// caller can persist the summary before applying it in memory.
+pub(crate) fn summarize(
+    provider: &dyn Provider,
+    model: &str,
+    max_tokens: u32,
+    messages: &[Message],
+    sink: &mut dyn FnMut(StreamNotice<'_>),
+) -> Result<(String, usize), Error> {
     let split = split_point(messages);
     if split == 0 {
         return Err(Error::Config(
@@ -105,16 +125,31 @@ pub fn compact(
         return Err(Error::Protocol("summarizer returned empty text".into()));
     }
     let summary = out.text.trim().to_string();
-    let tail = messages.split_off(split);
-    *messages = vec![summary_message(&summary)];
-    messages.extend(tail);
     Ok((summary, split))
+}
+
+pub(crate) fn apply_summary(messages: &mut Vec<Message>, summary: &str, split: usize) {
+    drop(messages.splice(..split, std::iter::once(summary_message(summary))));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ToolCall;
+    use crate::provider::{Event, ToolCall};
+
+    struct SummaryProvider;
+
+    impl Provider for SummaryProvider {
+        fn stream_once(
+            &self,
+            _request: &Request<'_>,
+            on_event: &mut dyn FnMut(Event),
+        ) -> Result<(), Error> {
+            on_event(Event::TextDelta("earlier work".into()));
+            on_event(Event::Done);
+            Ok(())
+        }
+    }
 
     #[test]
     fn split_never_orphans_tool_results() {
@@ -146,5 +181,35 @@ mod tests {
         assert!(!should_compact(0, 100_000, 0.85));
         assert!(!should_compact(84_999, 100_000, 0.85));
         assert!(should_compact(85_000, 100_000, 0.85));
+    }
+
+    #[test]
+    fn applying_summary_reuses_the_tail_unchanged() {
+        let mut messages = (0..12)
+            .map(|index| Message::user(format!("message {index}")))
+            .collect::<Vec<_>>();
+
+        apply_summary(&mut messages, "earlier work", 2);
+
+        assert_eq!(messages.len(), 11);
+        assert!(messages[0].content.contains("earlier work"));
+        assert_eq!(messages[1].content, "message 2");
+        assert_eq!(messages[10].content, "message 11");
+    }
+
+    #[test]
+    fn compact_keeps_its_public_mutation_contract() -> Result<(), Error> {
+        let mut messages = (0..12)
+            .map(|index| Message::user(format!("message {index}")))
+            .collect::<Vec<_>>();
+
+        let (summary, replaced) =
+            compact(&SummaryProvider, "test", 100, &mut messages, &mut |_| {})?;
+
+        assert_eq!(summary, "earlier work");
+        assert_eq!(replaced, 2);
+        assert!(messages[0].content.contains("earlier work"));
+        assert_eq!(messages[1].content, "message 2");
+        Ok(())
     }
 }

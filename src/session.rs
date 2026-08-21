@@ -5,7 +5,7 @@
 //! rebuilt by replaying the log.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -133,14 +133,15 @@ fn validate_id(id: &str) -> Result<(), Error> {
 
 /// Rebuilds the effective conversation from a session log.
 fn replay(path: &Path) -> Result<Vec<Message>, Error> {
-    let text = fs::read_to_string(path)?;
+    let file = File::open(path)?;
     let mut messages: Vec<Message> = Vec::new();
-    for line in text.lines() {
+    for line in BufReader::new(file).lines() {
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
         // Tolerate unknown/corrupt lines rather than losing the session.
-        let Ok(event) = serde_json::from_str::<SessionEvent>(line) else {
+        let Ok(event) = serde_json::from_str::<SessionEvent>(&line) else {
             continue;
         };
         match event {
@@ -195,11 +196,14 @@ pub fn list(dir: &Path) -> Result<Vec<SessionInfo>, Error> {
 }
 
 fn preview(path: &Path) -> String {
-    let Ok(text) = fs::read_to_string(path) else {
+    let Ok(file) = File::open(path) else {
         return String::new();
     };
-    for line in text.lines() {
-        if let Ok(SessionEvent::Message { message }) = serde_json::from_str(line)
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            return String::new();
+        };
+        if let Ok(SessionEvent::Message { message }) = serde_json::from_str(&line)
             && message.role == Role::User
         {
             let first = message.content.lines().next().unwrap_or("");

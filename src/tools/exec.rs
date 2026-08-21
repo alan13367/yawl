@@ -58,8 +58,12 @@ pub struct DescribeCache {
 pub fn scan_dir(dir: &Path, cache: &mut DescribeCache) -> (Vec<ExecTool>, Vec<String>) {
     let mut tools = Vec::new();
     let mut warnings = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return (tools, warnings);
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            cache.entries.retain(|path, _| path.parent() != Some(dir));
+            return (tools, warnings);
+        }
     };
     let mut paths: Vec<PathBuf> = entries
         .flatten()
@@ -67,6 +71,9 @@ pub fn scan_dir(dir: &Path, cache: &mut DescribeCache) -> (Vec<ExecTool>, Vec<St
         .filter(|p| is_executable_file(p))
         .collect();
     paths.sort();
+    cache
+        .entries
+        .retain(|path, _| path.parent() != Some(dir) || paths.binary_search(path).is_ok());
     for path in paths {
         let mtime = std::fs::metadata(&path)
             .and_then(|m| m.modified())
@@ -351,5 +358,24 @@ mod tests {
         assert!(result.stdout.len() < 70_000);
         assert!(result.stdout.ends_with("[process output truncated]"));
         Ok(())
+    }
+
+    #[test]
+    fn describe_cache_forgets_removed_tools() {
+        let dir = std::env::temp_dir().join(format!(
+            "yawl-describe-cache-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cache = DescribeCache::default();
+        cache
+            .entries
+            .insert(dir.join("removed-tool"), (SystemTime::UNIX_EPOCH, None));
+
+        let (tools, warnings) = scan_dir(&dir, &mut cache);
+
+        assert!(tools.is_empty());
+        assert!(warnings.is_empty());
+        assert!(cache.entries.is_empty());
     }
 }

@@ -203,7 +203,7 @@ impl Agent {
                 Err(e) => return Err(e),
             };
 
-            self.context_tokens = out.input_tokens + out.output_tokens;
+            self.context_tokens = out.input_tokens.saturating_add(out.output_tokens);
             sink(TurnEvent::Usage {
                 context_tokens: self.context_tokens,
                 context_window: self.context_window(),
@@ -288,11 +288,10 @@ impl Agent {
             return Ok(());
         }
         match self.compact_now(sink) {
-            Ok(()) => Ok(()),
             // A failed auto-compaction shouldn't kill the turn; the request
             // may still fit. Manual /compact reports errors directly.
             Err(Error::Interrupted) => Err(Error::Interrupted),
-            Err(_) => Ok(()),
+            Ok(()) | Err(_) => Ok(()),
         }
     }
 
@@ -301,15 +300,16 @@ impl Agent {
     pub fn compact_now(&mut self, sink: &mut dyn FnMut(TurnEvent<'_>)) -> Result<(), Error> {
         sink(TurnEvent::Compacting);
         let (provider, bare_model) = provider::resolve(&self.model, &self.config)?;
-        let (summary, replaced) = compaction::compact(
+        let (summary, replaced) = compaction::summarize(
             provider.as_ref(),
             &bare_model,
             crate::model::max_tokens(&self.config, &self.model),
-            &mut self.messages,
+            &self.messages,
             // Summarizer output is not user-facing; swallow its deltas.
             &mut |_| {},
         )?;
         self.session.append_compaction(&summary, replaced)?;
+        compaction::apply_summary(&mut self.messages, &summary, replaced);
         // Old usage estimate is stale after compaction; a fresh number
         // arrives with the next response.
         self.context_tokens = 0;
@@ -354,6 +354,8 @@ mod tests {
         Output {
             text: &'static str,
             tool_calls: Vec<ToolCall>,
+            input_tokens: u64,
+            output_tokens: u64,
         },
         Fail,
     }
@@ -380,7 +382,12 @@ mod tests {
                 return Err(Error::Protocol("test provider script exhausted".into()));
             };
             match step {
-                ProviderStep::Output { text, tool_calls } => {
+                ProviderStep::Output {
+                    text,
+                    tool_calls,
+                    input_tokens,
+                    output_tokens,
+                } => {
                     if !text.is_empty() {
                         on_event(ProviderEvent::TextDelta(text.into()));
                     }
@@ -388,8 +395,8 @@ mod tests {
                         on_event(ProviderEvent::ToolCall(call));
                     }
                     on_event(ProviderEvent::Usage {
-                        input_tokens: 10,
-                        output_tokens: 2,
+                        input_tokens,
+                        output_tokens,
                     });
                     on_event(ProviderEvent::Done);
                     Ok(())
@@ -456,10 +463,14 @@ mod tests {
                     name: "shell".into(),
                     arguments: r#"{"command":"printf tool-output"}"#.into(),
                 }],
+                input_tokens: 10,
+                output_tokens: 2,
             },
             ProviderStep::Output {
                 text: "done",
                 tool_calls: Vec::new(),
+                input_tokens: 10,
+                output_tokens: 2,
             },
         ])));
         let requests = Rc::new(RefCell::new(Vec::new()));
@@ -530,6 +541,35 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(test.agent.messages.len(), 1);
         assert_eq!(test.agent.messages[0].role, Role::User);
+    }
+
+    #[test]
+    fn provider_usage_saturates_instead_of_wrapping() {
+        let mut test = TestAgent::new("saturating-usage");
+        let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
+            text: "done",
+            tool_calls: Vec::new(),
+            input_tokens: u64::MAX,
+            output_tokens: 1,
+        }])));
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut resolve = |_: &str, _: &Config| {
+            Ok::<(Box<dyn Provider>, String), Error>((
+                Box::new(ScriptedProvider {
+                    steps: Rc::clone(&steps),
+                    requests: Rc::clone(&requests),
+                }),
+                "test".into(),
+            ))
+        };
+
+        let completed = test
+            .agent
+            .run_turn_with(Some("hello".into()), &mut |_| {}, &mut resolve)
+            .expect("scripted turn should complete");
+
+        assert!(completed);
+        assert_eq!(test.agent.context_tokens(), u64::MAX);
     }
 
     #[test]

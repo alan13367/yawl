@@ -190,17 +190,18 @@ pub(super) fn build_frame(
     let cursor_input_row = layout.cursor_row.saturating_sub(input_start);
     let input_height = input_lines.len() + 2;
     let menu_capacity = rows.saturating_sub(input_height + 1);
-    let match_count = if state.picker.is_none() {
-        matching_completions(state, editor).len().min(menu_capacity)
+    let completions = if state.picker.is_none() {
+        matching_completions(&state.completions, editor)
     } else {
-        0
+        Vec::new()
     };
+    let match_count = completions.len().min(menu_capacity);
     if match_count > 0 {
         state.completion_index = state.completion_index.min(match_count - 1);
     }
     let menu = if state.picker.is_none() {
-        matching_completions(state, editor)
-            .iter()
+        completions
+            .into_iter()
             .take(menu_capacity)
             .enumerate()
             .map(|(index, completion)| {

@@ -135,10 +135,7 @@ impl Registry {
                 ToolOutcome { content, is_error }
             }
         };
-        if outcome.content.chars().count() > MAX_RESULT_CHARS {
-            let cut: String = outcome.content.chars().take(MAX_RESULT_CHARS).collect();
-            outcome.content = format!("{cut}\n[output truncated]");
-        }
+        truncate_result(&mut outcome.content);
         if outcome.content.is_empty() {
             outcome.content = if outcome.is_error {
                 "(no output)".to_string()
@@ -147,6 +144,13 @@ impl Registry {
             };
         }
         outcome
+    }
+}
+
+fn truncate_result(content: &mut String) {
+    if let Some((cut, _)) = content.char_indices().nth(MAX_RESULT_CHARS) {
+        content.truncate(cut);
+        content.push_str("\n[output truncated]");
     }
 }
 
@@ -416,5 +420,18 @@ printf '%s:%s' "$YAWL_SESSION_ID" "$input"
         assert_eq!(outcome.content, r#"session-7:{"value":1}"#);
         let _ = std::fs::remove_dir_all(root);
         Ok(())
+    }
+
+    #[test]
+    fn result_truncation_preserves_utf8_boundaries() {
+        let exact = "é".repeat(MAX_RESULT_CHARS);
+        let mut unchanged = exact.clone();
+        truncate_result(&mut unchanged);
+        assert_eq!(unchanged, exact);
+
+        let mut truncated = "é".repeat(MAX_RESULT_CHARS + 1);
+        truncate_result(&mut truncated);
+        assert!(truncated.ends_with("\n[output truncated]"));
+        assert_eq!(truncated.matches('é').count(), MAX_RESULT_CHARS);
     }
 }

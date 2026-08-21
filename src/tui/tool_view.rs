@@ -283,27 +283,27 @@ fn sanitize_line(line: &str) -> String {
 }
 
 fn truncate_chars(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    if count <= width {
+    let Some((cut, _)) = text.char_indices().nth(width) else {
         return text.to_string();
-    }
+    };
     if width <= 1 {
         return "…".chars().take(width).collect();
     }
-    let mut truncated: String = text.chars().take(width - 1).collect();
+    let end = text
+        .char_indices()
+        .nth(width - 1)
+        .map_or(cut, |(index, _)| index);
+    let mut truncated = text[..end].to_string();
     truncated.push('…');
     truncated
 }
 
 fn wrap_chars(text: &str, width: usize) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
+    let chunks = markdown::split_chars(text, width);
+    if chunks.is_empty() {
         return vec![String::new()];
     }
-    chars
-        .chunks(width.max(1))
-        .map(|chunk| chunk.iter().collect())
-        .collect()
+    chunks
 }
 
 #[cfg(test)]

@@ -231,8 +231,13 @@ fn find_marker(chars: &[char], start: usize, marker: &str) -> Option<usize> {
 }
 
 fn starts_with(chars: &[char], index: usize, marker: &str) -> bool {
-    let marker: Vec<char> = marker.chars().collect();
-    chars.get(index..index + marker.len()) == Some(marker.as_slice())
+    let Some(suffix) = chars.get(index..) else {
+        return false;
+    };
+    let mut suffix = suffix.iter().copied();
+    marker
+        .chars()
+        .all(|expected| suffix.next() == Some(expected))
 }
 
 fn push_wrapped(
@@ -352,7 +357,22 @@ fn table_border(left: char, join: char, right: char, widths: &[usize]) -> String
 }
 
 pub(crate) fn visible_width(text: &str) -> usize {
-    strip_ansi(text).chars().count()
+    let bytes = text.as_bytes();
+    let mut width = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(end) = ansi_sequence_end(bytes, index) {
+            index = end;
+        } else {
+            let character = text[index..]
+                .chars()
+                .next()
+                .unwrap_or(char::REPLACEMENT_CHARACTER);
+            width += 1;
+            index += character.len_utf8();
+        }
+    }
+    width
 }
 
 pub(crate) fn fit_width(text: &str, width: usize) -> String {
@@ -372,15 +392,8 @@ pub(crate) fn strip_ansi(text: &str) -> String {
     let mut output = String::new();
     let mut index = 0usize;
     while index < bytes.len() {
-        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
-            index += 2;
-            while index < bytes.len() {
-                let byte = bytes[index];
-                index += 1;
-                if (0x40..=0x7e).contains(&byte) {
-                    break;
-                }
-            }
+        if let Some(end) = ansi_sequence_end(bytes, index) {
+            index = end;
         } else {
             let character = text[index..]
                 .chars()
@@ -391,6 +404,21 @@ pub(crate) fn strip_ansi(text: &str) -> String {
         }
     }
     output
+}
+
+fn ansi_sequence_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&0x1b) || bytes.get(start + 1) != Some(&b'[') {
+        return None;
+    }
+    let mut end = start + 2;
+    while end < bytes.len() {
+        let byte = bytes[end];
+        end += 1;
+        if (0x40..=0x7e).contains(&byte) {
+            break;
+        }
+    }
+    Some(end)
 }
 
 fn wrap_ansi(text: &str, width: usize) -> Vec<String> {
@@ -404,16 +432,9 @@ fn wrap_ansi(text: &str, width: usize) -> Vec<String> {
     let mut active_style = String::new();
     let mut index = 0usize;
     while index < bytes.len() {
-        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
+        if let Some(end) = ansi_sequence_end(bytes, index) {
             let start = index;
-            index += 2;
-            while index < bytes.len() {
-                let byte = bytes[index];
-                index += 1;
-                if (0x40..=0x7e).contains(&byte) {
-                    break;
-                }
-            }
+            index = end;
             let sequence = &text[start..index];
             line.push_str(sequence);
             if sequence == RESET {
@@ -452,12 +473,23 @@ fn wrap_ansi(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn split_chars(text: &str, width: usize) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    chars
-        .chunks(width.max(1))
-        .map(|chunk| chunk.iter().collect())
-        .collect()
+pub(super) fn split_chars(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut chunk_chars = 0;
+    for (index, _) in text.char_indices() {
+        if chunk_chars == width {
+            chunks.push(text[start..index].to_string());
+            start = index;
+            chunk_chars = 0;
+        }
+        chunk_chars += 1;
+    }
+    if start < text.len() {
+        chunks.push(text[start..].to_string());
+    }
+    chunks
 }
 
 fn sanitize(text: &str) -> String {

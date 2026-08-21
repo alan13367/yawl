@@ -44,14 +44,13 @@ pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
 }
 
 pub(super) fn matching_completions<'a>(
-    state: &'a ViewState,
+    completions: &'a [Completion],
     editor: &Editor,
 ) -> Vec<&'a Completion> {
     let Some(prefix) = editor.command_prefix() else {
         return Vec::new();
     };
-    state
-        .completions
+    completions
         .iter()
         .filter(|completion| completion.command.starts_with(&prefix))
         .take(8)
@@ -59,7 +58,7 @@ pub(super) fn matching_completions<'a>(
 }
 
 pub(super) fn handle_completion_key(state: &mut ViewState, editor: &mut Editor, key: Key) -> bool {
-    let matches = matching_completions(state, editor)
+    let matches = matching_completions(&state.completions, editor)
         .into_iter()
         .map(|completion| completion.command.clone())
         .collect::<Vec<_>>();

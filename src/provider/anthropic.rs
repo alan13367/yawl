@@ -137,12 +137,16 @@ impl Decoder {
                     .as_u64()
                     .unwrap_or(0);
                 // Prompt-cache reads/writes count toward context size.
-                self.input_tokens += value["message"]["usage"]["cache_read_input_tokens"]
-                    .as_u64()
-                    .unwrap_or(0);
-                self.input_tokens += value["message"]["usage"]["cache_creation_input_tokens"]
-                    .as_u64()
-                    .unwrap_or(0);
+                self.input_tokens = self.input_tokens.saturating_add(
+                    value["message"]["usage"]["cache_read_input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0),
+                );
+                self.input_tokens = self.input_tokens.saturating_add(
+                    value["message"]["usage"]["cache_creation_input_tokens"]
+                        .as_u64()
+                        .unwrap_or(0),
+                );
             }
             "content_block_start" => {
                 let index = value["index"].as_u64().unwrap_or(0);
@@ -357,5 +361,44 @@ mod tests {
             }
         ));
         assert!(matches!(events[3], Event::Done));
+    }
+
+    #[test]
+    fn decoder_saturates_cached_input_usage() {
+        let mut decoder = Decoder::default();
+        let mut events = Vec::new();
+        let start = SseEvent {
+            event: "message_start".into(),
+            data: json!({
+                "message": {
+                    "usage": {
+                        "input_tokens": u64::MAX,
+                        "cache_read_input_tokens": 1,
+                        "cache_creation_input_tokens": 1
+                    }
+                }
+            })
+            .to_string(),
+        };
+        decoder
+            .decode(start, &mut |event| events.push(event))
+            .expect("valid usage fixture should decode");
+        decoder
+            .decode(
+                SseEvent {
+                    event: "message_stop".into(),
+                    data: "{}".into(),
+                },
+                &mut |event| events.push(event),
+            )
+            .expect("message stop should decode");
+
+        assert!(matches!(
+            events[0],
+            Event::Usage {
+                input_tokens: u64::MAX,
+                output_tokens: 0
+            }
+        ));
     }
 }

@@ -84,10 +84,21 @@ impl From<ureq::Error> for Error {
 }
 
 pub(crate) fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max_chars).collect();
-        format!("{cut}…")
+    let Some((cut, _)) = s.char_indices().nth(max_chars) else {
+        return s.to_string();
+    };
+    format!("{}…", &s[..cut])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_respects_character_boundaries_and_exact_limits() {
+        assert_eq!(truncate("éclair", 2), "éc…");
+        assert_eq!(truncate("éclair", 6), "éclair");
+        assert_eq!(truncate("éclair", 0), "…");
+        assert_eq!(truncate("", 0), "");
     }
 }
