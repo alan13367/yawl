@@ -27,6 +27,21 @@ fn assistant_messages_do_not_show_a_title() {
 }
 
 #[test]
+fn assistant_transcript_reflows_whole_words_when_width_changes() {
+    let entries = [Entry::Assistant("hello wonderful world".into())];
+    let plain_lines = |width| {
+        render_entries(&entries, width, false, false)
+            .into_iter()
+            .map(|line| markdown::strip_ansi(&line))
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(plain_lines(12), ["hello", "wonderful", "world"]);
+    assert_eq!(plain_lines(20), ["hello wonderful", "world"]);
+}
+
+#[test]
 fn frame_keeps_input_and_status_pinned() {
     let mut state = ViewState {
         transcript: Transcript::from_messages(&[crate::provider::Message::assistant(

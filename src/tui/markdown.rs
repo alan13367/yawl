@@ -323,19 +323,31 @@ fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
 
     output.push(table_border('┌', '┬', '┐', &widths));
     for (row_index, row) in rows.iter().enumerate() {
-        let mut line = String::from("│");
-        for (column, cell_width) in widths.iter().copied().enumerate() {
-            let cell = row.get(column).map_or("", String::as_str);
-            let rendered = render_inline(cell);
-            let rendered = if row_index == 0 {
-                format!("\x1b[1m{rendered}\x1b[0m")
-            } else {
-                rendered
-            };
-            line.push_str(&fit_width(&rendered, cell_width));
-            line.push('│');
+        let cells = widths
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(column, cell_width)| {
+                let cell = row.get(column).map_or("", String::as_str);
+                let rendered = render_inline(cell);
+                let rendered = if row_index == 0 {
+                    format!("\x1b[1m{rendered}\x1b[0m")
+                } else {
+                    rendered
+                };
+                wrap_ansi(&rendered, cell_width)
+            })
+            .collect::<Vec<_>>();
+        let row_height = cells.iter().map(Vec::len).max().unwrap_or(1);
+        for physical_row in 0..row_height {
+            let mut line = String::from("│");
+            for (cell, cell_width) in cells.iter().zip(widths.iter().copied()) {
+                let content = cell.get(physical_row).map_or("", String::as_str);
+                line.push_str(&fit_width(content, cell_width));
+                line.push('│');
+            }
+            output.push(line);
         }
-        output.push(line);
         if row_index == 0 && rows.len() > 1 {
             output.push(table_border('├', '┼', '┤', &widths));
         }
@@ -383,7 +395,7 @@ pub(crate) fn visible_width(text: &str) -> usize {
 }
 
 pub(crate) fn fit_width(text: &str, width: usize) -> String {
-    let mut line = wrap_ansi(text, width)
+    let mut line = wrap_ansi_hard(text, width)
         .into_iter()
         .next()
         .unwrap_or_default();
@@ -428,7 +440,124 @@ fn ansi_sequence_end(bytes: &[u8], start: usize) -> Option<usize> {
     Some(end)
 }
 
+/// A whitespace run that can be replaced with a line break. Styles on each
+/// side are stored separately because an ANSI reset may occur inside the run.
+struct WrapBreak {
+    next_index: usize,
+    line_len: usize,
+    line_style: String,
+    resume_style: String,
+}
+
 fn wrap_ansi(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut column = 0usize;
+    let mut active_style = String::new();
+    let mut last_break: Option<WrapBreak> = None;
+    let mut separator_open = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if let Some(end) = ansi_sequence_end(bytes, index) {
+            let sequence = &text[index..end];
+            line.push_str(sequence);
+            if sequence == RESET {
+                active_style.clear();
+            } else if sequence.ends_with('m') {
+                active_style = sequence.to_string();
+            }
+            index = end;
+            if separator_open && let Some(break_point) = &mut last_break {
+                break_point.next_index = index;
+                break_point.resume_style.clone_from(&active_style);
+            }
+            continue;
+        }
+        if bytes[index] == b'\n' {
+            if !active_style.is_empty() {
+                line.push_str(RESET);
+            }
+            lines.push(line);
+            line = active_style.clone();
+            column = 0;
+            last_break = None;
+            separator_open = false;
+            index += 1;
+            continue;
+        }
+        let character = text[index..]
+            .chars()
+            .next()
+            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        let next_index = index + character.len_utf8();
+        let character_width = terminal_character_width(character);
+        if character.is_whitespace() {
+            if column == 0 {
+                index = next_index;
+                continue;
+            }
+            if !separator_open {
+                last_break = Some(WrapBreak {
+                    next_index,
+                    line_len: line.len(),
+                    line_style: active_style.clone(),
+                    resume_style: active_style.clone(),
+                });
+                separator_open = true;
+            } else if let Some(break_point) = &mut last_break {
+                break_point.next_index = next_index;
+                break_point.resume_style.clone_from(&active_style);
+            }
+        } else {
+            separator_open = false;
+        }
+        if column > 0 && column.saturating_add(character_width) > width {
+            if !character.is_whitespace()
+                && let Some(break_point) = last_break.take()
+            {
+                line.truncate(break_point.line_len);
+                if !break_point.line_style.is_empty() && !line.ends_with(RESET) {
+                    line.push_str(RESET);
+                }
+                lines.push(line);
+                line = break_point.resume_style.clone();
+                active_style = break_point.resume_style;
+                column = 0;
+                separator_open = false;
+                index = break_point.next_index;
+                continue;
+            }
+            if !active_style.is_empty() {
+                line.push_str(RESET);
+            }
+            lines.push(line);
+            line = active_style.clone();
+            column = 0;
+            last_break = None;
+            separator_open = false;
+            if character.is_whitespace() {
+                index = next_index;
+                continue;
+            }
+        }
+        line.push(character);
+        column = column.saturating_add(character_width);
+        index = next_index;
+    }
+    if !line.is_empty() || lines.is_empty() {
+        if !active_style.is_empty() && !line.ends_with(RESET) {
+            line.push_str(RESET);
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+fn wrap_ansi_hard(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
     }
@@ -536,6 +665,57 @@ mod tests {
     }
 
     #[test]
+    fn prose_wraps_at_word_boundaries_and_reflows_for_width() {
+        let text = "hello wonderful world";
+        let narrow = render(text, 12)
+            .into_iter()
+            .map(|line| strip_ansi(&line))
+            .collect::<Vec<_>>();
+        let wide = render(text, 20)
+            .into_iter()
+            .map(|line| strip_ansi(&line))
+            .collect::<Vec<_>>();
+
+        assert_eq!(narrow, ["hello", "wonderful", "world"]);
+        assert_eq!(wide, ["hello wonderful", "world"]);
+        assert_eq!(narrow.join(" "), text);
+        assert_eq!(wide.join(" "), text);
+    }
+
+    #[test]
+    fn styled_words_keep_their_style_after_wrapping() {
+        let lines = render("before **bold words** after", 10);
+        let plain = lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>();
+
+        assert_eq!(plain, ["before", "bold words", "after"]);
+        assert!(lines[1].starts_with("\x1b[1m"), "{:?}", lines[1]);
+    }
+
+    #[test]
+    fn oversized_words_and_fixed_width_fields_still_hard_wrap() {
+        let lines = render("abcdefghijkl end", 8)
+            .into_iter()
+            .map(|line| strip_ansi(&line))
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines, ["abcdefgh", "ijkl end"]);
+        assert_eq!(strip_ansi(&fit_width("alpha beta", 7)), "alpha b");
+    }
+
+    #[test]
+    fn list_continuations_wrap_whole_words_under_the_content() {
+        let lines = render("- alpha wonderful omega", 12)
+            .into_iter()
+            .map(|line| strip_ansi(&line))
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines, ["• alpha", "  wonderful", "  omega"]);
+    }
+
+    #[test]
     fn wide_glyphs_use_their_terminal_cell_width() {
         assert_eq!(visible_width("a✅b"), 4);
 
@@ -606,6 +786,23 @@ mod tests {
                 .map(|line| (strip_ansi(line), terminal_fixture_width(line)))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn table_cells_wrap_whole_words_instead_of_truncating_them() {
+        let lines = render(
+            "| Item | Description |\n| --- | --- |\n| one | hello wonderful world |",
+            20,
+        );
+        let plain = lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>();
+
+        assert!(plain.iter().any(|line| line.contains("│one │hello")));
+        assert!(plain.iter().any(|line| line.contains("│    │wonderful")));
+        assert!(plain.iter().any(|line| line.contains("│    │world")));
+        assert!(plain.iter().all(|line| visible_width(line) == 20));
     }
 
     #[test]
