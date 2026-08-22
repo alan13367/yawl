@@ -30,6 +30,7 @@ fn enter_submits_the_only_matching_command_completion() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagents_enabled: false,
         subagent_view: None,
     };
     let mut editor = Editor::default();

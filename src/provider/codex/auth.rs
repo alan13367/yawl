@@ -324,6 +324,24 @@ pub(super) fn load_and_refresh_credential(config: &Config) -> Result<CodexCreden
     Ok(credential)
 }
 
+/// Whether `auth.json` holds a Codex login the wizard can reuse. An expired
+/// access token still counts: it is refreshed on demand.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CodexLoginStatus {
+    Missing,
+    LoggedIn,
+}
+
+/// Reports whether a reusable Codex credential exists, without touching the
+/// network. A corrupt file reads as `Missing`; the login flow reports the
+/// real error if the user signs in again.
+pub fn credential_status(config: &Config) -> CodexLoginStatus {
+    match load_credential(config) {
+        Ok(Some(_)) => CodexLoginStatus::LoggedIn,
+        _ => CodexLoginStatus::Missing,
+    }
+}
+
 fn load_credential(config: &Config) -> Result<Option<CodexCredential>, Error> {
     let path = auth_path(config);
     let text = match std::fs::read_to_string(&path) {

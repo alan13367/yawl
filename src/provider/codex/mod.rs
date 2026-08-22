@@ -4,7 +4,7 @@
 mod auth;
 mod responses;
 
-pub use auth::login;
+pub use auth::{CodexLoginStatus, credential_status, login};
 
 use super::http_agent;
 use crate::config::Config;

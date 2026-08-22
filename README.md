@@ -16,14 +16,9 @@ cd yawl
 cargo install --path .
 ```
 
-Run `yawl` after installation. On first use it asks you to choose a provider, configure its endpoint and authentication, and select a model. Yawl does not assume a default model. Run `yawl --setup` to repeat onboarding later.
+Run `yawl` after installation. On first use a setup wizard starts: pick a provider with the arrow keys, confirm its endpoint and key, and choose a model from the list the server reports. Yawl does not assume a default model. Choosing "Skip setup" (or pressing Escape) defers configuration and writes `"setup": "skipped"`, so a later bare `yawl` run will not ask again; `yawl --setup` restarts the wizard and clears the marker. Run `yawl --doctor` at any time to check or repair the configuration files.
 
-API-key providers read their usual environment variables:
-
-```sh
-export ANTHROPIC_API_KEY="..."
-export OPENAI_API_KEY="..."
-```
+Built-in Anthropic and OpenAI read `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` when those variables are set. The wizard can also store either key in `~/.yawl/config.json` with mode `0600` as `anthropic_api_key` or `openai_api_key`; the environment variable wins when both exist.
 
 ## Use it
 
@@ -88,7 +83,7 @@ Messages submitted during an active response are queued automatically. Each pend
 | `/tools` | List builtin and discovered tools |
 | `/skills` | List discovered skills and their search directories |
 | `/skill:NAME [ARGS]` | Run a discovered Markdown skill |
-| `/subagents` | Open the full-screen subagent dashboard and takeover view |
+| `/subagents` | Open the full-screen subagent dashboard and takeover view, or print a note in the chat when nothing is running |
 | `/resume [ID\|NUMBER]` | Open the session picker, or resume directly by ID or number |
 | `/unqueue [NUMBER\|all]` | Open the queued-message picker, remove one pending message, or clear the queue |
 | `/help` | Show terminal controls and commands |
@@ -96,7 +91,7 @@ Messages submitted during an active response are queued automatically. Each pend
 
 ## Models and configuration
 
-Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`. Project values override global values. Every field is optional. If the merged config has no `model`, interactive startup runs onboarding; print mode requires `--model`. Values are validated at load with the same rules `/settings` enforces: `max_tokens` and context windows must be positive integers, `compact_threshold` must be between 0.1 and 0.99, `max_subagents` must be between 1 and 16, and `reasoning_effort` must be a supported level. An out-of-range value fails startup with the file and field named instead of being silently clamped.
+Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`. Project values override global values. Every field is optional. If the merged config has no `model`, interactive startup runs onboarding unless setup was skipped; print mode requires `--model`. Values are validated at load with the same rules `/settings` enforces: `max_tokens` and context windows must be positive integers, `compact_threshold` must be between 0.1 and 0.99, `max_subagents` must be between 1 and 16, and `reasoning_effort` must be a supported level. An out-of-range value fails startup with the file and field named instead of being silently clamped, and the error points at `yawl --doctor`.
 
 ```json
 {
@@ -134,7 +129,7 @@ The preset endpoints are `http://127.0.0.1:11434/v1` for Ollama, `http://127.0.0
 
 ### Use a ChatGPT subscription
 
-Choose "OpenAI Codex" during onboarding to use a ChatGPT Plus or Pro subscription. Yawl starts OpenAI's device-code flow, stores the OAuth credential in `~/.yawl/auth.json` with mode `0600`, and refreshes it before expiry. You can log in again without changing the selected model:
+Choose "OpenAI Codex" during onboarding to use a ChatGPT Plus or Pro subscription. Yawl starts OpenAI's device-code flow, stores the OAuth credential in `~/.yawl/auth.json` with mode `0600`, and refreshes it before expiry. If a saved login already exists, the wizard offers to reuse it instead of signing in again. You can also log in again without changing the selected model:
 
 ```sh
 yawl --login openai-codex
@@ -199,7 +194,24 @@ You can configure an endpoint from the TUI without editing JSON:
 /settings model omlx:Qwen3-Coder
 ```
 
-Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; `./.yawl/config.json` can still override it. When that happens, Yawl reports that the global value was saved while the project value remains effective. `/settings` also changes `max_tokens`, Codex reasoning effort, reasoning visibility, the TUI accent color, automatic compaction, the compaction threshold, context windows, subagent settings, and built-in endpoint URLs.
+Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; `./.yawl/config.json` can still override it. When that happens, Yawl reports that the global value was saved while the project value remains effective. `/settings` also changes `max_tokens`, Codex reasoning effort, reasoning visibility, the TUI accent color, automatic compaction, the compaction threshold, context windows, subagent settings, built-in endpoint URLs, and the stored built-in API keys (`/settings anthropic_api_key KEY|-`, `/settings openai_api_key KEY|-`).
+
+## Diagnose the configuration
+
+`yawl --doctor` checks `~/.yawl/config.json`, `./.yawl/config.json`, and `~/.yawl/auth.json`, then prints one line per finding. Errors, warnings, and notes are marked `✗`, `!`, and `·`. The exit code is 0 when no errors remain and 1 otherwise, so scripts can rely on it. It works even when the config is too broken to load.
+
+When stdin is a terminal, the doctor offers to repair what it can, one fix at a time:
+
+- reset an out-of-range value to its default, such as `compact_threshold` to `0.85`
+- remove a key whose type or value the loader rejects, narrowed to the smallest path that restores loading
+- rename a malformed file aside as `config.json.invalid-<timestamp>` so defaults regenerate
+- restore the newest `config.json.bak-*` or `config.json.invalid-*` file over the live config
+- restrict file permissions to `0600`
+- drop `$ENV_VAR` key references whose variable is unset, and `skill_dirs` entries that no longer exist
+
+Each repair asks `y/N`, and `a` applies the remaining fixes. A file is backed up to `config.json.bak-<timestamp>` before its first edit, and the checks run again afterward so the final report matches the disk.
+
+The doctor also reports problems it will not touch automatically: a `model` naming an unknown provider, a provider with no base URL, a missing key for the model in use (fix with `yawl --setup`), a missing Codex login (fix with `yawl --login openai-codex`), project values overriding global ones, and unknown keys, which are kept on write.
 
 ## Sessions and compaction
 
@@ -231,7 +243,7 @@ Yawl permits up to 16 active subagents and retains up to 64 tracked entries. Set
 
 Model-originated results arrive as one automatic follow-up after the main turn becomes idle, and every delivery carries the run's complete final response. An explicit wait consumes matching results and reports each settled run in full, so Yawl does not deliver anything twice. Print mode does not start automatic follow-ups, so its prompt asks the model to wait before finishing. Print mode cancels remaining workers on exit.
 
-Run `/subagents` to open the dashboard, including while the main model is busy. Arrow keys or `j` and `k` move between rows, Enter opens a takeover, `x` asks to cancel the selected run, and Escape closes the dashboard. The takeover shows the bounded transcript, live reasoning and answer text, tool previews, errors, and queued messages. Enter sends a private message, the arrow keys and Page Up/Page Down scroll, Ctrl+C asks to cancel the child, and Escape returns to the dashboard. Scrolling up holds the view in place while the child keeps generating; scrolling back to the bottom resumes following new output. Private takeover messages and results stay out of the main transcript.
+Run `/subagents` to open the dashboard, including while the main model is busy. When no subagents are tracked, the command prints a note in the chat instead: it says how to enable subagents when they are off, and that the dashboard opens once the model spawns one. Arrow keys or `j` and `k` move between rows, Enter opens a takeover, `x` asks to cancel the selected run, and Escape closes the dashboard. The takeover shows the bounded transcript, live reasoning and answer text, tool previews, errors, and queued messages. Enter sends a private message, the arrow keys and Page Up/Page Down scroll, Ctrl+C asks to cancel the child, and Escape returns to the dashboard. Scrolling up holds the view in place while the child keeps generating; scrolling back to the bottom resumes following new output. Private takeover messages and results stay out of the main transcript.
 
 ## Builtin tools
 
@@ -328,7 +340,8 @@ Yawl stays in one Cargo package. Stable facade modules keep callers independent 
 - `src/provider/mod.rs` re-exports the provider-neutral protocol. Private modules contain streaming retries, provider resolution, and SSE/HTTP support. Codex OAuth and Responses handling live separately under `src/provider/codex/`.
 - `src/config.rs` exposes the effective configuration. Its child modules separate runtime types, persisted schema, loading and merging, storage, and validated changes.
 - `src/tui/mod.rs` exposes `tui::run` and coordinates the event loop. Commands, completion, pickers, subagent views, state, workers, rendering, and terminal handling live in focused sibling modules.
-- `src/onboarding.rs` coordinates setup while its child modules own terminal prompts and model discovery.
+- `src/onboarding.rs` coordinates setup while its child modules own the arrow-key selector, terminal prompts, model discovery, and the wizard flow.
+- `src/doctor.rs` coordinates configuration diagnosis and repair; checks, interactive repairs, and report rendering live in its child modules.
 
 Internal module moves must preserve existing public paths through facade re-exports. Files are split when they own unrelated responsibilities, not when they cross an arbitrary line count.
 

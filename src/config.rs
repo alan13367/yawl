@@ -8,12 +8,13 @@ mod storage;
 mod types;
 
 pub(crate) use change::{ConfigChange, ConfigChangeEffect, SkillDirectoryAction};
+pub(crate) use loading::expand_home_path;
 pub use loading::normalize_reasoning_effort;
-pub(crate) use storage::resolve_config_value;
+pub(crate) use schema::validate_file_shape;
+pub(crate) use storage::{read_json_object, resolve_config_value, write_json_object};
 pub(crate) use types::UiColor;
 pub use types::{ModelConfig, OpenAiCompatibility, ProviderConfig};
 
-use loading::expand_home_path;
 use storage::{object_field, validate_provider_name};
 
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
@@ -51,6 +52,13 @@ pub struct Config {
     /// Directories containing `NAME/SKILL.md` or `NAME.md` skills.
     pub skill_dirs: Vec<PathBuf>,
     pub providers: HashMap<String, ProviderConfig>,
+    /// Whether the user explicitly skipped onboarding, suppressing the
+    /// first-run setup prompt.
+    pub setup_skipped: bool,
+    /// Anthropic key stored in config, used when `ANTHROPIC_API_KEY` is unset.
+    pub anthropic_api_key: Option<String>,
+    /// OpenAI key stored in config, used when `OPENAI_API_KEY` is unset.
+    pub openai_api_key: Option<String>,
     /// `~/.yawl`.
     pub home_dir: PathBuf,
     /// `./.yawl`.

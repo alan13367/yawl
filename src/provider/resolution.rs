@@ -81,8 +81,12 @@ fn custom_provider(
 }
 
 fn anthropic_provider(cfg: &Config, model: &str) -> Result<(Box<dyn Provider>, String), Error> {
-    let key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| Error::Config("ANTHROPIC_API_KEY is not set".into()))?;
+    let key = builtin_api_key(
+        std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
+        cfg.anthropic_api_key.as_deref(),
+        "ANTHROPIC_API_KEY",
+        "anthropic_api_key",
+    )?;
     Ok((
         Box::new(anthropic::Anthropic::new(
             cfg.anthropic_base_url.clone(),
@@ -93,11 +97,37 @@ fn anthropic_provider(cfg: &Config, model: &str) -> Result<(Box<dyn Provider>, S
 }
 
 fn openai_provider(cfg: &Config, model: &str) -> Result<(Box<dyn Provider>, String), Error> {
-    let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+    let key = builtin_api_key(
+        std::env::var("OPENAI_API_KEY").ok().as_deref(),
+        cfg.openai_api_key.as_deref(),
+        "OPENAI_API_KEY",
+        "openai_api_key",
+    )
+    .unwrap_or_default();
     Ok((
         Box::new(openai::OpenAi::new(cfg.openai_base_url.clone(), key)),
         model.to_string(),
     ))
+}
+
+/// Resolves a built-in provider key. The environment variable wins when set;
+/// otherwise the stored config value is resolved, which may itself be a
+/// `$NAME` or `${NAME}` reference.
+fn builtin_api_key(
+    environment: Option<&str>,
+    stored: Option<&str>,
+    env_name: &str,
+    config_key: &str,
+) -> Result<String, Error> {
+    if let Some(value) = environment.filter(|value| !value.trim().is_empty()) {
+        return Ok(value.to_string());
+    }
+    match stored {
+        Some(value) => crate::config::resolve_config_value(value),
+        None => Err(Error::Config(format!(
+            "{env_name} is not set and no {config_key} is configured; run 'yawl --setup'"
+        ))),
+    }
 }
 
 fn provider_key_environment_name(provider: &str) -> String {
@@ -124,4 +154,71 @@ fn validate_header(name: &str, value: &str) -> Result<(), Error> {
         ))
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_key_prefers_the_environment_over_stored_values() {
+        let key = builtin_api_key(
+            Some("env-key"),
+            Some("stored-key"),
+            "ANTHROPIC_API_KEY",
+            "anthropic_api_key",
+        )
+        .expect("the environment key should win");
+
+        assert_eq!(key, "env-key");
+    }
+
+    #[test]
+    fn builtin_key_falls_back_to_the_stored_literal() {
+        let key = builtin_api_key(None, Some("stored-key"), "OPENAI_API_KEY", "openai_api_key")
+            .expect("the stored key should be used");
+
+        assert_eq!(key, "stored-key");
+        let error = builtin_api_key(None, None, "ANTHROPIC_API_KEY", "anthropic_api_key")
+            .expect_err("a missing key should name both sources");
+        assert!(
+            error.to_string().contains("ANTHROPIC_API_KEY is not set"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("anthropic_api_key"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn builtin_key_resolves_environment_references() {
+        let missing = builtin_api_key(
+            None,
+            Some("$YAWL_UNSET_REFERENCE_9F3A"),
+            "OPENAI_API_KEY",
+            "openai_api_key",
+        )
+        .expect_err("an unset reference should fail");
+
+        assert!(
+            missing
+                .to_string()
+                .contains("YAWL_UNSET_REFERENCE_9F3A is not set"),
+            "unexpected error: {missing}"
+        );
+    }
+
+    #[test]
+    fn blank_environment_values_fall_through_to_the_stored_key() {
+        let key = builtin_api_key(
+            Some("  "),
+            Some("stored-key"),
+            "OPENAI_API_KEY",
+            "openai_api_key",
+        )
+        .expect("a blank env value should not mask the stored key");
+
+        assert_eq!(key, "stored-key");
+    }
 }

@@ -16,7 +16,7 @@ impl Config {
         Self::load_from(home.join(".yawl"), PathBuf::from(".yawl"))
     }
 
-    pub(super) fn load_from(home_dir: PathBuf, project_dir: PathBuf) -> Result<Config, Error> {
+    pub(crate) fn load_from(home_dir: PathBuf, project_dir: PathBuf) -> Result<Config, Error> {
         let home = home_dir.parent().unwrap_or(&home_dir);
         let mut cfg = Config {
             model: None,
@@ -35,6 +35,9 @@ impl Config {
             subagent_model: DEFAULT_SUBAGENT_MODEL.to_string(),
             skill_dirs: vec![home.join(".yawl/skills"), home.join(".agents/skills")],
             providers: default_local_providers(),
+            setup_skipped: false,
+            anthropic_api_key: None,
+            openai_api_key: None,
             home_dir,
             project_dir,
         };
@@ -148,6 +151,20 @@ impl Config {
                 .map(|dir| expand_home_path(&dir, &self.home_dir))
                 .collect();
         }
+        if let Some(value) = file.setup {
+            if value != "skipped" {
+                return Err(Error::Config(format!(
+                    "setup must be \"skipped\" if set, found \"{value}\""
+                )));
+            }
+            self.setup_skipped = true;
+        }
+        if let Some(value) = file.anthropic_api_key {
+            self.anthropic_api_key = (!value.trim().is_empty()).then_some(value);
+        }
+        if let Some(value) = file.openai_api_key {
+            self.openai_api_key = (!value.trim().is_empty()).then_some(value);
+        }
         if let Some(providers) = file.providers {
             for (name, provider) in providers {
                 self.providers
@@ -170,7 +187,7 @@ impl Config {
     }
 }
 
-pub(super) fn expand_home_path(value: &str, yawl_home: &Path) -> PathBuf {
+pub(crate) fn expand_home_path(value: &str, yawl_home: &Path) -> PathBuf {
     if value == "~" {
         return yawl_home.parent().unwrap_or(yawl_home).to_path_buf();
     }
@@ -229,6 +246,9 @@ mod tests {
             subagent_model: DEFAULT_SUBAGENT_MODEL.to_string(),
             skill_dirs: Vec::new(),
             providers: default_local_providers(),
+            setup_skipped: false,
+            anthropic_api_key: None,
+            openai_api_key: None,
             home_dir: PathBuf::new(),
             project_dir: PathBuf::new(),
         }
@@ -462,5 +482,29 @@ mod tests {
             let file = serde_json::from_value(value).expect("subagent config fixture");
             assert!(config.apply(file).is_err());
         }
+    }
+
+    #[test]
+    fn setup_marker_accepts_only_skipped_and_blank_keys_are_dropped() -> Result<(), Error> {
+        let mut cfg = test_config();
+        cfg.apply(serde_json::from_value(json!({"setup": "skipped"}))?)?;
+        assert!(cfg.setup_skipped);
+
+        let mut cfg = test_config();
+        let error = cfg
+            .apply(serde_json::from_value(json!({"setup": "later"}))?)
+            .expect_err("an unknown marker value should fail validation");
+        assert!(
+            error.to_string().contains("setup must be"),
+            "unexpected error: {error}"
+        );
+
+        let mut cfg = test_config();
+        cfg.apply(serde_json::from_value(
+            json!({"anthropic_api_key": "  ", "openai_api_key": ""}),
+        )?)?;
+        assert_eq!(cfg.anthropic_api_key, None);
+        assert_eq!(cfg.openai_api_key, None);
+        Ok(())
     }
 }

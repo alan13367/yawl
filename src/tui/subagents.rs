@@ -65,6 +65,11 @@ impl TakeoverScroll {
 
 pub(super) fn open_dashboard(state: &mut ViewState) {
     refresh(state);
+    if state.subagent_snapshots.is_empty() {
+        state.subagent_view = None;
+        state.notice(empty_dashboard_message(state.subagents_enabled));
+        return;
+    }
     let selected_id = state
         .subagent_snapshots
         .first()
@@ -75,6 +80,14 @@ pub(super) fn open_dashboard(state: &mut ViewState) {
         confirm_cancel: false,
     });
     state.picker = None;
+}
+
+fn empty_dashboard_message(subagents_enabled: bool) -> &'static str {
+    if subagents_enabled {
+        "No tracked subagents. The dashboard opens once the model spawns one."
+    } else {
+        "Subagents are off. Enable them with /settings subagents on, then ask the model to spawn one."
+    }
 }
 
 pub(super) fn refresh(state: &mut ViewState) {
@@ -674,6 +687,7 @@ mod tests {
             picker: None,
             subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
             subagent_snapshots: vec![snapshot()],
+            subagents_enabled: false,
             subagent_view: Some(view),
         }
     }
@@ -685,6 +699,27 @@ mod tests {
             .map(|index| SubagentTranscriptItem::Assistant(format!("line {index:02}")))
             .collect();
         snapshot
+    }
+
+    #[test]
+    fn dashboard_does_not_open_without_tracked_subagents() {
+        let mut view = state(SubagentView::Dashboard {
+            selected_id: None,
+            selected_index: 0,
+            confirm_cancel: false,
+        });
+        // The test manager tracks nothing, so refresh clears the seeded
+        // snapshot and the command must not open the dashboard.
+        open_dashboard(&mut view);
+        assert!(view.subagent_view.is_none());
+        assert_eq!(
+            empty_dashboard_message(true),
+            "No tracked subagents. The dashboard opens once the model spawns one."
+        );
+        assert_eq!(
+            empty_dashboard_message(false),
+            "Subagents are off. Enable them with /settings subagents on, then ask the model to spawn one."
+        );
     }
 
     #[test]

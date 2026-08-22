@@ -186,13 +186,6 @@ pub(crate) fn available_models(config: &Config) -> Vec<(String, String)> {
     models
 }
 
-pub(crate) fn codex_model_ids() -> Vec<String> {
-    CODEX_MODELS
-        .iter()
-        .map(|(id, _, _)| (*id).to_string())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -238,6 +231,9 @@ mod tests {
             subagent_model: crate::config::DEFAULT_SUBAGENT_MODEL.to_string(),
             skill_dirs: Vec::new(),
             providers,
+            setup_skipped: false,
+            anthropic_api_key: None,
+            openai_api_key: None,
             home_dir: PathBuf::new(),
             project_dir: PathBuf::new(),
         }

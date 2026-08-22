@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use super::{ModelConfig, OpenAiCompatibility, UiColor};
 
@@ -34,6 +35,11 @@ pub(super) struct ConfigFile {
     pub(super) subagent_model: Option<String>,
     pub(super) skill_dirs: Option<Vec<String>>,
     pub(super) providers: Option<HashMap<String, ProviderFile>>,
+    /// Marker set when the user explicitly skips onboarding.
+    pub(super) setup: Option<String>,
+    /// Stored built-in API keys, used when the matching env var is unset.
+    pub(super) anthropic_api_key: Option<String>,
+    pub(super) openai_api_key: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -49,4 +55,12 @@ pub(super) struct ProviderFile {
     pub(super) headers: Option<HashMap<String, String>>,
     pub(super) models: Option<Vec<ModelConfig>>,
     pub(super) compat: Option<OpenAiCompatibility>,
+}
+
+/// Checks one raw config file against the on-disk schema. Used by the
+/// doctor so its findings match what `Config::load` would reject.
+pub(crate) fn validate_file_shape(value: &Value) -> Result<(), String> {
+    serde_json::from_value::<ConfigFile>(value.clone())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }

@@ -45,7 +45,7 @@ pub(super) fn object_field<'a>(
     }
 }
 
-fn read_json_object(path: &Path) -> Result<Map<String, Value>, Error> {
+pub(crate) fn read_json_object(path: &Path) -> Result<Map<String, Value>, Error> {
     match std::fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str(&text)
             .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?
@@ -61,7 +61,7 @@ fn read_json_object(path: &Path) -> Result<Map<String, Value>, Error> {
     }
 }
 
-fn write_json_object(path: &Path, root: &Map<String, Value>) -> Result<(), Error> {
+pub(crate) fn write_json_object(path: &Path, root: &Map<String, Value>) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

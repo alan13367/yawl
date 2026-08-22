@@ -37,6 +37,9 @@ pub(crate) enum ConfigChange {
     },
     AnthropicBaseUrl(String),
     OpenAiBaseUrl(String),
+    AnthropicApiKey(String),
+    OpenAiApiKey(String),
+    SetupSkipped(bool),
 }
 
 #[derive(Clone, Copy)]
@@ -86,6 +89,9 @@ enum ValidatedChange {
     },
     AnthropicBaseUrl(String),
     OpenAiBaseUrl(String),
+    AnthropicApiKey(Option<String>),
+    OpenAiApiKey(Option<String>),
+    SetupSkipped(bool),
 }
 
 impl Config {
@@ -226,6 +232,13 @@ impl ValidatedChange {
                 validate_http_url(&url)?;
                 Ok(Self::OpenAiBaseUrl(url))
             }
+            ConfigChange::AnthropicApiKey(value) => {
+                Ok(Self::AnthropicApiKey(parse_builtin_api_key(&value)?))
+            }
+            ConfigChange::OpenAiApiKey(value) => {
+                Ok(Self::OpenAiApiKey(parse_builtin_api_key(&value)?))
+            }
+            ConfigChange::SetupSkipped(skipped) => Ok(Self::SetupSkipped(skipped)),
         }
     }
 
@@ -303,6 +316,21 @@ impl ValidatedChange {
             }),
             Self::AnthropicBaseUrl(url) => insert_scalar(config, "anthropic_base_url", json!(url)),
             Self::OpenAiBaseUrl(url) => insert_scalar(config, "openai_base_url", json!(url)),
+            Self::AnthropicApiKey(key) => match key {
+                Some(key) => insert_scalar(config, "anthropic_api_key", json!(key)),
+                None => remove_scalar(config, "anthropic_api_key"),
+            },
+            Self::OpenAiApiKey(key) => match key {
+                Some(key) => insert_scalar(config, "openai_api_key", json!(key)),
+                None => remove_scalar(config, "openai_api_key"),
+            },
+            Self::SetupSkipped(skipped) => {
+                if *skipped {
+                    insert_scalar(config, "setup", json!("skipped"))
+                } else {
+                    remove_scalar(config, "setup")
+                }
+            }
         }
     }
 
@@ -334,6 +362,9 @@ impl ValidatedChange {
             }),
             Self::AnthropicBaseUrl(url) => config.anthropic_base_url == *url,
             Self::OpenAiBaseUrl(url) => config.openai_base_url == *url,
+            Self::AnthropicApiKey(key) => config.anthropic_api_key == *key,
+            Self::OpenAiApiKey(key) => config.openai_api_key == *key,
+            Self::SetupSkipped(skipped) => config.setup_skipped == *skipped,
         }
     }
 }
@@ -343,6 +374,52 @@ fn insert_scalar(config: &Config, key: &str, value: Value) -> Result<(), Error> 
         root.insert(key.to_string(), value);
         Ok(())
     })
+}
+
+fn remove_scalar(config: &Config, key: &str) -> Result<(), Error> {
+    config.update_global_json(|root| {
+        root.remove(key);
+        Ok(())
+    })
+}
+
+/// Validates a built-in API key. `-` removes the stored key; otherwise the
+/// value may be a literal, a `$NAME` or `${NAME}` reference, or `-` to clear.
+fn parse_builtin_api_key(value: &str) -> Result<Option<String>, Error> {
+    if value == "-" {
+        return Ok(None);
+    }
+    if value.trim().is_empty() {
+        return Err(Error::Config(
+            "API key must not be empty; use '-' to remove the stored key".into(),
+        ));
+    }
+    if let Some(reference) = value.strip_prefix("${") {
+        let name = reference
+            .strip_suffix('}')
+            .ok_or_else(|| Error::Config("unterminated environment variable reference".into()))?;
+        ensure_environment_name(name)?;
+    } else if let Some(name) = value.strip_prefix('$') {
+        ensure_environment_name(name)?;
+    } else if value.starts_with('!') {
+        return Err(Error::Config(
+            "API keys beginning with '!' are not supported; use an environment variable reference"
+                .into(),
+        ));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn ensure_environment_name(name: &str) -> Result<(), Error> {
+    let mut bytes = name.bytes();
+    let valid_start = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+    if valid_start && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+        Ok(())
+    } else {
+        Err(Error::Config("invalid environment variable name".into()))
+    }
 }
 
 fn api_key_is_effective(provider: &ProviderConfig, requested: Option<&str>) -> bool {
@@ -572,6 +649,81 @@ mod tests {
             ConfigChangeEffect::SkillDirectoryNotConfigured(missing)
         );
         assert!(!dirs.home.join("config.json").exists());
+    }
+
+    #[test]
+    fn builtin_key_changes_store_validate_and_reload() {
+        let dirs = TestDirs::new("builtin-keys");
+        let config = dirs.config();
+
+        let stored = config
+            .change_global(ConfigChange::AnthropicApiKey("sk-ant-test".into()))
+            .expect("a literal anthropic key should apply");
+        assert_eq!(stored.effect, ConfigChangeEffect::Applied);
+        assert_eq!(
+            stored.config.anthropic_api_key.as_deref(),
+            Some("sk-ant-test")
+        );
+
+        let reference = stored
+            .config
+            .change_global(ConfigChange::OpenAiApiKey("$OPENAI_TEST_KEY".into()))
+            .expect("an environment reference should apply");
+        assert_eq!(
+            reference.config.openai_api_key.as_deref(),
+            Some("$OPENAI_TEST_KEY")
+        );
+
+        let removed = reference
+            .config
+            .change_global(ConfigChange::OpenAiApiKey("-".into()))
+            .expect("removing the stored key should apply");
+        assert_eq!(removed.config.openai_api_key, None);
+
+        assert!(
+            removed
+                .config
+                .change_global(ConfigChange::AnthropicApiKey("".into()))
+                .is_err()
+        );
+        assert!(
+            removed
+                .config
+                .change_global(ConfigChange::OpenAiApiKey("$2BAD".into()))
+                .is_err()
+        );
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(dirs.home.join("config.json"))
+                .expect("saved keys should be readable"),
+        )
+        .expect("saved config should be JSON");
+        assert_eq!(saved["anthropic_api_key"], "sk-ant-test");
+        assert!(saved.get("openai_api_key").is_none());
+    }
+
+    #[test]
+    fn setup_marker_round_trips_and_clears() {
+        let dirs = TestDirs::new("setup-marker");
+        let config = dirs.config();
+        assert!(!config.setup_skipped);
+
+        let skipped = config
+            .change_global(ConfigChange::SetupSkipped(true))
+            .expect("skipping setup should persist");
+        assert!(skipped.config.setup_skipped);
+
+        let restored = skipped
+            .config
+            .change_global(ConfigChange::SetupSkipped(false))
+            .expect("clearing the marker should persist");
+        assert!(!restored.config.setup_skipped);
+
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(dirs.home.join("config.json"))
+                .expect("saved marker config should be readable"),
+        )
+        .expect("saved config should be JSON");
+        assert!(saved.get("setup").is_none());
     }
 
     #[test]

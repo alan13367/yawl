@@ -359,6 +359,15 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
                 }
             })
         }
+        "anthropic_api_key" | "openai_api_key" => {
+            one_value(&mut parts, "usage: /settings anthropic_api_key KEY|-").map(|value| {
+                if key == "anthropic_api_key" {
+                    ConfigChange::AnthropicApiKey(value.to_string())
+                } else {
+                    ConfigChange::OpenAiApiKey(value.to_string())
+                }
+            })
+        }
         "provider" => {
             let name = parts.next();
             let url = parts.next();
@@ -388,6 +397,7 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
             state.reasoning_effort = agent.config().reasoning_effort.clone();
             state.hide_reasoning = agent.config().hide_reasoning;
             state.accent_color = agent.config().accent_color;
+            state.subagents_enabled = agent.config().subagents;
             state.show_scroll_bar = agent.config().scroll_bar;
             state.context_window = agent.context_window();
             notice_config_effect(agent.config(), effect, state);
@@ -426,7 +436,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- scroll_bar: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- scroll_bar: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -457,6 +467,16 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         agent.config().subagent_model,
         agent.config().anthropic_base_url,
         agent.config().openai_base_url,
+        if agent.config().anthropic_api_key.is_some() {
+            "set"
+        } else {
+            "not set"
+        },
+        if agent.config().openai_api_key.is_some() {
+            "set"
+        } else {
+            "not set"
+        },
     );
     for dir in &agent.config().skill_dirs {
         text.push_str(&format!("- `{}`\n", dir.display()));
@@ -475,7 +495,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);

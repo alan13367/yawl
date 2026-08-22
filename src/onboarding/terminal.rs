@@ -2,6 +2,8 @@ use std::io::{self, Write};
 
 use crate::error::Error;
 
+use super::select::{self, Choice};
+
 pub(super) enum Authentication {
     None,
     Environment { reference: String, value: String },
@@ -25,32 +27,60 @@ impl Authentication {
     }
 }
 
-pub(super) fn choose_authentication() -> Result<Authentication, Error> {
-    println!(
-        "\nAuthentication:\n  1. No API key\n  2. Read the key from an environment variable\n  3. Enter an API key now"
-    );
-    match prompt("Authentication number")?.as_str() {
-        "1" => Ok(Authentication::None),
-        "2" => {
-            let name = prompt("Environment variable name, without '$'")?;
-            validate_environment_name(&name)?;
+/// Asks how the provider authenticates. `None` means the user canceled and
+/// wants to go back.
+pub(super) fn choose_authentication() -> Result<Option<Authentication>, Error> {
+    let choices = [
+        Choice::new("No API key", "the server trusts local requests"),
+        Choice::new("Environment variable", "stores a $NAME reference"),
+        Choice::new("Enter the key now", "stored in config.json"),
+    ];
+    let choice = select::select("Authentication", &choices)?;
+    match choice {
+        None => Ok(None),
+        Some(0) => Ok(Some(Authentication::None)),
+        Some(1) => {
+            let name = loop {
+                let name = prompt("Environment variable name, without '$'")?;
+                if validate_environment_name(&name).is_ok() {
+                    break name;
+                }
+                println!("Use letters, numbers, and '_', starting with a letter or '_'.");
+            };
             let value = std::env::var(&name).unwrap_or_default();
-            Ok(Authentication::Environment {
+            if value.is_empty() {
+                println!("Note: {name} is not set right now. Requests will fail until it is.");
+            }
+            Ok(Some(Authentication::Environment {
                 reference: format!("${name}"),
                 value,
-            })
+            }))
         }
-        "3" => {
-            let key = prompt_secret("API key")?;
-            if key.is_empty() {
-                Err(Error::Config("API key must not be empty".into()))
-            } else {
-                Ok(Authentication::Literal(key))
-            }
+        Some(_) => {
+            let key = loop {
+                let key = prompt_secret("API key")?;
+                if !key.is_empty() {
+                    break key;
+                }
+                println!("The API key must not be empty.");
+            };
+            Ok(Some(Authentication::Literal(key)))
         }
-        _ => Err(Error::Config(
-            "authentication must be a number from 1 through 3".into(),
-        )),
+    }
+}
+
+/// Asks a yes or no question until it gets a valid answer. An empty answer
+/// picks `default`.
+pub(super) fn confirm(question: &str, default: bool) -> Result<bool, Error> {
+    let hint = if default { "[Y/n]" } else { "[y/N]" };
+    loop {
+        let answer = prompt(&format!("{question} {hint}"))?;
+        match answer.to_lowercase().as_str() {
+            "" => return Ok(default),
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => println!("Answer y or n."),
+        }
     }
 }
 
@@ -71,7 +101,7 @@ pub(super) fn prompt_with_default(label: &str, default: &str) -> Result<String, 
     }
 }
 
-fn prompt_secret(label: &str) -> Result<String, Error> {
+pub(super) fn prompt_secret(label: &str) -> Result<String, Error> {
     print!("{label}, input hidden: ");
     io::stdout().flush()?;
 
@@ -114,14 +144,6 @@ fn read_line() -> Result<String, Error> {
         return Err(Error::Config("onboarding canceled".into()));
     }
     Ok(line.trim().to_string())
-}
-
-pub(super) fn nonempty(value: String, name: &str) -> Result<String, Error> {
-    if value.is_empty() {
-        Err(Error::Config(format!("{name} must not be empty")))
-    } else {
-        Ok(value)
-    }
 }
 
 pub(super) fn validate_environment_name(name: &str) -> Result<(), Error> {

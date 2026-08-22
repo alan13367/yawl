@@ -91,6 +91,7 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         }),
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagents_enabled: false,
         subagent_view: None,
     };
     let mut editor = Editor::default();
@@ -150,6 +151,7 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         }),
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagents_enabled: false,
         subagent_view: None,
     };
     let mut editor = Editor::default();
@@ -197,6 +199,9 @@ fn settings_picker_indexes_keep_their_action_contracts() {
         subagent_model: crate::config::DEFAULT_SUBAGENT_MODEL.to_string(),
         skill_dirs: Vec::new(),
         providers: std::collections::HashMap::new(),
+        setup_skipped: false,
+        anthropic_api_key: None,
+        openai_api_key: None,
         home_dir: root.join("home/.yawl"),
         project_dir: root.join("project/.yawl"),
     };

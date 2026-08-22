@@ -34,6 +34,7 @@ fn queue_picker_removes_a_selected_message_and_keeps_the_rest() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagents_enabled: false,
         subagent_view: None,
     };
     open_queue_picker(&mut state);

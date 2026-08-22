@@ -8,6 +8,7 @@ pub mod agent;
 pub(crate) mod cancellation;
 pub mod compaction;
 pub mod config;
+pub mod doctor;
 pub mod error;
 pub(crate) mod model;
 pub mod onboarding;

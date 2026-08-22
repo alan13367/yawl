@@ -68,6 +68,7 @@ fn display_settings_apply_during_an_active_turn() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagents_enabled: false,
         subagent_view: None,
     };
     let root = std::env::temp_dir().join(format!(
@@ -95,6 +96,9 @@ fn display_settings_apply_during_an_active_turn() {
         subagent_model: crate::config::DEFAULT_SUBAGENT_MODEL.to_string(),
         skill_dirs: Vec::new(),
         providers: std::collections::HashMap::new(),
+        setup_skipped: false,
+        anthropic_api_key: None,
+        openai_api_key: None,
         home_dir: root.join("home/.yawl"),
         project_dir: root.join("project/.yawl"),
     };

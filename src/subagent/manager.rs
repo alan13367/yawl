@@ -1024,6 +1024,9 @@ mod tests {
             subagent_model: DEFAULT_SUBAGENT_MODEL.into(),
             skill_dirs: Vec::new(),
             providers: HashMap::<String, ProviderConfig>::new(),
+            setup_skipped: false,
+            anthropic_api_key: None,
+            openai_api_key: None,
             home_dir: PathBuf::new(),
             project_dir: PathBuf::new(),
         }

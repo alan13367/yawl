@@ -37,8 +37,19 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         println!("yawl {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
     }
+    if cli.doctor {
+        yawl::install_interrupt_handler()?;
+        return Ok(yawl::doctor::run()?);
+    }
 
-    let mut config = Config::load()?;
+    let mut config = match Config::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("yawl: {error}");
+            eprintln!("Run 'yawl --doctor' to diagnose and repair the configuration.");
+            return Ok(1);
+        }
+    };
     if let Some(provider) = &cli.login {
         yawl::install_interrupt_handler()?;
         match provider.as_str() {
@@ -53,7 +64,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     }
     if cli.setup {
         yawl::install_interrupt_handler()?;
-        let _ = yawl::onboarding::run(&config)?;
+        yawl::onboarding::run(&config)?;
         return Ok(0);
     }
     if let Some(model) = &cli.model {
@@ -65,14 +76,16 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     }
 
     let stdin_is_terminal = io::stdin().is_terminal();
-    if config.model.is_none() && cli.prompt.is_empty() && stdin_is_terminal {
+    if config.model.is_none() && !config.setup_skipped && cli.prompt.is_empty() && stdin_is_terminal
+    {
         yawl::install_interrupt_handler()?;
-        config = yawl::onboarding::run(&config)?;
+        config = match yawl::onboarding::run(&config)? {
+            yawl::onboarding::SetupOutcome::Configured(config) => *config,
+            yawl::onboarding::SetupOutcome::Skipped => return Ok(0),
+        };
     }
     let model = config.model.clone().ok_or_else(|| {
-        Error::Config(
-            "no model configured; run 'yawl' in a terminal for setup or pass --model".into(),
-        )
+        Error::Config("no model configured; run 'yawl --setup' or pass --model".into())
     })?;
     let (session, messages) = open_session(&config, &cli)?;
     let mut agent = Agent::new(config, model, session, messages);

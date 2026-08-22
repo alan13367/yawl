@@ -386,6 +386,7 @@ pub(super) fn apply_display_config_while_busy(
             state.hide_reasoning = config.hide_reasoning;
             state.accent_color = config.accent_color;
             state.show_scroll_bar = config.scroll_bar;
+            state.subagents_enabled = config.subagents;
             notice_config_effect(config, outcome.effect, state);
             active_pickers.refresh_display_settings(config);
             state.picker = Some(active_pickers.settings.clone());

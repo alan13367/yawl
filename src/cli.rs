@@ -13,6 +13,7 @@ Options:
       --list-tools            List builtin and discovered exec tools
       --login PROVIDER        Log into a subscription provider
       --setup                 Run provider and model onboarding again
+      --doctor                Diagnose and repair the configuration
   -h, --help                  Show this help
   -V, --version               Show the version
 ";
@@ -25,6 +26,7 @@ pub(super) struct Cli {
     pub(super) list_tools: bool,
     pub(super) login: Option<String>,
     pub(super) setup: bool,
+    pub(super) doctor: bool,
     pub(super) help: bool,
     pub(super) version: bool,
     pub(super) prompt: Vec<String>,
@@ -65,6 +67,7 @@ pub(super) fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, 
                 );
             }
             "--setup" => cli.setup = true,
+            "--doctor" => cli.doctor = true,
             "-h" | "--help" => cli.help = true,
             "-V" | "--version" => cli.version = true,
             _ if arg.starts_with('-') => return Err(format!("unknown option '{arg}'")),
@@ -74,15 +77,16 @@ pub(super) fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, 
     if cli.continue_latest && cli.session_id.is_some() {
         return Err("--continue and --session cannot be used together".into());
     }
-    if (cli.login.is_some() || cli.setup)
+    if (cli.login.is_some() || cli.setup || cli.doctor)
         && (cli.model.is_some()
             || cli.continue_latest
             || cli.session_id.is_some()
             || cli.list_tools
             || !cli.prompt.is_empty()
-            || cli.login.is_some() && cli.setup)
+            || cli.login.is_some() && (cli.setup || cli.doctor)
+            || cli.setup && cli.doctor)
     {
-        return Err("--login and --setup must be used alone".into());
+        return Err("--login, --setup, and --doctor must be used alone".into());
     }
     Ok(cli)
 }
@@ -123,6 +127,15 @@ mod tests {
         assert!(parse(&["--login", "openai-codex", "prompt"]).is_err());
         assert!(parse(&["--setup"]).is_ok());
         assert!(parse(&["--setup", "--login", "openai-codex"]).is_err());
+    }
+
+    #[test]
+    fn parses_standalone_doctor() {
+        let cli = parse(&["--doctor"]).expect("doctor should parse");
+        assert!(cli.doctor);
+        assert!(parse(&["--doctor", "--setup"]).is_err());
+        assert!(parse(&["--doctor", "-m", "openai:gpt-4o"]).is_err());
+        assert!(parse(&["--doctor", "prompt"]).is_err());
     }
 
     #[test]

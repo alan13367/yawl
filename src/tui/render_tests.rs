@@ -69,6 +69,7 @@ fn frame_keeps_input_and_status_pinned() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagents_enabled: false,
         subagent_view: None,
     };
     let editor = Editor::default();
@@ -209,6 +210,7 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagents_enabled: false,
         subagent_view: None,
     };
 
@@ -251,6 +253,7 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagents_enabled: false,
         subagent_view: None,
     };
 
@@ -304,6 +307,7 @@ fn loading_state_ignores_status_activity() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagents_enabled: false,
         subagent_view: None,
     };
     state.notice("Yawl is ready. Type /help for commands.");
@@ -351,6 +355,7 @@ fn overflow_state() -> ViewState {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagents_enabled: false,
         subagent_view: None,
     }
 }
@@ -503,6 +508,7 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagents_enabled: false,
         subagent_view: None,
     };
     let editor = Editor::default();

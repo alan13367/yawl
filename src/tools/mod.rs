@@ -579,6 +579,9 @@ mod tests {
             subagent_model: crate::config::DEFAULT_SUBAGENT_MODEL.to_string(),
             skill_dirs: Vec::new(),
             providers: std::collections::HashMap::new(),
+            setup_skipped: false,
+            anthropic_api_key: None,
+            openai_api_key: None,
             home_dir,
             project_dir,
         }

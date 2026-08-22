@@ -19,7 +19,8 @@ Yawl is one Cargo package with a Rust 2024 library target and binary target for 
 - `src/tui/commands.rs`, `completion.rs`, `picker.rs`, `state.rs`, `worker.rs`: TUI behavior and state
 - `src/tui/render.rs`, `terminal.rs`, `events.rs`, `input.rs`, `transcript.rs`: frame composition, terminal lifecycle, input decoding/editing, and transcript reduction
 - `src/tui/markdown.rs`, `highlight.rs`, `tool_view.rs`: sanitized Markdown, syntax highlighting, and tool presentation
-- `src/onboarding.rs`, `src/onboarding/`: onboarding coordination, model discovery, and terminal prompts
+- `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
+- `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
 - `src/tools/`: built-in tools and executable tool discovery
 - `src/session.rs`, `src/compaction.rs`: append-only sessions and context compaction
 - `README.md`: user-facing behavior, contracts, and a concise architecture map
@@ -41,7 +42,7 @@ Run `cargo fmt --all` after editing Rust. After making code changes, run `cargo 
 ## Code rules
 
 - Follow existing module boundaries and Rust naming conventions. Organize by responsibility, not by file size alone.
-- Keep `main.rs`, `provider/mod.rs`, `config.rs`, `tui/mod.rs`, and `onboarding.rs` as facades. Put implementation in their private child modules.
+- Keep `main.rs`, `provider/mod.rs`, `config.rs`, `tui/mod.rs`, `onboarding.rs`, and `doctor.rs` as facades. Put implementation in their private child modules.
 - Preserve established public paths when moving code. Re-export from the facade instead of forcing callers to follow the internal layout.
 - Prefer sibling visibility through `pub(super)` over widening internal APIs to `pub(crate)` or `pub`.
 - Prefer the standard library over a new dependency. Commit `Cargo.lock` when dependencies change.

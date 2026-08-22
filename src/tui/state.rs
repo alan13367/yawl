@@ -44,6 +44,9 @@ pub(super) struct ViewState {
     pub(super) completions: Vec<Completion>,
     pub(super) completion_index: usize,
     pub(super) picker: Option<Picker>,
+    /// Whether subagent orchestration is enabled, mirrored from the config
+    /// so busy-path commands can answer without the agent.
+    pub(super) subagents_enabled: bool,
     pub(super) subagent_manager: SubagentManager,
     pub(super) subagent_snapshots: Vec<SubagentSnapshot>,
     pub(super) subagent_view: Option<SubagentView>,
@@ -72,6 +75,7 @@ impl ViewState {
             completions: command_completions(agent),
             completion_index: 0,
             picker: None,
+            subagents_enabled: agent.config().subagents,
             subagent_manager: agent.subagents(),
             subagent_snapshots: agent.subagents().snapshots(),
             subagent_view: None,
