@@ -21,6 +21,7 @@ mod render_tests;
 mod state;
 #[cfg(test)]
 mod state_tests;
+mod subagents;
 mod terminal;
 #[cfg(test)]
 mod terminal_tests;
@@ -47,8 +48,12 @@ use self::picker::{
     take_picker_action,
 };
 use self::state::{ViewState, advance_ticks, scroll, toggle_tool_expansion};
+use self::subagents::open_dashboard;
 use self::terminal::Terminal;
-use self::worker::{compact_interactive, handle_mouse_selection, turn_interactive};
+use self::transcript::Transcript;
+use self::worker::{
+    compact_interactive, deferred_subagents_interactive, handle_mouse_selection, turn_interactive,
+};
 
 #[cfg(test)]
 use self::commands::{handle_queue_picker_action, open_queue_picker};
@@ -65,7 +70,7 @@ use self::terminal::{
     ScreenPoint, TextSelection, base64_encode, highlighted_selection, selected_text,
 };
 #[cfg(test)]
-use self::transcript::{Entry, Transcript, TranscriptEvent};
+use self::transcript::{Entry, TranscriptEvent};
 #[cfg(test)]
 use self::worker::{BusyCommand, activate_picker_action_while_busy, busy_command, is_cancel_key};
 #[cfg(test)]
@@ -94,6 +99,27 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
     terminal.draw(&mut state, &editor)?;
 
     loop {
+        if agent.has_deferred_subagent_results() {
+            state.activity = "delivering subagent results".into();
+            terminal.draw(&mut state, &editor)?;
+            match deferred_subagents_interactive(
+                agent,
+                &mut state,
+                &mut editor,
+                &mut terminal,
+                &mut events,
+            ) {
+                Ok(Some(true) | None) => {}
+                Ok(Some(false)) | Err(Error::Interrupted) => {
+                    state.notice("Subagent result follow-up interrupted.")
+                }
+                Err(error) => state.notice(format!("Subagent result follow-up failed: {error}")),
+            }
+            state.transcript = Transcript::from_messages(agent.messages());
+            state.activity.clear();
+            terminal.draw(&mut state, &editor)?;
+            continue;
+        }
         if let Some(action) = state.pending_actions.pop_front() {
             activate_picker_action(agent, &mut state, action);
             terminal.draw(&mut state, &editor)?;
@@ -116,6 +142,19 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
         }
 
         let event = events.read_event()?;
+        if matches!(&event, Event::Tick) && crate::interrupted() {
+            state.subagent_manager.interrupt_all();
+            crate::set_interrupted(false);
+            if !editor.is_empty() {
+                editor.clear();
+            }
+            state.activity = "input cleared".into();
+        }
+        if state.subagent_view.is_some() {
+            subagents::handle_event(&mut state, &mut editor, event);
+            terminal.draw(&mut state, &editor)?;
+            continue;
+        }
         if state.picker.is_some() {
             match event {
                 Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
@@ -135,13 +174,6 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
         match event {
             Event::Tick => {
                 advance_ticks(&mut state);
-                if crate::interrupted() {
-                    crate::set_interrupted(false);
-                    if !editor.is_empty() {
-                        editor.clear();
-                    }
-                    state.activity = "input cleared".into();
-                }
             }
             Event::MouseScroll(amount) => scroll(&mut state, amount),
             Event::Mouse(mouse) => handle_mouse_selection(&mut terminal, &mut state, mouse)?,
@@ -259,6 +291,8 @@ fn handle_submission<R: Read>(
                 state.notice(text);
             }
             "skills" => show_skills(agent, state),
+            "subagents" if argument.is_empty() => open_dashboard(state),
+            "subagents" => state.notice("Usage: /subagents"),
             "resume" if argument.is_empty() => open_resume_picker(agent, state),
             "resume" => resume(agent, argument, state),
             "unqueue" => unqueue(argument, state),

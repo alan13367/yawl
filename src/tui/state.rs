@@ -2,10 +2,12 @@
 
 use crate::agent::{Agent, TurnEvent};
 use crate::config::UiColor;
+use crate::subagent::{SubagentManager, SubagentSnapshot};
 
 use super::completion::{Completion, command_completions};
 use super::events::{MouseEvent, MouseKind};
 use super::picker::{Picker, PickerAction};
+use super::subagents::SubagentView;
 use super::transcript::{Transcript, TranscriptEvent};
 
 pub(super) const COPY_TOAST_TICKS: u8 = 15;
@@ -42,6 +44,9 @@ pub(super) struct ViewState {
     pub(super) completions: Vec<Completion>,
     pub(super) completion_index: usize,
     pub(super) picker: Option<Picker>,
+    pub(super) subagent_manager: SubagentManager,
+    pub(super) subagent_snapshots: Vec<SubagentSnapshot>,
+    pub(super) subagent_view: Option<SubagentView>,
 }
 
 impl ViewState {
@@ -67,6 +72,9 @@ impl ViewState {
             completions: command_completions(agent),
             completion_index: 0,
             picker: None,
+            subagent_manager: agent.subagents(),
+            subagent_snapshots: agent.subagents().snapshots(),
+            subagent_view: None,
         }
     }
 
@@ -201,6 +209,7 @@ impl Update {
 pub(super) fn advance_ticks(state: &mut ViewState) {
     state.copy_toast_ticks = state.copy_toast_ticks.saturating_sub(1);
     state.spinner_tick = state.spinner_tick.wrapping_add(1);
+    super::subagents::refresh(state);
 }
 pub(super) fn scroll(state: &mut ViewState, amount: i32) {
     if amount >= 0 {

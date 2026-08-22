@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::provider::ToolSpec;
+use crate::subagent::{RunOrigin, SubagentManager};
 
 pub use exec::DescribeCache;
 
@@ -30,6 +31,22 @@ enum ToolImpl {
     WriteFile,
     EditFile,
     Exec(exec::ExecTool),
+    Subagent(SubagentTool),
+}
+
+#[derive(Clone, Copy)]
+enum SubagentTool {
+    Spawn,
+    Send,
+    Wait,
+    Cancel,
+    List,
+}
+
+struct SubagentContext {
+    manager: SubagentManager,
+    config: Config,
+    parent_model: String,
 }
 
 struct ToolEntry {
@@ -61,6 +78,7 @@ impl ToolOutcome {
 pub struct Registry {
     entries: Vec<ToolEntry>,
     pub warnings: Vec<String>,
+    subagents: Option<SubagentContext>,
 }
 
 impl Registry {
@@ -70,17 +88,42 @@ impl Registry {
         let mut registry = Registry {
             entries: builtins(),
             warnings: Vec::new(),
+            subagents: None,
         };
         for dir in config.tool_dirs() {
             let (tools, warnings) = exec::scan_dir(&dir, cache);
             registry.warnings.extend(warnings);
             for tool in tools {
+                if RESERVED_TOOL_NAMES.contains(&tool.spec.name.as_str()) {
+                    registry.warnings.push(format!(
+                        "{}: tool name '{}' is reserved by Yawl",
+                        tool.path.display(),
+                        tool.spec.name
+                    ));
+                    continue;
+                }
                 registry.insert(ToolEntry {
                     spec: tool.spec.clone(),
                     imp: ToolImpl::Exec(tool),
                 });
             }
         }
+        registry
+    }
+
+    pub(crate) fn scan_with_subagents(
+        config: &Config,
+        cache: &mut DescribeCache,
+        manager: SubagentManager,
+        parent_model: &str,
+    ) -> Registry {
+        let mut registry = Self::scan(config, cache);
+        registry.entries.extend(subagent_tools());
+        registry.subagents = Some(SubagentContext {
+            manager,
+            config: config.clone(),
+            parent_model: parent_model.to_string(),
+        });
         registry
     }
 
@@ -107,6 +150,7 @@ impl Registry {
             .map(|e| {
                 let origin = match &e.imp {
                     ToolImpl::Exec(t) => t.path.display().to_string(),
+                    ToolImpl::Subagent(_) => "orchestration".to_string(),
                     _ => "builtin".to_string(),
                 };
                 (e.spec.name.clone(), e.spec.description.clone(), origin)
@@ -138,6 +182,7 @@ impl Registry {
                 let (content, is_error) = exec::invoke(tool, args_json, session_id);
                 ToolOutcome { content, is_error }
             }
+            ToolImpl::Subagent(tool) => self.execute_subagent(*tool, &args),
         };
         truncate_result(&mut outcome.content);
         if outcome.content.is_empty() {
@@ -149,6 +194,169 @@ impl Registry {
         }
         outcome
     }
+
+    fn execute_subagent(&self, tool: SubagentTool, args: &Value) -> ToolOutcome {
+        let Some(context) = &self.subagents else {
+            return ToolOutcome::error("subagent orchestration is not available");
+        };
+        let result = match tool {
+            SubagentTool::Spawn => {
+                let prompt = str_arg(args, "prompt").map_err(|error| error.content);
+                let name = str_arg(args, "name").map_err(|error| error.content);
+                prompt.and_then(|prompt| {
+                    name.and_then(|name| {
+                        let model = match args.get("model") {
+                            Some(value) => Some(value.as_str().ok_or_else(|| {
+                                "'model' must be a string when provided".to_string()
+                            })?),
+                            None => None,
+                        };
+                        context
+                            .manager
+                            .spawn(
+                                context.config.clone(),
+                                &context.parent_model,
+                                name,
+                                prompt,
+                                model,
+                            )
+                            .map(|id| format!("started {id}"))
+                    })
+                })
+            }
+            SubagentTool::Send => {
+                let id = str_arg(args, "id").map_err(|error| error.content);
+                let message = str_arg(args, "message").map_err(|error| error.content);
+                id.and_then(|id| {
+                    message.and_then(|message| context.manager.send(id, message, RunOrigin::Model))
+                })
+            }
+            SubagentTool::Wait => string_array(args, "ids").and_then(|ids| {
+                let timeout = match args.get("timeout_secs") {
+                    Some(value) => Some(
+                        value
+                            .as_u64()
+                            .ok_or_else(|| "'timeout_secs' must be an integer".to_string())?,
+                    ),
+                    None => None,
+                };
+                context.manager.wait(&ids, timeout)
+            }),
+            SubagentTool::Cancel => {
+                string_array(args, "ids").and_then(|ids| context.manager.cancel(&ids, false))
+            }
+            SubagentTool::List => match args.get("id") {
+                Some(value) => value
+                    .as_str()
+                    .ok_or_else(|| "'id' must be a string".to_string())
+                    .and_then(|id| context.manager.list(Some(id))),
+                None => context.manager.list(None),
+            },
+        };
+        match result {
+            Ok(content) => ToolOutcome::ok(content),
+            Err(error) => ToolOutcome::error(error),
+        }
+    }
+}
+
+const RESERVED_TOOL_NAMES: &[&str] = &[
+    "subagent_spawn",
+    "subagent_send",
+    "subagent_wait",
+    "subagent_cancel",
+    "subagent_list",
+];
+
+fn subagent_tools() -> Vec<ToolEntry> {
+    let tool = |name: &str, description: &str, input_schema: Value, imp| ToolEntry {
+        spec: ToolSpec {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+        },
+        imp: ToolImpl::Subagent(imp),
+    };
+    vec![
+        tool(
+            "subagent_spawn",
+            "Start a self-contained background coding subagent and return its ID immediately.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "name": {"type": "string"},
+                    "model": {"type": "string"}
+                },
+                "required": ["prompt", "name"]
+            }),
+            SubagentTool::Spawn,
+        ),
+        tool(
+            "subagent_send",
+            "Queue another model-directed turn on a subagent, restarting it if settled.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "message": {"type": "string"}
+                },
+                "required": ["id", "message"]
+            }),
+            SubagentTool::Send,
+        ),
+        tool(
+            "subagent_wait",
+            "Wait until all requested subagents settle or the timeout expires without canceling them. \
+             Every settled run reports its complete final response.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64},
+                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 300}
+                },
+                "required": ["ids"]
+            }),
+            SubagentTool::Wait,
+        ),
+        tool(
+            "subagent_cancel",
+            "Cancel active subagent runs, clear their queues, and retain partial transcripts.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64}
+                },
+                "required": ["ids"]
+            }),
+            SubagentTool::Cancel,
+        ),
+        tool(
+            "subagent_list",
+            "List tracked subagents or return detailed status and the complete latest result for one ID.",
+            json!({
+                "type": "object",
+                "properties": {"id": {"type": "string"}}
+            }),
+            SubagentTool::List,
+        ),
+    ]
+}
+
+fn string_array(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    let values = args
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("missing required array argument '{key}'"))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("'{key}' must contain only strings"))
+        })
+        .collect()
 }
 
 fn truncate_result(content: &mut String) {
@@ -353,6 +561,29 @@ mod tests {
         std::env::temp_dir().join(format!("yawl-tools-{}-{name}", std::process::id()))
     }
 
+    fn registry_config(home_dir: std::path::PathBuf, project_dir: std::path::PathBuf) -> Config {
+        Config {
+            model: Some("test".into()),
+            anthropic_base_url: String::new(),
+            openai_base_url: String::new(),
+            max_tokens: 1,
+            reasoning_effort: None,
+            hide_reasoning: false,
+            accent_color: crate::config::UiColor::WHITE,
+            scroll_bar: true,
+            context_windows: std::collections::HashMap::new(),
+            auto_compact: true,
+            compact_threshold: 0.85,
+            subagents: false,
+            max_subagents: crate::config::DEFAULT_MAX_SUBAGENTS,
+            subagent_model: crate::config::DEFAULT_SUBAGENT_MODEL.to_string(),
+            skill_dirs: Vec::new(),
+            providers: std::collections::HashMap::new(),
+            home_dir,
+            project_dir,
+        }
+    }
+
     #[test]
     fn edit_file_requires_unique_match() -> std::io::Result<()> {
         let path = temp_path("edit.txt");
@@ -412,23 +643,7 @@ printf '%s:%s' "$YAWL_SESSION_ID" "$input"
         permissions.set_mode(0o755);
         std::fs::set_permissions(&tool_path, permissions)?;
 
-        let config = Config {
-            model: Some("test".into()),
-            anthropic_base_url: String::new(),
-            openai_base_url: String::new(),
-            max_tokens: 1,
-            reasoning_effort: None,
-            hide_reasoning: false,
-            accent_color: crate::config::UiColor::WHITE,
-            scroll_bar: true,
-            context_windows: std::collections::HashMap::new(),
-            auto_compact: true,
-            compact_threshold: 0.85,
-            skill_dirs: Vec::new(),
-            providers: std::collections::HashMap::new(),
-            home_dir,
-            project_dir,
-        };
+        let config = registry_config(home_dir, project_dir);
         let mut cache = DescribeCache::default();
         let registry = Registry::scan(&config, &mut cache);
         assert!(
@@ -440,6 +655,59 @@ printf '%s:%s' "$YAWL_SESSION_ID" "$input"
         let outcome = registry.execute("echo_session", r#"{"value":1}"#, "session-7");
         assert!(!outcome.is_error, "{}", outcome.content);
         assert_eq!(outcome.content, r#"session-7:{"value":1}"#);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_tools_are_conditional_and_reserved() -> std::io::Result<()> {
+        let root = temp_path("reserved-subagent-tool");
+        let home_dir = root.join("home");
+        let project_dir = root.join("project");
+        let tools_dir = project_dir.join("tools");
+        std::fs::create_dir_all(&tools_dir)?;
+        let tool_path = tools_dir.join("reserved");
+        std::fs::write(
+            &tool_path,
+            r#"#!/bin/sh
+if [ "$1" = "--describe" ]; then
+  echo '{"name":"subagent_spawn","description":"override","input_schema":{"type":"object"}}'
+fi
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&tool_path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool_path, permissions)?;
+        let mut config = registry_config(home_dir, project_dir);
+        let mut cache = DescribeCache::default();
+
+        let disabled = Registry::scan(&config, &mut cache);
+        assert!(
+            disabled
+                .specs()
+                .iter()
+                .all(|spec| !spec.name.starts_with("subagent_"))
+        );
+        assert!(
+            disabled
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("reserved"))
+        );
+
+        config.subagents = true;
+        let manager = SubagentManager::new("session".into(), config.max_subagents);
+        let enabled = Registry::scan_with_subagents(&config, &mut cache, manager, "test");
+        let names = enabled
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert!(
+            RESERVED_TOOL_NAMES
+                .iter()
+                .all(|name| names.iter().any(|candidate| candidate == name))
+        );
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }

@@ -32,6 +32,9 @@ fn queue_picker_removes_a_selected_message_and_keeps_the_rest() {
         completions: Vec::new(),
         completion_index: 0,
         picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_view: None,
     };
     open_queue_picker(&mut state);
     let mut editor = Editor::default();

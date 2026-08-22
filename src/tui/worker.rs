@@ -4,6 +4,7 @@ use std::io::Read;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use crate::agent::Agent;
+use crate::cancellation::CancellationToken;
 use crate::config::{Config, ConfigChange};
 use crate::error::Error;
 
@@ -31,6 +32,8 @@ pub(super) fn turn_interactive<R: Read>(
 ) -> Result<bool, Error> {
     let mut active_pickers = ActivePickers::from_agent(agent);
     let mut active_config = agent.config().clone();
+    let active_cancellation = agent.cancellation_token();
+    agent.clear_cancellation();
     let active_agent = &mut *agent;
     let result = std::thread::scope(|scope| {
         let (updates_tx, updates_rx) = mpsc::channel();
@@ -38,7 +41,7 @@ pub(super) fn turn_interactive<R: Read>(
         let (thread_tx, thread_rx) = mpsc::channel();
         scope.spawn(move || {
             let _ = thread_tx.send(native_thread_id());
-            let result = active_agent.run_turn(Some(input), &mut |event| {
+            let result = active_agent.run_turn_preserving_cancellation(Some(input), &mut |event| {
                 let _ = updates_tx.send(Update::from_event(event));
             });
             let _ = done_tx.send(result);
@@ -51,6 +54,7 @@ pub(super) fn turn_interactive<R: Read>(
                 updates: updates_rx,
                 done: done_rx,
                 thread: worker_thread,
+                cancellation: active_cancellation,
             },
             state,
             editor,
@@ -73,6 +77,8 @@ pub(super) fn compact_interactive<R: Read>(
 ) -> Result<(), Error> {
     let mut active_pickers = ActivePickers::from_agent(agent);
     let mut active_config = agent.config().clone();
+    let active_cancellation = agent.cancellation_token();
+    agent.clear_cancellation();
     let active_agent = &mut *agent;
     let result = std::thread::scope(|scope| {
         let (updates_tx, updates_rx) = mpsc::channel();
@@ -80,7 +86,7 @@ pub(super) fn compact_interactive<R: Read>(
         let (thread_tx, thread_rx) = mpsc::channel();
         scope.spawn(move || {
             let _ = thread_tx.send(native_thread_id());
-            let result = active_agent.compact_now(&mut |event| {
+            let result = active_agent.compact_now_preserving_cancellation(&mut |event| {
                 let _ = updates_tx.send(Update::from_event(event));
             });
             let _ = done_tx.send(result);
@@ -93,6 +99,52 @@ pub(super) fn compact_interactive<R: Read>(
                 updates: updates_rx,
                 done: done_rx,
                 thread: worker_thread,
+                cancellation: active_cancellation,
+            },
+            state,
+            editor,
+            terminal,
+            events,
+            &mut active_pickers,
+            &mut active_config,
+        )
+    });
+    agent.sync_display_config(&active_config);
+    result
+}
+
+pub(super) fn deferred_subagents_interactive<R: Read>(
+    agent: &mut Agent,
+    state: &mut ViewState,
+    editor: &mut Editor,
+    terminal: &mut Terminal,
+    events: &mut EventReader<R>,
+) -> Result<Option<bool>, Error> {
+    let mut active_pickers = ActivePickers::from_agent(agent);
+    let mut active_config = agent.config().clone();
+    let active_cancellation = agent.cancellation_token();
+    agent.clear_cancellation();
+    let active_agent = &mut *agent;
+    let result = std::thread::scope(|scope| {
+        let (updates_tx, updates_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (thread_tx, thread_rx) = mpsc::channel();
+        scope.spawn(move || {
+            let _ = thread_tx.send(native_thread_id());
+            let result = active_agent.run_deferred_subagent_results(&mut |event| {
+                let _ = updates_tx.send(Update::from_event(event));
+            });
+            let _ = done_tx.send(result);
+        });
+        let worker_thread = thread_rx
+            .recv()
+            .map_err(|_| Error::Protocol("agent worker did not start".into()))?;
+        pump_events(
+            WorkerChannels {
+                updates: updates_rx,
+                done: done_rx,
+                thread: worker_thread,
+                cancellation: active_cancellation,
             },
             state,
             editor,
@@ -110,6 +162,7 @@ pub(super) struct WorkerChannels<T> {
     updates: Receiver<Update>,
     done: Receiver<Result<T, Error>>,
     thread: usize,
+    cancellation: CancellationToken,
 }
 
 pub(super) fn pump_events<R: Read, T>(
@@ -140,6 +193,15 @@ pub(super) fn pump_events<R: Read, T>(
         }
         terminal.draw(state, editor)?;
         let event = events.read_event()?;
+        if matches!(&event, Event::Tick) && crate::interrupted() {
+            state.subagent_manager.interrupt_all();
+            cancel_worker(worker.thread, &worker.cancellation, state);
+            crate::set_interrupted(false);
+        }
+        if state.subagent_view.is_some() {
+            super::subagents::handle_event(state, editor, event);
+            continue;
+        }
         if state.picker.is_some() {
             match event {
                 Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
@@ -163,14 +225,13 @@ pub(super) fn pump_events<R: Read, T>(
         match event {
             Event::Tick => {
                 advance_ticks(state);
-                if crate::interrupted() {
-                    state.activity = "canceling turn".into();
-                }
             }
             Event::MouseScroll(amount) => scroll(state, amount),
             Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
             Event::Paste(text) => editor.paste(&text),
-            Event::Key(key) if is_cancel_key(key) => cancel_worker(worker.thread, state),
+            Event::Key(key) if is_cancel_key(key) => {
+                cancel_worker(worker.thread, &worker.cancellation, state)
+            }
             Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
             Event::Key(Key::Ctrl('o')) => toggle_tool_expansion(state),
             Event::Key(Key::PageUp) => scroll(state, 10),
@@ -204,8 +265,12 @@ pub(super) fn is_cancel_key(key: Key) -> bool {
     matches!(key, Key::Escape | Key::Ctrl('c'))
 }
 
-pub(super) fn cancel_worker(thread: usize, state: &mut ViewState) {
-    crate::set_interrupted(true);
+pub(super) fn cancel_worker(
+    thread: usize,
+    cancellation: &CancellationToken,
+    state: &mut ViewState,
+) {
+    cancellation.cancel();
     interrupt_thread(thread);
     state.activity = "canceling turn".into();
 }
@@ -219,6 +284,7 @@ pub(super) fn handle_submission_while_busy(
         Some(BusyCommand::Settings) => state.picker = Some(active_pickers.settings.clone()),
         Some(BusyCommand::Model) => state.picker = Some(active_pickers.model.clone()),
         Some(BusyCommand::Unqueue(argument)) => unqueue(&argument, state),
+        Some(BusyCommand::Subagents) => super::subagents::open_dashboard(state),
         None => {
             state.queued_inputs.push_back(input);
             state.scroll_offset = 0;
@@ -231,6 +297,7 @@ pub(super) enum BusyCommand {
     Settings,
     Model,
     Unqueue(String),
+    Subagents,
 }
 
 pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
@@ -242,6 +309,7 @@ pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
         "settings" if argument.is_empty() => Some(BusyCommand::Settings),
         "model" if argument.is_empty() => Some(BusyCommand::Model),
         "unqueue" => Some(BusyCommand::Unqueue(argument.to_string())),
+        "subagents" if argument.is_empty() => Some(BusyCommand::Subagents),
         _ => None,
     }
 }
@@ -328,15 +396,9 @@ pub(super) fn apply_display_config_while_busy(
 }
 
 pub(super) fn native_thread_id() -> usize {
-    // SAFETY: `pthread_self` takes no arguments and returns the calling
-    // thread's stable pthread identifier.
-    unsafe { libc::pthread_self() as usize }
+    crate::cancellation::native_thread_id()
 }
 
 pub(super) fn interrupt_thread(thread: usize) {
-    // SAFETY: `thread` came from `pthread_self` in the live scoped worker.
-    // The installed SIGINT handler only sets the shared interrupt flag.
-    unsafe {
-        libc::pthread_kill(thread as libc::pthread_t, libc::SIGINT);
-    }
+    crate::cancellation::wake_thread(thread);
 }

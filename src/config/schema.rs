@@ -29,6 +29,9 @@ pub(super) struct ConfigFile {
     pub(super) auto_compact: Option<bool>,
     /// Fraction of the context window at which auto-compaction triggers.
     pub(super) compact_threshold: Option<f64>,
+    pub(super) subagents: Option<bool>,
+    pub(super) max_subagents: Option<usize>,
+    pub(super) subagent_model: Option<String>,
     pub(super) skill_dirs: Option<Vec<String>>,
     pub(super) providers: Option<HashMap<String, ProviderFile>>,
 }

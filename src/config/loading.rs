@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use super::schema::ConfigFile;
 use super::{
-    Config, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_COMPACT_THRESHOLD, DEFAULT_MAX_TOKENS,
-    DEFAULT_OPENAI_BASE_URL, ProviderConfig, UiColor,
+    Config, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_COMPACT_THRESHOLD, DEFAULT_MAX_SUBAGENTS,
+    DEFAULT_MAX_TOKENS, DEFAULT_OPENAI_BASE_URL, DEFAULT_SUBAGENT_MODEL, ProviderConfig, UiColor,
 };
 use crate::error::Error;
 
@@ -30,6 +30,9 @@ impl Config {
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
+            subagents: false,
+            max_subagents: DEFAULT_MAX_SUBAGENTS,
+            subagent_model: DEFAULT_SUBAGENT_MODEL.to_string(),
             skill_dirs: vec![home.join(".yawl/skills"), home.join(".agents/skills")],
             providers: default_local_providers(),
             home_dir,
@@ -120,6 +123,24 @@ impl Config {
             }
             self.compact_threshold = value;
         }
+        if let Some(value) = file.subagents {
+            self.subagents = value;
+        }
+        if let Some(value) = file.max_subagents {
+            if !(1..=16).contains(&value) {
+                return Err(Error::Config(
+                    "max_subagents must be between 1 and 16".into(),
+                ));
+            }
+            self.max_subagents = value;
+        }
+        if let Some(value) = file.subagent_model {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(Error::Config("subagent_model must not be empty".into()));
+            }
+            self.subagent_model = value.to_string();
+        }
         if let Some(dirs) = file.skill_dirs {
             self.skill_dirs = dirs
                 .into_iter()
@@ -203,6 +224,9 @@ mod tests {
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: 0.85,
+            subagents: false,
+            max_subagents: DEFAULT_MAX_SUBAGENTS,
+            subagent_model: DEFAULT_SUBAGENT_MODEL.to_string(),
             skill_dirs: Vec::new(),
             providers: default_local_providers(),
             home_dir: PathBuf::new(),
@@ -392,5 +416,51 @@ mod tests {
         assert!(error.to_string().contains("positive integer"));
         let _ = std::fs::remove_dir_all(root);
         Ok(())
+    }
+
+    #[test]
+    fn subagent_defaults_and_project_overrides_are_merged() -> Result<(), Error> {
+        let root =
+            std::env::temp_dir().join(format!("yawl-subagent-config-{}", std::process::id()));
+        let home = root.join("home/.yawl");
+        let project = root.join("project/.yawl");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let defaults = Config::load_from(home.clone(), project.clone())?;
+        assert!(!defaults.subagents);
+        assert_eq!(defaults.max_subagents, DEFAULT_MAX_SUBAGENTS);
+        assert_eq!(defaults.subagent_model, DEFAULT_SUBAGENT_MODEL);
+
+        std::fs::create_dir_all(&home)?;
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(
+            home.join("config.json"),
+            r#"{"subagents":true,"max_subagents":8,"subagent_model":"configured"}"#,
+        )?;
+        std::fs::write(
+            project.join("config.json"),
+            r#"{"max_subagents":2,"subagent_model":"inherit"}"#,
+        )?;
+
+        let merged = Config::load_from(home, project)?;
+        assert!(merged.subagents);
+        assert_eq!(merged.max_subagents, 2);
+        assert_eq!(merged.subagent_model, "inherit");
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_settings_reject_invalid_limits_and_empty_models() {
+        let cases = [
+            json!({"max_subagents": 0}),
+            json!({"max_subagents": 17}),
+            json!({"subagent_model": "  "}),
+        ];
+        for value in cases {
+            let mut config = test_config();
+            let file = serde_json::from_value(value).expect("subagent config fixture");
+            assert!(config.apply(file).is_err());
+        }
     }
 }

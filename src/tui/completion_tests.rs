@@ -28,6 +28,9 @@ fn enter_submits_the_only_matching_command_completion() {
         }],
         completion_index: 0,
         picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_view: None,
     };
     let mut editor = Editor::default();
     editor.paste("/qui");

@@ -9,6 +9,7 @@ use super::*;
 fn settings_and_model_pickers_are_recognized_during_an_active_turn() {
     assert_eq!(busy_command(" /settings "), Some(BusyCommand::Settings));
     assert_eq!(busy_command("/model"), Some(BusyCommand::Model));
+    assert_eq!(busy_command("/subagents"), Some(BusyCommand::Subagents));
     assert_eq!(
         busy_command("/unqueue 2"),
         Some(BusyCommand::Unqueue("2".into()))
@@ -65,6 +66,9 @@ fn display_settings_apply_during_an_active_turn() {
         completions: Vec::new(),
         completion_index: 0,
         picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_view: None,
     };
     let root = std::env::temp_dir().join(format!(
         "yawl-tui-live-settings-{}-{}",
@@ -86,6 +90,9 @@ fn display_settings_apply_during_an_active_turn() {
         context_windows: std::collections::HashMap::new(),
         auto_compact: true,
         compact_threshold: 0.85,
+        subagents: false,
+        max_subagents: crate::config::DEFAULT_MAX_SUBAGENTS,
+        subagent_model: crate::config::DEFAULT_SUBAGENT_MODEL.to_string(),
         skill_dirs: Vec::new(),
         providers: std::collections::HashMap::new(),
         home_dir: root.join("home/.yawl"),

@@ -18,6 +18,12 @@ pub(super) enum Entry {
         running: bool,
     },
     Notice(String),
+    SubagentResult {
+        id: String,
+        name: String,
+        status: String,
+        content: String,
+    },
 }
 
 pub(super) enum TranscriptEvent {
@@ -55,6 +61,16 @@ impl Transcript {
             match message.role {
                 Role::User if message.content.starts_with("[conversation summary]") => {
                     entries.push(Entry::Notice(message.content.clone()));
+                }
+                Role::User if !message.subagent_results.is_empty() => {
+                    entries.extend(message.subagent_results.iter().map(|result| {
+                        Entry::SubagentResult {
+                            id: result.id.clone(),
+                            name: result.name.clone(),
+                            status: result.status.clone(),
+                            content: result.content.clone(),
+                        }
+                    }));
                 }
                 Role::User => entries.push(Entry::User(message.content.clone())),
                 Role::Assistant => {
@@ -226,7 +242,7 @@ impl Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Reasoning, ToolCall};
+    use crate::provider::{Reasoning, SubagentResult, ToolCall};
 
     #[test]
     fn live_events_and_replayed_messages_produce_the_same_entries() {
@@ -309,6 +325,28 @@ mod tests {
                 output: String::new(),
                 is_error: false,
                 running: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn replayed_subagent_results_use_dedicated_entries() {
+        let message = Message::subagent_results(vec![SubagentResult {
+            id: "sa-1".into(),
+            name: "review".into(),
+            status: "completed".into(),
+            run_number: 1,
+            content: "done".into(),
+        }]);
+        let transcript = Transcript::from_messages(&[message]);
+
+        assert_eq!(
+            transcript.entries(),
+            &[Entry::SubagentResult {
+                id: "sa-1".into(),
+                name: "review".into(),
+                status: "completed".into(),
+                content: "done".into(),
             }]
         );
     }

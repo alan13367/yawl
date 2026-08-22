@@ -16,6 +16,7 @@ pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
     let mut completions = [
         ("/model", "List or switch models"),
         ("/settings", "Show or change settings"),
+        ("/subagents", "Open the subagent dashboard"),
         ("/new", "Start a session without changing directories"),
         ("/clear", "Alias for /new"),
         ("/compact", "Summarize older messages"),

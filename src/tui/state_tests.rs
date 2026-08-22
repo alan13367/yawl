@@ -41,6 +41,9 @@ fn state_with(geometry: Option<ScrollGeometry>) -> ViewState {
         completions: Vec::new(),
         completion_index: 0,
         picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_view: None,
     }
 }
 

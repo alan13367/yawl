@@ -245,7 +245,7 @@ pub fn run_with_timeout(
         if let Some(status) = child.try_wait()? {
             break Some(status);
         }
-        if crate::interrupted() {
+        if crate::cancellation::interrupted() {
             interrupted = true;
             kill_and_reap(&mut child);
             break None;

@@ -89,6 +89,9 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
             }],
             editing: None,
         }),
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_view: None,
     };
     let mut editor = Editor::default();
 
@@ -145,6 +148,9 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
             }],
             editing: None,
         }),
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_view: None,
     };
     let mut editor = Editor::default();
 
@@ -186,6 +192,9 @@ fn settings_picker_indexes_keep_their_action_contracts() {
         context_windows: std::collections::HashMap::new(),
         auto_compact: true,
         compact_threshold: 0.85,
+        subagents: false,
+        max_subagents: crate::config::DEFAULT_MAX_SUBAGENTS,
+        subagent_model: crate::config::DEFAULT_SUBAGENT_MODEL.to_string(),
         skill_dirs: Vec::new(),
         providers: std::collections::HashMap::new(),
         home_dir: root.join("home/.yawl"),

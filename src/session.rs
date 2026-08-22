@@ -242,6 +242,7 @@ fn format_timestamp(unix_secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::SubagentResult;
 
     #[test]
     fn timestamp_formats_known_date() {
@@ -276,5 +277,29 @@ mod tests {
     fn session_ids_do_not_escape_session_directory() {
         let dir = std::env::temp_dir().join(format!("yawl-session-id-test-{}", std::process::id()));
         assert!(Session::open(&dir, "../../outside").is_err());
+    }
+
+    #[test]
+    fn delivered_subagent_results_replay_with_metadata() -> Result<(), Error> {
+        let dir =
+            std::env::temp_dir().join(format!("yawl-subagent-session-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut session = Session::create(&dir)?;
+        let id = session.id.clone();
+        session.append_message(&Message::subagent_results(vec![SubagentResult {
+            id: "sa-1".into(),
+            name: "review".into(),
+            status: "completed".into(),
+            run_number: 1,
+            content: "result".into(),
+        }]))?;
+        drop(session);
+
+        let (_, messages) = Session::open(&dir, &id)?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].subagent_results[0].id, "sa-1");
+        assert_eq!(messages[0].subagent_results[0].content, "result");
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
     }
 }

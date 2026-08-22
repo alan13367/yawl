@@ -68,7 +68,7 @@ pub fn stream_turn(
         });
         match result {
             Ok(()) => return Ok(out),
-            Err(_) if crate::interrupted() => return Err(Error::Interrupted),
+            Err(_) if crate::cancellation::interrupted() => return Err(Error::Interrupted),
             Err(e) if e.is_retryable() && attempt < MAX_ATTEMPTS => {
                 let delay_ms = 500u64 << (attempt - 1);
                 sink(StreamNotice::Retrying {
@@ -77,7 +77,7 @@ pub fn stream_turn(
                     error: e.to_string(),
                 });
                 std::thread::sleep(Duration::from_millis(delay_ms));
-                if crate::interrupted() {
+                if crate::cancellation::interrupted() {
                     return Err(Error::Interrupted);
                 }
                 sink(StreamNotice::RetryReset);

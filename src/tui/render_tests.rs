@@ -67,6 +67,9 @@ fn frame_keeps_input_and_status_pinned() {
         completions: Vec::new(),
         completion_index: 0,
         picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_view: None,
     };
     let editor = Editor::default();
     let (frame, cursor) = build_frame(&mut state, &editor, 40, 12);
@@ -204,6 +207,9 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         completions: Vec::new(),
         completion_index: 0,
         picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_view: None,
     };
 
     let loading = render_loading_state(&state, 80).expect("loading state should be present");
@@ -243,6 +249,9 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         completions: Vec::new(),
         completion_index: 0,
         picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_view: None,
     };
 
     // Hidden reasoning delta arrives: loading state stays visible
@@ -293,6 +302,9 @@ fn loading_state_ignores_status_activity() {
         completions: Vec::new(),
         completion_index: 0,
         picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_view: None,
     };
     state.notice("Yawl is ready. Type /help for commands.");
 
@@ -337,6 +349,9 @@ fn overflow_state() -> ViewState {
         completions: Vec::new(),
         completion_index: 0,
         picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_view: None,
     }
 }
 
@@ -486,6 +501,9 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         completions: Vec::new(),
         completion_index: 0,
         picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_view: None,
     };
     let editor = Editor::default();
     let (frame, _) = build_frame(&mut state, &editor, 40, 12);

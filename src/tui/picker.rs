@@ -12,7 +12,8 @@ pub(super) const SETTINGS_REASONING_DISPLAY_INDEX: usize = 3;
 pub(super) const SETTINGS_ACCENT_COLOR_INDEX: usize = 4;
 pub(super) const SETTINGS_SCROLL_BAR_INDEX: usize = 5;
 pub(super) const SETTINGS_AUTO_COMPACT_INDEX: usize = 6;
-pub(super) const SETTINGS_RELOAD_INDEX: usize = 13;
+pub(super) const SETTINGS_SUBAGENTS_INDEX: usize = 13;
+pub(super) const SETTINGS_RELOAD_INDEX: usize = 16;
 
 #[derive(Clone)]
 pub(super) enum PickerAction {
@@ -30,6 +31,7 @@ pub(super) enum PickerAction {
     EditModel { save: bool, initial: String },
     ApplySetting { argument: String, selected: usize },
     SetAutoCompact(bool),
+    SetSubagents(bool),
     RemoveQueued(usize),
     ClearQueued,
     Reload,
@@ -104,6 +106,11 @@ impl ActivePickers {
             };
             item.description = format!("{visibility} · Enter to toggle");
             item.action = PickerAction::SetScrollBar(!config.scroll_bar);
+        }
+        if let Some(item) = self.settings.items.get_mut(SETTINGS_SUBAGENTS_INDEX) {
+            let state = if config.subagents { "On" } else { "Off" };
+            item.description = format!("{state} · Enter to toggle");
+            item.action = PickerAction::SetSubagents(!config.subagents);
         }
         self.accent_color = color_picker(config.accent_color);
     }
@@ -300,6 +307,34 @@ pub(super) fn settings_picker(agent: &Agent) -> Picker {
                 action: PickerAction::EditSetting {
                     key: "anthropic_base_url".into(),
                     initial: agent.config().anthropic_base_url.clone(),
+                },
+            },
+            PickerItem {
+                label: "Parallel subagents".into(),
+                description: format!(
+                    "{} · Enter to toggle",
+                    if agent.config().subagents {
+                        "On"
+                    } else {
+                        "Off"
+                    }
+                ),
+                action: PickerAction::SetSubagents(!agent.config().subagents),
+            },
+            PickerItem {
+                label: "Maximum active subagents".into(),
+                description: agent.config().max_subagents.to_string(),
+                action: PickerAction::EditSetting {
+                    key: "max_subagents".into(),
+                    initial: agent.config().max_subagents.to_string(),
+                },
+            },
+            PickerItem {
+                label: "Default subagent model".into(),
+                description: agent.config().subagent_model.clone(),
+                action: PickerAction::EditSetting {
+                    key: "subagent_model".into(),
+                    initial: agent.config().subagent_model.clone(),
                 },
             },
             PickerItem {

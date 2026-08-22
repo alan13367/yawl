@@ -51,8 +51,54 @@ pub(super) fn render_entries(
                 lines.push("\x1b[1;33mYawl\x1b[0m".into());
                 lines.extend(markdown::render(content, width));
             }
+            Entry::SubagentResult {
+                id,
+                name,
+                status,
+                content,
+            } => lines.extend(render_subagent_result(
+                id,
+                name,
+                status,
+                content,
+                width,
+                tools_expanded,
+            )),
         }
         lines.push(String::new());
+    }
+    lines
+}
+
+fn render_subagent_result(
+    id: &str,
+    name: &str,
+    status: &str,
+    content: &str,
+    width: usize,
+    expanded: bool,
+) -> Vec<String> {
+    let id = crate::subagent::sanitize_preview(id, 256);
+    let name = crate::subagent::sanitize_preview(name, 1024);
+    let status = crate::subagent::sanitize_preview(status, 64);
+    let color = if status == "failed" || status == "interrupted" {
+        "\x1b[1;31m"
+    } else {
+        "\x1b[1;36m"
+    };
+    let mut lines = vec![markdown::fit_width(
+        &format!("{color}Subagent {id} [{status}] {name}\x1b[0m"),
+        width,
+    )];
+    let rendered = markdown::render(content, width);
+    if expanded || rendered.len() <= 8 {
+        lines.extend(rendered);
+    } else {
+        lines.extend(rendered.into_iter().take(8));
+        lines.push(markdown::fit_width(
+            "\x1b[2m… Ctrl+O to expand\x1b[0m",
+            width,
+        ));
     }
     lines
 }
@@ -215,7 +261,7 @@ pub(super) fn has_visible_in_flight_content(state: &ViewState) -> bool {
         return false;
     };
     match last {
-        Entry::User(_) | Entry::Notice(_) => false,
+        Entry::User(_) | Entry::Notice(_) | Entry::SubagentResult { .. } => false,
         Entry::Tool { running, .. } => *running,
         Entry::Reasoning { content, .. } => !state.hide_reasoning && !content.trim().is_empty(),
         Entry::Assistant(content) => !content.trim().is_empty(),
@@ -250,6 +296,9 @@ pub(super) fn build_frame(
     columns: usize,
     rows: usize,
 ) -> (Vec<String>, (usize, usize)) {
+    if state.subagent_view.is_some() {
+        return super::subagents::render(state, editor, columns, rows);
+    }
     let columns = columns.max(20);
     let rows = rows.max(8);
     let inner_width = columns.saturating_sub(2);
@@ -367,6 +416,26 @@ pub(super) fn build_frame(
     }
     if !state.pending_actions.is_empty() {
         status.push_str(&format!("  {} change pending", state.pending_actions.len()));
+    }
+    if !state.subagent_snapshots.is_empty() {
+        let running = state
+            .subagent_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.status.is_active())
+            .count();
+        let done = state
+            .subagent_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.status == crate::subagent::SubagentStatus::Done)
+            .count();
+        let failed = state
+            .subagent_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.status == crate::subagent::SubagentStatus::Failed)
+            .count();
+        status.push_str(&format!(
+            "  agents {running} running · {done} done · {failed} failed"
+        ));
     }
     frame.push(format!(
         "{}{}\x1b[0m",

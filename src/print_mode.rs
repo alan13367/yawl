@@ -29,6 +29,7 @@ pub(super) fn read_prompt(
 }
 
 pub(super) fn run(agent: &mut Agent, prompt: String) -> Result<i32, Box<dyn std::error::Error>> {
+    agent.set_print_mode();
     let mut stdout = io::stdout().lock();
     let hide_reasoning = agent.config().hide_reasoning;
     let mut pending_reasoning = Vec::new();

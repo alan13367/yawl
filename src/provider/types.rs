@@ -37,6 +37,17 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Metadata for one synthetic background result delivered to the parent.
+/// Providers still receive the containing message as ordinary user content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentResult {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub run_number: u64,
+    pub content: String,
+}
+
 /// The provider-agnostic message format used in memory and in session JSONL.
 /// Translated to each provider's wire shape at request time, which is what
 /// makes mid-session `/model` switching possible.
@@ -60,6 +71,10 @@ pub struct Message {
     /// here so `store: false` tool loops remain valid.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_data: Vec<Value>,
+    /// Synthetic model-originated subagent results batched into this user
+    /// message. Older session files omit the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagent_results: Vec<SubagentResult>,
 }
 
 impl Message {
@@ -73,6 +88,7 @@ impl Message {
             tool_name: None,
             is_error: false,
             provider_data: Vec::new(),
+            subagent_results: Vec::new(),
         }
     }
 
@@ -86,6 +102,7 @@ impl Message {
             tool_name: None,
             is_error: false,
             provider_data: Vec::new(),
+            subagent_results: Vec::new(),
         }
     }
 
@@ -104,6 +121,28 @@ impl Message {
             tool_name: Some(name.into()),
             is_error,
             provider_data: Vec::new(),
+            subagent_results: Vec::new(),
+        }
+    }
+
+    pub fn subagent_results(results: Vec<SubagentResult>) -> Message {
+        let mut content = String::from("Background subagent results:\n");
+        for result in &results {
+            content.push_str(&format!(
+                "\n## {} [{}] {}\n{}\n",
+                result.id, result.status, result.name, result.content
+            ));
+        }
+        Message {
+            role: Role::User,
+            content,
+            tool_calls: Vec::new(),
+            reasoning: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            is_error: false,
+            provider_data: Vec::new(),
+            subagent_results: results,
         }
     }
 }

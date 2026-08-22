@@ -20,6 +20,8 @@ pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 pub const DEFAULT_COMPACT_THRESHOLD: f64 = 0.85;
+pub const DEFAULT_MAX_SUBAGENTS: usize = 3;
+pub const DEFAULT_SUBAGENT_MODEL: &str = "inherit";
 const OPENAI_COMPLETIONS_API: &str = "openai-completions";
 
 /// Effective configuration: defaults <- `~/.yawl/config.json` <-
@@ -40,6 +42,12 @@ pub struct Config {
     pub context_windows: HashMap<String, u64>,
     pub auto_compact: bool,
     pub compact_threshold: f64,
+    /// Whether model-facing subagent orchestration tools are enabled.
+    pub subagents: bool,
+    /// Maximum number of subagents that may own active worker slots.
+    pub max_subagents: usize,
+    /// Default model for new subagents. `inherit` snapshots the parent model.
+    pub subagent_model: String,
     /// Directories containing `NAME/SKILL.md` or `NAME.md` skills.
     pub skill_dirs: Vec<PathBuf>,
     pub providers: HashMap<String, ProviderConfig>,

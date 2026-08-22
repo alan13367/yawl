@@ -3,6 +3,33 @@ use std::time::Duration;
 
 use crate::error::Error;
 
+fn read_line_interruptible(reader: &mut impl BufRead, line: &mut String) -> std::io::Result<usize> {
+    let mut bytes = Vec::new();
+    loop {
+        let (consumed, finished) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                break;
+            }
+            let consumed = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            bytes.extend_from_slice(&available[..consumed]);
+            (consumed, available[consumed - 1] == b'\n')
+        };
+        reader.consume(consumed);
+        if finished {
+            break;
+        }
+    }
+    let read = bytes.len();
+    let text = String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    line.push_str(&text);
+    Ok(read)
+}
+
 /// Shared ureq agent config for streaming: no global timeout (streams are
 /// long-lived), non-2xx statuses surfaced as responses so we can read error
 /// bodies.
@@ -60,11 +87,11 @@ impl<R: BufRead> Iterator for SseReader<R> {
         let mut saw_field = false;
         let mut line = String::new();
         loop {
-            if crate::interrupted() {
+            if crate::cancellation::interrupted() {
                 return Some(Err(Error::Interrupted));
             }
             line.clear();
-            match self.reader.read_line(&mut line) {
+            match read_line_interruptible(&mut self.reader, &mut line) {
                 Ok(0) => {
                     // `Take` reports EOF at the byte ceiling; distinguish
                     // that from a genuine end of stream so oversized
@@ -81,6 +108,12 @@ impl<R: BufRead> Iterator for SseReader<R> {
                     };
                 }
                 Ok(_) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::Interrupted
+                        && crate::cancellation::interrupted() =>
+                {
+                    return Some(Err(Error::Interrupted));
+                }
                 Err(e) => return Some(Err(Error::Io(e))),
             }
             let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -125,7 +158,25 @@ pub(crate) fn error_body(response: &mut ureq::http::Response<ureq::Body>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
+
+    struct WokenReader(crate::cancellation::CancellationToken);
+
+    impl Read for WokenReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.0.cancel();
+            Err(std::io::ErrorKind::Interrupted.into())
+        }
+    }
+
+    impl BufRead for WokenReader {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.0.cancel();
+            Err(std::io::ErrorKind::Interrupted.into())
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+    }
 
     #[test]
     fn sse_reader_parses_events_and_multiline_data() -> Result<(), Error> {
@@ -180,5 +231,15 @@ mod tests {
             }
         }
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn a_targeted_wake_maps_interrupted_io_to_turn_interruption() {
+        crate::set_interrupted(false);
+        let token = crate::cancellation::CancellationToken::default();
+        crate::cancellation::scope(&token, || {
+            let mut reader = SseReader::new(WokenReader(token.clone()));
+            assert!(matches!(reader.next(), Some(Err(Error::Interrupted))));
+        });
     }
 }

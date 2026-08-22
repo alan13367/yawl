@@ -19,6 +19,9 @@ pub(crate) enum ConfigChange {
     ScrollBar(String),
     AutoCompact(String),
     CompactThreshold(String),
+    Subagents(String),
+    MaxSubagents(String),
+    SubagentModel(String),
     ContextWindow {
         model: String,
         value: String,
@@ -67,6 +70,9 @@ enum ValidatedChange {
     ScrollBar(bool),
     AutoCompact(bool),
     CompactThreshold(f64),
+    Subagents(bool),
+    MaxSubagents(usize),
+    SubagentModel(String),
     ContextWindow {
         model: String,
         window: u64,
@@ -142,6 +148,25 @@ impl ValidatedChange {
             ConfigChange::AutoCompact(value) => Ok(Self::AutoCompact(parse_on_off(&value)?)),
             ConfigChange::CompactThreshold(value) => {
                 Ok(Self::CompactThreshold(parse_threshold(&value)?))
+            }
+            ConfigChange::Subagents(value) => Ok(Self::Subagents(parse_on_off(&value)?)),
+            ConfigChange::MaxSubagents(value) => {
+                let limit = value
+                    .parse::<usize>()
+                    .map_err(|_| Error::Config("max_subagents must be between 1 and 16".into()))?;
+                if !(1..=16).contains(&limit) {
+                    return Err(Error::Config(
+                        "max_subagents must be between 1 and 16".into(),
+                    ));
+                }
+                Ok(Self::MaxSubagents(limit))
+            }
+            ConfigChange::SubagentModel(value) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(Error::Config("subagent_model must not be empty".into()));
+                }
+                Ok(Self::SubagentModel(value.to_string()))
             }
             ConfigChange::ContextWindow { model, value } => {
                 if model.trim().is_empty() {
@@ -224,6 +249,9 @@ impl ValidatedChange {
             Self::CompactThreshold(threshold) => {
                 insert_scalar(config, "compact_threshold", json!(threshold))
             }
+            Self::Subagents(enabled) => insert_scalar(config, "subagents", json!(enabled)),
+            Self::MaxSubagents(limit) => insert_scalar(config, "max_subagents", json!(limit)),
+            Self::SubagentModel(model) => insert_scalar(config, "subagent_model", json!(model)),
             Self::ContextWindow { model, window } => config.update_global_json(|root| {
                 object_field(root, "context_windows")?.insert(model.clone(), json!(window));
                 Ok(())
@@ -289,6 +317,9 @@ impl ValidatedChange {
             Self::ScrollBar(enabled) => config.scroll_bar == *enabled,
             Self::AutoCompact(enabled) => config.auto_compact == *enabled,
             Self::CompactThreshold(threshold) => config.compact_threshold == *threshold,
+            Self::Subagents(enabled) => config.subagents == *enabled,
+            Self::MaxSubagents(limit) => config.max_subagents == *limit,
+            Self::SubagentModel(model) => config.subagent_model == *model,
             Self::ContextWindow { model, window } => {
                 config.context_windows.get(model) == Some(window)
             }
@@ -541,5 +572,40 @@ mod tests {
             ConfigChangeEffect::SkillDirectoryNotConfigured(missing)
         );
         assert!(!dirs.home.join("config.json").exists());
+    }
+
+    #[test]
+    fn subagent_changes_validate_persist_and_reload() {
+        let dirs = TestDirs::new("subagents");
+        let config = dirs.config();
+        let enabled = config
+            .change_global(ConfigChange::Subagents("on".into()))
+            .expect("subagents should enable");
+        let limited = enabled
+            .config
+            .change_global(ConfigChange::MaxSubagents("16".into()))
+            .expect("maximum valid subagent limit should apply");
+        let modeled = limited
+            .config
+            .change_global(ConfigChange::SubagentModel("inherit".into()))
+            .expect("inherit should be persisted");
+
+        assert!(modeled.config.subagents);
+        assert_eq!(modeled.config.max_subagents, 16);
+        assert_eq!(modeled.config.subagent_model, "inherit");
+        assert!(
+            modeled
+                .config
+                .change_global(ConfigChange::MaxSubagents("17".into()))
+                .is_err()
+        );
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(dirs.home.join("config.json"))
+                .expect("saved subagent config should be readable"),
+        )
+        .expect("saved subagent config should be JSON");
+        assert_eq!(saved["subagents"], true);
+        assert_eq!(saved["max_subagents"], 16);
+        assert_eq!(saved["subagent_model"], "inherit");
     }
 }

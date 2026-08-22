@@ -2,11 +2,15 @@
 //! results → repeat until the model stops calling tools. Iterations are
 //! uncapped; Ctrl+C aborts the in-flight turn, not the process.
 
+use crate::cancellation::CancellationToken;
 use crate::compaction;
 use crate::config::{Config, ConfigChange, ConfigChangeEffect};
 use crate::error::Error;
-use crate::provider::{self, Message, ReasoningKind, StreamNotice, ToolCall, stream_turn};
+use crate::provider::{
+    self, Message, ReasoningKind, StreamNotice, SubagentResult, ToolCall, stream_turn,
+};
 use crate::session::Session;
+use crate::subagent::SubagentManager;
 use crate::tools::{DescribeCache, Registry};
 
 /// Progress events surfaced to the UI (print mode or TUI) during a turn.
@@ -46,53 +50,132 @@ pub enum TurnEvent<'a> {
     },
 }
 
-pub struct Agent {
+struct Journal {
+    id: String,
+    persistent: Option<Session>,
+}
+
+impl Journal {
+    fn persistent(session: Session) -> Self {
+        Self {
+            id: session.id.clone(),
+            persistent: Some(session),
+        }
+    }
+
+    fn memory(id: String) -> Self {
+        Self {
+            id,
+            persistent: None,
+        }
+    }
+
+    fn append_message(&mut self, message: &Message) -> Result<(), Error> {
+        match self.persistent.as_mut() {
+            Some(session) => session.append_message(message),
+            None => Ok(()),
+        }
+    }
+
+    fn append_compaction(&mut self, summary: &str, replaced: usize) -> Result<(), Error> {
+        match self.persistent.as_mut() {
+            Some(session) => session.append_compaction(summary, replaced),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Provider-neutral conversation state shared by the main agent and
+/// memory-only subagents.
+pub(crate) struct Conversation {
     config: Config,
     /// Current model spec (may carry an `anthropic:`/`openai:` prefix);
     /// switchable mid-session via `/model`.
     model: String,
     messages: Vec<Message>,
-    session: Session,
+    session: Journal,
     /// Last provider-reported total (input + output) tokens — the best
     /// estimate of current context usage.
     context_tokens: u64,
+    latest_turn_result: String,
     describe_cache: DescribeCache,
+    cancellation: CancellationToken,
+    subagents: Option<SubagentManager>,
+    print_mode: bool,
 }
 
-impl Agent {
-    pub fn new(config: Config, model: String, session: Session, messages: Vec<Message>) -> Agent {
-        Agent {
+impl Conversation {
+    fn persistent(config: Config, model: String, session: Session, messages: Vec<Message>) -> Self {
+        let subagents = SubagentManager::new(session.id.clone(), config.max_subagents);
+        Self {
             config,
             model,
             messages,
-            session,
+            session: Journal::persistent(session),
             context_tokens: 0,
+            latest_turn_result: String::new(),
             describe_cache: DescribeCache::default(),
+            cancellation: CancellationToken::default(),
+            subagents: Some(subagents),
+            print_mode: false,
         }
     }
 
-    pub fn context_window(&self) -> u64 {
+    pub(crate) fn memory(config: Config, model: String, session_id: String) -> Self {
+        Self {
+            config,
+            model,
+            messages: Vec::new(),
+            session: Journal::memory(session_id),
+            context_tokens: 0,
+            latest_turn_result: String::new(),
+            describe_cache: DescribeCache::default(),
+            cancellation: CancellationToken::default(),
+            subagents: None,
+            print_mode: false,
+        }
+    }
+
+    pub(crate) fn context_window(&self) -> u64 {
         crate::model::context_window(&self.config, &self.model)
     }
 
-    pub fn config(&self) -> &Config {
+    pub(crate) fn config(&self) -> &Config {
         &self.config
     }
 
-    pub fn model(&self) -> &str {
+    pub(crate) fn model(&self) -> &str {
         &self.model
     }
 
-    pub fn session_id(&self) -> &str {
+    pub(crate) fn session_id(&self) -> &str {
         &self.session.id
     }
 
-    pub fn messages(&self) -> &[Message] {
+    pub(crate) fn messages(&self) -> &[Message] {
         &self.messages
     }
 
-    pub fn context_tokens(&self) -> u64 {
+    pub(crate) fn context_tokens(&self) -> u64 {
         self.context_tokens
+    }
+
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn subagent_manager(&self) -> Option<SubagentManager> {
+        self.subagents.clone()
+    }
+
+    pub(crate) fn latest_turn_result(&self) -> String {
+        self.latest_turn_result.clone()
+    }
+
+    fn append_input_message(&mut self, message: Message) -> Result<(), Error> {
+        self.session.append_message(&message)?;
+        self.messages.push(message);
+        Ok(())
     }
 
     pub(crate) fn switch_model(&mut self, model: String) {
@@ -111,23 +194,48 @@ impl Agent {
 
     /// Starts a fresh session (used by `/new` and `/clear`).
     pub fn reset(&mut self) -> Result<(), Error> {
-        self.session = Session::create(&self.config.sessions_dir())?;
+        let session = Session::create(&self.config.sessions_dir())?;
+        if let Some(manager) = &self.subagents {
+            manager.shutdown_and_discard();
+        }
+        self.subagents = Some(SubagentManager::new(
+            session.id.clone(),
+            self.config.max_subagents,
+        ));
+        self.session = Journal::persistent(session);
         self.messages.clear();
         self.context_tokens = 0;
+        self.latest_turn_result.clear();
         Ok(())
     }
 
     /// Replaces the conversation with a saved session (used by `/resume`).
     pub fn load_session(&mut self, id: &str) -> Result<(), Error> {
         let (session, messages) = Session::open(&self.config.sessions_dir(), id)?;
-        self.session = session;
+        if let Some(manager) = &self.subagents {
+            manager.shutdown_and_discard();
+        }
+        self.subagents = Some(SubagentManager::new(
+            session.id.clone(),
+            self.config.max_subagents,
+        ));
+        self.session = Journal::persistent(session);
         self.messages = messages;
         self.context_tokens = 0;
+        self.latest_turn_result.clear();
         Ok(())
     }
 
     pub fn scan_tools(&mut self) -> Registry {
-        Registry::scan(&self.config, &mut self.describe_cache)
+        match (&self.subagents, self.config.subagents) {
+            (Some(manager), true) => Registry::scan_with_subagents(
+                &self.config,
+                &mut self.describe_cache,
+                manager.clone(),
+                &self.model,
+            ),
+            _ => Registry::scan(&self.config, &mut self.describe_cache),
+        }
     }
 
     pub(crate) fn change_global_config(
@@ -137,6 +245,9 @@ impl Agent {
         let changes_model = matches!(&change, ConfigChange::Model(_));
         let outcome = self.config.change_global(change)?;
         self.config = outcome.config;
+        if let Some(manager) = &self.subagents {
+            manager.set_limit(self.config.max_subagents);
+        }
         if changes_model {
             self.model = self
                 .config
@@ -158,7 +269,22 @@ impl Agent {
         user_input: Option<String>,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
-        self.run_turn_with(user_input, sink, &mut provider::resolve)
+        let cancellation = self.cancellation.clone();
+        crate::cancellation::scope(&cancellation, || {
+            self.cancellation.clear();
+            self.run_turn_with(user_input, sink, &mut provider::resolve)
+        })
+    }
+
+    pub(crate) fn run_turn_preserving_cancellation(
+        &mut self,
+        user_input: Option<String>,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        let cancellation = self.cancellation.clone();
+        crate::cancellation::scope(&cancellation, || {
+            self.run_turn_with(user_input, sink, &mut provider::resolve)
+        })
     }
 
     fn run_turn_with<F>(
@@ -170,17 +296,23 @@ impl Agent {
     where
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
     {
-        crate::set_interrupted(false);
+        self.latest_turn_result.clear();
         if let Some(input) = user_input {
-            let msg = Message::user(input);
-            self.session.append_message(&msg)?;
-            self.messages.push(msg);
+            self.append_input_message(Message::user(input))?;
         }
-        let system = crate::prompt::build_system_prompt(&self.config.home_dir);
+        let system = if self.subagents.is_some() {
+            crate::prompt::build_system_prompt(
+                &self.config.home_dir,
+                self.config.subagents,
+                self.print_mode,
+            )
+        } else {
+            crate::prompt::build_subagent_system_prompt(&self.config.home_dir)
+        };
 
         // Uncapped: the loop ends when the model stops calling tools.
         loop {
-            if crate::interrupted() {
+            if crate::cancellation::interrupted() {
                 return Ok(false);
             }
             // Rescan every iteration so a tool the model just wrote is
@@ -205,6 +337,9 @@ impl Agent {
                 Err(Error::Interrupted) => return Ok(false),
                 Err(e) => return Err(e),
             };
+            if crate::cancellation::interrupted() {
+                return Ok(false);
+            }
 
             self.context_tokens = out.input_tokens.saturating_add(out.output_tokens);
             sink(TurnEvent::Usage {
@@ -212,6 +347,7 @@ impl Agent {
                 context_window: self.context_window(),
             });
 
+            self.latest_turn_result.clone_from(&out.text);
             let mut assistant = Message::assistant(out.text, out.tool_calls.clone());
             assistant.reasoning = out.reasoning;
             assistant.provider_data = out.provider_data;
@@ -238,7 +374,7 @@ impl Agent {
         calls: &[ToolCall],
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
-        self.run_tools_while(registry, calls, sink, crate::interrupted)
+        self.run_tools_while(registry, calls, sink, crate::cancellation::interrupted)
     }
 
     fn run_tools_while(
@@ -314,7 +450,21 @@ impl Agent {
     /// Summarizes the head of the conversation with the current model
     /// (also the `/compact` slash command).
     pub fn compact_now(&mut self, sink: &mut dyn FnMut(TurnEvent<'_>)) -> Result<(), Error> {
-        self.compact_now_with(sink, &mut provider::resolve)
+        let cancellation = self.cancellation.clone();
+        crate::cancellation::scope(&cancellation, || {
+            self.cancellation.clear();
+            self.compact_now_with(sink, &mut provider::resolve)
+        })
+    }
+
+    pub(crate) fn compact_now_preserving_cancellation(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<(), Error> {
+        let cancellation = self.cancellation.clone();
+        crate::cancellation::scope(&cancellation, || {
+            self.compact_now_with(sink, &mut provider::resolve)
+        })
     }
 
     fn compact_now_with<F>(
@@ -342,6 +492,175 @@ impl Agent {
         self.context_tokens = 0;
         sink(TurnEvent::Compacted { replaced });
         Ok(())
+    }
+}
+
+/// A persistent user-facing conversation.
+pub struct Agent {
+    conversation: Conversation,
+}
+
+impl Agent {
+    pub fn new(config: Config, model: String, session: Session, messages: Vec<Message>) -> Self {
+        Self {
+            conversation: Conversation::persistent(config, model, session, messages),
+        }
+    }
+
+    pub fn context_window(&self) -> u64 {
+        self.conversation.context_window()
+    }
+
+    pub fn config(&self) -> &Config {
+        self.conversation.config()
+    }
+
+    pub fn model(&self) -> &str {
+        self.conversation.model()
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.conversation.session_id()
+    }
+
+    pub fn messages(&self) -> &[Message] {
+        self.conversation.messages()
+    }
+
+    pub fn context_tokens(&self) -> u64 {
+        self.conversation.context_tokens()
+    }
+
+    pub(crate) fn subagents(&self) -> SubagentManager {
+        self.conversation
+            .subagent_manager()
+            .expect("persistent agents always own a subagent manager")
+    }
+
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.conversation.cancellation_token()
+    }
+
+    pub(crate) fn clear_cancellation(&self) {
+        self.conversation.cancellation.clear();
+    }
+
+    /// Disables automatic subagent follow-ups and adjusts orchestration
+    /// guidance for a one-shot print-mode run.
+    pub fn set_print_mode(&mut self) {
+        self.conversation.print_mode = true;
+    }
+
+    pub(crate) fn switch_model(&mut self, model: String) {
+        self.conversation.switch_model(model);
+    }
+
+    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.conversation.set_reasoning_effort(effort);
+    }
+
+    pub(crate) fn sync_display_config(&mut self, config: &Config) {
+        self.conversation.sync_display_config(config);
+    }
+
+    pub fn reset(&mut self) -> Result<(), Error> {
+        self.conversation.reset()
+    }
+
+    pub fn load_session(&mut self, id: &str) -> Result<(), Error> {
+        self.conversation.load_session(id)
+    }
+
+    pub fn scan_tools(&mut self) -> Registry {
+        self.conversation.scan_tools()
+    }
+
+    pub(crate) fn change_global_config(
+        &mut self,
+        change: ConfigChange,
+    ) -> Result<ConfigChangeEffect, Error> {
+        self.conversation.change_global_config(change)
+    }
+
+    pub fn run_turn(
+        &mut self,
+        user_input: Option<String>,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.conversation.run_turn(user_input, sink)
+    }
+
+    pub(crate) fn run_turn_preserving_cancellation(
+        &mut self,
+        user_input: Option<String>,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.conversation
+            .run_turn_preserving_cancellation(user_input, sink)
+    }
+
+    pub(crate) fn has_deferred_subagent_results(&self) -> bool {
+        self.subagents().has_deferred()
+    }
+
+    pub(crate) fn run_deferred_subagent_results(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<Option<bool>, Error> {
+        let deliveries = self.subagents().drain_deferred();
+        if deliveries.is_empty() {
+            return Ok(None);
+        }
+        let backup = deliveries.clone();
+        let mut results = Vec::new();
+        for delivery in deliveries {
+            let status = match delivery.outcome {
+                crate::subagent::RunOutcome::Completed => "completed",
+                crate::subagent::RunOutcome::Failed => "failed",
+                crate::subagent::RunOutcome::Interrupted => "interrupted",
+            };
+            let content = if delivery.error.is_empty() {
+                delivery.result
+            } else if delivery.result.is_empty() {
+                delivery.error
+            } else {
+                format!("{}\n\nError: {}", delivery.result, delivery.error)
+            };
+            results.push(SubagentResult {
+                id: delivery.id.to_string(),
+                name: delivery.name,
+                status: status.into(),
+                run_number: delivery.run_number,
+                content,
+            });
+        }
+        if let Err(error) = self
+            .conversation
+            .append_input_message(Message::subagent_results(results))
+        {
+            self.subagents().restore_deferred(backup);
+            return Err(error);
+        }
+        self.conversation
+            .run_turn_preserving_cancellation(None, sink)
+            .map(Some)
+    }
+
+    pub fn compact_now(&mut self, sink: &mut dyn FnMut(TurnEvent<'_>)) -> Result<(), Error> {
+        self.conversation.compact_now(sink)
+    }
+
+    pub(crate) fn compact_now_preserving_cancellation(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<(), Error> {
+        self.conversation.compact_now_preserving_cancellation(sink)
+    }
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        self.subagents().shutdown_and_discard();
     }
 }
 
@@ -435,7 +754,7 @@ mod tests {
 
     struct TestAgent {
         root: PathBuf,
-        agent: Agent,
+        agent: Conversation,
     }
 
     impl TestAgent {
@@ -460,6 +779,9 @@ mod tests {
                 context_windows: HashMap::new(),
                 auto_compact: false,
                 compact_threshold: 0.85,
+                subagents: false,
+                max_subagents: crate::config::DEFAULT_MAX_SUBAGENTS,
+                subagent_model: crate::config::DEFAULT_SUBAGENT_MODEL.to_string(),
                 skill_dirs: Vec::new(),
                 providers: HashMap::<String, ProviderConfig>::new(),
                 home_dir: home_dir.clone(),
@@ -469,7 +791,7 @@ mod tests {
                 Session::create(&config.sessions_dir()).expect("test session should be created");
             Self {
                 root,
-                agent: Agent::new(config, "test".into(), session, Vec::new()),
+                agent: Conversation::persistent(config, "test".into(), session, Vec::new()),
             }
         }
     }

@@ -6,8 +6,8 @@ use crate::error::Error;
 
 use super::picker::{
     Picker, PickerAction, PickerItem, SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_AUTO_COMPACT_INDEX,
-    SETTINGS_RELOAD_INDEX, SETTINGS_SCROLL_BAR_INDEX, color_picker, open_model_picker,
-    open_reasoning_picker, open_settings_picker, select_picker_item,
+    SETTINGS_RELOAD_INDEX, SETTINGS_SCROLL_BAR_INDEX, SETTINGS_SUBAGENTS_INDEX, color_picker,
+    open_model_picker, open_reasoning_picker, open_settings_picker, select_picker_item,
 };
 use super::state::ViewState;
 
@@ -20,6 +20,7 @@ Commands
   /compact             summarize older messages now
   /tools               list builtin and discovered tools
   /skills              list discovered skills and search directories
+  /subagents           open the subagent dashboard
   /skill:NAME [ARGS]   run a discovered skill
   /resume [ID|NUMBER]  open the session picker or resume directly
   /unqueue [N|all]     cancel queued messages
@@ -253,6 +254,16 @@ pub(super) fn activate_picker_action(
                 select_picker_item(state, SETTINGS_AUTO_COMPACT_INDEX);
             }
         }
+        PickerAction::SetSubagents(enabled) => {
+            if settings(
+                agent,
+                &format!("subagents {}", if enabled { "on" } else { "off" }),
+                state,
+            ) {
+                open_settings_picker(agent, state);
+                select_picker_item(state, SETTINGS_SUBAGENTS_INDEX);
+            }
+        }
         PickerAction::Reload => {
             if settings(agent, "reload", state) {
                 open_settings_picker(agent, state);
@@ -306,6 +317,12 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
             "usage: /settings compact_threshold FRACTION|PERCENT%",
         )
         .map(|value| ConfigChange::CompactThreshold(value.to_string())),
+        "subagents" => one_value(&mut parts, "usage: /settings subagents on|off")
+            .map(|value| ConfigChange::Subagents(value.to_string())),
+        "max_subagents" => one_value(&mut parts, "usage: /settings max_subagents NUMBER")
+            .map(|value| ConfigChange::MaxSubagents(value.to_string())),
+        "subagent_model" => one_value(&mut parts, "usage: /settings subagent_model inherit|MODEL")
+            .map(|value| ConfigChange::SubagentModel(value.to_string())),
         "context_window" => {
             one_value(&mut parts, "usage: /settings context_window TOKENS").map(|value| {
                 ConfigChange::ContextWindow {
@@ -409,7 +426,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- scroll_bar: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- scroll_bar: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -431,6 +448,13 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         },
         agent.config().compact_threshold * 100.0,
         agent.context_window(),
+        if agent.config().subagents {
+            "on"
+        } else {
+            "off"
+        },
+        agent.config().max_subagents,
+        agent.config().subagent_model,
         agent.config().anthropic_base_url,
         agent.config().openai_base_url,
     );
@@ -451,7 +475,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as the provider key to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);
