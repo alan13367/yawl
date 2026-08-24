@@ -2,11 +2,12 @@ mod cli;
 mod print_mode;
 
 use std::io::{self, IsTerminal};
+use std::path::Path;
 
 use cli::{Cli, HELP, parse_args};
 use print_mode::{read_prompt, run as run_print_mode};
 use yawl::agent::Agent;
-use yawl::config::Config;
+use yawl::config::{Config, SessionDirs};
 use yawl::error::Error;
 use yawl::session::Session;
 use yawl::tools::{DescribeCache, Registry};
@@ -87,7 +88,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let model = config.model.clone().ok_or_else(|| {
         Error::Config("no model configured; run 'yawl --setup' or pass --model".into())
     })?;
-    let (session, messages) = open_session(&config, &cli)?;
+    let (session, messages) = open_session(&config, &cli, &model)?;
     let mut agent = Agent::new(config, model, session, messages);
 
     if cli.prompt.is_empty() && stdin_is_terminal {
@@ -104,16 +105,28 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
 fn open_session(
     config: &Config,
     cli: &Cli,
+    model: &str,
+) -> Result<(Session, Vec<yawl::provider::Message>), Error> {
+    let cwd = yawl::config::working_dir();
+    let dirs = config.session_dirs(&cwd);
+    select_session(cli, &cwd, &dirs, model)
+}
+
+fn select_session(
+    cli: &Cli,
+    cwd: &Path,
+    dirs: &SessionDirs,
+    model: &str,
 ) -> Result<(Session, Vec<yawl::provider::Message>), Error> {
     if let Some(id) = &cli.session_id {
-        return Session::open(&config.sessions_dir(), id);
+        return Session::open_searching(&dirs.search, id);
     }
     if cli.continue_latest
-        && let Some(session) = Session::open_latest(&config.sessions_dir())?
+        && let Some(session) = Session::open_latest(&dirs.project)?
     {
         return Ok(session);
     }
-    Ok((Session::create(&config.sessions_dir())?, Vec::new()))
+    Ok((Session::create(&dirs.project, cwd, model)?, Vec::new()))
 }
 
 fn resume_command(session_id: &str) -> String {
@@ -141,5 +154,106 @@ mod tests {
             resume_command("20260820-093301-1a2b"),
             "yawl --session 20260820-093301-1a2b"
         );
+    }
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "yawl-main-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    /// Writes a minimal header-only session log; replay tolerates the missing
+    /// message lines.
+    fn write_session(dir: &Path, id: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.jsonl")),
+            format!(
+                r#"{{"type":"meta","id":"{id}","created_unix":1,"cwd":"/proj","model":"test-model"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn parse(parts: &[&str]) -> Cli {
+        parse_args(parts.iter().map(|part| part.to_string())).expect("args should parse")
+    }
+
+    #[test]
+    fn continue_latest_uses_only_the_current_project() {
+        let root = temp_root("continue-current-project");
+        let project = root.join("proj");
+        let other = root.join("other");
+        write_session(&other, "20260101-000000-0001");
+        write_session(&project, "20260102-000000-0001");
+        let dirs = SessionDirs {
+            project: project.clone(),
+            search: vec![project.clone(), other],
+        };
+
+        let (session, messages) =
+            select_session(&parse(&["-c"]), Path::new("/proj"), &dirs, "test-model").unwrap();
+        assert_eq!(session.id, "20260102-000000-0001");
+        assert!(messages.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_flag_searches_current_and_other_projects() {
+        let root = temp_root("session-flag-search");
+        let project = root.join("proj");
+        let other = root.join("other");
+        write_session(&other, "20260101-000000-0002");
+        let dirs = SessionDirs {
+            project: project.clone(),
+            search: vec![project, other],
+        };
+
+        let (session, _) = select_session(
+            &parse(&["--session", "20260101-000000-0002"]),
+            Path::new("/proj"),
+            &dirs,
+            "test-model",
+        )
+        .unwrap();
+        assert_eq!(session.id, "20260101-000000-0002");
+
+        let error = select_session(
+            &parse(&["--session", "20990101-000000-0000"]),
+            Path::new("/proj"),
+            &dirs,
+            "test-model",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not found"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plain_start_creates_a_scoped_session_with_model() {
+        let root = temp_root("plain-start");
+        let project = root.join("proj");
+        let dirs = SessionDirs {
+            project: project.clone(),
+            search: vec![project.clone()],
+        };
+
+        let (session, messages) =
+            select_session(&parse(&[]), Path::new("/proj"), &dirs, "test-model").unwrap();
+        assert!(messages.is_empty());
+
+        let infos = yawl::session::list(&project).unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, session.id);
+        assert_eq!(infos[0].cwd, "/proj");
+        assert_eq!(infos[0].model, "test-model");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

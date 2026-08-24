@@ -146,6 +146,15 @@ impl Transcript {
         self.entries.is_empty()
     }
 
+    pub(super) fn streaming_index(&self) -> Option<usize> {
+        self.streaming_assistant
+            .or_else(|| self.streaming_reasoning.map(|(_, index)| index))
+    }
+
+    pub(super) fn running_tool_index(&self) -> Option<usize> {
+        self.running_tool
+    }
+
     pub(super) fn push_user(&mut self, content: String) {
         self.entries.push(Entry::User(content));
     }

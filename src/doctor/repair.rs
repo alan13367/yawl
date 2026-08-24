@@ -2,7 +2,7 @@
 //! backs the file up once before its first edit.
 
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -18,7 +18,8 @@ use super::{Finding, Fix};
 ///
 /// # Errors
 ///
-/// Returns an error when a confirmed repair fails on disk.
+/// Returns an error when a confirmed repair fails on disk, and
+/// [`Error::Interrupted`] when Ctrl+C interrupts a repair prompt.
 pub(super) fn offer(findings: &[Finding]) -> Result<bool, Error> {
     let fixable = findings
         .iter()
@@ -35,10 +36,10 @@ pub(super) fn offer(findings: &[Finding]) -> Result<bool, Error> {
         let Some(fix) = &finding.fix else {
             continue;
         };
-        if !apply_all {
+        if needs_confirmation(fix, apply_all) {
             print!("Fix: {}. Apply? [y/N, a=all] ", fix.describe());
             io::stdout().flush()?;
-            let answer = read_answer();
+            let answer = read_answer()?;
             match answer.as_str() {
                 "y" | "yes" => {}
                 "a" | "all" => apply_all = true,
@@ -56,16 +57,45 @@ pub(super) fn offer(findings: &[Finding]) -> Result<bool, Error> {
     Ok(applied)
 }
 
-fn read_answer() -> String {
-    let mut line = String::new();
-    if io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
-        return String::new();
+fn needs_confirmation(fix: &Fix, apply_all: bool) -> bool {
+    !apply_all || matches!(fix, Fix::RestoreBackup { .. })
+}
+
+fn read_answer() -> Result<String, Error> {
+    let stdin = io::stdin();
+    read_answer_from(&mut stdin.lock())
+}
+
+fn read_answer_from(input: &mut impl Read) -> Result<String, Error> {
+    let mut bytes = Vec::new();
+    loop {
+        if crate::interrupted() {
+            return Err(Error::Interrupted);
+        }
+        let mut byte = [0u8; 1];
+        match input.read(&mut byte) {
+            Ok(_) if crate::interrupted() => return Err(Error::Interrupted),
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => bytes.push(byte[0]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                return Err(Error::Interrupted);
+            }
+            Err(error) => return Err(Error::Io(error)),
+        }
     }
-    line.trim().to_lowercase()
+    let line = String::from_utf8(bytes).map_err(|error| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            error.utf8_error(),
+        ))
+    })?;
+    Ok(line.trim().to_lowercase())
 }
 
 /// Copies the target file aside before its first in-place edit. Quarantine
-/// and restore moves already preserve content, so they skip the copy.
+/// moves already preserve the original content. Restore handles its own
+/// backup because it must preserve the live file at the moment of restore.
 fn backup_once(fix: &Fix, backed_up: &mut HashSet<PathBuf>) -> Result<(), Error> {
     let target = match fix {
         Fix::QuarantineFile { .. } | Fix::RestoreBackup { .. } => return Ok(()),
@@ -76,8 +106,7 @@ fn backup_once(fix: &Fix, backed_up: &mut HashSet<PathBuf>) -> Result<(), Error>
     if !backed_up.insert(target.clone()) || !target.is_file() {
         return Ok(());
     }
-    let backup = sibling(target, "bak");
-    std::fs::copy(target, &backup)?;
+    let backup = preserve_file(target)?;
     println!("Backed up to {}.", backup.display());
     Ok(())
 }
@@ -109,10 +138,20 @@ fn apply(fix: &Fix) -> Result<(), Error> {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
         Fix::RestoreBackup { from, to } => {
+            if to.is_file() {
+                let backup = preserve_file(to)?;
+                println!("Backed up to {}.", backup.display());
+            }
             std::fs::rename(from, to)?;
         }
     }
     Ok(())
+}
+
+fn preserve_file(path: &Path) -> Result<PathBuf, Error> {
+    let backup = sibling(path, "bak");
+    std::fs::copy(path, &backup)?;
+    Ok(backup)
 }
 
 /// `config.json` becomes `config.json.kind-<timestamp>` beside itself.
@@ -192,6 +231,37 @@ mod tests {
     }
 
     #[test]
+    fn invalid_array_entries_are_removed_without_index_shifting() -> Result<(), Error> {
+        let dirs = TestDirs::new("array-removals");
+        dirs.write(
+            r#"{"providers":{"local":{"models":[{"id":"bad-a","contextWindow":0},{"id":"good","contextWindow":4096},{"id":"bad-b","contextWindow":0}]}}}"#,
+        );
+        let paths = super::super::Paths {
+            global: dirs.global.clone(),
+            project: dirs.root.join("project/.yawl/config.json"),
+            auth: dirs.root.join("home/.yawl/auth.json"),
+        };
+        let findings = super::super::checks::run(&paths);
+
+        for fix in findings.iter().filter_map(|finding| finding.fix.as_ref()) {
+            if matches!(fix, Fix::RemoveKey { keys, .. } if keys.get(2).is_some_and(|key| key == "models"))
+            {
+                apply(fix)?;
+            }
+        }
+
+        let models = dirs.read()["providers"]["local"]["models"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            models,
+            vec![serde_json::json!({"id":"good","contextWindow":4096})]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn set_value_writes_nested_defaults() -> Result<(), Error> {
         let dirs = TestDirs::new("set");
         dirs.write(r#"{"max_tokens":0}"#);
@@ -226,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_backup_replaces_the_live_file() -> Result<(), Error> {
+    fn restore_backup_replaces_and_preserves_the_live_file() -> Result<(), Error> {
         let dirs = TestDirs::new("restore");
         dirs.write(r#"{"model":"ghost:m"}"#);
         let backup = dirs.global.parent().unwrap().join("config.json.bak-1");
@@ -238,7 +308,56 @@ mod tests {
         })?;
 
         assert_eq!(dirs.read()["model"], "ollama:llama4");
+        let preserved_live = fs::read_dir(dirs.global.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.json.bak-")
+            })
+            .any(|entry| {
+                fs::read_to_string(entry.path())
+                    .is_ok_and(|text| text.contains(r#""model":"ghost:m""#))
+            });
+        assert!(
+            preserved_live,
+            "the previous live config should be backed up"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn repair_all_still_requires_confirmation_for_restore() {
+        let path = PathBuf::from("config.json");
+        let ordinary = Fix::RemoveKey {
+            path: path.clone(),
+            keys: vec!["max_tokens".into()],
+        };
+        let restore = Fix::RestoreBackup {
+            from: PathBuf::from("config.json.bak-1"),
+            to: path,
+        };
+
+        assert!(!needs_confirmation(&ordinary, true));
+        assert!(needs_confirmation(&restore, true));
+    }
+
+    struct InterruptedInput;
+
+    impl std::io::Read for InterruptedInput {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(io::ErrorKind::Interrupted.into())
+        }
+    }
+
+    #[test]
+    fn interrupted_repair_prompt_propagates_interruption() {
+        let error = read_answer_from(&mut InterruptedInput)
+            .expect_err("an interrupted prompt should stop doctor repair");
+
+        assert!(matches!(error, Error::Interrupted));
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub(super) struct ConfigFile {
     pub(super) subagents: Option<bool>,
     pub(super) max_subagents: Option<usize>,
     pub(super) subagent_model: Option<String>,
+    pub(super) subagent_request_budget: Option<usize>,
+    pub(super) subagent_timeout_secs: Option<u64>,
     pub(super) skill_dirs: Option<Vec<String>>,
     pub(super) providers: Option<HashMap<String, ProviderFile>>,
     /// Marker set when the user explicitly skips onboarding.

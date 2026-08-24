@@ -4,19 +4,21 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::agent::Conversation;
+use crate::agent::{Conversation, RunLimits};
 use crate::cancellation::CancellationToken;
 use crate::config::Config;
 
+use super::presets::AgentPreset;
 use super::types::{
     MAX_ERROR_BYTES, MAX_FINAL_RESULT_BYTES, MAX_PROMPT_CHARS, MAX_QUEUE_MESSAGES,
     MAX_TRACKED_SUBAGENTS, QueuedSubagentMessage, RunOrigin, RunOutcome, SubagentId,
-    SubagentSnapshot, SubagentStatus, bounded,
+    SubagentSnapshot, SubagentStatus, SubagentTranscriptItem, bounded,
 };
 
 const DEFAULT_WAIT_SECS: u64 = 30;
 const MAX_WAIT_SECS: u64 = 300;
 const CANCEL_WAIT: Duration = Duration::from_secs(5);
+const SALVAGE_SNIPPET_BYTES: usize = 500;
 
 #[derive(Clone)]
 pub(crate) struct SubagentManager {
@@ -37,6 +39,9 @@ struct State {
     deferred: VecDeque<DeferredResult>,
     settlement_sequence: u64,
     shutting_down: bool,
+    /// Usage tokens accumulated by finished subagent runs, kept for the
+    /// session-wide total even after entries are pruned.
+    total_child_tokens: u64,
 }
 
 struct Entry {
@@ -90,6 +95,7 @@ impl SubagentManager {
                     deferred: VecDeque::new(),
                     settlement_sequence: 0,
                     shutting_down: false,
+                    total_child_tokens: 0,
                 }),
                 changed: Condvar::new(),
             }),
@@ -104,13 +110,21 @@ impl SubagentManager {
         &self,
         config: Config,
         parent_model: &str,
-        name: &str,
+        name: Option<&str>,
         prompt: &str,
         requested_model: Option<&str>,
+        preset: Option<&AgentPreset>,
     ) -> Result<SubagentId, String> {
-        let name = validate_name(name)?;
+        let supplied_name = match name.map(str::trim) {
+            Some(name) if !name.is_empty() => Some(validate_name(name)?),
+            _ => None,
+        };
         let prompt = validate_message(prompt, "prompt")?;
-        let model = resolve_model(&config, parent_model, requested_model)?;
+        let preset_model = preset
+            .and_then(|preset| preset.model.as_deref())
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && *model != "inherit");
+        let model = resolve_model(&config, parent_model, requested_model, preset_model)?;
 
         let (id, conversation, work) = {
             let mut state = self.lock();
@@ -134,9 +148,33 @@ impl SubagentManager {
                 .next_id
                 .checked_add(1)
                 .ok_or_else(|| "subagent ID space is exhausted for this session".to_string())?;
+            let name = match supplied_name {
+                Some(name) => name,
+                None => {
+                    let existing = state
+                        .entries
+                        .iter()
+                        .map(|entry| entry.snapshot.name.clone())
+                        .collect::<Vec<_>>();
+                    super::names::generate_name(&existing, state.next_id)
+                }
+            };
             let synthetic_session = format!("{}-{id}", state.session_id);
-            let conversation =
+            let mut conversation =
                 Conversation::memory(config.clone(), model.clone(), synthetic_session);
+            conversation.set_run_limits(RunLimits {
+                max_requests: config.subagent_request_budget as u64,
+                timeout: (config.subagent_timeout_secs > 0)
+                    .then(|| Duration::from_secs(config.subagent_timeout_secs)),
+            });
+            if let Some(preset) = preset {
+                if let Some(tools) = &preset.tools {
+                    conversation.set_tool_allowlist(tools.clone());
+                }
+                if let Some(fragment) = &preset.prompt {
+                    conversation.set_role_fragment(fragment.clone());
+                }
+            }
             let cancellation = conversation.cancellation_token();
             let work = WorkItem {
                 message: prompt.clone(),
@@ -146,6 +184,7 @@ impl SubagentManager {
             let snapshot = SubagentSnapshot::new(
                 id.clone(),
                 name,
+                preset.map_or_else(|| "default".to_string(), |preset| preset.name.clone()),
                 prompt,
                 model.clone(),
                 crate::model::context_window(&config, &model),
@@ -446,6 +485,42 @@ impl SubagentManager {
             .collect()
     }
 
+    /// Session-wide usage tokens across every finished subagent run.
+    pub(crate) fn total_child_tokens(&self) -> u64 {
+        self.lock().total_child_tokens
+    }
+
+    pub(crate) fn active_count(&self) -> usize {
+        self.lock().active
+    }
+
+    /// Blocks until every active subagent settles, the process is
+    /// interrupted, or `timeout_secs` elapses. Returns `true` only when all
+    /// subagents settled. Used by print mode, which has no event loop to
+    /// receive background deliveries on.
+    pub(crate) fn wait_all(&self, timeout_secs: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1));
+        let mut state = self.lock();
+        loop {
+            if state.active == 0 || crate::cancellation::interrupted() {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            state = match self
+                .shared
+                .changed
+                .wait_timeout(state, remaining.min(Duration::from_millis(100)))
+            {
+                Ok((state, _)) => state,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        state.active == 0
+    }
+
     pub(crate) fn has_deferred(&self) -> bool {
         !self.lock().deferred.is_empty()
     }
@@ -463,6 +538,30 @@ impl SubagentManager {
         combined.extend(deliveries);
         combined.sort_by_key(|delivery| delivery.sequence);
         state.deferred = combined.into();
+    }
+
+    /// Pushes a fabricated settled-run delivery. Test-only: real deliveries
+    /// come from worker threads. `id_sequence` picks the `sa-N` id.
+    #[cfg(test)]
+    pub(crate) fn push_test_deferred(
+        &self,
+        id_sequence: u64,
+        name: &str,
+        outcome: RunOutcome,
+        result: &str,
+    ) {
+        let mut state = self.lock();
+        state.settlement_sequence = state.settlement_sequence.saturating_add(1);
+        let sequence = state.settlement_sequence;
+        state.deferred.push_back(DeferredResult {
+            id: SubagentId::new(id_sequence),
+            name: name.into(),
+            run_number: 1,
+            outcome,
+            result: result.into(),
+            error: String::new(),
+            sequence,
+        });
     }
 
     pub(crate) fn shutdown_and_discard(&self) {
@@ -620,6 +719,7 @@ impl SubagentManager {
                     .snapshot
                     .begin_turn(&work.message, work.origin, work.run_number);
             }
+            let run_model = conversation.model().to_string();
             let result = conversation.run_turn_preserving_cancellation(
                 Some(work.message.clone()),
                 &mut |event| {
@@ -638,7 +738,9 @@ impl SubagentManager {
                 Ok(false) | Err(crate::error::Error::Interrupted) => {
                     (RunOutcome::Interrupted, None)
                 }
-                Err(error) => (RunOutcome::Failed, Some(error.to_string())),
+                // Attribution: a failed child rarely knows which provider or
+                // model actually errored, so the label rides the error text.
+                Err(error) => (RunOutcome::Failed, Some(format!("[{run_model}] {error}"))),
             };
             let final_result = conversation.latest_turn_result();
             let mut state = self.lock();
@@ -652,27 +754,42 @@ impl SubagentManager {
             entry
                 .snapshot
                 .finish_turn(outcome, &final_result, error.as_deref());
+            let run_tokens = entry.snapshot.run_tokens;
+            // finish_turn has already folded any live partial text into the
+            // transcript, so the salvage scan sees the complete history.
+            let delivered_result = match outcome {
+                RunOutcome::Interrupted => {
+                    let salvaged = salvage_result(&entry.snapshot, &final_result);
+                    entry.snapshot.latest_final_result = salvaged.clone();
+                    salvaged
+                }
+                _ => bounded(&final_result, MAX_FINAL_RESULT_BYTES),
+            };
             if work.origin == RunOrigin::Model && !entry.suppress_delivery {
                 entry.pending_delivery.push(PendingDelivery {
                     run_number: work.run_number,
                     outcome,
-                    result: bounded(&final_result, MAX_FINAL_RESULT_BYTES),
+                    result: delivered_result,
                     error: error
                         .as_deref()
                         .map_or_else(String::new, |text| bounded(text, MAX_ERROR_BYTES)),
                 });
             }
-            self.shared.changed.notify_all();
-            if entry.snapshot.status == SubagentStatus::Canceling {
-                return RunOutcome::Interrupted;
-            }
-            let Some(next) = entry.work.pop_front() else {
-                return outcome;
-            };
+            let canceling = entry.snapshot.status == SubagentStatus::Canceling;
+            let next = entry.work.pop_front();
             if !entry.snapshot.queued_messages.is_empty() {
                 entry.snapshot.queued_messages.remove(0);
             }
             entry.cancellation.clear();
+            // The entry borrow ends here; the session total outlives entries.
+            state.total_child_tokens = state.total_child_tokens.saturating_add(run_tokens);
+            self.shared.changed.notify_all();
+            if canceling {
+                return RunOutcome::Interrupted;
+            }
+            let Some(next) = next else {
+                return outcome;
+            };
             work = next;
         }
     }
@@ -801,18 +918,27 @@ fn resolve_model(
     config: &Config,
     parent_model: &str,
     requested_model: Option<&str>,
+    preset_model: Option<&str>,
 ) -> Result<String, String> {
-    if let Some(model) = requested_model {
-        let model = model.trim();
+    if let Some(model) = requested_model.or(preset_model).map(str::trim) {
         if model.is_empty() {
             return Err("model must not be empty".into());
         }
-        return Ok(model.to_string());
+        return validate_resolved_model(config, model.to_string());
     }
     if config.subagent_model != "inherit" {
-        return Ok(config.subagent_model.clone());
+        return validate_resolved_model(config, config.subagent_model.clone());
     }
-    Ok(parent_model.to_string())
+    validate_resolved_model(config, parent_model.to_string())
+}
+
+/// Fails at spawn time instead of as a dead run later. Resolution instantiates
+/// the provider (which checks credentials and may perform an OAuth refresh for
+/// near-expiry Codex tokens).
+fn validate_resolved_model(config: &Config, model: String) -> Result<String, String> {
+    crate::provider::resolve(&model, config)
+        .map(|_| model.clone())
+        .map_err(|error| format!("model '{model}' is not usable: {error}"))
 }
 
 fn validate_id_list(ids: &[String]) -> Result<(), String> {
@@ -935,10 +1061,11 @@ fn format_detailed_snapshot(snapshot: &SubagentSnapshot) -> String {
         .checked_div(snapshot.context_window)
         .unwrap_or(0);
     let mut output = format!(
-        "{} [{}] {}\nmodel: {}\ninitial task: {}\ncontext: {}% ({}/{})\nelapsed: {}\nactivity: {}\noutcome: {}\nturns: {}\nqueued: {}",
+        "{} [{}] {}\nagent: {}\nmodel: {}\ninitial task: {}\ncontext: {}% ({}/{})\nelapsed: {}\nactivity: {}\noutcome: {}\nturns: {}\nrequests: {}\nqueued: {}",
         snapshot.id,
         snapshot.status.label(),
         snapshot.name,
+        snapshot.agent,
         snapshot.model,
         bounded(&snapshot.initial_prompt.replace('\n', " "), 240),
         percentage,
@@ -957,6 +1084,7 @@ fn format_detailed_snapshot(snapshot: &SubagentSnapshot) -> String {
             None => "pending",
         },
         snapshot.completed_turns,
+        snapshot.requests,
         snapshot.queued_messages.len()
     );
     if !snapshot.error.is_empty() {
@@ -984,6 +1112,38 @@ fn final_output(snapshot: &SubagentSnapshot) -> String {
     source.clone()
 }
 
+/// Interrupted runs deliver a salvage envelope instead of a possibly empty
+/// final result: the request count plus the last assistant text, so partial
+/// work still reaches the parent.
+fn salvage_result(snapshot: &SubagentSnapshot, final_result: &str) -> String {
+    let requests = snapshot.requests;
+    let result = final_result.trim();
+    if !result.is_empty() {
+        return bounded(
+            &format!("[cancelled after {requests} requests]\n{result}"),
+            MAX_FINAL_RESULT_BYTES,
+        );
+    }
+    let last_activity = snapshot
+        .transcript
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            SubagentTranscriptItem::Assistant(text) => Some(text.as_str()),
+            _ => None,
+        });
+    match last_activity {
+        Some(text) if !text.trim().is_empty() => bounded(
+            &format!(
+                "[cancelled after {requests} requests — last activity: \"{}\"]",
+                bounded(text.trim(), SALVAGE_SNIPPET_BYTES)
+            ),
+            MAX_FINAL_RESULT_BYTES,
+        ),
+        _ => format!("[cancelled after {requests} requests]"),
+    }
+}
+
 fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
     if seconds >= 3600 {
@@ -1000,35 +1160,17 @@ mod tests {
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::path::PathBuf;
     use std::sync::mpsc;
 
     use super::*;
-    use crate::config::{DEFAULT_MAX_TOKENS, DEFAULT_SUBAGENT_MODEL, ProviderConfig, UiColor};
+    use crate::config::ProviderConfig;
 
     fn config() -> Config {
         Config {
             model: Some("parent".into()),
-            anthropic_base_url: String::new(),
-            openai_base_url: String::new(),
-            max_tokens: DEFAULT_MAX_TOKENS,
-            reasoning_effort: None,
-            hide_reasoning: false,
-            accent_color: UiColor::WHITE,
-            scroll_bar: true,
-            context_windows: HashMap::new(),
-            auto_compact: false,
-            compact_threshold: 0.85,
             subagents: true,
-            max_subagents: 3,
-            subagent_model: DEFAULT_SUBAGENT_MODEL.into(),
-            skill_dirs: Vec::new(),
-            providers: HashMap::<String, ProviderConfig>::new(),
-            setup_skipped: false,
-            anthropic_api_key: None,
-            openai_api_key: None,
-            home_dir: PathBuf::new(),
-            project_dir: PathBuf::new(),
+            auto_compact: false,
+            ..Config::test_default()
         }
     }
 
@@ -1050,14 +1192,14 @@ mod tests {
         config
     }
 
-    fn read_request(stream: &mut TcpStream) -> std::io::Result<()> {
+    fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
         let mut request = Vec::new();
         let mut buffer = [0u8; 4096];
         let mut wanted = None;
         loop {
             let read = stream.read(&mut buffer)?;
             if read == 0 {
-                return Ok(());
+                return Ok(String::new());
             }
             request.extend_from_slice(&buffer[..read]);
             if wanted.is_none()
@@ -1076,7 +1218,7 @@ mod tests {
                 wanted = Some(header_end + 4 + content_length);
             }
             if wanted.is_some_and(|wanted| request.len() >= wanted) {
-                return Ok(());
+                return Ok(String::from_utf8_lossy(&request).into_owned());
             }
         }
     }
@@ -1108,6 +1250,42 @@ mod tests {
         stream.flush()
     }
 
+    /// Streams `text` followed by an unknown-tool call and a usage event, so
+    /// the child keeps issuing requests while burning budget.
+    fn write_tool_call_response(
+        stream: &mut TcpStream,
+        text: &str,
+        call_id: &str,
+    ) -> std::io::Result<()> {
+        let mut body = String::new();
+        if !text.is_empty() {
+            let event = serde_json::json!({"choices": [{"delta": {"content": text}}]});
+            body.push_str(&format!("data: {event}\n\n"));
+        }
+        let call = serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "noop_probe", "arguments": "{}"}
+            }]}}]
+        });
+        body.push_str(&format!("data: {call}\n\n"));
+        let usage = serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+        });
+        body.push_str(&format!("data: {usage}\n\n"));
+        body.push_str("data: [DONE]\n\n");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )?;
+        stream.flush()
+    }
+
     #[test]
     fn wait_reports_the_complete_final_result() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
@@ -1129,8 +1307,9 @@ mod tests {
             .spawn(
                 provider_config(base_url),
                 "local:model",
-                "scanner",
+                Some("scanner"),
                 "scan the library",
+                None,
                 None,
             )
             .expect("subagent spawn");
@@ -1167,8 +1346,9 @@ mod tests {
             .spawn(
                 provider_config(base_url),
                 "local:model",
-                "reused",
+                Some("reused"),
                 "first task",
+                None,
                 None,
             )
             .expect("initial subagent spawn");
@@ -1191,20 +1371,43 @@ mod tests {
 
     #[test]
     fn model_precedence_prefers_spawn_then_config_then_parent() {
-        let mut config = config();
+        let mut config = provider_config("http://127.0.0.1:9/v1".into());
         assert_eq!(
-            resolve_model(&config, "parent", Some("spawn")).expect("spawn model"),
-            "spawn"
+            resolve_model(&config, "local:parent", Some("local:spawn"), None).expect("spawn model"),
+            "local:spawn"
         );
-        config.subagent_model = "configured".into();
+        config.subagent_model = "local:configured".into();
         assert_eq!(
-            resolve_model(&config, "parent", None).expect("configured model"),
-            "configured"
+            resolve_model(&config, "local:parent", None, None).expect("configured model"),
+            "local:configured"
         );
         config.subagent_model = "inherit".into();
         assert_eq!(
-            resolve_model(&config, "parent", None).expect("inherited model"),
-            "parent"
+            resolve_model(&config, "local:parent", None, None).expect("inherited model"),
+            "local:parent"
+        );
+    }
+
+    #[test]
+    fn unresolvable_spawn_models_are_rejected_at_spawn_time() {
+        let mut config = config();
+        config.providers.insert(
+            "broken".into(),
+            ProviderConfig {
+                base_url: String::new(),
+                api: "openai-completions".into(),
+                api_key: None,
+                auth_header: Some(false),
+                headers: HashMap::new(),
+                models: Vec::new(),
+                compat: crate::config::OpenAiCompatibility::default(),
+            },
+        );
+        let error = resolve_model(&config, "local:parent", Some("broken:model"), None)
+            .expect_err("unusable provider models must fail fast");
+        assert!(
+            error.contains("'broken:model' is not usable"),
+            "unexpected error: {error}"
         );
     }
 
@@ -1224,12 +1427,56 @@ mod tests {
     }
 
     #[test]
+    fn omitted_spawn_names_are_generated_and_supplied_names_are_kept() {
+        let config = provider_config("http://127.0.0.1:9/v1".into());
+        let manager = SubagentManager::new("session".into(), 3);
+        manager
+            .spawn(config.clone(), "local:model", None, "task one", None, None)
+            .expect("spawn without a name");
+        manager
+            .spawn(config, "local:model", None, "task two", None, None)
+            .expect("second spawn without a name");
+        manager
+            .spawn(
+                provider_config("http://127.0.0.1:9/v1".into()),
+                "local:model",
+                Some("  custom  "),
+                "task three",
+                None,
+                None,
+            )
+            .expect("spawn with an explicit name");
+
+        let snapshots = manager.snapshots();
+        let names = snapshots
+            .iter()
+            .map(|snapshot| snapshot.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            names.contains(&"custom"),
+            "supplied names should be trimmed and kept; got {names:?}"
+        );
+        let generated = names
+            .iter()
+            .filter(|name| **name != "custom")
+            .collect::<Vec<_>>();
+        assert_eq!(generated.len(), 2);
+        assert!(
+            generated[0] != generated[1],
+            "generated handles must be unique; got {names:?}"
+        );
+        assert!(generated.iter().all(|name| !name.is_empty()));
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
     fn wait_format_reports_every_id_with_complete_results() {
         let snapshots = (1..=MAX_TRACKED_SUBAGENTS as u64)
             .map(|sequence| {
                 let mut snapshot = SubagentSnapshot::new(
                     SubagentId::new(sequence),
                     format!("agent {sequence}"),
+                    "default".into(),
                     "p".repeat(240),
                     "model".into(),
                     100,
@@ -1267,14 +1514,21 @@ mod tests {
         let config = provider_config(base_url);
         let manager = SubagentManager::new("session".into(), 1);
         let id = manager
-            .spawn(config.clone(), "local:model", "first", "work", None)
+            .spawn(
+                config.clone(),
+                "local:model",
+                Some("first"),
+                "work",
+                None,
+                None,
+            )
             .expect("first spawn should reserve the only slot");
         ready_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("first worker should reach the provider");
 
         let error = manager
-            .spawn(config, "local:model", "second", "work", None)
+            .spawn(config, "local:model", Some("second"), "work", None, None)
             .expect_err("a simultaneous spawn must not exceed capacity");
         assert!(error.contains("capacity is full"));
         for index in 0..MAX_QUEUE_MESSAGES {
@@ -1314,7 +1568,14 @@ mod tests {
         let config = provider_config(base_url);
         let manager = SubagentManager::new("session".into(), 1);
         let id = manager
-            .spawn(config, "local:model", "reused", "first task", None)
+            .spawn(
+                config,
+                "local:model",
+                Some("reused"),
+                "first task",
+                None,
+                None,
+            )
             .expect("initial subagent spawn");
         manager
             .wait(&[id.to_string()], Some(5))
@@ -1365,8 +1626,9 @@ mod tests {
             .spawn(
                 provider_config(base_url),
                 "local:model",
-                "ordered",
+                Some("ordered"),
                 "first task",
+                None,
                 None,
             )
             .expect("initial subagent spawn");
@@ -1417,6 +1679,7 @@ mod tests {
             let mut snapshot = SubagentSnapshot::new(
                 SubagentId::new(sequence),
                 format!("agent {sequence}"),
+                "default".into(),
                 "task".into(),
                 "parent".into(),
                 100,
@@ -1498,7 +1761,14 @@ mod tests {
         let config = provider_config(base_url);
         let manager = SubagentManager::new("session".into(), 1);
         let id = manager
-            .spawn(config, "local:model", "delivery", "model task", None)
+            .spawn(
+                config,
+                "local:model",
+                Some("delivery"),
+                "model task",
+                None,
+                None,
+            )
             .expect("model-originated run should start");
         let deadline = Instant::now() + Duration::from_secs(5);
         while manager
@@ -1550,15 +1820,17 @@ mod tests {
             read_request(&mut private).expect("private provider request");
             private_ready_tx.send(()).expect("private provider ready");
             private_release_rx.recv().expect("private provider release");
-            write_response(&mut private, "private result").expect("private provider response");
+            // Cancellation may already have closed the client connection.
+            let _ = write_response(&mut private, "private result");
         });
         let manager = SubagentManager::new("session".into(), 1);
         let id = manager
             .spawn(
                 provider_config(base_url),
                 "local:model",
-                "mixed origin",
+                Some("mixed origin"),
                 "model task",
+                None,
                 None,
             )
             .expect("model subagent spawn");
@@ -1576,20 +1848,10 @@ mod tests {
         let cancel_manager = manager.clone();
         let cancel_id = id.to_string();
         let cancel = std::thread::spawn(move || cancel_manager.cancel(&[cancel_id], true));
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !manager
-            .snapshots()
-            .iter()
-            .any(|snapshot| snapshot.id == id && snapshot.status == SubagentStatus::Canceling)
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(
-            manager.snapshots().iter().any(|snapshot| {
-                snapshot.id == id && snapshot.status == SubagentStatus::Canceling
-            })
-        );
+        // Once the wake handler is installed, cancellation may interrupt the
+        // provider read and pass through the transient Canceling state before
+        // this thread can observe it. Releasing the server remains safe in
+        // either ordering.
         private_release_tx
             .send(())
             .expect("release private provider response");
@@ -1603,5 +1865,192 @@ mod tests {
         assert_eq!(deferred[0].result, "model result");
         server.join().expect("provider server should exit");
         manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn wait_all_returns_immediately_without_active_subagents() {
+        let manager = SubagentManager::new("session".into(), 3);
+        assert_eq!(manager.active_count(), 0);
+        assert!(manager.wait_all(1));
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn preset_spawns_apply_the_preset_model_and_agent_label() {
+        // Port 9 refuses connections instantly, so the child settles Failed
+        // without a server; the assertions are about spawn-time effects.
+        let config = provider_config("http://127.0.0.1:9/v1".into());
+        let preset = super::super::presets::bundled().remove(0);
+        let manager = SubagentManager::new("session".into(), 1);
+        let id = manager
+            .spawn(
+                config,
+                "local:model",
+                None,
+                "find the bug",
+                None,
+                Some(&preset),
+            )
+            .expect("preset spawn");
+        manager
+            .wait(&[id.to_string()], Some(10))
+            .expect("preset child settles");
+
+        let snapshot = manager
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.id == id)
+            .expect("preset child snapshot");
+        assert_eq!(snapshot.agent, "scout");
+        assert_eq!(snapshot.model, "local:model", "scout inherits by default");
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn preset_model_sits_between_spawn_argument_and_config() {
+        let mut config = provider_config("http://127.0.0.1:9/v1".into());
+        config.subagent_model = "local:configured".into();
+        let mut preset = super::super::presets::bundled().remove(0);
+        preset.model = Some("local:fast".into());
+
+        let via_preset = resolve_model(&config, "local:parent", None, preset.model.as_deref())
+            .expect("preset model applies");
+        assert_eq!(via_preset, "local:fast");
+        let via_argument = resolve_model(
+            &config,
+            "local:parent",
+            Some("local:explicit"),
+            preset.model.as_deref(),
+        )
+        .expect("spawn argument wins over the preset");
+        assert_eq!(via_argument, "local:explicit");
+
+        preset.model = None;
+        let via_config = resolve_model(&config, "local:parent", None, preset.model.as_deref())
+            .expect("config applies");
+        assert_eq!(via_config, "local:configured");
+    }
+
+    #[test]
+    fn request_budget_steers_then_stops_a_runaway_subagent() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
+        let base_url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("test provider address")
+        );
+        let server = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().expect("subagent provider connection");
+                let body = read_request(&mut stream).expect("subagent provider request");
+                bodies.push(body);
+                write_tool_call_response(&mut stream, "working", &format!("call-{index}"))
+                    .expect("subagent provider response");
+            }
+            bodies
+        });
+        let mut config = provider_config(base_url);
+        config.subagent_request_budget = 2;
+        let manager = SubagentManager::new("session".into(), 1);
+        let id = manager
+            .spawn(
+                config,
+                "local:model",
+                Some("runaway"),
+                "keep working forever",
+                None,
+                None,
+            )
+            .expect("runaway subagent spawn");
+        let waited = manager
+            .wait(&[id.to_string()], Some(10))
+            .expect("budget-stopped subagent should settle");
+
+        assert!(
+            waited.contains("[cancelled after 3 requests]"),
+            "the hard stop must deliver a salvage envelope; got:\n{waited}"
+        );
+        let snapshot = manager
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.id == id)
+            .expect("runaway subagent snapshot");
+        assert_eq!(snapshot.requests, 3);
+        assert_eq!(snapshot.run_tokens, 36);
+        assert_eq!(manager.total_child_tokens(), 36);
+        let bodies = server.join().expect("provider server should exit");
+        assert_eq!(bodies.len(), 3, "the fourth request must never happen");
+        assert!(
+            bodies[2].contains("Request budget reached"),
+            "the steer message must ride the final request; got:\n{}",
+            bodies[2]
+        );
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn run_timeout_interrupts_an_in_flight_subagent_request() {
+        crate::install_interrupt_handler().expect("interrupt handler");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
+        let base_url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("test provider address")
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("subagent provider connection");
+            read_request(&mut stream).expect("subagent provider request");
+            std::thread::sleep(Duration::from_secs(3));
+            // The timeout should close or interrupt the client before this
+            // response. A broken pipe is therefore an expected outcome.
+            let _ = write_tool_call_response(&mut stream, "too late", "call-0");
+        });
+        let mut config = provider_config(base_url);
+        config.subagent_timeout_secs = 1;
+        let manager = SubagentManager::new("session".into(), 1);
+        let started = Instant::now();
+        let id = manager
+            .spawn(config, "local:model", Some("slow"), "slow work", None, None)
+            .expect("slow subagent spawn");
+        let waited = manager
+            .wait(&[id.to_string()], Some(10))
+            .expect("timed-out subagent should settle");
+
+        assert!(
+            waited.contains("[cancelled after"),
+            "the timeout stop must deliver a salvage marker; got:\n{waited}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the watchdog must interrupt the in-flight provider request"
+        );
+        server.join().expect("provider server should exit");
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn salvage_envelope_reports_requests_and_last_activity() {
+        let mut snapshot = SubagentSnapshot::new(
+            SubagentId::new(1),
+            "agent".into(),
+            "default".into(),
+            "prompt".into(),
+            "local:model".into(),
+            100,
+        );
+        snapshot.requests = 4;
+        assert_eq!(
+            salvage_result(&snapshot, ""),
+            "[cancelled after 4 requests]",
+            "an empty transcript delivers the bare marker"
+        );
+        snapshot.push_transcript(SubagentTranscriptItem::Assistant("found the bug".into()));
+        assert_eq!(
+            salvage_result(&snapshot, ""),
+            "[cancelled after 4 requests — last activity: \"found the bug\"]"
+        );
+        assert_eq!(
+            salvage_result(&snapshot, "full result"),
+            "[cancelled after 4 requests]\nfull result"
+        );
     }
 }

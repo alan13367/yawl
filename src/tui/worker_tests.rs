@@ -68,8 +68,10 @@ fn display_settings_apply_during_an_active_turn() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        render_cache: crate::tui::render::RenderCache::default(),
     };
     let root = std::env::temp_dir().join(format!(
         "yawl-tui-live-settings-{}-{}",
@@ -81,26 +83,9 @@ fn display_settings_apply_during_an_active_turn() {
     ));
     let mut config = Config {
         model: Some("test".into()),
-        anthropic_base_url: String::new(),
-        openai_base_url: String::new(),
-        max_tokens: 8192,
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        scroll_bar: true,
-        context_windows: std::collections::HashMap::new(),
-        auto_compact: true,
-        compact_threshold: 0.85,
-        subagents: false,
-        max_subagents: crate::config::DEFAULT_MAX_SUBAGENTS,
-        subagent_model: crate::config::DEFAULT_SUBAGENT_MODEL.to_string(),
-        skill_dirs: Vec::new(),
-        providers: std::collections::HashMap::new(),
-        setup_skipped: false,
-        anthropic_api_key: None,
-        openai_api_key: None,
         home_dir: root.join("home/.yawl"),
         project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
     };
 
     activate_picker_action_while_busy(

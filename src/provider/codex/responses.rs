@@ -149,6 +149,13 @@ impl Decoder {
                     text: "\n\n".into(),
                 });
             }
+            "response.output_item.added" if value["item"]["type"] == "function_call" => {
+                if let Some(name) = value["item"]["name"].as_str()
+                    && !name.is_empty()
+                {
+                    on_event(Event::ToolCallName(name.to_string()));
+                }
+            }
             "response.output_item.done" => self.output_item(&value["item"], on_event),
             "response.completed" | "response.done" | "response.incomplete" => {
                 let terminal = &value["response"];
@@ -368,6 +375,7 @@ mod tests {
                 "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}}\n\n",
                 "data: {{\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"think\"}}\n\n",
                 "data: {{\"type\":\"response.reasoning_summary_part.done\"}}\n\n",
+                "data: {{\"type\":\"response.output_item.added\",\"item\":{function_call}}}\n\n",
                 "data: {{\"type\":\"response.output_item.done\",\"item\":{function_call}}}\n\n",
                 "data: {{\"type\":\"response.output_item.done\",\"item\":{reasoning}}}\n\n",
                 "data: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{function_call},{reasoning}],\"usage\":{{\"input_tokens\":13,\"output_tokens\":6}}}}}}\n\n",
@@ -403,26 +411,27 @@ mod tests {
                 text
             } if text == "\n\n"
         ));
+        assert!(matches!(&events[3], Event::ToolCallName(name) if name == "shell"));
         assert!(matches!(
-            &events[3],
+            &events[4],
             Event::ToolCall(call)
                 if call.id == "call_1|fc_1"
                     && call.name == "shell"
                     && call.arguments == r#"{"command":"pwd"}"#
         ));
         assert!(matches!(
-            events[4],
+            events[5],
             Event::Usage {
                 input_tokens: 13,
                 output_tokens: 6
             }
         ));
         assert!(matches!(
-            &events[5],
+            &events[6],
             Event::ProviderData(item)
                 if item["id"] == "rs_1" && item["encrypted_content"] == "secret"
         ));
-        assert!(matches!(events[6], Event::Done));
+        assert!(matches!(events[7], Event::Done));
         assert_eq!(
             events
                 .iter()

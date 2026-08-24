@@ -152,11 +152,17 @@ impl Decoder {
                 let index = value["index"].as_u64().unwrap_or(0);
                 let block = &value["content_block"];
                 let state = match block["type"].as_str() {
-                    Some("tool_use") => Block::ToolUse {
-                        id: block["id"].as_str().unwrap_or("").to_string(),
-                        name: block["name"].as_str().unwrap_or("").to_string(),
-                        args: String::new(),
-                    },
+                    Some("tool_use") => {
+                        let name = block["name"].as_str().unwrap_or("").to_string();
+                        if !name.is_empty() {
+                            on_event(Event::ToolCallName(name.clone()));
+                        }
+                        Block::ToolUse {
+                            id: block["id"].as_str().unwrap_or("").to_string(),
+                            name,
+                            args: String::new(),
+                        }
+                    }
                     _ => Block::Text,
                 };
                 self.blocks.push((index, state));
@@ -346,21 +352,22 @@ mod tests {
         }
 
         assert!(matches!(&events[0], Event::TextDelta(text) if text == "hello"));
+        assert!(matches!(&events[1], Event::ToolCallName(name) if name == "shell"));
         assert!(matches!(
-            &events[1],
+            &events[2],
             Event::ToolCall(call)
                 if call.id == "call_1"
                     && call.name == "shell"
                     && call.arguments == r#"{"command":"pwd"}"#
         ));
         assert!(matches!(
-            events[2],
+            events[3],
             Event::Usage {
                 input_tokens: 15,
                 output_tokens: 4
             }
         ));
-        assert!(matches!(events[3], Event::Done));
+        assert!(matches!(events[4], Event::Done));
     }
 
     #[test]

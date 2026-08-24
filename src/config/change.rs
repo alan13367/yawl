@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use serde_json::{Map, Value, json};
 
 use super::{
-    Config, OPENAI_COMPLETIONS_API, ProviderConfig, UiColor, expand_home_path, object_field,
+    Config, MAX_SUBAGENT_REQUEST_BUDGET, MAX_SUBAGENT_TIMEOUT_SECS, OPENAI_COMPLETIONS_API,
+    ProviderConfig, UiColor, expand_home_path, object_field, parse_bounded, validate_bounded,
     validate_provider_name,
 };
 use crate::error::Error;
@@ -22,6 +23,8 @@ pub(crate) enum ConfigChange {
     Subagents(String),
     MaxSubagents(String),
     SubagentModel(String),
+    SubagentRequestBudget(String),
+    SubagentTimeoutSecs(String),
     ContextWindow {
         model: String,
         value: String,
@@ -76,6 +79,8 @@ enum ValidatedChange {
     Subagents(bool),
     MaxSubagents(usize),
     SubagentModel(String),
+    SubagentRequestBudget(usize),
+    SubagentTimeoutSecs(u64),
     ContextWindow {
         model: String,
         window: u64,
@@ -156,23 +161,34 @@ impl ValidatedChange {
                 Ok(Self::CompactThreshold(parse_threshold(&value)?))
             }
             ConfigChange::Subagents(value) => Ok(Self::Subagents(parse_on_off(&value)?)),
-            ConfigChange::MaxSubagents(value) => {
-                let limit = value
-                    .parse::<usize>()
-                    .map_err(|_| Error::Config("max_subagents must be between 1 and 16".into()))?;
-                if !(1..=16).contains(&limit) {
-                    return Err(Error::Config(
-                        "max_subagents must be between 1 and 16".into(),
-                    ));
-                }
-                Ok(Self::MaxSubagents(limit))
-            }
+            ConfigChange::MaxSubagents(value) => Ok(Self::MaxSubagents(parse_bounded(
+                &value,
+                1,
+                16,
+                "max_subagents",
+            )?)),
             ConfigChange::SubagentModel(value) => {
                 let value = value.trim();
                 if value.is_empty() {
                     return Err(Error::Config("subagent_model must not be empty".into()));
                 }
                 Ok(Self::SubagentModel(value.to_string()))
+            }
+            ConfigChange::SubagentRequestBudget(value) => {
+                Ok(Self::SubagentRequestBudget(parse_bounded(
+                    &value,
+                    0,
+                    MAX_SUBAGENT_REQUEST_BUDGET,
+                    "subagent_request_budget",
+                )?))
+            }
+            ConfigChange::SubagentTimeoutSecs(value) => {
+                Ok(Self::SubagentTimeoutSecs(parse_bounded(
+                    &value,
+                    0,
+                    MAX_SUBAGENT_TIMEOUT_SECS,
+                    "subagent_timeout_secs",
+                )?))
             }
             ConfigChange::ContextWindow { model, value } => {
                 if model.trim().is_empty() {
@@ -265,6 +281,12 @@ impl ValidatedChange {
             Self::Subagents(enabled) => insert_scalar(config, "subagents", json!(enabled)),
             Self::MaxSubagents(limit) => insert_scalar(config, "max_subagents", json!(limit)),
             Self::SubagentModel(model) => insert_scalar(config, "subagent_model", json!(model)),
+            Self::SubagentRequestBudget(budget) => {
+                insert_scalar(config, "subagent_request_budget", json!(budget))
+            }
+            Self::SubagentTimeoutSecs(timeout) => {
+                insert_scalar(config, "subagent_timeout_secs", json!(timeout))
+            }
             Self::ContextWindow { model, window } => config.update_global_json(|root| {
                 object_field(root, "context_windows")?.insert(model.clone(), json!(window));
                 Ok(())
@@ -348,6 +370,8 @@ impl ValidatedChange {
             Self::Subagents(enabled) => config.subagents == *enabled,
             Self::MaxSubagents(limit) => config.max_subagents == *limit,
             Self::SubagentModel(model) => config.subagent_model == *model,
+            Self::SubagentRequestBudget(budget) => config.subagent_request_budget == *budget,
+            Self::SubagentTimeoutSecs(timeout) => config.subagent_timeout_secs == *timeout,
             Self::ContextWindow { model, window } => {
                 config.context_windows.get(model) == Some(window)
             }
@@ -449,12 +473,12 @@ fn parse_threshold(value: &str) -> Result<f64, Error> {
             .parse::<f64>()
             .map_err(|_| Error::Config("invalid compaction threshold".into()))?
     };
-    if !threshold.is_finite() || !(0.1..=0.99).contains(&threshold) {
+    if !threshold.is_finite() {
         return Err(Error::Config(
             "compact_threshold must be between 0.1 and 0.99".into(),
         ));
     }
-    Ok(threshold)
+    validate_bounded(threshold, 0.1, 0.99, "compact_threshold")
 }
 
 fn validate_http_url(url: &str) -> Result<(), Error> {
@@ -741,14 +765,36 @@ mod tests {
             .config
             .change_global(ConfigChange::SubagentModel("inherit".into()))
             .expect("inherit should be persisted");
+        let budgeted = modeled
+            .config
+            .change_global(ConfigChange::SubagentRequestBudget("50".into()))
+            .expect("valid request budget should apply");
+        let timed = budgeted
+            .config
+            .change_global(ConfigChange::SubagentTimeoutSecs("300".into()))
+            .expect("valid timeout should apply");
 
-        assert!(modeled.config.subagents);
-        assert_eq!(modeled.config.max_subagents, 16);
-        assert_eq!(modeled.config.subagent_model, "inherit");
+        assert!(timed.config.subagents);
+        assert_eq!(timed.config.max_subagents, 16);
+        assert_eq!(timed.config.subagent_model, "inherit");
+        assert_eq!(timed.config.subagent_request_budget, 50);
+        assert_eq!(timed.config.subagent_timeout_secs, 300);
         assert!(
-            modeled
+            timed
                 .config
                 .change_global(ConfigChange::MaxSubagents("17".into()))
+                .is_err()
+        );
+        assert!(
+            timed
+                .config
+                .change_global(ConfigChange::SubagentRequestBudget("1001".into()))
+                .is_err()
+        );
+        assert!(
+            timed
+                .config
+                .change_global(ConfigChange::SubagentTimeoutSecs("86401".into()))
                 .is_err()
         );
         let saved: Value = serde_json::from_str(
@@ -759,5 +805,7 @@ mod tests {
         assert_eq!(saved["subagents"], true);
         assert_eq!(saved["max_subagents"], 16);
         assert_eq!(saved["subagent_model"], "inherit");
+        assert_eq!(saved["subagent_request_budget"], 50);
+        assert_eq!(saved["subagent_timeout_secs"], 300);
     }
 }

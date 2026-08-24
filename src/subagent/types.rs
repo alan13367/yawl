@@ -107,6 +107,8 @@ pub(crate) struct LiveTool {
 pub(crate) struct SubagentSnapshot {
     pub(crate) id: SubagentId,
     pub(crate) name: String,
+    /// Preset name ("default" for the unrestricted child).
+    pub(crate) agent: String,
     pub(crate) initial_prompt: String,
     pub(crate) model: String,
     pub(crate) origin: RunOrigin,
@@ -116,6 +118,10 @@ pub(crate) struct SubagentSnapshot {
     pub(crate) settled_at: Option<Instant>,
     pub(crate) context_tokens: u64,
     pub(crate) context_window: u64,
+    /// Completed model requests in the current run.
+    pub(crate) requests: u64,
+    /// Summed usage tokens across the requests of the current run.
+    pub(crate) run_tokens: u64,
     pub(crate) transcript: Vec<SubagentTranscriptItem>,
     pub(crate) live_assistant: String,
     pub(crate) live_reasoning: String,
@@ -134,6 +140,7 @@ impl SubagentSnapshot {
     pub(crate) fn new(
         id: SubagentId,
         name: String,
+        agent: String,
         prompt: String,
         model: String,
         context_window: u64,
@@ -141,6 +148,7 @@ impl SubagentSnapshot {
         Self {
             id,
             name,
+            agent,
             initial_prompt: prompt,
             model,
             origin: RunOrigin::Model,
@@ -150,6 +158,8 @@ impl SubagentSnapshot {
             settled_at: None,
             context_tokens: 0,
             context_window,
+            requests: 0,
+            run_tokens: 0,
             transcript: Vec::new(),
             live_assistant: String::new(),
             live_reasoning: String::new(),
@@ -180,6 +190,8 @@ impl SubagentSnapshot {
         self.settled_at = None;
         self.error.clear();
         self.latest_outcome = None;
+        self.requests = 0;
+        self.run_tokens = 0;
         self.current_activity = "sending".into();
         self.push_transcript(SubagentTranscriptItem::User {
             text: bounded(text, MAX_TRANSCRIPT_TEXT_BYTES),
@@ -223,6 +235,13 @@ impl SubagentSnapshot {
                 }
                 self.current_activity.clear();
             }
+            TurnEvent::ToolPreparing { name } => {
+                self.current_activity = match name {
+                    "write_file" => "preparing write".into(),
+                    "edit_file" => "preparing edit".into(),
+                    _ => "preparing tool".into(),
+                };
+            }
             TurnEvent::ToolStart { name, args } => {
                 self.current_activity = format!("running {name}");
                 self.current_tool = Some(LiveTool {
@@ -258,6 +277,8 @@ impl SubagentSnapshot {
             } => {
                 self.context_tokens = context_tokens;
                 self.context_window = context_window;
+                self.requests = self.requests.saturating_add(1);
+                self.run_tokens = self.run_tokens.saturating_add(context_tokens);
             }
         }
     }
@@ -287,7 +308,7 @@ impl SubagentSnapshot {
         self.push_transcript(SubagentTranscriptItem::Reasoning { kind, text });
     }
 
-    fn push_transcript(&mut self, mut item: SubagentTranscriptItem) {
+    pub(super) fn push_transcript(&mut self, mut item: SubagentTranscriptItem) {
         match &mut item {
             SubagentTranscriptItem::User { text, .. }
             | SubagentTranscriptItem::Assistant(text)
@@ -367,6 +388,7 @@ mod tests {
         SubagentSnapshot::new(
             SubagentId::new(1),
             "test".into(),
+            "default".into(),
             "prompt".into(),
             "model".into(),
             100,
@@ -410,6 +432,17 @@ mod tests {
         }
         snapshot.apply_event(TurnEvent::AssistantDone);
         assert_eq!(snapshot.transcript.len(), MAX_TRANSCRIPT_ITEMS);
+    }
+
+    #[test]
+    fn snapshot_reports_file_tool_preparation() {
+        let mut snapshot = snapshot();
+
+        snapshot.apply_event(TurnEvent::ToolPreparing { name: "write_file" });
+        assert_eq!(snapshot.current_activity, "preparing write");
+
+        snapshot.apply_event(TurnEvent::ToolPreparing { name: "edit_file" });
+        assert_eq!(snapshot.current_activity, "preparing edit");
     }
 
     #[test]

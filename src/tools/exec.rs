@@ -139,7 +139,7 @@ fn describe(path: &Path) -> Result<ExecTool, String> {
     })
 }
 
-fn valid_tool_name(name: &str) -> bool {
+pub(crate) fn valid_tool_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name

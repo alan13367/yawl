@@ -3,6 +3,8 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 static WAKE_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
@@ -41,6 +43,36 @@ pub(crate) fn scope<T>(token: &CancellationToken, run: impl FnOnce() -> T) -> T 
     let previous = CURRENT_TOKEN.with_borrow_mut(|current| current.replace(token.clone()));
     let _guard = ScopeGuard(previous);
     run()
+}
+
+/// Runs `run` with a watchdog that cancels the token and wakes the calling
+/// thread when `timeout` expires. Returns whether the watchdog fired.
+pub(crate) fn with_timeout<T>(
+    token: &CancellationToken,
+    timeout: Duration,
+    run: impl FnOnce() -> T,
+) -> (T, bool) {
+    let thread = native_thread_id();
+    let timed_out = AtomicBool::new(false);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let result = std::thread::scope(|scope| {
+        let token = token.clone();
+        let timed_out = &timed_out;
+        scope.spawn(move || {
+            if matches!(
+                done_rx.recv_timeout(timeout),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                timed_out.store(true, Ordering::Release);
+                token.cancel();
+                wake_thread(thread);
+            }
+        });
+        let result = run();
+        let _ = done_tx.send(());
+        result
+    });
+    (result, timed_out.load(Ordering::Acquire))
 }
 
 /// True when SIGINT canceled the process activity or the current
@@ -82,6 +114,38 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn watchdog_cancels_the_bound_run_at_its_deadline() {
+        crate::set_interrupted(false);
+        let token = CancellationToken::default();
+        let started = Instant::now();
+        let (observed, timed_out) = scope(&token, || {
+            with_timeout(&token, Duration::from_millis(25), || {
+                while !interrupted() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                interrupted()
+            })
+        });
+
+        assert!(observed);
+        assert!(timed_out);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn watchdog_stops_without_canceling_a_completed_run() {
+        crate::set_interrupted(false);
+        let token = CancellationToken::default();
+        let (value, timed_out) = scope(&token, || {
+            with_timeout(&token, Duration::from_secs(1), || 42)
+        });
+
+        assert_eq!(value, 42);
+        assert!(!timed_out);
+        assert!(!token.is_canceled());
+    }
 
     #[test]
     fn tokens_cancel_only_the_bound_thread() {

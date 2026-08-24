@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use super::schema::ConfigFile;
 use super::{
     Config, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_COMPACT_THRESHOLD, DEFAULT_MAX_SUBAGENTS,
-    DEFAULT_MAX_TOKENS, DEFAULT_OPENAI_BASE_URL, DEFAULT_SUBAGENT_MODEL, ProviderConfig, UiColor,
+    DEFAULT_MAX_TOKENS, DEFAULT_OPENAI_BASE_URL, DEFAULT_SUBAGENT_MODEL,
+    DEFAULT_SUBAGENT_REQUEST_BUDGET, DEFAULT_SUBAGENT_TIMEOUT_SECS, MAX_SUBAGENT_REQUEST_BUDGET,
+    MAX_SUBAGENT_TIMEOUT_SECS, ProviderConfig, UiColor,
 };
 use crate::error::Error;
 
@@ -17,30 +19,7 @@ impl Config {
     }
 
     pub(crate) fn load_from(home_dir: PathBuf, project_dir: PathBuf) -> Result<Config, Error> {
-        let home = home_dir.parent().unwrap_or(&home_dir);
-        let mut cfg = Config {
-            model: None,
-            anthropic_base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
-            openai_base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
-            max_tokens: DEFAULT_MAX_TOKENS,
-            reasoning_effort: None,
-            hide_reasoning: false,
-            accent_color: UiColor::WHITE,
-            scroll_bar: true,
-            context_windows: HashMap::new(),
-            auto_compact: true,
-            compact_threshold: DEFAULT_COMPACT_THRESHOLD,
-            subagents: false,
-            max_subagents: DEFAULT_MAX_SUBAGENTS,
-            subagent_model: DEFAULT_SUBAGENT_MODEL.to_string(),
-            skill_dirs: vec![home.join(".yawl/skills"), home.join(".agents/skills")],
-            providers: default_local_providers(),
-            setup_skipped: false,
-            anthropic_api_key: None,
-            openai_api_key: None,
-            home_dir,
-            project_dir,
-        };
+        let mut cfg = Self::defaults(home_dir, project_dir);
         let global = cfg.global_config_path();
         let project = cfg.project_dir.join("config.json");
         for path in [global, project] {
@@ -56,6 +35,35 @@ impl Config {
             }
         }
         Ok(cfg)
+    }
+
+    fn defaults(home_dir: PathBuf, project_dir: PathBuf) -> Config {
+        let home = home_dir.parent().unwrap_or(&home_dir);
+        Config {
+            model: None,
+            anthropic_base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
+            openai_base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            reasoning_effort: None,
+            hide_reasoning: false,
+            accent_color: UiColor::WHITE,
+            scroll_bar: true,
+            context_windows: HashMap::new(),
+            auto_compact: true,
+            compact_threshold: DEFAULT_COMPACT_THRESHOLD,
+            subagents: false,
+            max_subagents: DEFAULT_MAX_SUBAGENTS,
+            subagent_model: DEFAULT_SUBAGENT_MODEL.to_string(),
+            subagent_request_budget: DEFAULT_SUBAGENT_REQUEST_BUDGET,
+            subagent_timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
+            skill_dirs: vec![home.join(".yawl/skills"), home.join(".agents/skills")],
+            providers: default_local_providers(),
+            setup_skipped: false,
+            anthropic_api_key: None,
+            openai_api_key: None,
+            home_dir,
+            project_dir,
+        }
     }
 
     pub(crate) fn reload(&self) -> Result<Config, Error> {
@@ -119,23 +127,13 @@ impl Config {
             self.auto_compact = value;
         }
         if let Some(value) = file.compact_threshold {
-            if !(0.1..=0.99).contains(&value) {
-                return Err(Error::Config(
-                    "compact_threshold must be between 0.1 and 0.99".into(),
-                ));
-            }
-            self.compact_threshold = value;
+            self.compact_threshold = validate_bounded(value, 0.1, 0.99, "compact_threshold")?;
         }
         if let Some(value) = file.subagents {
             self.subagents = value;
         }
         if let Some(value) = file.max_subagents {
-            if !(1..=16).contains(&value) {
-                return Err(Error::Config(
-                    "max_subagents must be between 1 and 16".into(),
-                ));
-            }
-            self.max_subagents = value;
+            self.max_subagents = validate_bounded(value, 1, 16, "max_subagents")?;
         }
         if let Some(value) = file.subagent_model {
             let value = value.trim();
@@ -143,6 +141,18 @@ impl Config {
                 return Err(Error::Config("subagent_model must not be empty".into()));
             }
             self.subagent_model = value.to_string();
+        }
+        if let Some(value) = file.subagent_request_budget {
+            self.subagent_request_budget = validate_bounded(
+                value,
+                0,
+                MAX_SUBAGENT_REQUEST_BUDGET,
+                "subagent_request_budget",
+            )?;
+        }
+        if let Some(value) = file.subagent_timeout_secs {
+            self.subagent_timeout_secs =
+                validate_bounded(value, 0, MAX_SUBAGENT_TIMEOUT_SECS, "subagent_timeout_secs")?;
         }
         if let Some(dirs) = file.skill_dirs {
             self.skill_dirs = dirs
@@ -187,21 +197,59 @@ impl Config {
     }
 }
 
-pub(crate) fn expand_home_path(value: &str, yawl_home: &Path) -> PathBuf {
-    if value == "~" {
-        return yawl_home.parent().unwrap_or(yawl_home).to_path_buf();
+/// Validates one config JSON value with the same semantic checks used while
+/// loading, without reading or merging on-disk files.
+pub(crate) fn validate_file_value(value: &serde_json::Value, home_dir: &Path) -> Result<(), Error> {
+    let file: ConfigFile = serde_json::from_value(value.clone())?;
+    Config::defaults(home_dir.to_path_buf(), PathBuf::new()).apply(file)
+}
+
+pub(crate) fn bounded_message<T: std::fmt::Display>(field: &str, min: T, max: T) -> String {
+    format!("{field} must be between {min} and {max}")
+}
+
+pub(crate) fn validate_bounded<T>(value: T, min: T, max: T, field: &str) -> Result<T, Error>
+where
+    T: PartialOrd + std::fmt::Display,
+{
+    if value < min || value > max {
+        Err(Error::Config(bounded_message(field, min, max)))
+    } else {
+        Ok(value)
     }
-    if let Some(relative) = value.strip_prefix("~/") {
-        return yawl_home.parent().unwrap_or(yawl_home).join(relative);
+}
+
+pub(crate) fn parse_bounded<T>(raw: &str, min: T, max: T, field: &str) -> Result<T, Error>
+where
+    T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
+{
+    let parsed = raw
+        .trim()
+        .parse::<T>()
+        .map_err(|_| Error::Config(bounded_message(field, min, max)))?;
+    validate_bounded(parsed, min, max, field)
+}
+
+pub(crate) fn expand_home_path(raw: &str, home_dir: &Path) -> PathBuf {
+    let Some(user_home) = home_dir.parent() else {
+        return PathBuf::from(raw);
+    };
+    if raw == "~" {
+        return user_home.to_path_buf();
     }
-    PathBuf::from(value)
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return user_home.join(rest);
+    }
+    PathBuf::from(raw)
 }
 
 fn default_local_providers() -> HashMap<String, ProviderConfig> {
     let mut providers = [
-        ("ollama", "http://127.0.0.1:11434/v1"),
-        ("lmstudio", "http://127.0.0.1:1234/v1"),
-        ("omlx", "http://127.0.0.1:8000/v1"),
+        ("lmstudio", "http://localhost:1234/v1"),
+        ("ollama", "http://localhost:11434/v1"),
+        ("omlx", "http://localhost:8000/v1"),
+        ("vllm", "http://localhost:8000/v1"),
+        ("sglang", "http://localhost:30000/v1"),
     ]
     .into_iter()
     .map(|(name, url)| (name.to_string(), ProviderConfig::openai_compatible(url)))
@@ -230,27 +278,8 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            model: None,
-            anthropic_base_url: String::new(),
-            openai_base_url: String::new(),
-            max_tokens: 8192,
-            reasoning_effort: None,
-            hide_reasoning: false,
-            accent_color: UiColor::WHITE,
-            scroll_bar: true,
-            context_windows: HashMap::new(),
-            auto_compact: true,
-            compact_threshold: 0.85,
-            subagents: false,
-            max_subagents: DEFAULT_MAX_SUBAGENTS,
-            subagent_model: DEFAULT_SUBAGENT_MODEL.to_string(),
-            skill_dirs: Vec::new(),
             providers: default_local_providers(),
-            setup_skipped: false,
-            anthropic_api_key: None,
-            openai_api_key: None,
-            home_dir: PathBuf::new(),
-            project_dir: PathBuf::new(),
+            ..Config::test_default()
         }
     }
 
@@ -450,22 +479,32 @@ mod tests {
         assert!(!defaults.subagents);
         assert_eq!(defaults.max_subagents, DEFAULT_MAX_SUBAGENTS);
         assert_eq!(defaults.subagent_model, DEFAULT_SUBAGENT_MODEL);
+        assert_eq!(
+            defaults.subagent_request_budget,
+            DEFAULT_SUBAGENT_REQUEST_BUDGET
+        );
+        assert_eq!(
+            defaults.subagent_timeout_secs,
+            DEFAULT_SUBAGENT_TIMEOUT_SECS
+        );
 
         std::fs::create_dir_all(&home)?;
         std::fs::create_dir_all(&project)?;
         std::fs::write(
             home.join("config.json"),
-            r#"{"subagents":true,"max_subagents":8,"subagent_model":"configured"}"#,
+            r#"{"subagents":true,"max_subagents":8,"subagent_model":"configured","subagent_request_budget":50,"subagent_timeout_secs":120}"#,
         )?;
         std::fs::write(
             project.join("config.json"),
-            r#"{"max_subagents":2,"subagent_model":"inherit"}"#,
+            r#"{"max_subagents":2,"subagent_model":"inherit","subagent_request_budget":0}"#,
         )?;
 
         let merged = Config::load_from(home, project)?;
         assert!(merged.subagents);
         assert_eq!(merged.max_subagents, 2);
         assert_eq!(merged.subagent_model, "inherit");
+        assert_eq!(merged.subagent_request_budget, 0);
+        assert_eq!(merged.subagent_timeout_secs, 120);
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
@@ -476,6 +515,8 @@ mod tests {
             json!({"max_subagents": 0}),
             json!({"max_subagents": 17}),
             json!({"subagent_model": "  "}),
+            json!({"subagent_request_budget": 1001}),
+            json!({"subagent_timeout_secs": 86_401}),
         ];
         for value in cases {
             let mut config = test_config();
@@ -506,5 +547,50 @@ mod tests {
         assert_eq!(cfg.anthropic_api_key, None);
         assert_eq!(cfg.openai_api_key, None);
         Ok(())
+    }
+
+    #[test]
+    fn home_paths_expand_the_home_directory_itself_and_descendants() {
+        let yawl_home = Path::new("/home/test/.yawl");
+        assert_eq!(expand_home_path("~", yawl_home), Path::new("/home/test"));
+        assert_eq!(
+            expand_home_path("~/skills", yawl_home),
+            Path::new("/home/test/skills")
+        );
+        assert_eq!(
+            expand_home_path("relative", yawl_home),
+            Path::new("relative")
+        );
+    }
+
+    #[test]
+    fn bounded_helpers_validate_and_parse_ranges() {
+        assert_eq!(
+            bounded_message("test", 1, 10),
+            "test must be between 1 and 10"
+        );
+        assert_eq!(validate_bounded(5, 1, 10, "test").unwrap(), 5);
+        assert_eq!(
+            validate_bounded(0, 1, 10, "test").unwrap_err().to_string(),
+            "config error: test must be between 1 and 10"
+        );
+        assert_eq!(
+            validate_bounded(11, 1, 10, "test").unwrap_err().to_string(),
+            "config error: test must be between 1 and 10"
+        );
+
+        assert_eq!(parse_bounded::<usize>("5", 1, 10, "test").unwrap(), 5);
+        assert_eq!(
+            parse_bounded::<usize>("not-a-number", 1, 10, "test")
+                .unwrap_err()
+                .to_string(),
+            "config error: test must be between 1 and 10"
+        );
+        assert_eq!(
+            parse_bounded::<usize>("15", 1, 10, "test")
+                .unwrap_err()
+                .to_string(),
+            "config error: test must be between 1 and 10"
+        );
     }
 }

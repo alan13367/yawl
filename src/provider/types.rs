@@ -171,6 +171,8 @@ pub enum Event {
         kind: ReasoningKind,
         text: String,
     },
+    /// The accumulated tool name, emitted while a call's arguments are still streaming.
+    ToolCallName(String),
     /// A complete tool call (emitted once its arguments finished streaming).
     ToolCall(ToolCall),
     Usage {

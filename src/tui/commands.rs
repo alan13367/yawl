@@ -323,6 +323,16 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
             .map(|value| ConfigChange::MaxSubagents(value.to_string())),
         "subagent_model" => one_value(&mut parts, "usage: /settings subagent_model inherit|MODEL")
             .map(|value| ConfigChange::SubagentModel(value.to_string())),
+        "subagent_request_budget" => one_value(
+            &mut parts,
+            "usage: /settings subagent_request_budget NUMBER|0-for-unlimited",
+        )
+        .map(|value| ConfigChange::SubagentRequestBudget(value.to_string())),
+        "subagent_timeout_secs" => one_value(
+            &mut parts,
+            "usage: /settings subagent_timeout_secs SECONDS|0-for-unlimited",
+        )
+        .map(|value| ConfigChange::SubagentTimeoutSecs(value.to_string())),
         "context_window" => {
             one_value(&mut parts, "usage: /settings context_window TOKENS").map(|value| {
                 ConfigChange::ContextWindow {
@@ -436,7 +446,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- scroll_bar: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- scroll_bar: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -465,6 +475,16 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         },
         agent.config().max_subagents,
         agent.config().subagent_model,
+        if agent.config().subagent_request_budget == 0 {
+            "unlimited".to_string()
+        } else {
+            agent.config().subagent_request_budget.to_string()
+        },
+        if agent.config().subagent_timeout_secs == 0 {
+            "unlimited".to_string()
+        } else {
+            format!("{}s", agent.config().subagent_timeout_secs)
+        },
         agent.config().anthropic_base_url,
         agent.config().openai_base_url,
         if agent.config().anthropic_api_key.is_some() {
@@ -495,7 +515,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);
@@ -515,7 +535,9 @@ pub(super) fn one_value<'a>(
 }
 
 pub(super) fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
-    let sessions = match crate::session::list(&agent.config().sessions_dir()) {
+    let cwd = crate::config::working_dir();
+    let dirs = agent.config().session_dirs(&cwd);
+    let sessions = match crate::session::list(&dirs.project) {
         Ok(sessions) => sessions,
         Err(error) => {
             state.notice(format!("Could not list sessions: {error}"));
@@ -523,7 +545,7 @@ pub(super) fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
         }
     };
     if sessions.is_empty() {
-        state.notice("No saved sessions.");
+        state.notice("No saved sessions for this directory.");
         return;
     }
     state.picker = Some(Picker {
@@ -539,7 +561,7 @@ pub(super) fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
                 } else {
                     session.preview
                 },
-                description: session.id.clone(),
+                description: format!("{} · {}", session.model, session.id),
                 action: PickerAction::ResumeSession(session.id),
             })
             .collect(),
@@ -548,7 +570,14 @@ pub(super) fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
 }
 
 pub(super) fn resume(agent: &mut Agent, selector: &str, state: &mut ViewState) {
-    let sessions = match crate::session::list(&agent.config().sessions_dir()) {
+    if !selector.is_empty() && selector.parse::<usize>().is_err() {
+        load_session(agent, selector, state);
+        return;
+    }
+
+    let cwd = crate::config::working_dir();
+    let dirs = agent.config().session_dirs(&cwd);
+    let sessions = match crate::session::list(&dirs.project) {
         Ok(sessions) => sessions,
         Err(error) => {
             state.notice(format!("Could not list sessions: {error}"));
@@ -557,7 +586,7 @@ pub(super) fn resume(agent: &mut Agent, selector: &str, state: &mut ViewState) {
     };
     if selector.is_empty() {
         if sessions.is_empty() {
-            state.notice("No saved sessions.");
+            state.notice("No saved sessions for this directory.");
             return;
         }
         let mut text = String::from("Saved sessions\n\n");

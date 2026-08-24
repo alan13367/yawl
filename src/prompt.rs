@@ -5,12 +5,29 @@ use std::path::Path;
 
 pub(crate) fn build_system_prompt(global_dir: &Path, subagents: bool, print_mode: bool) -> String {
     let cwd = std::env::current_dir().ok();
-    build_system_prompt_from(cwd.as_deref(), global_dir, subagents, false, print_mode)
+    build_system_prompt_from(
+        cwd.as_deref(),
+        global_dir,
+        subagents,
+        false,
+        print_mode,
+        None,
+    )
 }
 
-pub(crate) fn build_subagent_system_prompt(global_dir: &Path) -> String {
+pub(crate) fn build_subagent_system_prompt(
+    global_dir: &Path,
+    role_fragment: Option<&str>,
+) -> String {
     let cwd = std::env::current_dir().ok();
-    build_system_prompt_from(cwd.as_deref(), global_dir, false, true, false)
+    build_system_prompt_from(
+        cwd.as_deref(),
+        global_dir,
+        false,
+        true,
+        false,
+        role_fragment,
+    )
 }
 
 fn build_system_prompt_from(
@@ -19,6 +36,7 @@ fn build_system_prompt_from(
     subagents: bool,
     is_subagent: bool,
     print_mode: bool,
+    role_fragment: Option<&str>,
 ) -> String {
     let cwd_display = cwd.map_or_else(
         || "(unknown)".to_string(),
@@ -57,7 +75,7 @@ Tools:
     }
     if subagents {
         let delivery = if print_mode {
-            "- Print mode has no automatic follow-up. Wait for every spawned child before finishing.\n"
+            "- Print mode delivers settled results automatically after the turn; you may still wait when your next step needs one.\n"
         } else {
             "- TUI results arrive automatically. Wait only when your next step depends on a result.\n"
         };
@@ -68,17 +86,27 @@ Tools:
 "#);
         prompt.push_str(delivery);
         prompt.push_str(
-            "- Use subagent_send for more model-directed work. Children do not see this conversation and cannot create subagents.\n</subagent_guidance>\n",
+            "- Use subagent_send for more model-directed work. Children do not see this conversation and cannot create subagents.\n\
+             - Write each spawn prompt as a contract: # Target (exact files and symbols, plus non-goals), # Change (steps), # Acceptance (observable result).\n\
+             - Set required_tools to every tool the task needs before choosing an agent. Use [] only when the child can answer without tools.\n\
+             - Omit agent to use the default child for any task that creates, edits, or deletes files, runs commands, tests, or builds, or otherwise needs a tool the preset does not advertise. File creation requires write_file; file modification requires edit_file or write_file.\n\
+             - Use agent=\"scout\" only to inspect exact existing files with read_file and return findings in its response. Never ask Scout to create or modify a file.\n\
+             - Decide interfaces between concurrent agents up front and restate them in every prompt.\n\
+             - Tell every agent to skip formatters, linters, and project-wide test suites; validate once yourself after all agents finish.\n\
+             - When a result will be large and must be written to disk, use the default child, include write_file in required_tools, and have it return the path with a summary.\n</subagent_guidance>\n",
         );
     }
     if is_subagent {
         prompt.push_str(
-            r#"
-<subagent_role>
-You are a background subagent working on one delegated task. You share the parent's working directory but not its conversation. Do not ask the user questions and do not create subagents. Preserve concurrent edits and do not revert work you did not make. Complete only the delegated task, verify it when possible, and return a concise result to the parent.
-</subagent_role>
-"#,
+            "\n<subagent_role>\nYou are a background subagent working on one delegated task. You share the parent's working directory but not its conversation. Do not ask the user questions and do not create subagents. Preserve concurrent edits and do not revert work you did not make. Project-wide validation is the parent's job: never run formatters, linters, or project-wide builds or test suites unless your task explicitly requires it; scoped proof of your own change is fine. Complete only the delegated task, verify it when possible, and return a concise result to the parent.\n",
         );
+        if let Some(fragment) = role_fragment.map(str::trim)
+            && !fragment.is_empty()
+        {
+            prompt.push_str(fragment);
+            prompt.push('\n');
+        }
+        prompt.push_str("</subagent_role>\n");
     }
     prompt
 }
@@ -130,8 +158,14 @@ mod tests {
     #[test]
     fn prompt_is_coding_focused_and_documents_extension_contract() {
         let dirs = TestDirs::new();
-        let prompt =
-            build_system_prompt_from(Some(&dirs.0), &dirs.0.join("global"), false, false, false);
+        let prompt = build_system_prompt_from(
+            Some(&dirs.0),
+            &dirs.0.join("global"),
+            false,
+            false,
+            false,
+            None,
+        );
         assert!(prompt.contains("expert coding agent"));
         assert!(prompt.contains("--describe"));
         assert!(prompt.contains("YAWL_SESSION_ID"));
@@ -152,7 +186,8 @@ mod tests {
         std::fs::write(project_dir.join("YAWL.md"), "legacy rule")
             .expect("legacy instructions should be written");
 
-        let prompt = build_system_prompt_from(Some(&project_dir), &global_dir, false, false, false);
+        let prompt =
+            build_system_prompt_from(Some(&project_dir), &global_dir, false, false, false, None);
         let global_position = prompt
             .find("global rule")
             .expect("global instructions should be present");
@@ -169,15 +204,58 @@ mod tests {
     #[test]
     fn orchestration_and_subagent_guidance_are_conditional() {
         let dirs = TestDirs::new();
-        let main = build_system_prompt_from(Some(&dirs.0), &dirs.0, true, false, false);
-        let child = build_system_prompt_from(Some(&dirs.0), &dirs.0, false, true, false);
-        let disabled = build_system_prompt_from(Some(&dirs.0), &dirs.0, false, false, false);
-        let print = build_system_prompt_from(Some(&dirs.0), &dirs.0, true, false, true);
+        let main = build_system_prompt_from(Some(&dirs.0), &dirs.0, true, false, false, None);
+        let child = build_system_prompt_from(Some(&dirs.0), &dirs.0, false, true, false, None);
+        let disabled = build_system_prompt_from(Some(&dirs.0), &dirs.0, false, false, false, None);
+        let print = build_system_prompt_from(Some(&dirs.0), &dirs.0, true, false, true, None);
 
         assert!(main.contains("<subagent_guidance>"));
         assert!(child.contains("<subagent_role>"));
         assert!(!child.contains("<subagent_guidance>"));
         assert!(!disabled.contains("subagent_guidance"));
-        assert!(print.contains("Wait for every spawned child"));
+        assert!(print.contains("Print mode delivers settled results automatically"));
+        assert!(
+            main.contains("# Target") && main.contains("# Change") && main.contains("# Acceptance"),
+            "the spawn prompt contract must be part of the guidance"
+        );
+        assert!(
+            main.contains("skip formatters, linters, and project-wide test suites"),
+            "the mid-flight validation ban must reach the main agent"
+        );
+        assert!(
+            main.contains("Set required_tools to every tool the task needs")
+                && main.contains("Never ask Scout to create or modify a file")
+                && main.contains("Omit agent to use the default child"),
+            "the parent must route write tasks away from read-only presets"
+        );
+        assert!(
+            child.contains("Project-wide validation is the parent's job"),
+            "the mid-flight validation ban must reach the child"
+        );
+    }
+
+    #[test]
+    fn role_fragment_is_appended_inside_the_role_block() {
+        let dirs = TestDirs::new();
+        let child = build_system_prompt_from(
+            Some(&dirs.0),
+            &dirs.0,
+            false,
+            true,
+            false,
+            Some("You are a scout: investigate and report paths."),
+        );
+
+        let block_start = child.find("<subagent_role>").expect("role block opens");
+        let block_end = child.find("</subagent_role>").expect("role block closes");
+        let fragment_at = child
+            .find("You are a scout: investigate and report paths.")
+            .expect("fragment is present");
+        assert!(
+            block_start < fragment_at && fragment_at < block_end,
+            "the preset fragment must land inside the role block"
+        );
+        let plain = build_subagent_system_prompt(&dirs.0, None);
+        assert!(!plain.contains("You are a scout"));
     }
 }

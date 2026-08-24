@@ -49,7 +49,10 @@ pub(super) struct ViewState {
     pub(super) subagents_enabled: bool,
     pub(super) subagent_manager: SubagentManager,
     pub(super) subagent_snapshots: Vec<SubagentSnapshot>,
+    /// Session-wide usage tokens across finished subagent runs.
+    pub(super) subagent_tokens: u64,
     pub(super) subagent_view: Option<SubagentView>,
+    pub(super) render_cache: super::render::RenderCache,
 }
 
 impl ViewState {
@@ -78,7 +81,9 @@ impl ViewState {
             subagents_enabled: agent.config().subagents,
             subagent_manager: agent.subagents(),
             subagent_snapshots: agent.subagents().snapshots(),
+            subagent_tokens: agent.subagents().total_child_tokens(),
             subagent_view: None,
+            render_cache: super::render::RenderCache::default(),
         }
     }
 
@@ -108,6 +113,13 @@ impl ViewState {
                     TranscriptEvent::RetryReset => self.activity.clone(),
                 };
                 self.transcript.apply(event);
+            }
+            Update::ToolPreparing { name } => {
+                self.activity = match name.as_str() {
+                    "write_file" => "preparing write".into(),
+                    "edit_file" => "preparing edit".into(),
+                    _ => "preparing tool".into(),
+                };
             }
             Update::Retrying {
                 attempt,
@@ -144,6 +156,9 @@ impl ViewState {
 
 pub(super) enum Update {
     Transcript(TranscriptEvent),
+    ToolPreparing {
+        name: String,
+    },
     Retrying {
         attempt: u32,
         delay_ms: u64,
@@ -183,6 +198,9 @@ impl Update {
                 error,
             },
             TurnEvent::AssistantDone => Self::Transcript(TranscriptEvent::AssistantDone),
+            TurnEvent::ToolPreparing { name } => Self::ToolPreparing {
+                name: name.to_string(),
+            },
             TurnEvent::ToolStart { name, args } => Self::Transcript(TranscriptEvent::ToolStart {
                 name: name.to_string(),
                 args: args.to_string(),

@@ -21,6 +21,10 @@ pub enum StreamNotice<'a> {
         kind: ReasoningKind,
         text: &'a str,
     },
+    /// The provider has selected a tool and is still streaming its arguments.
+    ToolPreparing {
+        name: &'a str,
+    },
     /// A retry is about to restart the request from scratch; the consumer
     /// must discard any partial text it displayed.
     RetryReset,
@@ -55,6 +59,7 @@ pub fn stream_turn(
                 sink(StreamNotice::ReasoningDelta { kind, text: &text });
                 super::append_reasoning(&mut out.reasoning, kind, &text);
             }
+            Event::ToolCallName(name) => sink(StreamNotice::ToolPreparing { name: &name }),
             Event::ToolCall(tc) => out.tool_calls.push(tc),
             Event::Usage {
                 input_tokens,
@@ -133,6 +138,7 @@ mod tests {
                 text: "complete thought".into(),
             });
             on_event(Event::TextDelta("complete".into()));
+            on_event(Event::ToolCallName("write_file".into()));
             on_event(Event::Usage {
                 input_tokens: 10,
                 output_tokens: 2,
@@ -161,6 +167,9 @@ mod tests {
             StreamNotice::ReasoningDelta { kind, text } => {
                 notices.push(format!("reasoning:{kind:?}:{text}"));
             }
+            StreamNotice::ToolPreparing { name } => {
+                notices.push(format!("preparing:{name}"));
+            }
             StreamNotice::RetryReset => notices.push("reset".into()),
             StreamNotice::Retrying { attempt, .. } => {
                 notices.push(format!("retry:{attempt}"));
@@ -178,7 +187,8 @@ mod tests {
                 "retry:1",
                 "reset",
                 "reasoning:Full:complete thought",
-                "text:complete"
+                "text:complete",
+                "preparing:write_file"
             ]
         );
         assert_eq!((output.input_tokens, output.output_tokens), (10, 2));

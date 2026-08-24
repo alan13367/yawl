@@ -189,10 +189,9 @@ pub(crate) fn available_models(config: &Config) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     use super::*;
-    use crate::config::{DEFAULT_MAX_TOKENS, OpenAiCompatibility};
+    use crate::config::OpenAiCompatibility;
 
     fn config() -> Config {
         let mut providers = HashMap::new();
@@ -215,27 +214,8 @@ mod tests {
             },
         );
         Config {
-            model: None,
-            anthropic_base_url: String::new(),
-            openai_base_url: String::new(),
-            max_tokens: DEFAULT_MAX_TOKENS,
-            reasoning_effort: None,
-            hide_reasoning: false,
-            accent_color: crate::config::UiColor::WHITE,
-            scroll_bar: true,
-            context_windows: HashMap::new(),
-            auto_compact: true,
-            compact_threshold: 0.85,
-            subagents: false,
-            max_subagents: crate::config::DEFAULT_MAX_SUBAGENTS,
-            subagent_model: crate::config::DEFAULT_SUBAGENT_MODEL.to_string(),
-            skill_dirs: Vec::new(),
             providers,
-            setup_skipped: false,
-            anthropic_api_key: None,
-            openai_api_key: None,
-            home_dir: PathBuf::new(),
-            project_dir: PathBuf::new(),
+            ..Config::test_default()
         }
     }
 

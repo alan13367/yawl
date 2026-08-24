@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::provider::ToolSpec;
-use crate::subagent::{RunOrigin, SubagentManager};
+use crate::subagent::presets::discover as discover_presets;
+use crate::subagent::{AgentPreset, RunOrigin, SubagentManager};
 
 pub use exec::DescribeCache;
 
@@ -47,6 +48,7 @@ struct SubagentContext {
     manager: SubagentManager,
     config: Config,
     parent_model: String,
+    presets: Vec<AgentPreset>,
 }
 
 struct ToolEntry {
@@ -118,13 +120,23 @@ impl Registry {
         parent_model: &str,
     ) -> Registry {
         let mut registry = Self::scan(config, cache);
-        registry.entries.extend(subagent_tools());
+        let (presets, warnings) = discover_presets(config);
+        registry.warnings.extend(warnings);
+        registry.entries.extend(subagent_tools(&presets));
         registry.subagents = Some(SubagentContext {
             manager,
             config: config.clone(),
             parent_model: parent_model.to_string(),
+            presets,
         });
         registry
+    }
+
+    /// Drops every entry whose name is not listed. Used for preset
+    /// subagents, whose tool allowlist is enforced at scan time.
+    pub(crate) fn retain_names(&mut self, names: &[String]) {
+        self.entries
+            .retain(|entry| names.contains(&entry.spec.name));
     }
 
     fn insert(&mut self, entry: ToolEntry) {
@@ -202,25 +214,64 @@ impl Registry {
         let result = match tool {
             SubagentTool::Spawn => {
                 let prompt = str_arg(args, "prompt").map_err(|error| error.content);
-                let name = str_arg(args, "name").map_err(|error| error.content);
+                let required_tools = string_array(args, "required_tools");
+                let name = match args.get("name") {
+                    Some(value) => value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "'name' must be a string when provided".to_string()),
+                    None => Ok(String::new()),
+                };
                 prompt.and_then(|prompt| {
-                    name.and_then(|name| {
-                        let model = match args.get("model") {
-                            Some(value) => Some(value.as_str().ok_or_else(|| {
-                                "'model' must be a string when provided".to_string()
-                            })?),
-                            None => None,
-                        };
-                        context
-                            .manager
-                            .spawn(
-                                context.config.clone(),
-                                &context.parent_model,
-                                name,
-                                prompt,
-                                model,
-                            )
-                            .map(|id| format!("started {id}"))
+                    required_tools.and_then(|required_tools| {
+                        name.and_then(|name| {
+                            let model = match args.get("model") {
+                                Some(value) => Some(value.as_str().ok_or_else(|| {
+                                    "'model' must be a string when provided".to_string()
+                                })?),
+                                None => None,
+                            };
+                            let preset: Option<&AgentPreset> = match args.get("agent") {
+                                Some(value) => {
+                                    let agent = value.as_str().ok_or_else(|| {
+                                        "'agent' must be a string when provided".to_string()
+                                    })?;
+                                    Some(
+                                        context
+                                            .presets
+                                            .iter()
+                                            .find(|preset| preset.name == agent)
+                                            .ok_or_else(|| {
+                                                format!(
+                                                    "unknown agent '{agent}'; available: {}",
+                                                    context
+                                                        .presets
+                                                        .iter()
+                                                        .map(|preset| preset.name.as_str())
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ")
+                                                )
+                                            })?,
+                                    )
+                                }
+                                None => None,
+                            };
+                            if let Some(preset) = preset {
+                                validate_preset_capabilities(preset, &required_tools)?;
+                            }
+                            let supplied_name = (!name.trim().is_empty()).then_some(name.as_str());
+                            context
+                                .manager
+                                .spawn(
+                                    context.config.clone(),
+                                    &context.parent_model,
+                                    supplied_name,
+                                    prompt,
+                                    model,
+                                    preset,
+                                )
+                                .map(|id| format!("started {id}"))
+                        })
                     })
                 })
             }
@@ -268,7 +319,7 @@ const RESERVED_TOOL_NAMES: &[&str] = &[
     "subagent_list",
 ];
 
-fn subagent_tools() -> Vec<ToolEntry> {
+fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
     let tool = |name: &str, description: &str, input_schema: Value, imp| ToolEntry {
         spec: ToolSpec {
             name: name.into(),
@@ -277,18 +328,54 @@ fn subagent_tools() -> Vec<ToolEntry> {
         },
         imp: ToolImpl::Subagent(imp),
     };
+    let available_agents = presets
+        .iter()
+        .map(|preset| {
+            let tools = preset
+                .tools
+                .as_ref()
+                .map_or_else(|| "all tools".to_string(), |tools| tools.join("+"));
+            format!("{} ({}): {}", preset.name, tools, preset.description)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let agent_names = presets
+        .iter()
+        .map(|preset| preset.name.clone())
+        .collect::<Vec<_>>();
+    let spawn_description = format!(
+        "Start a self-contained background coding subagent and return its ID immediately. \
+         Declare every tool the task needs in required_tools before choosing an agent. Omit agent \
+         unless the selected preset includes every required tool. In particular, scout is only for \
+         read-only inspection of existing files; any task that creates or modifies files must \
+         require write_file or edit_file and use the default agent. Write the prompt as a contract: \
+         # Target (exact files and symbols, plus non-goals), # Change (steps), # Acceptance \
+         (observable result). The agent must skip formatters, linters, and project-wide test suites. \
+         Available agents: {available_agents}."
+    );
     vec![
         tool(
             "subagent_spawn",
-            "Start a self-contained background coding subagent and return its ID immediately.",
+            &spawn_description,
             json!({
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string"},
+                    "required_tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 64,
+                        "description": "Every tool the delegated task must use. Use [] only when the child can answer directly without tools. File creation requires write_file; file modification requires edit_file or write_file."
+                    },
                     "name": {"type": "string"},
-                    "model": {"type": "string"}
+                    "model": {"type": "string"},
+                    "agent": {
+                        "type": "string",
+                        "enum": agent_names,
+                        "description": "Optional specialist preset. Omit this field for the default agent whenever the task needs a tool absent from the preset. Scout is read-only and cannot create or modify files."
+                    }
                 },
-                "required": ["prompt", "name"]
+                "required": ["prompt", "required_tools"]
             }),
             SubagentTool::Spawn,
         ),
@@ -341,6 +428,29 @@ fn subagent_tools() -> Vec<ToolEntry> {
             SubagentTool::List,
         ),
     ]
+}
+
+fn validate_preset_capabilities(
+    preset: &AgentPreset,
+    required_tools: &[String],
+) -> Result<(), String> {
+    let Some(allowed_tools) = &preset.tools else {
+        return Ok(());
+    };
+    let missing = required_tools
+        .iter()
+        .filter(|required| !allowed_tools.contains(required))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "agent '{}' does not provide required tool(s): {}; omit 'agent' to use the default agent or choose a compatible preset",
+            preset.name,
+            missing.join(", ")
+        ))
+    }
 }
 
 fn string_array(args: &Value, key: &str) -> Result<Vec<String>, String> {
@@ -564,26 +674,10 @@ mod tests {
     fn registry_config(home_dir: std::path::PathBuf, project_dir: std::path::PathBuf) -> Config {
         Config {
             model: Some("test".into()),
-            anthropic_base_url: String::new(),
-            openai_base_url: String::new(),
             max_tokens: 1,
-            reasoning_effort: None,
-            hide_reasoning: false,
-            accent_color: crate::config::UiColor::WHITE,
-            scroll_bar: true,
-            context_windows: std::collections::HashMap::new(),
-            auto_compact: true,
-            compact_threshold: 0.85,
-            subagents: false,
-            max_subagents: crate::config::DEFAULT_MAX_SUBAGENTS,
-            subagent_model: crate::config::DEFAULT_SUBAGENT_MODEL.to_string(),
-            skill_dirs: Vec::new(),
-            providers: std::collections::HashMap::new(),
-            setup_skipped: false,
-            anthropic_api_key: None,
-            openai_api_key: None,
             home_dir,
             project_dir,
+            ..Config::test_default()
         }
     }
 
@@ -713,6 +807,95 @@ fi
         );
         let _ = std::fs::remove_dir_all(root);
         Ok(())
+    }
+
+    #[test]
+    fn spawn_tool_lists_presets_and_takes_an_optional_agent() {
+        let root = temp_path("preset-spawn-tool");
+        let config = registry_config(root.join("home"), root.join("project"));
+        let manager = SubagentManager::new("session".into(), config.max_subagents);
+        let registry =
+            Registry::scan_with_subagents(&config, &mut DescribeCache::default(), manager, "test");
+
+        let spawn = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "subagent_spawn")
+            .expect("spawn tool present");
+        assert!(
+            spawn.description.contains("scout (read_file)"),
+            "the description should advertise bundled presets; got:\n{}",
+            spawn.description
+        );
+        assert!(spawn.description.contains("# Target"));
+        let required = spawn.input_schema.get("required").expect("required list");
+        assert_eq!(
+            required,
+            &json!(["prompt", "required_tools"]),
+            "name and agent are optional, but capability planning is required"
+        );
+        assert!(
+            spawn
+                .description
+                .contains("any task that creates or modifies files")
+        );
+        let properties = spawn
+            .input_schema
+            .get("properties")
+            .expect("properties object");
+        assert!(properties.get("agent").is_some());
+        assert!(properties.get("required_tools").is_some());
+        assert!(
+            properties["agent"]["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("Scout is read-only"))
+        );
+    }
+
+    #[test]
+    fn scout_rejects_spawn_tasks_that_require_file_writes() {
+        let root = temp_path("scout-write-capability");
+        let config = registry_config(root.join("home"), root.join("project"));
+        let manager = SubagentManager::new("session".into(), config.max_subagents);
+        let registry = Registry::scan_with_subagents(
+            &config,
+            &mut DescribeCache::default(),
+            manager.clone(),
+            "test",
+        );
+        let args = json!({
+            "agent": "scout",
+            "prompt": "Create short_story.txt and write a story into it.",
+            "required_tools": ["write_file"]
+        });
+
+        let outcome = registry.execute("subagent_spawn", &args.to_string(), "session");
+
+        assert!(outcome.is_error, "unexpected outcome: {}", outcome.content);
+        assert!(outcome.content.contains("scout"), "{}", outcome.content);
+        assert!(
+            outcome.content.contains("write_file"),
+            "{}",
+            outcome.content
+        );
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn retain_names_filters_the_registry_for_preset_children() {
+        let root = temp_path("preset-allowlist");
+        let config = registry_config(root.join("home"), root.join("project"));
+        let mut registry = Registry::scan(&config, &mut DescribeCache::default());
+
+        registry.retain_names(&["read_file".to_string(), "shell".to_string()]);
+
+        let mut names = registry
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["read_file", "shell"]);
     }
 
     #[test]

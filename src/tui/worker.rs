@@ -192,57 +192,63 @@ pub(super) fn pump_events<R: Read, T>(
             Err(TryRecvError::Empty) => {}
         }
         terminal.draw(state, editor)?;
-        let event = events.read_event()?;
-        if matches!(&event, Event::Tick) && crate::interrupted() {
-            state.subagent_manager.interrupt_all();
-            cancel_worker(worker.thread, &worker.cancellation, state);
-            crate::set_interrupted(false);
-        }
-        if state.subagent_view.is_some() {
-            super::subagents::handle_event(state, editor, event);
-            continue;
-        }
-        if state.picker.is_some() {
+        let mut event = events.read_event()?;
+        loop {
+            if matches!(&event, Event::Tick) && crate::interrupted() {
+                state.subagent_manager.interrupt_all();
+                cancel_worker(worker.thread, &worker.cancellation, state);
+                crate::set_interrupted(false);
+            }
+            if state.subagent_view.is_some() {
+                super::subagents::handle_event(state, editor, event);
+                break;
+            }
+            if state.picker.is_some() {
+                match event {
+                    Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
+                    Event::Key(key) => {
+                        if let Some(action) = take_picker_action(state, editor, key) {
+                            activate_picker_action_while_busy(
+                                state,
+                                action,
+                                active_pickers,
+                                active_config,
+                            );
+                        }
+                    }
+                    Event::Paste(text) if picker_is_editing(state) => editor.paste(&text),
+                    Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
+                    Event::Tick => advance_ticks(state),
+                    Event::MouseScroll(_) | Event::Paste(_) => {}
+                }
+                break;
+            }
             match event {
+                Event::Tick => {
+                    advance_ticks(state);
+                }
+                Event::MouseScroll(amount) => scroll(state, amount),
+                Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
+                Event::Paste(text) => editor.paste(&text),
+                Event::Key(key) if is_cancel_key(key) => {
+                    cancel_worker(worker.thread, &worker.cancellation, state)
+                }
                 Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
+                Event::Key(Key::Ctrl('o')) => toggle_tool_expansion(state),
+                Event::Key(Key::PageUp) => scroll(state, 10),
+                Event::Key(Key::PageDown) => scroll(state, -10),
                 Event::Key(key) => {
-                    if let Some(action) = take_picker_action(state, editor, key) {
-                        activate_picker_action_while_busy(
-                            state,
-                            action,
-                            active_pickers,
-                            active_config,
-                        );
+                    if handle_completion_key(state, editor, key) {
+                        // Keep accepting and completing input while the agent runs.
+                    } else if let EditAction::Submit(input) = editor.handle_key(key) {
+                        handle_submission_while_busy(input, state, active_pickers);
                     }
                 }
-                Event::Paste(text) if picker_is_editing(state) => editor.paste(&text),
-                Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
-                Event::Tick => advance_ticks(state),
-                Event::MouseScroll(_) | Event::Paste(_) => {}
             }
-            continue;
-        }
-        match event {
-            Event::Tick => {
-                advance_ticks(state);
+            if !events.has_pending() {
+                break;
             }
-            Event::MouseScroll(amount) => scroll(state, amount),
-            Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
-            Event::Paste(text) => editor.paste(&text),
-            Event::Key(key) if is_cancel_key(key) => {
-                cancel_worker(worker.thread, &worker.cancellation, state)
-            }
-            Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
-            Event::Key(Key::Ctrl('o')) => toggle_tool_expansion(state),
-            Event::Key(Key::PageUp) => scroll(state, 10),
-            Event::Key(Key::PageDown) => scroll(state, -10),
-            Event::Key(key) => {
-                if handle_completion_key(state, editor, key) {
-                    // Keep accepting and completing input while the agent runs.
-                } else if let EditAction::Submit(input) = editor.handle_key(key) {
-                    handle_submission_while_busy(input, state, active_pickers);
-                }
-            }
+            event = events.read_event()?;
         }
     }
 }

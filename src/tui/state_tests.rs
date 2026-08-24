@@ -43,8 +43,10 @@ fn state_with(geometry: Option<ScrollGeometry>) -> ViewState {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        render_cache: super::render::RenderCache::default(),
     }
 }
 

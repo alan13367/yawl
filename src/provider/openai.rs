@@ -221,15 +221,24 @@ impl Decoder {
         if let Some(calls) = delta["tool_calls"].as_array() {
             for call in calls {
                 let index = call["index"].as_u64().unwrap_or(0);
-                let entry = self.pending_call(index);
-                if let Some(id) = call["id"].as_str() {
-                    entry.id.push_str(id);
-                }
-                if let Some(name) = call["function"]["name"].as_str() {
-                    entry.name.push_str(name);
-                }
-                if let Some(arguments) = call["function"]["arguments"].as_str() {
-                    entry.arguments.push_str(arguments);
+                let name_part = call["function"]["name"].as_str();
+                let preparing_name = {
+                    let entry = self.pending_call(index);
+                    if let Some(id) = call["id"].as_str() {
+                        entry.id.push_str(id);
+                    }
+                    if let Some(name) = name_part {
+                        entry.name.push_str(name);
+                    }
+                    if let Some(arguments) = call["function"]["arguments"].as_str() {
+                        entry.arguments.push_str(arguments);
+                    }
+                    name_part
+                        .filter(|part| !part.is_empty())
+                        .map(|_| entry.name.clone())
+                };
+                if let Some(name) = preparing_name {
+                    on_event(Event::ToolCallName(name));
                 }
             }
         }
@@ -464,20 +473,21 @@ mod tests {
             } if text == "think"
         ));
         assert!(matches!(&events[1], Event::TextDelta(text) if text == "hello"));
+        assert!(matches!(&events[2], Event::ToolCallName(name) if name == "shell"));
         assert!(matches!(
-            &events[2],
+            &events[3],
             Event::ToolCall(call)
                 if call.id == "call_1"
                     && call.name == "shell"
                     && call.arguments == r#"{"command":"pwd"}"#
         ));
         assert!(matches!(
-            events[3],
+            events[4],
             Event::Usage {
                 input_tokens: 11,
                 output_tokens: 5
             }
         ));
-        assert!(matches!(events[4], Event::Done));
+        assert!(matches!(events[5], Event::Done));
     }
 }

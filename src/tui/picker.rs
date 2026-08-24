@@ -13,7 +13,7 @@ pub(super) const SETTINGS_ACCENT_COLOR_INDEX: usize = 4;
 pub(super) const SETTINGS_SCROLL_BAR_INDEX: usize = 5;
 pub(super) const SETTINGS_AUTO_COMPACT_INDEX: usize = 6;
 pub(super) const SETTINGS_SUBAGENTS_INDEX: usize = 13;
-pub(super) const SETTINGS_RELOAD_INDEX: usize = 16;
+pub(super) const SETTINGS_RELOAD_INDEX: usize = 18;
 
 #[derive(Clone)]
 pub(super) enum PickerAction {
@@ -335,6 +335,33 @@ pub(super) fn settings_picker(agent: &Agent) -> Picker {
                 action: PickerAction::EditSetting {
                     key: "subagent_model".into(),
                     initial: agent.config().subagent_model.clone(),
+                },
+            },
+            PickerItem {
+                label: "Subagent request budget".into(),
+                description: if agent.config().subagent_request_budget == 0 {
+                    "unlimited".into()
+                } else {
+                    format!(
+                        "{} requests per run",
+                        agent.config().subagent_request_budget
+                    )
+                },
+                action: PickerAction::EditSetting {
+                    key: "subagent_request_budget".into(),
+                    initial: agent.config().subagent_request_budget.to_string(),
+                },
+            },
+            PickerItem {
+                label: "Subagent timeout".into(),
+                description: if agent.config().subagent_timeout_secs == 0 {
+                    "unlimited".into()
+                } else {
+                    format!("{}s per run", agent.config().subagent_timeout_secs)
+                },
+                action: PickerAction::EditSetting {
+                    key: "subagent_timeout_secs".into(),
+                    initial: agent.config().subagent_timeout_secs.to_string(),
                 },
             },
             PickerItem {

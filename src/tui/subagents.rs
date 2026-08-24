@@ -92,6 +92,7 @@ fn empty_dashboard_message(subagents_enabled: bool) -> &'static str {
 
 pub(super) fn refresh(state: &mut ViewState) {
     state.subagent_snapshots = state.subagent_manager.snapshots();
+    state.subagent_tokens = state.subagent_manager.total_child_tokens();
     let Some(SubagentView::Dashboard {
         selected_id,
         selected_index,
@@ -413,10 +414,15 @@ fn render_dashboard(
             .checked_div(snapshot.context_window)
             .unwrap_or(0);
         let model = crate::subagent::sanitize_preview(&snapshot.model, 1024);
+        let name = if snapshot.agent == "default" {
+            snapshot.name.clone()
+        } else {
+            format!("{} · {}", snapshot.name, snapshot.agent)
+        };
         let line = format!(
             "{marker} {square} {:<10} {} · {}  {}  {}% {}/{}  {}  q{}",
             snapshot.status.label(),
-            snapshot.name,
+            name,
             snapshot.id,
             model,
             percentage,
@@ -647,6 +653,7 @@ mod tests {
         let mut snapshot = SubagentSnapshot::new(
             SubagentId::new(1),
             "narrow dashboard row".into(),
+            "default".into(),
             "inspect the project".into(),
             "test:model".into(),
             100,
@@ -686,9 +693,11 @@ mod tests {
             completion_index: 0,
             picker: None,
             subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+            subagent_tokens: 0,
             subagent_snapshots: vec![snapshot()],
             subagents_enabled: false,
             subagent_view: Some(view),
+            render_cache: crate::tui::render::RenderCache::default(),
         }
     }
 

@@ -84,14 +84,14 @@ Messages submitted during an active response are queued automatically. Each pend
 | `/skills` | List discovered skills and their search directories |
 | `/skill:NAME [ARGS]` | Run a discovered Markdown skill |
 | `/subagents` | Open the full-screen subagent dashboard and takeover view, or print a note in the chat when nothing is running |
-| `/resume [ID\|NUMBER]` | Open the session picker, or resume directly by ID or number |
+| `/resume [ID\|NUMBER]` | Open the session picker scoped to the current directory, or resume directly by ID or number |
 | `/unqueue [NUMBER\|all]` | Open the queued-message picker, remove one pending message, or clear the queue |
 | `/help` | Show terminal controls and commands |
-| `/quit` | Exit the terminal interface and print `yawl --session ID` |
+| `/quit` | Exit the terminal interface and print `yawl --session ID` (resumable from any directory) |
 
 ## Models and configuration
 
-Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`. Project values override global values. Every field is optional. If the merged config has no `model`, interactive startup runs onboarding unless setup was skipped; print mode requires `--model`. Values are validated at load with the same rules `/settings` enforces: `max_tokens` and context windows must be positive integers, `compact_threshold` must be between 0.1 and 0.99, `max_subagents` must be between 1 and 16, and `reasoning_effort` must be a supported level. An out-of-range value fails startup with the file and field named instead of being silently clamped, and the error points at `yawl --doctor`.
+Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`. Project values override global values. Every field is optional. If the merged config has no `model`, interactive startup runs onboarding unless setup was skipped; print mode requires `--model`. Values are validated at load with the same rules `/settings` enforces: `max_tokens` and context windows must be positive integers, `compact_threshold` must be between 0.1 and 0.99, `max_subagents` must be between 1 and 16, `subagent_request_budget` must be between 0 and 1000, `subagent_timeout_secs` must be between 0 and 86400, and `reasoning_effort` must be a supported level. An out-of-range value fails startup with the file and field named instead of being silently clamped, and the error points at `yawl --doctor`.
 
 ```json
 {
@@ -108,6 +108,8 @@ Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`
   "subagents": false,
   "max_subagents": 3,
   "subagent_model": "inherit",
+  "subagent_request_budget": 200,
+  "subagent_timeout_secs": 0,
   "context_windows": {
     "omlx:Qwen3-Coder": 65536
   }
@@ -205,17 +207,17 @@ When stdin is a terminal, the doctor offers to repair what it can, one fix at a 
 - reset an out-of-range value to its default, such as `compact_threshold` to `0.85`
 - remove a key whose type or value the loader rejects, narrowed to the smallest path that restores loading
 - rename a malformed file aside as `config.json.invalid-<timestamp>` so defaults regenerate
-- restore the newest `config.json.bak-*` or `config.json.invalid-*` file over the live config
+- restore the newest loadable `config.json.bak-*` file over the live config; quarantined `invalid-*` files are never offered
 - restrict file permissions to `0600`
 - drop `$ENV_VAR` key references whose variable is unset, and `skill_dirs` entries that no longer exist
 
-Each repair asks `y/N`, and `a` applies the remaining fixes. A file is backed up to `config.json.bak-<timestamp>` before its first edit, and the checks run again afterward so the final report matches the disk.
+Each repair asks `y/N`, and `a` applies the remaining fixes. Restoring a backup always asks separately and first preserves the live file. A file is backed up to `config.json.bak-<timestamp>` before its first edit, and the checks run again afterward so the final report matches the disk.
 
 The doctor also reports problems it will not touch automatically: a `model` naming an unknown provider, a provider with no base URL, a missing key for the model in use (fix with `yawl --setup`), a missing Codex login (fix with `yawl --login openai-codex`), project values overriding global ones, and unknown keys, which are kept on write.
 
 ## Sessions and compaction
 
-Yawl stores append-only JSONL session files in `~/.yawl/sessions/`. Each user message, assistant response, reasoning block, tool result, and compaction event is written as it happens. The original history remains in the log after compaction. `/new` starts a blank session without changing the current working directory. Leaving the terminal interface prints `yawl --session ID` so you can resume that conversation.
+Yawl stores append-only JSONL session files in `~/.yawl/sessions/projects/<project-key>/<id>.jsonl`, scoped to the canonical working directory. The first line records the session ID, creation timestamp, working directory, and model. Both `-c` (`--continue`) and the `/resume` picker list sessions only for the active working directory. Passing `--session ID` or `/resume ID` searches the current and other project directories, so an ID can be resumed from any directory. Session IDs must be unique across project directories; Yawl reports duplicate matches as ambiguous instead of choosing one. Each user message, assistant response, reasoning block, tool result, and compaction event is written as it happens. The original history remains in the log after compaction. `/new` starts a blank session without changing the current working directory. Leaving the terminal interface prints `yawl --session ID` so you can resume that conversation.
 
 Yawl checks the last provider-reported token usage before each request. At the configured threshold, 85 percent by default, it asks the current model to summarize the older conversation and keeps roughly the last ten messages unchanged. Use `/compact` to do this manually. If automatic compaction fails, Yawl shows a warning and continues without compacting; the next request may still fit.
 
@@ -227,23 +229,42 @@ Subagents are off by default. Enable them from the settings picker or with these
 /settings subagents on
 /settings max_subagents 3
 /settings subagent_model inherit
+/settings subagent_request_budget 200
+/settings subagent_timeout_secs 0
 ```
 
-`subagent_model` accepts `inherit` or a model ID. A model supplied to one spawn wins over this setting. `inherit` records the main agent's current model when the child starts. Lowering `max_subagents` does not cancel active work. It blocks new starts until the running count falls below the new limit.
+`subagent_model` accepts `inherit` or a model ID. A model supplied to one spawn wins over this setting, and a preset's model sits between them. `inherit` records the main agent's current model when the child starts. Lowering `max_subagents` does not cancel active work. It blocks new starts until the running count falls below the new limit.
+
+`subagent_request_budget` caps the model requests a child may spend on one run. At the limit the child receives a wrap-up instruction; at 1.5 times the limit the run stops and whatever it produced is delivered with a `[cancelled after N requests]` marker. `0` disables the cap. `subagent_timeout_secs` is an optional wall clock per run with the same stop-and-salvage behavior; `0`, the default, disables it.
 
 When enabled, the main model receives five tools:
 
-- `subagent_spawn` starts a named background task and returns its `sa-N` ID.
+- `subagent_spawn` starts a background task and returns its `sa-N` ID. `prompt` and `required_tools` are required; the latter declares every tool the task needs before an optional preset is selected. The name is generated when omitted, and an invalid model fails the call instead of the run.
 - `subagent_send` queues another turn or restarts a settled child with its retained conversation.
 - `subagent_wait` waits for selected IDs without canceling unfinished work on timeout. Every settled run reports its complete final response.
-- `subagent_cancel` cancels selected runs and clears their queued messages.
+- `subagent_cancel` cancels selected runs and clears their queued messages. A cancelled run delivers any last activity it produced, labeled with its request count.
 - `subagent_list` returns compact rows or detailed status and the complete latest result for one ID.
 
 Yawl permits up to 16 active subagents and retains up to 64 tracked entries. Settled entries do not use active capacity. Each child has memory-only history, shares the working directory, receives the global and project `AGENTS.md` files, and cannot create more subagents. Executable tools cannot claim the reserved orchestration names.
 
-Model-originated results arrive as one automatic follow-up after the main turn becomes idle, and every delivery carries the run's complete final response. An explicit wait consumes matching results and reports each settled run in full, so Yawl does not deliver anything twice. Print mode does not start automatic follow-ups, so its prompt asks the model to wait before finishing. Print mode cancels remaining workers on exit.
+Model-originated results arrive as one automatic follow-up after the main turn becomes idle, and every delivery carries the run's complete final response. An explicit wait consumes matching results and reports each settled run in full, so Yawl does not deliver anything twice. Print mode pumps settled results and waits for still-running children after the main turn, so nothing is lost at exit. A failed child reports its error prefixed with the model that produced it. The status bar adds up child usage tokens across the session next to the running counts. Interrupting the main turn also cancels every subagent with delivery suppressed; use the dashboard for targeted cancels instead.
 
-Run `/subagents` to open the dashboard, including while the main model is busy. When no subagents are tracked, the command prints a note in the chat instead: it says how to enable subagents when they are off, and that the dashboard opens once the model spawns one. Arrow keys or `j` and `k` move between rows, Enter opens a takeover, `x` asks to cancel the selected run, and Escape closes the dashboard. The takeover shows the bounded transcript, live reasoning and answer text, tool previews, errors, and queued messages. Enter sends a private message, the arrow keys and Page Up/Page Down scroll, Ctrl+C asks to cancel the child, and Escape returns to the dashboard. Scrolling up holds the view in place while the child keeps generating; scrolling back to the bottom resumes following new output. Private takeover messages and results stay out of the main transcript.
+### Agent presets
+
+`subagent_spawn` accepts an optional `agent` naming a preset that pins the child's model, tool set, and an extra role instruction. Yawl rejects the spawn when `required_tools` names a tool the preset does not provide. Yawl bundles `scout`, a read-only investigator limited to `read_file`, and the default child uses every tool. Tasks that create or modify files must declare `write_file` or `edit_file` and omit `agent` so they use the default child. Presets load from JSON files in `~/.yawl/agents/` and `./.yawl/agents/` (project files win by name, and either can replace the bundled `scout`):
+
+```json
+{
+  "description": "Fast review pass over a diff",
+  "model": "inherit",
+  "tools": ["read_file"],
+  "prompt": "Review only. Report findings with paths; do not edit files."
+}
+```
+
+All fields are optional. `model` follows the usual precedence when omitted or `inherit`; `tools` grants everything when omitted; `prompt` is appended to the child's role block. The preset name comes from the file name and must use ASCII letters, digits, `_`, or `-`. Malformed files are skipped with a warning shown by `/tools`.
+
+Run `/subagents` to open the dashboard, including while the main model is busy. When no subagents are tracked, the command prints a note in the chat instead: it says how to enable subagents when they are off, and that the dashboard opens once the model spawns one. Arrow keys or `j` and `k` move between rows, Enter opens a takeover, `x` asks to cancel the selected run, and Escape closes the dashboard. Rows show the preset after the name for non-default agents. The takeover shows the bounded transcript, live reasoning and answer text, tool previews, errors, and queued messages. Enter sends a private message, the arrow keys and Page Up/Page Down scroll, Ctrl+C asks to cancel the child, and Escape returns to the dashboard. Scrolling up holds the view in place while the child keeps generating; scrolling back to the bottom resumes following new output. Private takeover messages and results stay out of the main transcript.
 
 ## Builtin tools
 
@@ -335,7 +356,7 @@ Yawl stays in one Cargo package. Stable facade modules keep callers independent 
 
 - `src/main.rs` coordinates startup. `src/cli.rs` and `src/print_mode.rs` contain the two binary frontends.
 - `src/agent.rs` owns the reusable provider and tool conversation loop. The persistent main agent and memory-only subagents both use it.
-- `src/subagent/` contains typed snapshots, capacity accounting, worker lifecycles, deferred delivery, cancellation, and retained conversations.
+- `src/subagent/` contains typed snapshots, capacity accounting, worker lifecycles, deferred delivery, cancellation, retained conversations, generated handles, request budgets, and JSON agent presets.
 - `src/cancellation.rs` binds cancellation tokens to worker threads while preserving process-wide SIGINT handling.
 - `src/provider/mod.rs` re-exports the provider-neutral protocol. Private modules contain streaming retries, provider resolution, and SSE/HTTP support. Codex OAuth and Responses handling live separately under `src/provider/codex/`.
 - `src/config.rs` exposes the effective configuration. Its child modules separate runtime types, persisted schema, loading and merging, storage, and validated changes.

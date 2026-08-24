@@ -62,7 +62,9 @@ use self::completion::Completion;
 #[cfg(test)]
 use self::picker::{ActivePickers, Picker, PickerAction, PickerItem, color_picker, render_picker};
 #[cfg(test)]
-use self::render::{build_frame, render_entries, render_loading_state, render_queued_panel};
+use self::render::{
+    RenderCache, build_frame, render_entries, render_loading_state, render_queued_panel,
+};
 #[cfg(test)]
 use self::state::Update;
 #[cfg(test)]
@@ -115,7 +117,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                 }
                 Err(error) => state.notice(format!("Subagent result follow-up failed: {error}")),
             }
-            state.transcript = Transcript::from_messages(agent.messages());
+            rebuild_transcript_after_deferred_follow_up(&mut state, agent.messages());
             state.activity.clear();
             terminal.draw(&mut state, &editor)?;
             continue;
@@ -141,73 +143,87 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
             continue;
         }
 
-        let event = events.read_event()?;
-        if matches!(&event, Event::Tick) && crate::interrupted() {
-            state.subagent_manager.interrupt_all();
-            crate::set_interrupted(false);
-            if !editor.is_empty() {
-                editor.clear();
-            }
-            state.activity = "input cleared".into();
-        }
-        if state.subagent_view.is_some() {
-            subagents::handle_event(&mut state, &mut editor, event);
-            terminal.draw(&mut state, &editor)?;
-            continue;
-        }
-        if state.picker.is_some() {
-            match event {
-                Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
-                Event::Key(key) => {
-                    if let Some(action) = take_picker_action(&mut state, &mut editor, key) {
-                        activate_picker_action(agent, &mut state, action);
-                    }
+        let mut event = events.read_event()?;
+        loop {
+            if matches!(&event, Event::Tick) && crate::interrupted() {
+                state.subagent_manager.interrupt_all();
+                crate::set_interrupted(false);
+                if !editor.is_empty() {
+                    editor.clear();
                 }
-                Event::Paste(text) if picker_is_editing(&state) => editor.paste(&text),
-                Event::Mouse(mouse) => handle_mouse_selection(&mut terminal, &mut state, mouse)?,
-                Event::Tick => advance_ticks(&mut state),
-                Event::MouseScroll(_) | Event::Paste(_) => {}
-            }
-            terminal.draw(&mut state, &editor)?;
-            continue;
-        }
-        match event {
-            Event::Tick => {
-                advance_ticks(&mut state);
-            }
-            Event::MouseScroll(amount) => scroll(&mut state, amount),
-            Event::Mouse(mouse) => handle_mouse_selection(&mut terminal, &mut state, mouse)?,
-            Event::Paste(text) => {
-                editor.paste(&text);
-                state.scroll_offset = 0;
-            }
-            Event::Key(Key::PageUp) => scroll(&mut state, 10),
-            Event::Key(Key::PageDown) => scroll(&mut state, -10),
-            Event::Key(Key::Ctrl('c')) => {
-                editor.clear();
                 state.activity = "input cleared".into();
             }
-            Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
-            Event::Key(Key::Ctrl('o')) => toggle_tool_expansion(&mut state),
-            Event::Key(key) => {
-                if handle_completion_key(&mut state, &mut editor, key) {
-                    // The completion menu consumed navigation or Tab.
-                } else if let EditAction::Submit(input) = editor.handle_key(key)
-                    && handle_submission(
-                        agent,
-                        input,
-                        &mut state,
-                        &mut editor,
-                        &mut terminal,
-                        &mut events,
-                    )?
-                {
-                    return Ok(());
+            if state.subagent_view.is_some() {
+                subagents::handle_event(&mut state, &mut editor, event);
+                break;
+            }
+            if state.picker.is_some() {
+                match event {
+                    Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
+                    Event::Key(key) => {
+                        if let Some(action) = take_picker_action(&mut state, &mut editor, key) {
+                            activate_picker_action(agent, &mut state, action);
+                        }
+                    }
+                    Event::Paste(text) if picker_is_editing(&state) => editor.paste(&text),
+                    Event::Mouse(mouse) => {
+                        handle_mouse_selection(&mut terminal, &mut state, mouse)?
+                    }
+                    Event::Tick => advance_ticks(&mut state),
+                    Event::MouseScroll(_) | Event::Paste(_) => {}
+                }
+                break;
+            }
+            match event {
+                Event::Tick => {
+                    advance_ticks(&mut state);
+                }
+                Event::MouseScroll(amount) => scroll(&mut state, amount),
+                Event::Mouse(mouse) => handle_mouse_selection(&mut terminal, &mut state, mouse)?,
+                Event::Paste(text) => {
+                    editor.paste(&text);
+                    state.scroll_offset = 0;
+                }
+                Event::Key(Key::PageUp) => scroll(&mut state, 10),
+                Event::Key(Key::PageDown) => scroll(&mut state, -10),
+                Event::Key(Key::Ctrl('c')) => {
+                    editor.clear();
+                    state.activity = "input cleared".into();
+                }
+                Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
+                Event::Key(Key::Ctrl('o')) => toggle_tool_expansion(&mut state),
+                Event::Key(key) => {
+                    if handle_completion_key(&mut state, &mut editor, key) {
+                        // The completion menu consumed navigation or Tab.
+                    } else if let EditAction::Submit(input) = editor.handle_key(key)
+                        && handle_submission(
+                            agent,
+                            input,
+                            &mut state,
+                            &mut editor,
+                            &mut terminal,
+                            &mut events,
+                        )?
+                    {
+                        return Ok(());
+                    }
                 }
             }
+            if !events.has_pending() {
+                break;
+            }
+            event = events.read_event()?;
         }
         terminal.draw(&mut state, &editor)?;
     }
+}
+
+fn rebuild_transcript_after_deferred_follow_up(
+    state: &mut ViewState,
+    messages: &[crate::provider::Message],
+) {
+    state.transcript = Transcript::from_messages(messages);
+    state.render_cache.invalidate();
 }
 
 fn handle_submission<R: Read>(

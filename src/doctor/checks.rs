@@ -32,6 +32,8 @@ const KNOWN_KEYS: &[&str] = &[
     "subagents",
     "max_subagents",
     "subagent_model",
+    "subagent_request_budget",
+    "subagent_timeout_secs",
     "skill_dirs",
     "providers",
     "setup",
@@ -49,11 +51,18 @@ pub(super) fn run(paths: &Paths) -> Vec<Finding> {
     }
     check_backups(paths, &mut findings);
     check_auth(paths, &mut findings);
-    // A missing project config is normal; only the global file is required.
-    if let Some(global_map) = &global {
+    // Missing files contribute no values. Broken files suppress merged checks
+    // until their file-level finding is repaired.
+    let global_usable = global.is_some() || !paths.global.exists();
+    let project_usable = project.is_some() || !paths.project.exists();
+    if global_usable && project_usable && (global.is_some() || project.is_some()) {
         let empty = Map::new();
-        let project_map = project.as_ref().unwrap_or(&empty);
-        cross_checks(paths, global_map, project_map, &mut findings);
+        cross_checks(
+            paths,
+            global.as_ref().unwrap_or(&empty),
+            project.as_ref().unwrap_or(&empty),
+            &mut findings,
+        );
     }
     findings
 }
@@ -205,11 +214,11 @@ fn semantic_checks(
         ));
     }
     if let Some(threshold) = map.get("compact_threshold").and_then(Value::as_f64)
-        && (!threshold.is_finite() || !(0.1..=0.99).contains(&threshold))
+        && config::validate_bounded(threshold, 0.1, 0.99, "compact_threshold").is_err()
     {
         findings.push(error(
             area,
-            "compact_threshold must be between 0.1 and 0.99".into(),
+            config::bounded_message("compact_threshold", 0.1, 0.99),
             Some(set(
                 path,
                 ["compact_threshold"],
@@ -241,11 +250,11 @@ fn semantic_checks(
         }
     }
     if let Some(limit) = map.get("max_subagents").and_then(Value::as_u64)
-        && !(1..=16).contains(&limit)
+        && config::validate_bounded(limit, 1, 16, "max_subagents").is_err()
     {
         findings.push(error(
             area,
-            "max_subagents must be between 1 and 16".into(),
+            config::bounded_message("max_subagents", 1, 16),
             Some(set(
                 path,
                 ["max_subagents"],
@@ -263,6 +272,52 @@ fn semantic_checks(
                 path,
                 ["subagent_model"],
                 json!(config::DEFAULT_SUBAGENT_MODEL),
+            )),
+        ));
+    }
+    if let Some(budget) = map.get("subagent_request_budget").and_then(Value::as_u64)
+        && config::validate_bounded(
+            budget,
+            0,
+            config::MAX_SUBAGENT_REQUEST_BUDGET as u64,
+            "subagent_request_budget",
+        )
+        .is_err()
+    {
+        findings.push(error(
+            area,
+            config::bounded_message(
+                "subagent_request_budget",
+                0,
+                config::MAX_SUBAGENT_REQUEST_BUDGET,
+            ),
+            Some(set(
+                path,
+                ["subagent_request_budget"],
+                json!(config::DEFAULT_SUBAGENT_REQUEST_BUDGET),
+            )),
+        ));
+    }
+    if let Some(timeout) = map.get("subagent_timeout_secs").and_then(Value::as_u64)
+        && config::validate_bounded(
+            timeout,
+            0,
+            config::MAX_SUBAGENT_TIMEOUT_SECS,
+            "subagent_timeout_secs",
+        )
+        .is_err()
+    {
+        findings.push(error(
+            area,
+            config::bounded_message(
+                "subagent_timeout_secs",
+                0,
+                config::MAX_SUBAGENT_TIMEOUT_SECS,
+            ),
+            Some(set(
+                path,
+                ["subagent_timeout_secs"],
+                json!(config::DEFAULT_SUBAGENT_TIMEOUT_SECS),
             )),
         ));
     }
@@ -293,7 +348,9 @@ fn semantic_checks(
                 ));
             }
             if let Some(models) = provider.get("models").and_then(Value::as_array) {
-                for (index, model) in models.iter().enumerate() {
+                // Findings are applied in report order. Remove higher indexes
+                // first so earlier removals cannot shift later targets.
+                for (index, model) in models.iter().enumerate().rev() {
                     if model.get("contextWindow").and_then(Value::as_u64) == Some(0) {
                         findings.push(error(
                             area,
@@ -344,18 +401,28 @@ fn check_env_references(
     findings: &mut Vec<Finding>,
 ) {
     let mut check = |keys: Vec<&str>, value: &str| {
-        let Some(name) = referenced_variable(value) else {
-            return;
+        let names = match referenced_variables(value) {
+            Ok(names) => names,
+            Err(message) => {
+                findings.push(error(
+                    area,
+                    format!("{} has {message}", keys.join(".")),
+                    None,
+                ));
+                return;
+            }
         };
-        if std::env::var(name).is_err() {
-            findings.push(error(
-                area,
-                format!("{} references {name}, which is not set", keys.join(".")),
-                Some(Fix::RemoveKey {
-                    path: path.to_path_buf(),
-                    keys: keys.iter().map(|key| (*key).to_string()).collect(),
-                }),
-            ));
+        for name in names {
+            if std::env::var(&name).is_err() {
+                findings.push(error(
+                    area,
+                    format!("{} references {name}, which is not set", keys.join(".")),
+                    Some(Fix::RemoveKey {
+                        path: path.to_path_buf(),
+                        keys: keys.iter().map(|key| (*key).to_string()).collect(),
+                    }),
+                ));
+            }
         }
     };
     for key in ["anthropic_api_key", "openai_api_key"] {
@@ -368,16 +435,66 @@ fn check_env_references(
             if let Some(value) = provider.get("api_key").and_then(Value::as_str) {
                 check(vec!["providers", name, "api_key"], value);
             }
+            if let Some(headers) = provider.get("headers").and_then(Value::as_object) {
+                for (header, value) in headers {
+                    if let Some(value) = value.as_str() {
+                        check(vec!["providers", name, "headers", header], value);
+                    }
+                }
+            }
         }
     }
 }
 
-fn referenced_variable(value: &str) -> Option<&str> {
-    let body = value
-        .strip_prefix("${")
-        .and_then(|rest| rest.strip_suffix('}'))
-        .or_else(|| value.strip_prefix('$'))?;
-    (!body.is_empty()).then_some(body)
+/// Extracts references with the same scan rules as
+/// `config::resolve_config_value`. Escaped `$$` and `$!` pairs are literals.
+fn referenced_variables(value: &str) -> Result<Vec<String>, &'static str> {
+    if value.starts_with('!') {
+        return Err(
+            "a value beginning with '!', which is unsupported; use an environment variable",
+        );
+    }
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut names = Vec::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] != '$' {
+            index += 1;
+            continue;
+        }
+        let Some(next) = chars.get(index + 1).copied() else {
+            break;
+        };
+        if matches!(next, '$' | '!') {
+            index += 2;
+            continue;
+        }
+        let (name, next_index) = if next == '{' {
+            let Some(relative_end) = chars[index + 2..]
+                .iter()
+                .position(|character| *character == '}')
+            else {
+                return Err("an unterminated environment variable reference");
+            };
+            let end = index + 2 + relative_end;
+            (chars[index + 2..end].iter().collect::<String>(), end + 1)
+        } else {
+            let end = chars[index + 1..]
+                .iter()
+                .position(|character| !(character.is_ascii_alphanumeric() || *character == '_'))
+                .map_or(chars.len(), |relative| index + 1 + relative);
+            if end == index + 1 {
+                index += 1;
+                continue;
+            }
+            (chars[index + 1..end].iter().collect::<String>(), end)
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+        index = next_index;
+    }
+    Ok(names)
 }
 
 fn check_skill_dirs(
@@ -390,15 +507,12 @@ fn check_skill_dirs(
     let Some(dirs) = map.get("skill_dirs").and_then(Value::as_array) else {
         return;
     };
-    let home = paths
-        .global
-        .parent()
-        .map(|global_dir| global_dir.parent().unwrap_or(global_dir))
-        .map(Path::to_path_buf);
+    // `expand_home_path` accepts the config home (`~/.yawl`), not `~`.
+    let config_home = paths.global.parent();
     let mut missing = Vec::new();
     let mut kept = Vec::new();
     for dir in dirs.iter().filter_map(Value::as_str) {
-        let expanded = home.as_ref().map_or_else(
+        let expanded = config_home.map_or_else(
             || Path::new(dir).to_path_buf(),
             |home| config::expand_home_path(dir, home),
         );
@@ -432,15 +546,16 @@ fn check_backups(paths: &Paths, findings: &mut Vec<Finding>) {
     let mut backups = entries
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| {
-            name.starts_with("config.json.bak-") || name.starts_with("config.json.invalid-")
-        })
+        .filter(|name| name.starts_with("config.json.bak-"))
         .collect::<Vec<_>>();
     if backups.is_empty() {
         return;
     }
     backups.sort();
-    let newest = backups.last().cloned().unwrap_or_default();
+    let newest_valid = backups
+        .iter()
+        .rev()
+        .find(|name| is_restorable_backup(&dir.join(name)));
     findings.push(Finding {
         severity: Severity::Info,
         area: "backups".into(),
@@ -449,11 +564,24 @@ fn check_backups(paths: &Paths, findings: &mut Vec<Finding>) {
             backups.len(),
             backups.join(", ")
         ),
-        fix: Some(Fix::RestoreBackup {
-            from: dir.join(&newest),
+        fix: newest_valid.map(|name| Fix::RestoreBackup {
+            from: dir.join(name),
             to: paths.global.clone(),
         }),
     });
+}
+
+fn is_restorable_backup(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    value.is_object()
+        && path
+            .parent()
+            .is_some_and(|home| config::validate_file_value(&value, home).is_ok())
 }
 
 fn check_auth(paths: &Paths, findings: &mut Vec<Finding>) {
@@ -510,8 +638,9 @@ fn check_auth(paths: &Paths, findings: &mut Vec<Finding>) {
     }
 }
 
-/// Checks that need the merged effective config. Only runs when both files
-/// parse, so a broken file never hides behind downstream confusion.
+/// Checks that need the merged effective config. Only runs when every
+/// existing file parses, so a broken file never hides behind downstream
+/// confusion.
 fn cross_checks(
     paths: &Paths,
     global_map: &Map<String, Value>,
@@ -888,6 +1017,56 @@ mod tests {
     }
 
     #[test]
+    fn escaped_environment_markers_are_not_reported_as_missing() {
+        let dirs = TestDirs::new("escaped-env");
+        let map = serde_json::from_value::<Value>(json!({
+            "openai_api_key": "$$YAWL_DOCTOR_ESCAPED_MISSING-$!literal"
+        }))
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone();
+        let mut findings = Vec::new();
+
+        check_env_references(&dirs.global, "global config", &map, &mut findings);
+
+        assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn unbraced_environment_reference_stops_before_suffix() {
+        let dirs = TestDirs::new("env-suffix");
+        let name = format!(
+            "YAWL_DOCTOR_MISSING_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        assert!(std::env::var_os(&name).is_none());
+        let map = serde_json::from_value::<Value>(json!({
+            "openai_api_key": format!("${name}-suffix")
+        }))
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone();
+        let mut findings = Vec::new();
+
+        check_env_references(&dirs.global, "global config", &map, &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0]
+                .message
+                .contains(&format!("references {name}, which is not set")),
+            "finding: {:?}",
+            findings[0]
+        );
+    }
+
+    #[test]
     fn missing_skill_directories_warn_with_a_fix() {
         let dirs = TestDirs::new("skill-dirs");
         let kept = dirs.root.join("kept-skills");
@@ -913,6 +1092,61 @@ mod tests {
             }
             other => panic!("expected SetValue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tilde_skill_directory_uses_the_home_above_dot_yawl() {
+        let dirs = TestDirs::new("tilde-skill-dir");
+        fs::create_dir_all(dirs.root.join("home/skills")).unwrap();
+        dirs.write_global(r#"{"skill_dirs":["~/skills"]}"#);
+
+        let findings = run(&dirs.paths());
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.message.contains("skill_dirs entries do not exist")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn project_only_config_runs_cross_checks() {
+        let dirs = TestDirs::new("project-only");
+        fs::write(&dirs.project, r#"{"model":"ghost:haunt"}"#).unwrap();
+
+        let findings = run(&dirs.paths());
+
+        assert!(
+            errors(&findings)
+                .iter()
+                .any(|finding| finding.message.contains("provider 'ghost'")),
+            "findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn only_valid_bak_files_are_offered_for_restore() {
+        let dirs = TestDirs::new("restorable-backups");
+        dirs.write_global(r#"{"model":"ollama:current"}"#);
+        let dir = dirs.global.parent().unwrap();
+        let valid = dir.join("config.json.bak-1");
+        fs::write(&valid, r#"{"model":"ollama:backup"}"#).unwrap();
+        fs::write(dir.join("config.json.bak-8"), "{not json").unwrap();
+        fs::write(dir.join("config.json.bak-9"), r#"{"max_tokens":0}"#).unwrap();
+        fs::write(
+            dir.join("config.json.invalid-10"),
+            r#"{"model":"ollama:quarantined"}"#,
+        )
+        .unwrap();
+
+        let findings = run(&dirs.paths());
+        let restore_source = findings.iter().find_map(|finding| match &finding.fix {
+            Some(Fix::RestoreBackup { from, .. }) => Some(from),
+            _ => None,
+        });
+
+        assert_eq!(restore_source, Some(&valid));
     }
 
     #[test]

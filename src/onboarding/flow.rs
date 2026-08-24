@@ -182,7 +182,7 @@ fn configure_provider(
         ProviderChoice::Codex => configure_codex(config),
         ProviderChoice::Anthropic => configure_builtin(&ANTHROPIC, &config.anthropic_base_url),
         ProviderChoice::OpenAi => configure_builtin(&OPENAI, &config.openai_base_url),
-        ProviderChoice::Local(name) => configure_entry(name, default_local_url(name)),
+        ProviderChoice::Local(name) => configure_entry(name, local_base_url(config, name)),
         ProviderChoice::Custom => configure_custom(config),
         // Handled by the caller before dispatch.
         ProviderChoice::KeepCurrent | ProviderChoice::Skip => Ok(None),
@@ -457,6 +457,15 @@ fn configure_entry_with(
     }))
 }
 
+fn local_base_url<'a>(config: &'a Config, name: &str) -> &'a str {
+    config
+        .providers
+        .get(name)
+        .map(|provider| provider.base_url.trim())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| default_local_url(name))
+}
+
 fn default_local_url(name: &str) -> &'static str {
     match name {
         "ollama" => "http://127.0.0.1:11434/v1",
@@ -480,10 +489,18 @@ fn choose_model(models: Vec<String>) -> Result<Option<String>, Error> {
         "Enter a model ID manually",
         "type the exact ID the server expects",
     ));
-    match select::select("Model", &choices)? {
+    resolve_model_selection(&models, manual, select::select("Model", &choices)?)
+}
+
+fn resolve_model_selection(
+    models: &[String],
+    manual: usize,
+    selection: Option<usize>,
+) -> Result<Option<String>, Error> {
+    match selection {
         Some(index) if index == manual => prompt_model_id().map(Some),
         Some(index) => Ok(Some(models[index].clone())),
-        None => prompt_model_id().map(Some),
+        None => Ok(None),
     }
 }
 
@@ -505,5 +522,47 @@ fn prompt_url(label: &str, default: &str) -> Result<String, Error> {
             return Ok(url);
         }
         println!("The URL must start with http:// or https://.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_base_url_uses_effective_config_then_builtin_default() {
+        let mut config = Config::test_default();
+        assert_eq!(
+            local_base_url(&config, "ollama"),
+            "http://127.0.0.1:11434/v1"
+        );
+
+        config.providers.insert(
+            "ollama".into(),
+            crate::config::ProviderConfig {
+                base_url: "http://remote-host:11434/v1".into(),
+                api: "openai-completions".into(),
+                api_key: None,
+                auth_header: None,
+                headers: Default::default(),
+                models: Vec::new(),
+                compat: Default::default(),
+            },
+        );
+
+        assert_eq!(
+            local_base_url(&config, "ollama"),
+            "http://remote-host:11434/v1"
+        );
+    }
+
+    #[test]
+    fn canceling_discovered_model_selection_returns_to_provider_menu() {
+        let models = vec!["discovered-model".to_string()];
+
+        let selected = resolve_model_selection(&models, models.len(), None)
+            .expect("canceling selection should succeed");
+
+        assert_eq!(selected, None);
     }
 }

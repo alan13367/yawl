@@ -66,6 +66,10 @@ impl<R: Read> EventReader<R> {
         }
     }
 
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     pub fn read_event(&mut self) -> io::Result<Event> {
         let Some(byte) = self.read_byte()? else {
             return Ok(Event::Tick);
@@ -203,11 +207,14 @@ impl<R: Read> EventReader<R> {
         if let Some(byte) = self.pending.pop_front() {
             return Ok(Some(byte));
         }
-        let mut byte = [0u8; 1];
+        let mut buf = [0u8; 512];
         loop {
-            match self.input.read(&mut byte) {
+            match self.input.read(&mut buf) {
                 Ok(0) => return Ok(None),
-                Ok(_) => return Ok(Some(byte[0])),
+                Ok(n) => {
+                    self.pending.extend(&buf[1..n]);
+                    return Ok(Some(buf[0]));
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             }
@@ -344,6 +351,20 @@ mod tests {
                 row: 2,
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tracks_pending_buffered_events() -> std::io::Result<()> {
+        let input = b"\x1b[<64;10;4M\x1b[<64;10;4M\x1b[<64;10;4M";
+        let mut reader = EventReader::new(Cursor::new(input));
+        assert!(!reader.has_pending());
+        assert_eq!(reader.read_event()?, Event::MouseScroll(3));
+        assert!(reader.has_pending());
+        assert_eq!(reader.read_event()?, Event::MouseScroll(3));
+        assert!(reader.has_pending());
+        assert_eq!(reader.read_event()?, Event::MouseScroll(3));
+        assert!(!reader.has_pending());
         Ok(())
     }
 }

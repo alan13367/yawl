@@ -43,6 +43,8 @@ pub(super) fn render(
     expanded: bool,
 ) -> Vec<String> {
     let width = width.max(8);
+    let horizontal_padding = usize::from(width >= 3);
+    let content_width = width.saturating_sub(horizontal_padding * 2).max(1);
     let parsed = serde_json::from_str::<Value>(args).ok();
     let mut lines = render_call(name, parsed.as_ref(), args, running, is_error, expanded);
 
@@ -69,11 +71,16 @@ pub(super) fn render(
     let padding = format!("{background}{}\x1b[0m", " ".repeat(width));
     let mut rendered = Vec::new();
     rendered.push(padding.clone());
-    rendered.extend(
-        lines
-            .into_iter()
-            .flat_map(|line| render_line(line, width, expanded, background)),
-    );
+    rendered.extend(lines.into_iter().flat_map(|line| {
+        render_line(
+            line,
+            width,
+            content_width,
+            horizontal_padding,
+            expanded,
+            background,
+        )
+    }));
     rendered.push(padding);
     rendered
 }
@@ -240,12 +247,19 @@ fn preview_lines(
     }
 }
 
-fn render_line(line: ToolLine, width: usize, expanded: bool, background: &str) -> Vec<String> {
+fn render_line(
+    line: ToolLine,
+    width: usize,
+    content_width: usize,
+    horizontal_padding: usize,
+    expanded: bool,
+    background: &str,
+) -> Vec<String> {
     let sanitized = sanitize_line(&line.text);
     let chunks = if expanded {
-        wrap_chars(&sanitized, width)
+        wrap_chars(&sanitized, content_width)
     } else {
-        vec![truncate_chars(&sanitized, width)]
+        vec![truncate_chars(&sanitized, content_width)]
     };
     let style = match line.tone {
         Tone::Header => "\x1b[1;97m",
@@ -255,14 +269,13 @@ fn render_line(line: ToolLine, width: usize, expanded: bool, background: &str) -
         Tone::Removed => "\x1b[38;5;203m",
         Tone::Error => "\x1b[38;5;210m",
     };
+    let left_pad = " ".repeat(horizontal_padding);
     chunks
         .into_iter()
         .map(|chunk| {
-            let padded = format!(
-                "{chunk}{}",
-                " ".repeat(width.saturating_sub(chunk.chars().count()))
-            );
-            format!("{background}{style}{padded}\x1b[0m")
+            let right_pad =
+                " ".repeat(width.saturating_sub(horizontal_padding + chunk.chars().count()));
+            format!("{background}{style}{left_pad}{chunk}{right_pad}\x1b[0m")
         })
         .collect()
 }
@@ -393,5 +406,20 @@ mod tests {
         assert!(plain.contains("line 1 "));
         assert!(plain.contains("line 20"));
         assert!(plain.contains("Ctrl+O to collapse"));
+    }
+
+    #[test]
+    fn tool_blocks_have_horizontal_padding() {
+        let rendered = render(
+            "shell",
+            r#"{"command":"true"}"#,
+            "",
+            false,
+            false,
+            40,
+            false,
+        );
+        let plain = markdown::strip_ansi(&rendered[1]);
+        assert!(plain.starts_with(" $ true"));
     }
 }

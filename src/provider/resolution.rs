@@ -97,13 +97,10 @@ fn anthropic_provider(cfg: &Config, model: &str) -> Result<(Box<dyn Provider>, S
 }
 
 fn openai_provider(cfg: &Config, model: &str) -> Result<(Box<dyn Provider>, String), Error> {
-    let key = builtin_api_key(
+    let key = openai_api_key(
         std::env::var("OPENAI_API_KEY").ok().as_deref(),
         cfg.openai_api_key.as_deref(),
-        "OPENAI_API_KEY",
-        "openai_api_key",
-    )
-    .unwrap_or_default();
+    )?;
     Ok((
         Box::new(openai::OpenAi::new(cfg.openai_base_url.clone(), key)),
         model.to_string(),
@@ -127,6 +124,13 @@ fn builtin_api_key(
         None => Err(Error::Config(format!(
             "{env_name} is not set and no {config_key} is configured; run 'yawl --setup'"
         ))),
+    }
+}
+
+fn openai_api_key(environment: Option<&str>, stored: Option<&str>) -> Result<String, Error> {
+    match builtin_api_key(environment, stored, "OPENAI_API_KEY", "openai_api_key") {
+        Err(_) if stored.is_none() => Ok(String::new()),
+        result => result,
     }
 }
 
@@ -220,5 +224,20 @@ mod tests {
         .expect("a blank env value should not mask the stored key");
 
         assert_eq!(key, "stored-key");
+    }
+
+    #[test]
+    fn openai_key_is_optional_only_when_unconfigured() {
+        let key = openai_api_key(None, None).expect("OpenAI should allow keyless requests");
+        assert!(key.is_empty());
+
+        let error = openai_api_key(None, Some("$YAWL_UNSET_OPENAI_REFERENCE_4C71"))
+            .expect_err("an explicitly configured missing reference should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("YAWL_UNSET_OPENAI_REFERENCE_4C71 is not set"),
+            "unexpected error: {error}"
+        );
     }
 }

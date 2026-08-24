@@ -10,6 +10,183 @@ use super::state::{ScrollGeometry, scroll_bar_position, scroll_bar_span};
 use super::transcript::Entry;
 use super::{USER_BACKGROUND, USER_TEXT, ViewState, markdown, tool_view};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheSlot {
+    width: usize,
+    tools_expanded: bool,
+    hide_reasoning: bool,
+    entry_lines: Vec<Option<Vec<String>>>,
+    flattened: Vec<String>,
+    frozen_count: usize,
+}
+
+impl CacheSlot {
+    fn new(width: usize, tools_expanded: bool, hide_reasoning: bool) -> Self {
+        Self {
+            width,
+            tools_expanded,
+            hide_reasoning,
+            entry_lines: Vec::new(),
+            flattened: Vec::new(),
+            frozen_count: 0,
+        }
+    }
+
+    fn matches(&self, width: usize, tools_expanded: bool, hide_reasoning: bool) -> bool {
+        self.width == width
+            && self.tools_expanded == tools_expanded
+            && self.hide_reasoning == hide_reasoning
+    }
+
+    fn update(
+        &mut self,
+        transcript: &super::transcript::Transcript,
+        tools_expanded: bool,
+        hide_reasoning: bool,
+    ) {
+        let entries = transcript.entries();
+        if entries.len() < self.frozen_count {
+            self.frozen_count = entries.len();
+        }
+
+        let mutable_index = transcript
+            .streaming_index()
+            .or_else(|| transcript.running_tool_index());
+        let frozen_boundary = mutable_index.unwrap_or(entries.len()).min(entries.len());
+
+        let mut changed = false;
+        if self.entry_lines.len() < entries.len() {
+            self.entry_lines.resize_with(entries.len(), || None);
+        } else if self.entry_lines.len() > entries.len() {
+            self.entry_lines.truncate(entries.len());
+            changed = true;
+        }
+
+        for (i, entry) in entries
+            .iter()
+            .enumerate()
+            .take(frozen_boundary)
+            .skip(self.frozen_count)
+        {
+            self.entry_lines[i] = render_entry(entry, self.width, tools_expanded, hide_reasoning);
+            changed = true;
+        }
+        self.frozen_count = frozen_boundary;
+
+        if let Some(idx) = mutable_index
+            && idx < entries.len()
+        {
+            self.entry_lines[idx] =
+                render_entry(&entries[idx], self.width, tools_expanded, hide_reasoning);
+            changed = true;
+        }
+
+        if changed || (self.flattened.is_empty() && !entries.is_empty()) {
+            self.flattened.clear();
+            for lines in self.entry_lines.iter().flatten() {
+                self.flattened.extend(lines.iter().cloned());
+                self.flattened.push(String::new());
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct RenderCache {
+    slots: [Option<CacheSlot>; 2],
+}
+
+impl RenderCache {
+    pub(super) fn invalidate(&mut self) {
+        self.slots = Default::default();
+    }
+
+    pub(super) fn get_or_render<'a>(
+        &'a mut self,
+        transcript: &super::transcript::Transcript,
+        tools_expanded: bool,
+        hide_reasoning: bool,
+        width: usize,
+    ) -> &'a [String] {
+        let slot_idx = self.slots.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|s| s.matches(width, tools_expanded, hide_reasoning))
+        });
+
+        let idx = match slot_idx {
+            Some(i) => i,
+            None => {
+                let empty_idx = self.slots.iter().position(|s| s.is_none()).unwrap_or(1);
+                self.slots[empty_idx] = Some(CacheSlot::new(width, tools_expanded, hide_reasoning));
+                empty_idx
+            }
+        };
+
+        let slot = self.slots[idx].as_mut().expect("slot was set above");
+        slot.update(transcript, tools_expanded, hide_reasoning);
+        &slot.flattened
+    }
+}
+
+fn render_entry(
+    entry: &Entry,
+    width: usize,
+    tools_expanded: bool,
+    hide_reasoning: bool,
+) -> Option<Vec<String>> {
+    match entry {
+        Entry::User(content) => Some(render_user_panel(content, width)),
+        Entry::Assistant(content) => {
+            if content.trim().is_empty() {
+                None
+            } else {
+                Some(markdown::render(content.trim(), width))
+            }
+        }
+        Entry::Reasoning { kind, content } => {
+            if hide_reasoning || content.trim().is_empty() {
+                None
+            } else {
+                Some(render_reasoning(*kind, content, width))
+            }
+        }
+        Entry::Tool {
+            name,
+            args,
+            output,
+            is_error,
+            running,
+        } => Some(tool_view::render(
+            name,
+            args,
+            output,
+            *is_error,
+            *running,
+            width,
+            tools_expanded,
+        )),
+        Entry::Notice(content) => {
+            let mut lines = vec!["\x1b[1;33mYawl\x1b[0m".into()];
+            lines.extend(markdown::render(content, width));
+            Some(lines)
+        }
+        Entry::SubagentResult {
+            id,
+            name,
+            status,
+            content,
+        } => Some(render_subagent_result(
+            id,
+            name,
+            status,
+            content,
+            width,
+            tools_expanded,
+        )),
+    }
+}
+
+#[cfg(test)]
 pub(super) fn render_entries(
     entries: &[Entry],
     width: usize,
@@ -18,54 +195,10 @@ pub(super) fn render_entries(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for entry in entries {
-        match entry {
-            Entry::User(content) => lines.extend(render_user_panel(content, width)),
-            Entry::Assistant(content) => {
-                if content.trim().is_empty() {
-                    continue;
-                }
-                lines.extend(markdown::render(content.trim(), width));
-            }
-            Entry::Reasoning { kind, content } => {
-                if hide_reasoning || content.trim().is_empty() {
-                    continue;
-                }
-                lines.extend(render_reasoning(*kind, content, width));
-            }
-            Entry::Tool {
-                name,
-                args,
-                output,
-                is_error,
-                running,
-            } => lines.extend(tool_view::render(
-                name,
-                args,
-                output,
-                *is_error,
-                *running,
-                width,
-                tools_expanded,
-            )),
-            Entry::Notice(content) => {
-                lines.push("\x1b[1;33mYawl\x1b[0m".into());
-                lines.extend(markdown::render(content, width));
-            }
-            Entry::SubagentResult {
-                id,
-                name,
-                status,
-                content,
-            } => lines.extend(render_subagent_result(
-                id,
-                name,
-                status,
-                content,
-                width,
-                tools_expanded,
-            )),
+        if let Some(rendered) = render_entry(entry, width, tools_expanded, hide_reasoning) {
+            lines.extend(rendered);
+            lines.push(String::new());
         }
-        lines.push(String::new());
     }
     lines
 }
@@ -239,13 +372,16 @@ pub(super) fn apply_scroll_bar(
     }
 }
 
-fn render_transcript(state: &ViewState, width: usize) -> Vec<String> {
-    let mut transcript = render_entries(
-        state.transcript.entries(),
-        width,
-        state.tools_expanded,
-        state.hide_reasoning,
-    );
+fn render_transcript(state: &mut ViewState, width: usize) -> Vec<String> {
+    let mut transcript = state
+        .render_cache
+        .get_or_render(
+            &state.transcript,
+            state.tools_expanded,
+            state.hide_reasoning,
+            width,
+        )
+        .to_vec();
     if let Some(loading) = render_loading_state(state, width) {
         transcript.push(loading);
         transcript.push(String::new());
@@ -271,6 +407,9 @@ pub(super) fn has_visible_in_flight_content(state: &ViewState) -> bool {
 pub(super) fn loading_label(activity: &str) -> Option<&str> {
     match activity {
         "sending" | "responding" | "reasoning" => Some("Waiting…"),
+        "preparing write" => Some("Preparing write…"),
+        "preparing edit" => Some("Preparing edit…"),
+        "preparing tool" => Some("Preparing tool…"),
         "compacting conversation" => Some("Compacting conversation…"),
         "canceling turn" => Some("Canceling turn…"),
         other if other.starts_with("attempt") => Some(other),
@@ -280,7 +419,7 @@ pub(super) fn loading_label(activity: &str) -> Option<&str> {
 
 pub(super) fn render_loading_state(state: &ViewState, width: usize) -> Option<String> {
     let label = loading_label(&state.activity)?;
-    if has_visible_in_flight_content(state) {
+    if has_visible_in_flight_content(state) && !state.activity.starts_with("preparing ") {
         return None;
     }
     const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -436,6 +575,12 @@ pub(super) fn build_frame(
         status.push_str(&format!(
             "  agents {running} running · {done} done · {failed} failed"
         ));
+        if state.subagent_tokens > 0 {
+            status.push_str(&format!(
+                " · {} child tokens",
+                format_token_count(state.subagent_tokens)
+            ));
+        }
     }
     frame.push(format!(
         "{}{}\x1b[0m",
@@ -450,4 +595,20 @@ pub(super) fn build_frame(
     let cursor_row = transcript_height + menu_height + 2 + cursor_input_row;
     let cursor_col = (2 + layout.cursor_col).min(columns.saturating_sub(1));
     (frame, (cursor_row, cursor_col))
+}
+
+/// Compact token counts for the status bar: raw below 10,000, then 12.3k
+/// and 1.2M steps so the line stays short.
+pub(super) fn format_token_count(tokens: u64) -> String {
+    if tokens < 10_000 {
+        return tokens.to_string();
+    }
+    if tokens < 1_000_000 {
+        return format!("{}.{:01}k", tokens / 1_000, tokens % 1_000 / 100);
+    }
+    format!(
+        "{}.{:01}M",
+        tokens / 1_000_000,
+        tokens % 1_000_000 / 100_000
+    )
 }

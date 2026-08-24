@@ -1,6 +1,10 @@
 //! The agent loop: send messages → stream → execute tool calls → append
 //! results → repeat until the model stops calling tools. Iterations are
-//! uncapped; Ctrl+C aborts the in-flight turn, not the process.
+//! uncapped; Ctrl+C aborts the in-flight turn, not the process. Memory-only
+//! subagent conversations may carry [`RunLimits`] that steer a runaway run
+//! toward completion and then stop it.
+
+use std::time::Duration;
 
 use crate::cancellation::CancellationToken;
 use crate::compaction;
@@ -12,6 +16,15 @@ use crate::provider::{
 use crate::session::Session;
 use crate::subagent::SubagentManager;
 use crate::tools::{DescribeCache, Registry};
+
+/// Per-run guard rails for a memory-only subagent conversation. At
+/// `max_requests` completed model requests a wrap-up instruction is injected;
+/// at `max_requests + max_requests/2` (at least one extra) the run is stopped.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RunLimits {
+    pub(crate) max_requests: u64,
+    pub(crate) timeout: Option<Duration>,
+}
 
 /// Progress events surfaced to the UI (print mode or TUI) during a turn.
 pub enum TurnEvent<'a> {
@@ -29,6 +42,10 @@ pub enum TurnEvent<'a> {
     },
     /// One assistant response finished (there may be more after tools run).
     AssistantDone,
+    /// A tool was selected but its arguments are still being generated.
+    ToolPreparing {
+        name: &'a str,
+    },
     ToolStart {
         name: &'a str,
         args: &'a str,
@@ -102,6 +119,11 @@ pub(crate) struct Conversation {
     cancellation: CancellationToken,
     subagents: Option<SubagentManager>,
     print_mode: bool,
+    run_limits: Option<RunLimits>,
+    /// Tool-name allowlist for preset children; `None` grants everything.
+    tool_allowlist: Option<Vec<String>>,
+    /// Extra instruction appended to the subagent role block by a preset.
+    role_fragment: Option<String>,
 }
 
 impl Conversation {
@@ -118,6 +140,9 @@ impl Conversation {
             cancellation: CancellationToken::default(),
             subagents: Some(subagents),
             print_mode: false,
+            run_limits: None,
+            tool_allowlist: None,
+            role_fragment: None,
         }
     }
 
@@ -133,7 +158,22 @@ impl Conversation {
             cancellation: CancellationToken::default(),
             subagents: None,
             print_mode: false,
+            run_limits: None,
+            tool_allowlist: None,
+            role_fragment: None,
         }
+    }
+
+    pub(crate) fn set_run_limits(&mut self, limits: RunLimits) {
+        self.run_limits = Some(limits);
+    }
+
+    pub(crate) fn set_tool_allowlist(&mut self, tools: Vec<String>) {
+        self.tool_allowlist = Some(tools);
+    }
+
+    pub(crate) fn set_role_fragment(&mut self, fragment: String) {
+        self.role_fragment = Some(fragment);
     }
 
     pub(crate) fn context_window(&self) -> u64 {
@@ -194,7 +234,9 @@ impl Conversation {
 
     /// Starts a fresh session (used by `/new` and `/clear`).
     pub fn reset(&mut self) -> Result<(), Error> {
-        let session = Session::create(&self.config.sessions_dir())?;
+        let cwd = crate::config::working_dir();
+        let dirs = self.config.session_dirs(&cwd);
+        let session = Session::create(&dirs.project, &cwd, &self.model)?;
         if let Some(manager) = &self.subagents {
             manager.shutdown_and_discard();
         }
@@ -211,7 +253,9 @@ impl Conversation {
 
     /// Replaces the conversation with a saved session (used by `/resume`).
     pub fn load_session(&mut self, id: &str) -> Result<(), Error> {
-        let (session, messages) = Session::open(&self.config.sessions_dir(), id)?;
+        let cwd = crate::config::working_dir();
+        let (session, messages) =
+            Session::open_searching(&self.config.session_dirs(&cwd).search, id)?;
         if let Some(manager) = &self.subagents {
             manager.shutdown_and_discard();
         }
@@ -227,7 +271,7 @@ impl Conversation {
     }
 
     pub fn scan_tools(&mut self) -> Registry {
-        match (&self.subagents, self.config.subagents) {
+        let mut registry = match (&self.subagents, self.config.subagents) {
             (Some(manager), true) => Registry::scan_with_subagents(
                 &self.config,
                 &mut self.describe_cache,
@@ -235,7 +279,11 @@ impl Conversation {
                 &self.model,
             ),
             _ => Registry::scan(&self.config, &mut self.describe_cache),
+        };
+        if let Some(allowed) = &self.tool_allowlist {
+            registry.retain_names(allowed);
         }
+        registry
     }
 
     pub(crate) fn change_global_config(
@@ -283,8 +331,126 @@ impl Conversation {
     ) -> Result<bool, Error> {
         let cancellation = self.cancellation.clone();
         crate::cancellation::scope(&cancellation, || {
-            self.run_turn_with(user_input, sink, &mut provider::resolve)
+            let Some(timeout) = self.run_limits.and_then(|limits| limits.timeout) else {
+                return self.run_turn_with(user_input, sink, &mut provider::resolve);
+            };
+            let (result, timed_out) =
+                crate::cancellation::with_timeout(&cancellation, timeout, || {
+                    self.run_turn_with(user_input, sink, &mut provider::resolve)
+                });
+            if timed_out {
+                sink(TurnEvent::Warning("subagent timeout exceeded".into()));
+            }
+            result
         })
+    }
+
+    /// Delivers settled subagent results and waits for still-running ones
+    /// until nothing is pending. Blocking waits happen in `wait_slice_secs`
+    /// slices so Ctrl+C stays responsive. Returns `false` when the pump was
+    /// interrupted. Used by print mode, which has no event loop.
+    pub(crate) fn pump_subagent_results(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        wait_slice_secs: u64,
+    ) -> Result<bool, Error> {
+        self.pump_subagent_results_with(sink, wait_slice_secs, &mut provider::resolve)
+    }
+
+    pub(crate) fn pump_subagent_results_with<F>(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        wait_slice_secs: u64,
+        resolve_provider: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        loop {
+            if crate::cancellation::interrupted() {
+                return Ok(false);
+            }
+            let Some(manager) = self.subagents.clone() else {
+                return Ok(true);
+            };
+            if manager.has_deferred() {
+                if self.run_deferred_subagent_results_with(sink, resolve_provider)? == Some(false) {
+                    return Ok(false);
+                }
+                continue;
+            }
+            let active = manager.active_count();
+            if active == 0 {
+                return Ok(true);
+            }
+            if self.print_mode {
+                let noun = if active == 1 { "subagent" } else { "subagents" };
+                eprintln!("waiting for {active} {noun}…");
+            }
+            // False means the slice timed out or the process was
+            // interrupted; the loop top sorts out which.
+            let _ = manager.wait_all(wait_slice_secs);
+        }
+    }
+
+    /// Appends one synthetic user message carrying the drained deferred
+    /// results and runs a follow-up turn on it. Results are restored if the
+    /// append fails.
+    pub(crate) fn run_deferred_subagent_results(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<Option<bool>, Error> {
+        self.run_deferred_subagent_results_with(sink, &mut provider::resolve)
+    }
+
+    pub(crate) fn run_deferred_subagent_results_with<F>(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<Option<bool>, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        let manager = self
+            .subagents
+            .clone()
+            .expect("deferred results require a subagent manager");
+        let deliveries = manager.drain_deferred();
+        if deliveries.is_empty() {
+            return Ok(None);
+        }
+        let backup = deliveries.clone();
+        let mut results = Vec::new();
+        for delivery in deliveries {
+            let status = match delivery.outcome {
+                crate::subagent::RunOutcome::Completed => "completed",
+                crate::subagent::RunOutcome::Failed => "failed",
+                crate::subagent::RunOutcome::Interrupted => "interrupted",
+            };
+            let content = if delivery.error.is_empty() {
+                delivery.result
+            } else if delivery.result.is_empty() {
+                delivery.error
+            } else {
+                format!("{}\n\nError: {}", delivery.result, delivery.error)
+            };
+            results.push(SubagentResult {
+                id: delivery.id.to_string(),
+                name: delivery.name,
+                status: status.into(),
+                run_number: delivery.run_number,
+                content,
+            });
+        }
+        if let Err(error) = self.append_input_message(Message::subagent_results(results)) {
+            manager.restore_deferred(backup);
+            return Err(error);
+        }
+        let cancellation = self.cancellation.clone();
+        crate::cancellation::scope(&cancellation, || {
+            self.run_turn_with(None, sink, resolve_provider)
+        })
+        .map(Some)
     }
 
     fn run_turn_with<F>(
@@ -307,13 +473,41 @@ impl Conversation {
                 self.print_mode,
             )
         } else {
-            crate::prompt::build_subagent_system_prompt(&self.config.home_dir)
+            crate::prompt::build_subagent_system_prompt(
+                &self.config.home_dir,
+                self.role_fragment.as_deref(),
+            )
         };
+
+        // Per-run guard rails: only subagent conversations carry limits.
+        let limits = self.run_limits;
+        let max_requests = limits.map_or(0, |limits| limits.max_requests);
+        let hard_requests = max_requests.saturating_add((max_requests / 2).max(1));
+        let mut requests_made: u64 = 0;
+        let mut steer_sent = false;
 
         // Uncapped: the loop ends when the model stops calling tools.
         loop {
             if crate::cancellation::interrupted() {
                 return Ok(false);
+            }
+            if max_requests > 0 {
+                if requests_made == max_requests && !steer_sent {
+                    steer_sent = true;
+                    sink(TurnEvent::Warning(
+                        "subagent request budget reached; steering to wrap up".into(),
+                    ));
+                    self.append_input_message(Message::user(
+                        "Request budget reached. Finish your current step and reply with your final result now; do not start new work.",
+                    ))?;
+                }
+                if requests_made >= hard_requests {
+                    sink(TurnEvent::Warning(
+                        "subagent request budget exceeded".into(),
+                    ));
+                    self.cancellation.cancel();
+                    return Ok(false);
+                }
             }
             // Rescan every iteration so a tool the model just wrote is
             // available on its very next step.
@@ -342,6 +536,7 @@ impl Conversation {
             }
 
             self.context_tokens = out.input_tokens.saturating_add(out.output_tokens);
+            requests_made = requests_made.saturating_add(1);
             sink(TurnEvent::Usage {
                 context_tokens: self.context_tokens,
                 context_window: self.context_window(),
@@ -607,43 +802,19 @@ impl Agent {
         &mut self,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<Option<bool>, Error> {
-        let deliveries = self.subagents().drain_deferred();
-        if deliveries.is_empty() {
-            return Ok(None);
-        }
-        let backup = deliveries.clone();
-        let mut results = Vec::new();
-        for delivery in deliveries {
-            let status = match delivery.outcome {
-                crate::subagent::RunOutcome::Completed => "completed",
-                crate::subagent::RunOutcome::Failed => "failed",
-                crate::subagent::RunOutcome::Interrupted => "interrupted",
-            };
-            let content = if delivery.error.is_empty() {
-                delivery.result
-            } else if delivery.result.is_empty() {
-                delivery.error
-            } else {
-                format!("{}\n\nError: {}", delivery.result, delivery.error)
-            };
-            results.push(SubagentResult {
-                id: delivery.id.to_string(),
-                name: delivery.name,
-                status: status.into(),
-                run_number: delivery.run_number,
-                content,
-            });
-        }
-        if let Err(error) = self
-            .conversation
-            .append_input_message(Message::subagent_results(results))
-        {
-            self.subagents().restore_deferred(backup);
-            return Err(error);
-        }
+        self.conversation.run_deferred_subagent_results(sink)
+    }
+
+    /// Delivers settled subagent results and waits for still-running ones
+    /// until nothing is pending. Follow-up turns stream through `sink`.
+    /// Returns `false` when the pump was interrupted.
+    pub fn pump_subagent_results(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        wait_slice_secs: u64,
+    ) -> Result<bool, Error> {
         self.conversation
-            .run_turn_preserving_cancellation(None, sink)
-            .map(Some)
+            .pump_subagent_results(sink, wait_slice_secs)
     }
 
     pub fn compact_now(&mut self, sink: &mut dyn FnMut(TurnEvent<'_>)) -> Result<(), Error> {
@@ -671,6 +842,7 @@ fn forward<'s>(sink: &'s mut dyn FnMut(TurnEvent<'_>)) -> impl FnMut(StreamNotic
         StreamNotice::ReasoningDelta { kind, text } => {
             sink(TurnEvent::ReasoningDelta { kind, text })
         }
+        StreamNotice::ToolPreparing { name } => sink(TurnEvent::ToolPreparing { name }),
         StreamNotice::RetryReset => sink(TurnEvent::RetryReset),
         StreamNotice::Retrying {
             attempt,
@@ -687,13 +859,12 @@ fn forward<'s>(sink: &'s mut dyn FnMut(TurnEvent<'_>)) -> impl FnMut(StreamNotic
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::config::{DEFAULT_MAX_TOKENS, ProviderConfig};
     use crate::provider::{Event as ProviderEvent, Provider, Request, Role};
 
     enum ProviderStep {
@@ -754,6 +925,7 @@ mod tests {
 
     struct TestAgent {
         root: PathBuf,
+        sessions_dir: PathBuf,
         agent: Conversation,
     }
 
@@ -769,31 +941,18 @@ mod tests {
             let project_dir = root.join("project");
             let config = Config {
                 model: Some("test".into()),
-                anthropic_base_url: String::new(),
-                openai_base_url: String::new(),
-                max_tokens: DEFAULT_MAX_TOKENS,
-                reasoning_effort: None,
-                hide_reasoning: false,
-                accent_color: crate::config::UiColor::WHITE,
-                scroll_bar: true,
-                context_windows: HashMap::new(),
                 auto_compact: false,
-                compact_threshold: 0.85,
-                subagents: false,
-                max_subagents: crate::config::DEFAULT_MAX_SUBAGENTS,
-                subagent_model: crate::config::DEFAULT_SUBAGENT_MODEL.to_string(),
-                skill_dirs: Vec::new(),
-                providers: HashMap::<String, ProviderConfig>::new(),
-                setup_skipped: false,
-                anthropic_api_key: None,
-                openai_api_key: None,
                 home_dir: home_dir.clone(),
                 project_dir,
+                ..Config::test_default()
             };
-            let session =
-                Session::create(&config.sessions_dir()).expect("test session should be created");
+            let cwd = root.join("cwd");
+            let dirs = config.session_dirs(&cwd);
+            let session = Session::create(&dirs.project, &cwd, "test")
+                .expect("test session should be created");
             Self {
                 root,
+                sessions_dir: dirs.project,
                 agent: Conversation::persistent(config, "test".into(), session, Vec::new()),
             }
         }
@@ -803,6 +962,106 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn tool_allowlist_filters_child_tool_scans() {
+        let test = TestAgent::new("allowlist");
+        let mut child =
+            Conversation::memory(test.agent.config().clone(), "test".into(), "child".into());
+        child.set_tool_allowlist(vec!["read_file".into()]);
+
+        let mut names = child
+            .scan_tools()
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            ["read_file"],
+            "preset children see only allowed tools"
+        );
+    }
+
+    #[test]
+    fn print_mode_pump_delivers_deferred_results_in_a_follow_up_turn() {
+        let mut test = TestAgent::new("subagent-pump");
+        test.agent.config.subagents = true;
+        test.agent
+            .subagents
+            .as_ref()
+            .expect("persistent conversations own a manager")
+            .push_test_deferred(
+                1,
+                "scout",
+                crate::subagent::RunOutcome::Completed,
+                "found it",
+            );
+        let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
+            text: "delivered summary",
+            tool_calls: Vec::new(),
+            input_tokens: 10,
+            output_tokens: 2,
+        }])));
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut resolve = |_: &str, _: &Config| {
+            Ok::<(Box<dyn Provider>, String), Error>((
+                Box::new(ScriptedProvider {
+                    steps: Rc::clone(&steps),
+                    requests: Rc::clone(&requests),
+                }),
+                "test".into(),
+            ))
+        };
+
+        // Drive the pump's delivery turn with the injected resolver the same
+        // way run drives it with the real one.
+        let pumped = test
+            .agent
+            .pump_subagent_results_with(&mut |_| {}, 1, &mut resolve)
+            .expect("pump should complete");
+
+        assert!(pumped);
+        assert!(
+            !test
+                .agent
+                .subagents
+                .as_ref()
+                .expect("manager survives the pump")
+                .has_deferred()
+        );
+        let messages = &test.agent.messages;
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            [Role::User, Role::Assistant]
+        );
+        assert!(
+            messages[0].content.contains("Background subagent results"),
+            "the delivery message should carry the results; got:\n{}",
+            messages[0].content
+        );
+        assert!(
+            messages[0].content.contains("found it"),
+            "the delivery message should carry the subagent result text"
+        );
+        assert_eq!(messages[1].content, "delivered summary");
+        assert_eq!(requests.borrow().len(), 1);
+    }
+
+    #[test]
+    fn print_mode_pump_with_no_active_subagents_returns_promptly() {
+        let mut test = TestAgent::new("subagent-pump-idle");
+        test.agent.print_mode = true;
+        let pumped = test
+            .agent
+            .pump_subagent_results_with(&mut |_| {}, 1, &mut |_, _| unreachable!())
+            .expect("idle pump should complete immediately");
+        assert!(pumped);
     }
 
     #[test]
@@ -860,9 +1119,8 @@ mod tests {
                 vec![Role::User, Role::Assistant, Role::Tool]
             ]
         );
-        let (_, replayed) =
-            Session::open(&test.agent.config.sessions_dir(), &test.agent.session.id)
-                .expect("persisted session should replay");
+        let (_, replayed) = Session::open(&test.sessions_dir, &test.agent.session.id)
+            .expect("persisted session should replay");
         assert_eq!(
             replayed
                 .iter()

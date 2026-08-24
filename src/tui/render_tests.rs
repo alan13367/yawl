@@ -69,8 +69,10 @@ fn frame_keeps_input_and_status_pinned() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        render_cache: RenderCache::default(),
     };
     let editor = Editor::default();
     let (frame, cursor) = build_frame(&mut state, &editor, 40, 12);
@@ -182,7 +184,7 @@ fn reasoning_has_one_blank_line_on_each_side() {
         .map(|line| markdown::strip_ansi(line).trim_end().to_string())
         .collect::<Vec<_>>();
 
-    assert_eq!(plain, ["Answer", "", "Thinking", "", "", "$ true", "", ""]);
+    assert_eq!(plain, ["Answer", "", "Thinking", "", "", " $ true", "", ""]);
 }
 
 #[test]
@@ -210,8 +212,10 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        render_cache: RenderCache::default(),
     };
 
     let loading = render_loading_state(&state, 80).expect("loading state should be present");
@@ -253,8 +257,10 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        render_cache: RenderCache::default(),
     };
 
     // Hidden reasoning delta arrives: loading state stays visible
@@ -283,6 +289,25 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
 }
 
 #[test]
+fn preparing_file_tool_stays_visible_after_assistant_text() {
+    let mut state = overflow_state();
+    state.apply(Update::from_event(crate::agent::TurnEvent::ToolPreparing {
+        name: "write_file",
+    }));
+
+    let loading = render_loading_state(&state, 80)
+        .expect("tool preparation should remain visible after assistant text");
+    assert!(markdown::strip_ansi(&loading).contains("Preparing write…"));
+
+    state.apply(Update::from_event(crate::agent::TurnEvent::ToolPreparing {
+        name: "edit_file",
+    }));
+    let loading = render_loading_state(&state, 80)
+        .expect("edit preparation should remain visible after assistant text");
+    assert!(markdown::strip_ansi(&loading).contains("Preparing edit…"));
+}
+
+#[test]
 fn loading_state_ignores_status_activity() {
     let mut state = ViewState {
         transcript: Transcript::from_messages(&[]),
@@ -307,8 +332,10 @@ fn loading_state_ignores_status_activity() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        render_cache: RenderCache::default(),
     };
     state.notice("Yawl is ready. Type /help for commands.");
 
@@ -355,8 +382,10 @@ fn overflow_state() -> ViewState {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        render_cache: RenderCache::default(),
     }
 }
 
@@ -508,8 +537,10 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
+        subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        render_cache: RenderCache::default(),
     };
     let editor = Editor::default();
     let (frame, _) = build_frame(&mut state, &editor, 40, 12);
@@ -533,4 +564,106 @@ fn scroll_bar_does_not_overlay_an_open_picker() {
 
     assert!(!frame[..8].iter().any(|line| line.contains("\x1b[48;2;")));
     assert!(state.scroll_geometry.is_none());
+}
+
+#[test]
+fn token_counts_compact_for_the_status_bar() {
+    assert_eq!(crate::tui::render::format_token_count(0), "0");
+    assert_eq!(crate::tui::render::format_token_count(9_999), "9999");
+    assert_eq!(crate::tui::render::format_token_count(12_340), "12.3k");
+    assert_eq!(crate::tui::render::format_token_count(1_234_567), "1.2M");
+}
+
+#[test]
+fn reconstructed_deferred_follow_up_replaces_frozen_cache_entries() {
+    let initial_messages = [
+        crate::provider::Message::user("request"),
+        crate::provider::Message::assistant("initial answer".into(), Vec::new()),
+    ];
+    let mut state = overflow_state();
+    state.transcript = Transcript::from_messages(&initial_messages);
+    state.render_cache = RenderCache::default();
+    state.apply(Update::Transcript(TranscriptEvent::TextDelta(
+        "stale follow-up".into(),
+    )));
+    state.apply(Update::Transcript(TranscriptEvent::AssistantDone));
+    let cached = state
+        .render_cache
+        .get_or_render(&state.transcript, false, false, 80);
+    assert!(cached.iter().any(|line| line.contains("stale follow-up")));
+
+    let rebuilt_messages = [
+        crate::provider::Message::user("request"),
+        crate::provider::Message::assistant("initial answer".into(), Vec::new()),
+        crate::provider::Message::subagent_results(vec![crate::provider::SubagentResult {
+            id: "sa-1".into(),
+            name: "review".into(),
+            status: "completed".into(),
+            run_number: 1,
+            content: "inserted result".into(),
+        }]),
+        crate::provider::Message::assistant("fresh follow-up".into(), Vec::new()),
+    ];
+    rebuild_transcript_after_deferred_follow_up(&mut state, &rebuilt_messages);
+
+    let rendered = state
+        .render_cache
+        .get_or_render(&state.transcript, false, false, 80)
+        .join("\n");
+    let plain = markdown::strip_ansi(&rendered);
+    assert!(
+        plain.contains("Subagent sa-1 [completed] review"),
+        "{plain:?}"
+    );
+    assert!(plain.contains("inserted result"), "{plain:?}");
+    assert!(plain.contains("fresh follow-up"), "{plain:?}");
+    assert!(!plain.contains("stale follow-up"), "{plain:?}");
+}
+
+#[test]
+fn retry_reset_immediately_removes_partial_output_from_render_cache() {
+    let mut cache = RenderCache::default();
+    let mut transcript = Transcript::from_messages(&[crate::provider::Message::user("request")]);
+    transcript.apply(TranscriptEvent::ReasoningDelta {
+        kind: ReasoningKind::Summary,
+        text: "partial reasoning".into(),
+    });
+    transcript.apply(TranscriptEvent::TextDelta("partial answer".into()));
+
+    let partial = cache
+        .get_or_render(&transcript, false, false, 80)
+        .join("\n");
+    assert!(partial.contains("partial reasoning"));
+    assert!(partial.contains("partial answer"));
+
+    transcript.apply(TranscriptEvent::RetryReset);
+
+    let reset = cache
+        .get_or_render(&transcript, false, false, 80)
+        .join("\n");
+    assert!(reset.contains("request"));
+    assert!(!reset.contains("partial reasoning"), "{reset:?}");
+    assert!(!reset.contains("partial answer"), "{reset:?}");
+}
+
+#[test]
+fn render_cache_preserves_and_updates_incremental_entries() {
+    let mut cache = RenderCache::default();
+    let mut transcript =
+        Transcript::from_messages(&[crate::provider::Message::user("first message")]);
+
+    let lines1 = cache.get_or_render(&transcript, false, false, 80);
+    assert!(lines1.iter().any(|line| line.contains("first message")));
+    let len1 = lines1.len();
+
+    // Cache hit should return identical lines
+    let lines2 = cache.get_or_render(&transcript, false, false, 80);
+    assert_eq!(lines2.len(), len1);
+
+    // Appending a notice should incrementally extend the cache
+    transcript.notice("system notice".into());
+    let lines3 = cache.get_or_render(&transcript, false, false, 80);
+    assert!(lines3.len() > len1);
+    assert!(lines3.iter().any(|line| line.contains("system notice")));
+    assert!(lines3.iter().any(|line| line.contains("first message")));
 }
