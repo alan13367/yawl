@@ -89,6 +89,7 @@ Tools:
             "- Use subagent_send for more model-directed work. Children do not see this conversation and cannot create subagents.\n\
              - Write each spawn prompt as a contract: # Target (exact files and symbols, plus non-goals), # Change (steps), # Acceptance (observable result).\n\
              - Set required_tools to every tool the task needs before choosing an agent. Use [] only when the child can answer without tools.\n\
+             - Never select a model in subagent_spawn. A preset or user configuration may pin the child model; otherwise it inherits the active parent model.\n\
              - Omit agent to use the default child for any task that creates, edits, or deletes files, runs commands, tests, or builds, or otherwise needs a tool the preset does not advertise. File creation requires write_file; file modification requires edit_file or write_file.\n\
              - Use agent=\"scout\" only to inspect exact existing files with read_file and return findings in its response. Never ask Scout to create or modify a file.\n\
              - Decide interfaces between concurrent agents up front and restate them in every prompt.\n\
@@ -224,6 +225,7 @@ mod tests {
         );
         assert!(
             main.contains("Set required_tools to every tool the task needs")
+                && main.contains("Never select a model in subagent_spawn")
                 && main.contains("Never ask Scout to create or modify a file")
                 && main.contains("Omit agent to use the default child"),
             "the parent must route write tasks away from read-only presets"

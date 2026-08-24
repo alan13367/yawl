@@ -112,7 +112,6 @@ impl SubagentManager {
         parent_model: &str,
         name: Option<&str>,
         prompt: &str,
-        requested_model: Option<&str>,
         preset: Option<&AgentPreset>,
     ) -> Result<SubagentId, String> {
         let supplied_name = match name.map(str::trim) {
@@ -124,7 +123,7 @@ impl SubagentManager {
             .and_then(|preset| preset.model.as_deref())
             .map(str::trim)
             .filter(|model| !model.is_empty() && *model != "inherit");
-        let model = resolve_model(&config, parent_model, requested_model, preset_model)?;
+        let model = resolve_model(&config, parent_model, preset_model)?;
 
         let (id, conversation, work) = {
             let mut state = self.lock();
@@ -917,10 +916,9 @@ fn validate_message(message: &str, label: &str) -> Result<String, String> {
 fn resolve_model(
     config: &Config,
     parent_model: &str,
-    requested_model: Option<&str>,
     preset_model: Option<&str>,
 ) -> Result<String, String> {
-    if let Some(model) = requested_model.or(preset_model).map(str::trim) {
+    if let Some(model) = preset_model.map(str::trim) {
         if model.is_empty() {
             return Err("model must not be empty".into());
         }
@@ -1310,7 +1308,6 @@ mod tests {
                 Some("scanner"),
                 "scan the library",
                 None,
-                None,
             )
             .expect("subagent spawn");
         let waited = manager
@@ -1349,7 +1346,6 @@ mod tests {
                 Some("reused"),
                 "first task",
                 None,
-                None,
             )
             .expect("initial subagent spawn");
         manager
@@ -1370,26 +1366,22 @@ mod tests {
     }
 
     #[test]
-    fn model_precedence_prefers_spawn_then_config_then_parent() {
+    fn model_precedence_prefers_config_then_parent() {
         let mut config = provider_config("http://127.0.0.1:9/v1".into());
-        assert_eq!(
-            resolve_model(&config, "local:parent", Some("local:spawn"), None).expect("spawn model"),
-            "local:spawn"
-        );
         config.subagent_model = "local:configured".into();
         assert_eq!(
-            resolve_model(&config, "local:parent", None, None).expect("configured model"),
+            resolve_model(&config, "local:parent", None).expect("configured model"),
             "local:configured"
         );
         config.subagent_model = "inherit".into();
         assert_eq!(
-            resolve_model(&config, "local:parent", None, None).expect("inherited model"),
+            resolve_model(&config, "local:parent", None).expect("inherited model"),
             "local:parent"
         );
     }
 
     #[test]
-    fn unresolvable_spawn_models_are_rejected_at_spawn_time() {
+    fn unresolvable_configured_models_are_rejected_at_spawn_time() {
         let mut config = config();
         config.providers.insert(
             "broken".into(),
@@ -1403,7 +1395,8 @@ mod tests {
                 compat: crate::config::OpenAiCompatibility::default(),
             },
         );
-        let error = resolve_model(&config, "local:parent", Some("broken:model"), None)
+        config.subagent_model = "broken:model".into();
+        let error = resolve_model(&config, "local:parent", None)
             .expect_err("unusable provider models must fail fast");
         assert!(
             error.contains("'broken:model' is not usable"),
@@ -1431,10 +1424,10 @@ mod tests {
         let config = provider_config("http://127.0.0.1:9/v1".into());
         let manager = SubagentManager::new("session".into(), 3);
         manager
-            .spawn(config.clone(), "local:model", None, "task one", None, None)
+            .spawn(config.clone(), "local:model", None, "task one", None)
             .expect("spawn without a name");
         manager
-            .spawn(config, "local:model", None, "task two", None, None)
+            .spawn(config, "local:model", None, "task two", None)
             .expect("second spawn without a name");
         manager
             .spawn(
@@ -1442,7 +1435,6 @@ mod tests {
                 "local:model",
                 Some("  custom  "),
                 "task three",
-                None,
                 None,
             )
             .expect("spawn with an explicit name");
@@ -1514,21 +1506,14 @@ mod tests {
         let config = provider_config(base_url);
         let manager = SubagentManager::new("session".into(), 1);
         let id = manager
-            .spawn(
-                config.clone(),
-                "local:model",
-                Some("first"),
-                "work",
-                None,
-                None,
-            )
+            .spawn(config.clone(), "local:model", Some("first"), "work", None)
             .expect("first spawn should reserve the only slot");
         ready_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("first worker should reach the provider");
 
         let error = manager
-            .spawn(config, "local:model", Some("second"), "work", None, None)
+            .spawn(config, "local:model", Some("second"), "work", None)
             .expect_err("a simultaneous spawn must not exceed capacity");
         assert!(error.contains("capacity is full"));
         for index in 0..MAX_QUEUE_MESSAGES {
@@ -1568,14 +1553,7 @@ mod tests {
         let config = provider_config(base_url);
         let manager = SubagentManager::new("session".into(), 1);
         let id = manager
-            .spawn(
-                config,
-                "local:model",
-                Some("reused"),
-                "first task",
-                None,
-                None,
-            )
+            .spawn(config, "local:model", Some("reused"), "first task", None)
             .expect("initial subagent spawn");
         manager
             .wait(&[id.to_string()], Some(5))
@@ -1628,7 +1606,6 @@ mod tests {
                 "local:model",
                 Some("ordered"),
                 "first task",
-                None,
                 None,
             )
             .expect("initial subagent spawn");
@@ -1761,14 +1738,7 @@ mod tests {
         let config = provider_config(base_url);
         let manager = SubagentManager::new("session".into(), 1);
         let id = manager
-            .spawn(
-                config,
-                "local:model",
-                Some("delivery"),
-                "model task",
-                None,
-                None,
-            )
+            .spawn(config, "local:model", Some("delivery"), "model task", None)
             .expect("model-originated run should start");
         let deadline = Instant::now() + Duration::from_secs(5);
         while manager
@@ -1831,7 +1801,6 @@ mod tests {
                 Some("mixed origin"),
                 "model task",
                 None,
-                None,
             )
             .expect("model subagent spawn");
         first_ready_rx
@@ -1883,14 +1852,7 @@ mod tests {
         let preset = super::super::presets::bundled().remove(0);
         let manager = SubagentManager::new("session".into(), 1);
         let id = manager
-            .spawn(
-                config,
-                "local:model",
-                None,
-                "find the bug",
-                None,
-                Some(&preset),
-            )
+            .spawn(config, "local:model", None, "find the bug", Some(&preset))
             .expect("preset spawn");
         manager
             .wait(&[id.to_string()], Some(10))
@@ -1907,26 +1869,18 @@ mod tests {
     }
 
     #[test]
-    fn preset_model_sits_between_spawn_argument_and_config() {
+    fn preset_model_overrides_config() {
         let mut config = provider_config("http://127.0.0.1:9/v1".into());
         config.subagent_model = "local:configured".into();
         let mut preset = super::super::presets::bundled().remove(0);
         preset.model = Some("local:fast".into());
 
-        let via_preset = resolve_model(&config, "local:parent", None, preset.model.as_deref())
+        let via_preset = resolve_model(&config, "local:parent", preset.model.as_deref())
             .expect("preset model applies");
         assert_eq!(via_preset, "local:fast");
-        let via_argument = resolve_model(
-            &config,
-            "local:parent",
-            Some("local:explicit"),
-            preset.model.as_deref(),
-        )
-        .expect("spawn argument wins over the preset");
-        assert_eq!(via_argument, "local:explicit");
 
         preset.model = None;
-        let via_config = resolve_model(&config, "local:parent", None, preset.model.as_deref())
+        let via_config = resolve_model(&config, "local:parent", preset.model.as_deref())
             .expect("config applies");
         assert_eq!(via_config, "local:configured");
     }
@@ -1958,7 +1912,6 @@ mod tests {
                 "local:model",
                 Some("runaway"),
                 "keep working forever",
-                None,
                 None,
             )
             .expect("runaway subagent spawn");
@@ -2009,7 +1962,7 @@ mod tests {
         let manager = SubagentManager::new("session".into(), 1);
         let started = Instant::now();
         let id = manager
-            .spawn(config, "local:model", Some("slow"), "slow work", None, None)
+            .spawn(config, "local:model", Some("slow"), "slow work", None)
             .expect("slow subagent spawn");
         let waited = manager
             .wait(&[id.to_string()], Some(10))

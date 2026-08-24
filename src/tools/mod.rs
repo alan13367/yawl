@@ -213,6 +213,11 @@ impl Registry {
         };
         let result = match tool {
             SubagentTool::Spawn => {
+                if args.get("model").is_some() {
+                    return ToolOutcome::error(
+                        "'model' is not accepted; subagents use the configured model or inherit the active parent model",
+                    );
+                }
                 let prompt = str_arg(args, "prompt").map_err(|error| error.content);
                 let required_tools = string_array(args, "required_tools");
                 let name = match args.get("name") {
@@ -225,12 +230,6 @@ impl Registry {
                 prompt.and_then(|prompt| {
                     required_tools.and_then(|required_tools| {
                         name.and_then(|name| {
-                            let model = match args.get("model") {
-                                Some(value) => Some(value.as_str().ok_or_else(|| {
-                                    "'model' must be a string when provided".to_string()
-                                })?),
-                                None => None,
-                            };
                             let preset: Option<&AgentPreset> = match args.get("agent") {
                                 Some(value) => {
                                     let agent = value.as_str().ok_or_else(|| {
@@ -267,7 +266,6 @@ impl Registry {
                                     &context.parent_model,
                                     supplied_name,
                                     prompt,
-                                    model,
                                     preset,
                                 )
                                 .map(|id| format!("started {id}"))
@@ -348,8 +346,9 @@ fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
          Declare every tool the task needs in required_tools before choosing an agent. Omit agent \
          unless the selected preset includes every required tool. In particular, scout is only for \
          read-only inspection of existing files; any task that creates or modifies files must \
-         require write_file or edit_file and use the default agent. Write the prompt as a contract: \
-         # Target (exact files and symbols, plus non-goals), # Change (steps), # Acceptance \
+         require write_file or edit_file and use the default agent. Do not select a child model: \
+         presets and user configuration may pin one, otherwise the active parent model is inherited. \
+         Write the prompt as a contract: # Target (exact files and symbols, plus non-goals), # Change (steps), # Acceptance \
          (observable result). The agent must skip formatters, linters, and project-wide test suites. \
          Available agents: {available_agents}."
     );
@@ -368,7 +367,6 @@ fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
                         "description": "Every tool the delegated task must use. Use [] only when the child can answer directly without tools. File creation requires write_file; file modification requires edit_file or write_file."
                     },
                     "name": {"type": "string"},
-                    "model": {"type": "string"},
                     "agent": {
                         "type": "string",
                         "enum": agent_names,
@@ -846,10 +844,67 @@ fi
         assert!(properties.get("agent").is_some());
         assert!(properties.get("required_tools").is_some());
         assert!(
+            properties.get("model").is_none(),
+            "the orchestrator must not override the configured child model"
+        );
+        assert!(
             properties["agent"]["description"]
                 .as_str()
                 .is_some_and(|text| text.contains("Scout is read-only"))
         );
+    }
+
+    #[test]
+    fn spawn_without_model_inherits_the_active_parent() {
+        let root = temp_path("spawn-model-inherit");
+        let mut config = registry_config(root.join("home"), root.join("project"));
+        config.openai_base_url = "http://127.0.0.1:9/v1".into();
+        let manager = SubagentManager::new("session".into(), config.max_subagents);
+        let registry = Registry::scan_with_subagents(
+            &config,
+            &mut DescribeCache::default(),
+            manager.clone(),
+            "openai:active-parent",
+        );
+        let args = json!({
+            "prompt": "Report the delegated result directly.",
+            "required_tools": []
+        });
+
+        let outcome = registry.execute("subagent_spawn", &args.to_string(), "session");
+
+        assert!(!outcome.is_error, "unexpected outcome: {}", outcome.content);
+        assert_eq!(manager.snapshots()[0].model, "openai:active-parent");
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn spawn_rejects_model_overrides_from_the_orchestrator() {
+        let root = temp_path("spawn-model-override");
+        let config = registry_config(root.join("home"), root.join("project"));
+        let manager = SubagentManager::new("session".into(), config.max_subagents);
+        let registry = Registry::scan_with_subagents(
+            &config,
+            &mut DescribeCache::default(),
+            manager.clone(),
+            "openai-codex:parent",
+        );
+        let args = json!({
+            "prompt": "Inspect the requested file.",
+            "required_tools": ["read_file"],
+            "model": "gpt-4.1-mini"
+        });
+
+        let outcome = registry.execute("subagent_spawn", &args.to_string(), "session");
+
+        assert!(outcome.is_error, "unexpected outcome: {}", outcome.content);
+        assert!(
+            outcome.content.contains("not accepted"),
+            "{}",
+            outcome.content
+        );
+        assert!(manager.snapshots().is_empty());
+        manager.shutdown_and_discard();
     }
 
     #[test]

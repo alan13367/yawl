@@ -233,13 +233,13 @@ Subagents are off by default. Enable them from the settings picker or with these
 /settings subagent_timeout_secs 0
 ```
 
-`subagent_model` accepts `inherit` or a model ID. A model supplied to one spawn wins over this setting, and a preset's model sits between them. `inherit` records the main agent's current model when the child starts. Lowering `max_subagents` does not cancel active work. It blocks new starts until the running count falls below the new limit.
+`subagent_model` accepts `inherit` or a model ID. A preset's model overrides this setting. Otherwise, `inherit` records the main agent's current model when the child starts. The model-facing spawn tool cannot override that selection. Lowering `max_subagents` does not cancel active work. It blocks new starts until the running count falls below the new limit.
 
 `subagent_request_budget` caps the model requests a child may spend on one run. At the limit the child receives a wrap-up instruction; at 1.5 times the limit the run stops and whatever it produced is delivered with a `[cancelled after N requests]` marker. `0` disables the cap. `subagent_timeout_secs` is an optional wall clock per run with the same stop-and-salvage behavior; `0`, the default, disables it.
 
 When enabled, the main model receives five tools:
 
-- `subagent_spawn` starts a background task and returns its `sa-N` ID. `prompt` and `required_tools` are required; the latter declares every tool the task needs before an optional preset is selected. The name is generated when omitted, and an invalid model fails the call instead of the run.
+- `subagent_spawn` starts a background task and returns its `sa-N` ID. `prompt` and `required_tools` are required; the latter declares every tool the task needs before an optional preset is selected. The name is generated when omitted. The child model comes from its preset, `subagent_model`, or the active parent model, in that order.
 - `subagent_send` queues another turn or restarts a settled child with its retained conversation.
 - `subagent_wait` waits for selected IDs without canceling unfinished work on timeout. Every settled run reports its complete final response.
 - `subagent_cancel` cancels selected runs and clears their queued messages. A cancelled run delivers any last activity it produced, labeled with its request count.

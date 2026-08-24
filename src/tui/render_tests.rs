@@ -152,6 +152,23 @@ fn reasoning_summary_is_one_line_and_full_reasoning_is_not() {
 }
 
 #[test]
+fn codex_reasoning_summary_parts_render_on_separate_lines() {
+    let summary = Entry::Reasoning {
+        kind: ReasoningKind::Summary,
+        content: "**Planning the change**\n\n**Delegating inspection**".into(),
+    };
+
+    let rendered = render_entries(&[summary], 80, false, false);
+    let visible = rendered
+        .iter()
+        .map(|line| markdown::strip_ansi(line).trim_end().to_string())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    assert_eq!(visible, ["Planning the change", "Delegating inspection"]);
+}
+
+#[test]
 fn hidden_reasoning_is_removed_from_the_transcript() {
     let reasoning = Entry::Reasoning {
         kind: ReasoningKind::Full,

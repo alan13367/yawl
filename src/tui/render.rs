@@ -241,15 +241,38 @@ pub(super) fn render_reasoning(kind: ReasoningKind, content: &str, width: usize)
     let continuation = format!("\x1b[0m{STYLE}");
     let style = |line: String| format!("{STYLE}{}\x1b[0m", line.replace("\x1b[0m", &continuation));
     match kind {
-        ReasoningKind::Summary => {
-            let summary = content.split_whitespace().collect::<Vec<_>>().join(" ");
-            vec![style(markdown::fit_width(&summary, width))]
-        }
+        ReasoningKind::Summary => reasoning_summary_parts(content)
+            .into_iter()
+            .flat_map(|summary| markdown::render(&summary, width))
+            .map(style)
+            .collect(),
         ReasoningKind::Full => markdown::render(content.trim(), width)
             .into_iter()
             .map(style)
             .collect(),
     }
+}
+
+fn reasoning_summary_parts(content: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            if !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(line);
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
 }
 
 pub(super) fn render_user_panel(content: &str, width: usize) -> Vec<String> {
