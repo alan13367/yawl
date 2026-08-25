@@ -18,6 +18,7 @@ fn queue_picker_removes_a_selected_message_and_keeps_the_rest() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -34,6 +35,8 @@ fn queue_picker_removes_a_selected_message_and_keeps_the_rest() {
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::default(),
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
@@ -165,4 +168,20 @@ fn format_copy_all_keeps_user_and_assistant_and_drops_tools_and_reasoning() {
     assert!(!text.contains("secret thoughts"));
     assert!(!text.contains("ok"));
     assert_eq!(format_copy_all(&[], None), "");
+}
+
+#[test]
+fn format_copy_all_drops_a_user_turn_with_only_an_empty_assistant() {
+    let messages = [
+        crate::provider::Message::user("keep this"),
+        crate::provider::Message::assistant("answer".into(), vec![]),
+        crate::provider::Message::user("failed turn"),
+        crate::provider::Message::assistant(String::new(), vec![]),
+        crate::compaction::summary_message("earlier work"),
+    ];
+    let text = format_copy_all(&messages, None);
+    assert!(text.contains("User:\nkeep this"));
+    assert!(text.contains("Assistant:\nanswer"));
+    assert!(!text.contains("failed turn"));
+    assert!(text.contains("User:\n[conversation summary]"));
 }

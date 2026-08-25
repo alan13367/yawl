@@ -34,6 +34,9 @@ pub(super) struct ViewState {
     pub(super) reasoning_effort: Option<String>,
     pub(super) hide_reasoning: bool,
     pub(super) accent_color: UiColor,
+    /// Effective selection highlight color: `selection_color` from the
+    /// config when set, otherwise the accent color.
+    pub(super) selection_color: UiColor,
     pub(super) show_scroll_bar: bool,
     /// Whether the config enables the scroll bar at all. Kept beside the
     /// effective `show_scroll_bar` so auto-hide can re-show it on activity.
@@ -52,6 +55,11 @@ pub(super) struct ViewState {
     pub(super) pending_actions: std::collections::VecDeque<PickerAction>,
     pub(super) completions: Vec<Completion>,
     pub(super) completion_index: usize,
+    /// Slash-command or `@` mention prefix last used to rank the completion
+    /// menu. When it changes, the cursor returns to the first match.
+    pub(super) completion_filter: Option<String>,
+    /// Lazily-built project file index behind `@` mention completion.
+    pub(super) file_index: super::files::FileIndex,
     pub(super) picker: Option<Picker>,
     /// Whether subagent orchestration is enabled, mirrored from the config
     /// so busy-path commands can answer without the agent.
@@ -73,6 +81,7 @@ impl ViewState {
             reasoning_effort: agent.config().reasoning_effort.clone(),
             hide_reasoning: agent.config().hide_reasoning,
             accent_color: agent.config().accent_color,
+            selection_color: agent.config().effective_selection_color(),
             scroll_bar_enabled: agent.config().scroll_bar,
             scroll_bar_auto_hide: agent.config().scroll_bar_auto_hide,
             show_scroll_bar: agent.config().scroll_bar,
@@ -89,6 +98,8 @@ impl ViewState {
             pending_actions: std::collections::VecDeque::new(),
             completions: command_completions(agent),
             completion_index: 0,
+            completion_filter: None,
+            file_index: super::files::FileIndex::default(),
             picker: None,
             subagents_enabled: agent.config().subagents,
             subagent_manager: agent.subagents(),
@@ -102,6 +113,7 @@ impl ViewState {
     pub(super) fn refresh_completions(&mut self, agent: &Agent) {
         self.completions = command_completions(agent);
         self.completion_index = 0;
+        self.completion_filter = None;
     }
 
     /// Mirrors scroll-bar settings from the config into runtime state and

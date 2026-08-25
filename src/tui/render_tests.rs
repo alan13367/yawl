@@ -53,6 +53,7 @@ fn frame_keeps_input_and_status_pinned() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -69,6 +70,8 @@ fn frame_keeps_input_and_status_pinned() {
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::default(),
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
@@ -85,7 +88,18 @@ fn frame_keeps_input_and_status_pinned() {
         .expect("the frame length was asserted immediately above");
     assert!(markdown::strip_ansi(status).contains("test"));
     assert_eq!(cursor.0, 10);
-    assert!(status.contains("48;2;238;238;238"));
+    assert!(
+        !status.contains("48;2;"),
+        "the status bar draws without a background"
+    );
+    assert!(
+        status.contains("38;2;238;238;238"),
+        "the model name uses the accent color"
+    );
+    assert!(
+        status.contains("38;2;219;219;219"),
+        "the remaining status text uses the muted accent"
+    );
     assert!(frame[8].contains("38;2;238;238;238"));
 
     state.copy_toast_ticks = 1;
@@ -216,6 +230,7 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -232,6 +247,8 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::default(),
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
@@ -264,6 +281,7 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         reasoning_effort: None,
         hide_reasoning: true,
         accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -280,6 +298,8 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::default(),
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
@@ -342,6 +362,7 @@ fn loading_state_ignores_status_activity() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -358,6 +379,8 @@ fn loading_state_ignores_status_activity() {
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::default(),
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
@@ -395,6 +418,7 @@ fn overflow_state() -> ViewState {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -411,6 +435,8 @@ fn overflow_state() -> ViewState {
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::default(),
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
@@ -553,6 +579,7 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -569,6 +596,8 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::default(),
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
@@ -701,4 +730,211 @@ fn render_cache_preserves_and_updates_incremental_entries() {
     assert!(lines3.len() > len1);
     assert!(lines3.iter().any(|line| line.contains("system notice")));
     assert!(lines3.iter().any(|line| line.contains("first message")));
+}
+
+#[test]
+fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
+    let mut state = ViewState {
+        transcript: Transcript::from_messages(&[]),
+        tools_expanded: false,
+        model: "test".into(),
+        reasoning_effort: None,
+        hide_reasoning: false,
+        accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
+        show_scroll_bar: false,
+        scroll_bar_enabled: false,
+        scroll_bar_auto_hide: false,
+        scroll_bar_idle_ticks: 0,
+        scroll_geometry: None,
+        scroll_bar_drag: None,
+        copy_toast_ticks: 0,
+        spinner_tick: 0,
+        context_tokens: 0,
+        context_window: 100,
+        activity: String::new(),
+        scroll_offset: 0,
+        queued_inputs: std::collections::VecDeque::new(),
+        pending_actions: std::collections::VecDeque::new(),
+        completions: (1..=12)
+            .map(|n| Completion {
+                command: format!("/cmd{n:02}"),
+                description: format!("Command {n}"),
+            })
+            .collect(),
+        completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::default(),
+        picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_tokens: 0,
+        subagents_enabled: false,
+        subagent_view: None,
+        render_cache: RenderCache::default(),
+    };
+    let mut editor = Editor::default();
+    editor.paste("/");
+
+    let (frame, _) = build_frame(&mut state, &editor, 40, 20);
+    let first_page = markdown::strip_ansi(&frame.join("\n"));
+    assert_eq!(
+        frame.iter().filter(|line| line.contains("/cmd")).count(),
+        COMPLETION_MENU_ROWS
+    );
+    assert!(first_page.contains("/cmd01"));
+    assert!(first_page.contains("/cmd06"));
+    assert!(!first_page.contains("/cmd07"));
+    assert!(
+        frame
+            .iter()
+            .any(|line| line.contains("/cmd01") && line.contains("48;2;238;238;238"))
+    );
+    assert!(
+        first_page.contains("↑ wraps to end"),
+        "the top indicator advertises wrapping at the first page"
+    );
+    assert!(
+        first_page.contains("↓ 6 more · 1/12"),
+        "the bottom indicator counts the hidden matches"
+    );
+
+    state.completion_index = 11;
+    let (frame, _) = build_frame(&mut state, &editor, 40, 20);
+    let scrolled = markdown::strip_ansi(&frame.join("\n"));
+    assert_eq!(
+        frame.iter().filter(|line| line.contains("/cmd")).count(),
+        COMPLETION_MENU_ROWS
+    );
+    assert!(scrolled.contains("/cmd12"));
+    assert!(!scrolled.contains("/cmd01"));
+    assert!(
+        frame
+            .iter()
+            .any(|line| line.contains("/cmd12") && line.contains("48;2;238;238;238"))
+    );
+    assert!(scrolled.contains("↑ 6 more"));
+    assert!(scrolled.contains("↓ wraps to start · 12/12"));
+
+    let bottom_border = frame
+        .iter()
+        .position(|line| line.contains('└'))
+        .expect("the input box has a bottom border");
+    let top_indicator = frame
+        .iter()
+        .position(|line| line.contains('↑'))
+        .expect("the top cycle indicator is rendered");
+    let first_menu_row = frame
+        .iter()
+        .position(|line| line.contains("/cmd"))
+        .expect("the menu is rendered");
+    assert_eq!(
+        top_indicator,
+        bottom_border + 1,
+        "the menu sits directly under the input box"
+    );
+    assert_eq!(first_menu_row, top_indicator + 1);
+    let bottom_indicator = frame
+        .iter()
+        .position(|line| line.contains('↓'))
+        .expect("the bottom cycle indicator is rendered");
+    assert_eq!(bottom_indicator, first_menu_row + COMPLETION_MENU_ROWS);
+}
+
+#[test]
+fn selection_style_keeps_text_readable_for_every_color() {
+    // Every palette color is light enough to demand near-black text.
+    for name in [
+        "white", "gray", "red", "orange", "yellow", "green", "cyan", "blue", "purple", "pink",
+    ] {
+        let color = UiColor::parse(name).expect("palette names parse");
+        let style = selection_style(color);
+        assert!(
+            style.contains("38;2;16;16;16"),
+            "light palette color {name} should get dark text, got {style:?}"
+        );
+        assert!(style.contains(&format!(
+            "48;2;{};{};{}m",
+            color.red, color.green, color.blue
+        )));
+    }
+    // Dark custom colors flip to near-white text.
+    let dark = UiColor::parse("#20242c").expect("hex colors parse");
+    assert!(selection_style(dark).contains("38;2;250;250;250"));
+}
+
+#[test]
+fn selected_row_re_arms_the_highlight_after_embedded_resets() {
+    let style = selection_style(UiColor::WHITE);
+    let row = selected_row("a\x1b[0mb", &style);
+    assert!(row.starts_with(&style));
+    assert!(
+        row.contains(&format!("\x1b[0m{style}b")),
+        "an embedded reset should immediately restore the highlight"
+    );
+    assert!(row.ends_with("\x1b[0m"));
+}
+
+#[test]
+fn mention_menu_lists_matching_files_below_the_input_box() {
+    let mut state = ViewState {
+        transcript: Transcript::from_messages(&[]),
+        tools_expanded: false,
+        model: "test".into(),
+        reasoning_effort: None,
+        hide_reasoning: false,
+        accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
+        show_scroll_bar: false,
+        scroll_bar_enabled: false,
+        scroll_bar_auto_hide: false,
+        scroll_bar_idle_ticks: 0,
+        scroll_geometry: None,
+        scroll_bar_drag: None,
+        copy_toast_ticks: 0,
+        spinner_tick: 0,
+        context_tokens: 0,
+        context_window: 100,
+        activity: String::new(),
+        scroll_offset: 0,
+        queued_inputs: std::collections::VecDeque::new(),
+        pending_actions: std::collections::VecDeque::new(),
+        completions: Vec::new(),
+        completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::with_entries(vec![
+            "src/tui/render.rs".into(),
+            "src/config.rs".into(),
+            "README.md".into(),
+        ]),
+        picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_tokens: 0,
+        subagents_enabled: false,
+        subagent_view: None,
+        render_cache: RenderCache::default(),
+    };
+    let mut editor = Editor::default();
+    editor.paste("look at @rend");
+
+    let (frame, _) = build_frame(&mut state, &editor, 60, 20);
+    let plain = markdown::strip_ansi(&frame.join("\n"));
+    assert!(plain.contains("render.rs"));
+    assert!(plain.contains("src/tui"));
+    assert!(!plain.contains("config.rs"));
+
+    let bottom_border = frame
+        .iter()
+        .position(|line| line.contains('└'))
+        .expect("the input box has a bottom border");
+    let menu_row = frame
+        .iter()
+        .position(|line| line.contains("render.rs") && !line.contains('│'))
+        .expect("the mention menu is rendered");
+    assert_eq!(menu_row, bottom_border + 1);
+    assert!(
+        !plain.contains('↑') && !plain.contains('↓'),
+        "cycle indicators only appear when matches overflow the menu"
+    );
 }

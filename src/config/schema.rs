@@ -18,6 +18,9 @@ pub(super) struct ConfigFile {
     /// Whether reasoning content is omitted from terminal output.
     pub(super) hide_reasoning: Option<bool>,
     pub(super) accent_color: Option<UiColor>,
+    /// Menu selection highlight: `"accent"` follows the accent color,
+    /// otherwise a palette name or `#RRGGBB`.
+    pub(super) selection_color: Option<String>,
     /// Whether the transcript scroll bar is drawn in the TUI.
     pub(super) scroll_bar: Option<bool>,
     /// Whether an idle transcript scroll bar hides itself after a pause.

@@ -288,7 +288,7 @@ pub(super) fn handle_event(state: &mut ViewState, editor: &mut Editor, event: Ev
                     }
                     Event::Key(key) => {
                         if let EditAction::Submit(message) = editor.handle_key(key) {
-                            let message = editor.expand_pastes(&message);
+                            let message = editor.expand_submission(&message);
                             match state
                                 .subagent_manager
                                 .send(&id, &message, RunOrigin::PrivateUser)
@@ -350,6 +350,7 @@ pub(super) fn render(
         } => render_dashboard(
             &state.subagent_snapshots,
             state.accent_color,
+            state.selection_color,
             selected_id.as_deref(),
             *confirm_cancel,
             columns,
@@ -378,6 +379,7 @@ pub(super) fn render(
 fn render_dashboard(
     snapshots: &[SubagentSnapshot],
     accent_color: crate::config::UiColor,
+    selection_color: crate::config::UiColor,
     selected_id: Option<&str>,
     confirm_cancel: bool,
     columns: usize,
@@ -433,7 +435,10 @@ fn render_dashboard(
             snapshot.queued_messages.len()
         );
         frame.push(if selected {
-            format!("\x1b[7m{}\x1b[0m", markdown::fit_width(&line, columns))
+            super::render::selected_row(
+                &markdown::fit_width(&line, columns),
+                &super::render::selection_style(selection_color),
+            )
         } else {
             markdown::fit_width(&line, columns)
         });
@@ -679,6 +684,7 @@ mod tests {
             reasoning_effort: None,
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
+            selection_color: UiColor::WHITE,
             show_scroll_bar: true,
             scroll_bar_enabled: true,
             scroll_bar_auto_hide: false,
@@ -695,6 +701,8 @@ mod tests {
             pending_actions: VecDeque::new(),
             completions: Vec::new(),
             completion_index: 0,
+            completion_filter: None,
+            file_index: crate::tui::files::FileIndex::default(),
             picker: None,
             subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
             subagent_tokens: 0,

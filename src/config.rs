@@ -45,6 +45,9 @@ pub struct Config {
     pub reasoning_effort: Option<String>,
     pub hide_reasoning: bool,
     pub(crate) accent_color: UiColor,
+    /// Highlight color for the selected row in menus and pickers. `None`
+    /// follows the accent color.
+    pub(crate) selection_color: Option<UiColor>,
     /// Whether the TUI draws a transcript scroll bar.
     pub scroll_bar: bool,
     /// Whether an idle transcript scroll bar hides itself after a pause.
@@ -80,6 +83,12 @@ pub struct Config {
 }
 
 impl Config {
+    /// The menu selection highlight color: the explicit `selection_color`
+    /// when set, otherwise the accent color.
+    pub(crate) fn effective_selection_color(&self) -> UiColor {
+        self.selection_color.unwrap_or(self.accent_color)
+    }
+
     pub fn global_config_path(&self) -> PathBuf {
         self.home_dir.join("config.json")
     }
@@ -203,6 +212,7 @@ impl Config {
             reasoning_effort: None,
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
+            selection_color: None,
             scroll_bar: true,
             scroll_bar_auto_hide: true,
             context_windows: HashMap::new(),

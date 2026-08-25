@@ -27,7 +27,7 @@ fn picker_is_bounded_and_highlights_selection() {
         ],
         editing: None,
     };
-    let rendered = render_picker(&picker, &Editor::default(), 50, 10);
+    let rendered = render_picker(&picker, &Editor::default(), "\x1b[7m", 50, 10);
     assert_eq!(rendered.len(), 10);
     assert!(
         rendered
@@ -55,6 +55,25 @@ fn accent_picker_selects_the_current_shared_color() {
 }
 
 #[test]
+fn selection_picker_defaults_to_following_the_accent() {
+    let picker = selection_color_picker(None);
+    assert_eq!(picker.title, "Selection color");
+    assert_eq!(picker.items[picker.selected].label, "Accent");
+    assert!(matches!(
+        picker.items[picker.selected].action,
+        PickerAction::SetSelectionColor(None)
+    ));
+
+    let green = UiColor::new(139, 213, 162);
+    let picker = selection_color_picker(Some(green));
+    assert!(matches!(
+        picker.items[picker.selected].action,
+        PickerAction::SetSelectionColor(Some(color)) if color == green
+    ));
+    assert!(picker.items.iter().any(|item| item.label == "Custom RGB…"));
+}
+
+#[test]
 fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
     let mut state = ViewState {
         transcript: Transcript::from_messages(&[]),
@@ -63,6 +82,7 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -79,6 +99,8 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::default(),
         picker: Some(Picker {
             title: "Settings".into(),
             hint: "Enter change".into(),
@@ -128,6 +150,7 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -144,6 +167,8 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::default(),
         picker: Some(Picker {
             title: "Settings".into(),
             hint: "Enter change".into(),

@@ -17,8 +17,8 @@ use super::events::{Event, EventReader, Key, MouseEvent};
 use super::input::{EditAction, Editor};
 use super::picker::{
     ActivePickers, PickerAction, SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_REASONING_DISPLAY_INDEX,
-    SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX, SETTINGS_SCROLL_BAR_INDEX, picker_is_editing,
-    select_picker_item, take_picker_action,
+    SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX, SETTINGS_SCROLL_BAR_INDEX, SETTINGS_SELECTION_COLOR_INDEX,
+    picker_is_editing, select_picker_item, take_picker_action,
 };
 use super::state::{
     COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, scroll,
@@ -361,6 +361,9 @@ pub(super) fn activate_picker_action_while_busy(
         PickerAction::OpenAccentColor => {
             state.picker = Some(active_pickers.accent_color.clone());
         }
+        PickerAction::OpenSelectionColor => {
+            state.picker = Some(active_pickers.selection_color.clone());
+        }
         PickerAction::EditSetting { .. } | PickerAction::EditModel { .. } => {}
         PickerAction::RemoveQueued(_) | PickerAction::ClearQueued => {}
         action => {
@@ -380,6 +383,12 @@ pub(super) fn display_config_change(action: &PickerAction) -> Option<(ConfigChan
             ConfigChange::AccentColor(color.config_value()),
             SETTINGS_ACCENT_COLOR_INDEX,
         )),
+        PickerAction::SetSelectionColor(selection) => Some((
+            ConfigChange::SelectionColor(crate::config::UiColor::selection_config_value(
+                *selection,
+            )),
+            SETTINGS_SELECTION_COLOR_INDEX,
+        )),
         PickerAction::SetScrollBar(enabled) => Some((
             ConfigChange::ScrollBar(if *enabled { "on" } else { "off" }.into()),
             SETTINGS_SCROLL_BAR_INDEX,
@@ -390,7 +399,12 @@ pub(super) fn display_config_change(action: &PickerAction) -> Option<(ConfigChan
         )),
         PickerAction::ApplySetting { argument, selected } => argument
             .strip_prefix("accent_color ")
-            .map(|value| (ConfigChange::AccentColor(value.to_string()), *selected)),
+            .map(|value| (ConfigChange::AccentColor(value.to_string()), *selected))
+            .or_else(|| {
+                argument
+                    .strip_prefix("selection_color ")
+                    .map(|value| (ConfigChange::SelectionColor(value.to_string()), *selected))
+            }),
         _ => None,
     }
 }
@@ -407,6 +421,7 @@ pub(super) fn apply_display_config_while_busy(
             *config = outcome.config;
             state.hide_reasoning = config.hide_reasoning;
             state.accent_color = config.accent_color;
+            state.selection_color = config.effective_selection_color();
             state.sync_scroll_bar_config(config);
             state.subagents_enabled = config.subagents;
             notice_config_effect(config, outcome.effect, state);

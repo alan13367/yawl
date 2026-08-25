@@ -16,7 +16,7 @@ Yawl is one Cargo package with a Rust 2024 library target and binary target for 
 - `src/config.rs`: effective `Config` facade and stable re-exports
 - `src/config/types.rs`, `schema.rs`, `loading.rs`, `storage.rs`, `change.rs`: runtime types, on-disk schema, merge logic, JSON storage, and validated mutations
 - `src/tui/mod.rs`: `tui::run` facade and top-level event/submission coordination
-- `src/tui/commands.rs`, `completion.rs`, `picker.rs`, `state.rs`, `worker.rs`: TUI behavior and state
+- `src/tui/commands.rs`, `completion.rs`, `files.rs`, `picker.rs`, `state.rs`, `worker.rs`: TUI behavior and state
 - `src/tui/render.rs`, `terminal.rs`, `events.rs`, `input.rs`, `transcript.rs`: frame composition, terminal lifecycle, input decoding/editing, and transcript reduction
 - `src/tui/markdown.rs`, `highlight.rs`, `tool_view.rs`: sanitized Markdown, syntax highlighting, and tool presentation
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts

@@ -56,7 +56,8 @@ Run `yawl --help` for the complete command-line reference.
 - `Enter` submits the editor contents.
 - `Shift+Enter` inserts a newline. `Ctrl+J` and `Alt+Enter` also insert a newline if the terminal does not report Shift.
 - Pasted multiline text stays multiline through bracketed paste mode. Pastes longer than 400 characters or 8 lines appear as `[Pasted #N 1234 characters]` in the editor and transcript; the model still receives the full text.
-- Typing `/` opens a filtered command and skill menu. `Up`/`Down` select an item and `Tab` completes it. Enter completes and runs the command when only one match remains, so `/qui` runs `/quit`.
+- Typing `/` opens a filtered command and skill menu below the input box. Up to 6 matches are shown at a time; `Up`/`Down` move the selection and wrap through the full list. When more matches exist than fit, `↑`/`↓` indicator rows frame the menu showing how many matches are hidden in each direction, the selection position, and where the list wraps. The first match is selected. `Tab` completes it. Enter runs the selected command, or the exact name when you have typed it in full, so `/copy` runs `/copy` rather than `/copy-all`.
+- Typing `@` opens the same menu filtered over the project's files so you can tag one for the model. The file list is indexed lazily on first use and cached for the session; it comes from `git ls-files` (which respects `.gitignore`) or, outside a repository, a bounded walk that skips hidden and build directories. Matching is case-insensitive and ranks file-name hits above path and subsequence hits. `Tab` or `Enter` inserts a short tag such as `@render.rs` (two files with the same name get longer tags like `@other/render.rs`); the editor and transcript keep the short tag while the model receives the relative path, such as `@src/tui/render.rs`.
 - `/undo` restores the working directory to how it looked before the last prompt, including when the folder is not a git repository. If this directory is a git repo and the agent moved `HEAD`, `/undo` also resets local `HEAD` to the pre-turn commit. It then removes that user prompt and the assistant reply from the conversation. `/copy` puts the last assistant reply on the clipboard; `/copy-all` copies the full user/assistant transcript without reasoning so you can paste it into another harness.
 - Outside the completion menu, `Up` and `Down` browse input history.
 - `Ctrl+U`, `Ctrl+K`, and `Ctrl+W` delete text.
@@ -69,7 +70,7 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 
 ## Slash commands
 
-`/model` and `/settings` open lightweight keyboard pickers, including while a model response is still running. Use the arrow keys and Enter to choose, or Escape to close. Editable settings stay in the picker: Enter starts editing the current value, Enter again saves it, and the refreshed value is shown in the menu. Reasoning visibility and accent color changes apply immediately during an active response. Settings that can affect generation, including the model and reasoning effort, apply as soon as the response releases the agent and before the next message starts.
+`/model` and `/settings` open lightweight keyboard pickers, including while a model response is still running. Use the arrow keys and Enter to choose, or Escape to close. Editable settings stay in the picker: Enter starts editing the current value, Enter again saves it, and the refreshed value is shown in the menu. Reasoning visibility, accent color, and selection color changes apply immediately during an active response. Settings that can affect generation, including the model and reasoning effort, apply as soon as the response releases the agent and before the next message starts.
 
 Messages submitted during an active response are queued automatically. Each pending message is shown below the live transcript with a `Queued` label, and the status bar shows the queue length. Run `/unqueue` to choose a pending message to remove, `/unqueue NUMBER` to remove one directly, or `/unqueue all` to clear the queue.
 
@@ -105,6 +106,7 @@ Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`
   "reasoning_effort": "high",
   "hide_reasoning": false,
   "accent_color": "white",
+  "selection_color": "accent",
   "scroll_bar": true,
   "scroll_bar_auto_hide": true,
   "auto_compact": true,
@@ -174,6 +176,8 @@ Add providers under `providers`. This uses the same field names as pi's `models.
 Set `hide_reasoning` to `true`, choose "Reasoning display" in `/settings`, or run `/settings hide_reasoning on` to remove both summary and full reasoning from the TUI and print-mode output. Yawl still records the reasoning in the session so it reappears if the setting is turned off. In print mode, visible reasoning goes to standard error and the answer remains on standard output.
 
 Choose "Accent color" in `/settings` to set the status bar and text-box border from one palette. The same value can be set directly with `/settings accent_color blue` or `/settings accent_color '#7aa2f7'`. Palette names and `#RRGGBB` values are accepted; the default is white.
+
+The highlighted row in the completion menu, pickers, and the subagent dashboard follows the accent color by default. Choose "Selection color" in `/settings`, or run `/settings selection_color accent|NAME|#RRGGBB`, to keep it on the accent (`accent`, the default) or pick an independent color. Whatever color is chosen, Yawl draws the selected row's text in near-black or near-white based on the color's luminance so the row always stays readable.
 
 When the transcript overflows the screen, Yawl draws a solid scroll bar along its right edge: a muted track in the accent color with a darker rectangle as the thumb. Click anywhere on it to jump, or press and drag to scrub through the history. With auto-hide on (the default), the bar appears while you scroll — mouse wheel, PageUp/PageDown, or dragging the bar — and fades out of the layout after two idle seconds so text reclaims the full width; it reappears on the next scroll. Set `scroll_bar` to `false`, choose "Scroll bar" in `/settings`, or run `/settings scroll_bar off` to hide it entirely. Set `scroll_bar_auto_hide` to `false`, choose "Auto-hide scroll bar" in `/settings`, or run `/settings scroll_bar_auto_hide off` to keep it permanently visible. Both default to on.
 

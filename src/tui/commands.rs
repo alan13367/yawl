@@ -8,8 +8,8 @@ use crate::provider::{Message, Role};
 use super::picker::{
     Picker, PickerAction, PickerItem, SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_AUTO_COMPACT_INDEX,
     SETTINGS_RELOAD_INDEX, SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX, SETTINGS_SCROLL_BAR_INDEX,
-    SETTINGS_SUBAGENTS_INDEX, color_picker, open_model_picker, open_reasoning_picker,
-    open_settings_picker, select_picker_item,
+    SETTINGS_SELECTION_COLOR_INDEX, SETTINGS_SUBAGENTS_INDEX, color_picker, open_model_picker,
+    open_reasoning_picker, open_settings_picker, select_picker_item, selection_color_picker,
 };
 use super::state::ViewState;
 
@@ -34,7 +34,8 @@ Commands
 
 Input
   Enter submits. Shift+Enter, Alt+Enter, or Ctrl+J inserts a newline.
-  Type / for commands; Up/Down select, Tab completes, and Enter accepts a sole match.
+    Type / for commands; Up/Down select, Tab completes, and Enter runs the selected
+    command or an exact name such as /copy.
   Model and settings pickers remain available during an active response.
   Messages submitted during a response appear below it as queued.
   Outside the menu, Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
@@ -222,6 +223,22 @@ pub(super) fn activate_picker_action(
         PickerAction::OpenAccentColor => {
             state.picker = Some(color_picker(agent.config().accent_color));
         }
+        PickerAction::OpenSelectionColor => {
+            state.picker = Some(selection_color_picker(agent.config().selection_color));
+        }
+        PickerAction::SetSelectionColor(selection) => {
+            if settings(
+                agent,
+                &format!(
+                    "selection_color {}",
+                    crate::config::UiColor::selection_config_value(selection)
+                ),
+                state,
+            ) {
+                open_settings_picker(agent, state);
+                select_picker_item(state, SETTINGS_SELECTION_COLOR_INDEX);
+            }
+        }
         PickerAction::SetScrollBar(enabled) => {
             if settings(
                 agent,
@@ -326,6 +343,11 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
             one_value(&mut parts, "usage: /settings accent_color NAME|#RRGGBB")
                 .map(|value| ConfigChange::AccentColor(value.to_string()))
         }
+        "selection_color" => one_value(
+            &mut parts,
+            "usage: /settings selection_color accent|NAME|#RRGGBB",
+        )
+        .map(|value| ConfigChange::SelectionColor(value.to_string())),
         "scroll_bar" => one_value(&mut parts, "usage: /settings scroll_bar on|off")
             .map(|value| ConfigChange::ScrollBar(value.to_string())),
         "scroll_bar_auto_hide" => {
@@ -429,6 +451,7 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
             state.reasoning_effort = agent.config().reasoning_effort.clone();
             state.hide_reasoning = agent.config().hide_reasoning;
             state.accent_color = agent.config().accent_color;
+            state.selection_color = agent.config().effective_selection_color();
             state.subagents_enabled = agent.config().subagents;
             state.sync_scroll_bar_config(agent.config());
             state.context_window = agent.context_window();
@@ -468,7 +491,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -478,6 +501,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
             .unwrap_or("provider default"),
         agent.config().hide_reasoning,
         agent.config().accent_color.config_value(),
+        crate::config::UiColor::selection_config_value(agent.config().selection_color),
         if agent.config().scroll_bar {
             "on"
         } else {
@@ -542,7 +566,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);
@@ -610,44 +634,110 @@ pub(super) fn last_assistant_reply<'a>(
 }
 
 pub(super) fn format_copy_all(messages: &[Message], streaming: Option<&str>) -> String {
-    let mut blocks = Vec::new();
+    let mut parts = Vec::new();
     for message in messages {
         match message.role {
-            Role::User => blocks.push(format!("User:\n{}", message.content)),
-            Role::Assistant if !message.content.is_empty() => {
-                blocks.push(format!("Assistant:\n{}", message.content));
-            }
-            _ => {}
+            Role::User => parts.push(CopyPart::User(&message.content)),
+            Role::Assistant => parts.push(CopyPart::Assistant(&message.content)),
+            Role::Tool => {}
         }
     }
-    if let Some(text) = streaming.filter(|text| !text.is_empty()) {
-        blocks.push(format!("Assistant:\n{text}"));
+    if let Some(text) = streaming {
+        parts.push(CopyPart::Assistant(text));
     }
-    blocks.join("\n\n")
+    format_copy_parts(&parts)
 }
 
 pub(super) fn format_copy_all_from_transcript(
     transcript: &super::transcript::Transcript,
 ) -> String {
-    let mut blocks = Vec::new();
+    let mut parts = Vec::new();
     for entry in transcript.entries() {
         match entry {
-            super::transcript::Entry::User(content) => {
-                blocks.push(format!("User:\n{content}"));
-            }
-            super::transcript::Entry::Assistant(content) if !content.is_empty() => {
-                blocks.push(format!("Assistant:\n{content}"));
+            super::transcript::Entry::User(content) => parts.push(CopyPart::User(content)),
+            super::transcript::Entry::Assistant(content) => {
+                parts.push(CopyPart::Assistant(content));
             }
             super::transcript::Entry::SubagentResult {
                 id,
                 name,
                 status,
                 content,
-            } => blocks.push(format!("User:\n[{id} {status}] {name}\n{content}")),
+            } => {
+                parts.push(CopyPart::OwnedUser(format!(
+                    "[{id} {status}] {name}\n{content}"
+                )));
+            }
             _ => {}
         }
     }
+    format_copy_parts(&parts)
+}
+
+enum CopyPart<'a> {
+    User(&'a str),
+    Assistant(&'a str),
+    OwnedUser(String),
+}
+
+fn format_copy_parts(parts: &[CopyPart<'_>]) -> String {
+    let mut blocks = Vec::new();
+    let mut pending_user: Option<String> = None;
+    let mut assistants: Vec<String> = Vec::new();
+    let mut saw_empty_assistant = false;
+    for part in parts {
+        match part {
+            CopyPart::User(content) => {
+                flush_copy_turn(
+                    &mut blocks,
+                    &mut pending_user,
+                    &mut assistants,
+                    &mut saw_empty_assistant,
+                );
+                pending_user = Some((*content).to_string());
+            }
+            CopyPart::OwnedUser(content) => {
+                flush_copy_turn(
+                    &mut blocks,
+                    &mut pending_user,
+                    &mut assistants,
+                    &mut saw_empty_assistant,
+                );
+                pending_user = Some(content.clone());
+            }
+            CopyPart::Assistant("") => {
+                saw_empty_assistant = true;
+            }
+            CopyPart::Assistant(content) => assistants.push((*content).to_string()),
+        }
+    }
+    flush_copy_turn(
+        &mut blocks,
+        &mut pending_user,
+        &mut assistants,
+        &mut saw_empty_assistant,
+    );
     blocks.join("\n\n")
+}
+
+fn flush_copy_turn(
+    blocks: &mut Vec<String>,
+    pending_user: &mut Option<String>,
+    assistants: &mut Vec<String>,
+    saw_empty_assistant: &mut bool,
+) {
+    if assistants.is_empty() && *saw_empty_assistant {
+        pending_user.take();
+        *saw_empty_assistant = false;
+        return;
+    }
+    if let Some(user) = pending_user.take() {
+        blocks.push(format!("User:\n{user}"));
+    }
+    for text in assistants.drain(..) {
+        blocks.push(format!("Assistant:\n{text}"));
+    }
+    *saw_empty_assistant = false;
 }
 
 pub(super) fn copy_to_clipboard(

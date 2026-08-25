@@ -17,6 +17,7 @@ pub(crate) enum ConfigChange {
     ReasoningEffort(String),
     HideReasoning(String),
     AccentColor(String),
+    SelectionColor(String),
     ScrollBar(String),
     ScrollBarAutoHide(String),
     AutoCompact(String),
@@ -74,6 +75,7 @@ enum ValidatedChange {
     },
     HideReasoning(bool),
     AccentColor(UiColor),
+    SelectionColor(Option<UiColor>),
     ScrollBar(bool),
     ScrollBarAutoHide(bool),
     AutoCompact(bool),
@@ -156,6 +158,9 @@ impl ValidatedChange {
             ConfigChange::HideReasoning(value) => Ok(Self::HideReasoning(parse_on_off(&value)?)),
             ConfigChange::AccentColor(value) => UiColor::parse(&value)
                 .map(Self::AccentColor)
+                .map_err(Error::Config),
+            ConfigChange::SelectionColor(value) => UiColor::parse_selection(&value)
+                .map(Self::SelectionColor)
                 .map_err(Error::Config),
             ConfigChange::ScrollBar(value) => Ok(Self::ScrollBar(parse_on_off(&value)?)),
             ConfigChange::ScrollBarAutoHide(value) => {
@@ -278,6 +283,11 @@ impl ValidatedChange {
                 root.remove("text_box_color");
                 Ok(())
             }),
+            Self::SelectionColor(selection) => insert_scalar(
+                config,
+                "selection_color",
+                json!(UiColor::selection_config_value(*selection)),
+            ),
             Self::ScrollBar(enabled) => insert_scalar(config, "scroll_bar", json!(enabled)),
             Self::ScrollBarAutoHide(enabled) => {
                 insert_scalar(config, "scroll_bar_auto_hide", json!(enabled))
@@ -372,6 +382,7 @@ impl ValidatedChange {
             Self::ReasoningEffort { effective, .. } => config.reasoning_effort == *effective,
             Self::HideReasoning(hidden) => config.hide_reasoning == *hidden,
             Self::AccentColor(color) => config.accent_color == *color,
+            Self::SelectionColor(selection) => config.selection_color == *selection,
             Self::ScrollBar(enabled) => config.scroll_bar == *enabled,
             Self::ScrollBarAutoHide(enabled) => config.scroll_bar_auto_hide == *enabled,
             Self::AutoCompact(enabled) => config.auto_compact == *enabled,
@@ -633,6 +644,49 @@ mod tests {
             outcome
                 .config
                 .change_global(ConfigChange::AccentColor("transparent".into()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn selection_color_change_supports_accent_and_explicit_colors() {
+        let dirs = TestDirs::new("selection-color");
+        let config = dirs.config();
+        assert_eq!(config.selection_color, None);
+
+        let outcome = config
+            .change_global(ConfigChange::SelectionColor("blue".into()))
+            .expect("a palette color should apply");
+        assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
+        assert_eq!(
+            outcome.config.selection_color,
+            Some(UiColor::new(117, 169, 255))
+        );
+        assert_eq!(
+            outcome.config.effective_selection_color(),
+            UiColor::new(117, 169, 255)
+        );
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(dirs.home.join("config.json"))
+                .expect("saved config should be readable"),
+        )
+        .expect("saved config should remain JSON");
+        assert_eq!(saved["selection_color"], "blue");
+
+        let outcome = outcome
+            .config
+            .change_global(ConfigChange::SelectionColor("accent".into()))
+            .expect("'accent' should restore following the accent color");
+        assert_eq!(outcome.config.selection_color, None);
+        assert_eq!(
+            outcome.config.effective_selection_color(),
+            outcome.config.accent_color
+        );
+
+        assert!(
+            outcome
+                .config
+                .change_global(ConfigChange::SelectionColor("transparent".into()))
                 .is_err()
         );
     }

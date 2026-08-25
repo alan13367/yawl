@@ -10,28 +10,73 @@ use super::markdown;
 
 pub(super) const SETTINGS_REASONING_DISPLAY_INDEX: usize = 3;
 pub(super) const SETTINGS_ACCENT_COLOR_INDEX: usize = 4;
-pub(super) const SETTINGS_SCROLL_BAR_INDEX: usize = 5;
-pub(super) const SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX: usize = 6;
-pub(super) const SETTINGS_AUTO_COMPACT_INDEX: usize = 7;
-pub(super) const SETTINGS_SUBAGENTS_INDEX: usize = 14;
-pub(super) const SETTINGS_RELOAD_INDEX: usize = 19;
+pub(super) const SETTINGS_SELECTION_COLOR_INDEX: usize = 5;
+pub(super) const SETTINGS_SCROLL_BAR_INDEX: usize = 6;
+pub(super) const SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX: usize = 7;
+pub(super) const SETTINGS_AUTO_COMPACT_INDEX: usize = 8;
+pub(super) const SETTINGS_SUBAGENTS_INDEX: usize = 15;
+pub(super) const SETTINGS_RELOAD_INDEX: usize = 20;
+
+/// Named colors offered by the accent and selection pickers, mirroring
+/// `UiColor::parse`.
+const COLOR_PALETTE: [(&str, UiColor); 10] = [
+    ("White", UiColor::WHITE),
+    ("Gray", UiColor::new(148, 148, 158)),
+    ("Red", UiColor::new(235, 111, 146)),
+    ("Orange", UiColor::new(240, 160, 96)),
+    ("Yellow", UiColor::new(232, 202, 118)),
+    ("Green", UiColor::new(139, 213, 162)),
+    ("Cyan", UiColor::new(116, 199, 213)),
+    ("Blue", UiColor::new(117, 169, 255)),
+    ("Purple", UiColor::new(190, 149, 255)),
+    ("Pink", UiColor::new(238, 148, 200)),
+];
+
+fn swatch_description(color: UiColor) -> String {
+    format!(
+        "\x1b[48;2;{};{};{}m   \x1b[0m {}",
+        color.red,
+        color.green,
+        color.blue,
+        color.config_value()
+    )
+}
 
 #[derive(Clone)]
 pub(super) enum PickerAction {
     SwitchModel(String),
     SaveModel(String),
-    OpenModels { save: bool },
-    OpenReasoning { save: bool },
-    SetReasoning { effort: Option<String>, save: bool },
+    OpenModels {
+        save: bool,
+    },
+    OpenReasoning {
+        save: bool,
+    },
+    SetReasoning {
+        effort: Option<String>,
+        save: bool,
+    },
     SetHideReasoning(bool),
     OpenAccentColor,
     SetAccentColor(UiColor),
+    OpenSelectionColor,
+    /// `None` follows the accent color.
+    SetSelectionColor(Option<UiColor>),
     SetScrollBar(bool),
     SetScrollBarAutoHide(bool),
     ResumeSession(String),
-    EditSetting { key: String, initial: String },
-    EditModel { save: bool, initial: String },
-    ApplySetting { argument: String, selected: usize },
+    EditSetting {
+        key: String,
+        initial: String,
+    },
+    EditModel {
+        save: bool,
+        initial: String,
+    },
+    ApplySetting {
+        argument: String,
+        selected: usize,
+    },
     SetAutoCompact(bool),
     SetSubagents(bool),
     RemoveQueued(usize),
@@ -69,6 +114,7 @@ pub(super) struct ActivePickers {
     pub(super) reasoning: Picker,
     pub(super) default_reasoning: Picker,
     pub(super) accent_color: Picker,
+    pub(super) selection_color: Picker,
 }
 
 impl ActivePickers {
@@ -80,6 +126,7 @@ impl ActivePickers {
             reasoning: reasoning_picker(agent, false),
             default_reasoning: reasoning_picker(agent, true),
             accent_color: color_picker(agent.config().accent_color),
+            selection_color: selection_color_picker(agent.config().selection_color),
         }
     }
 
@@ -99,6 +146,9 @@ impl ActivePickers {
         }
         if let Some(item) = self.settings.items.get_mut(SETTINGS_ACCENT_COLOR_INDEX) {
             item.description = config.accent_color.config_value();
+        }
+        if let Some(item) = self.settings.items.get_mut(SETTINGS_SELECTION_COLOR_INDEX) {
+            item.description = UiColor::selection_config_value(config.selection_color);
         }
         if let Some(item) = self.settings.items.get_mut(SETTINGS_SCROLL_BAR_INDEX) {
             let visibility = if config.scroll_bar {
@@ -128,6 +178,7 @@ impl ActivePickers {
             item.action = PickerAction::SetSubagents(!config.subagents);
         }
         self.accent_color = color_picker(config.accent_color);
+        self.selection_color = selection_color_picker(config.selection_color);
     }
 }
 
@@ -269,6 +320,11 @@ pub(super) fn settings_picker(agent: &Agent) -> Picker {
                 action: PickerAction::OpenAccentColor,
             },
             PickerItem {
+                label: "Selection color".into(),
+                description: UiColor::selection_config_value(agent.config().selection_color),
+                action: PickerAction::OpenSelectionColor,
+            },
+            PickerItem {
                 label: "Scroll bar".into(),
                 description: format!("{scroll_bar_visibility} · Enter to toggle"),
                 action: PickerAction::SetScrollBar(!agent.config().scroll_bar),
@@ -405,29 +461,11 @@ pub(super) fn settings_picker(agent: &Agent) -> Picker {
 }
 
 pub(super) fn color_picker(current: UiColor) -> Picker {
-    let choices = [
-        ("White", UiColor::WHITE),
-        ("Gray", UiColor::new(148, 148, 158)),
-        ("Red", UiColor::new(235, 111, 146)),
-        ("Orange", UiColor::new(240, 160, 96)),
-        ("Yellow", UiColor::new(232, 202, 118)),
-        ("Green", UiColor::new(139, 213, 162)),
-        ("Cyan", UiColor::new(116, 199, 213)),
-        ("Blue", UiColor::new(117, 169, 255)),
-        ("Purple", UiColor::new(190, 149, 255)),
-        ("Pink", UiColor::new(238, 148, 200)),
-    ];
-    let mut items = choices
+    let mut items = COLOR_PALETTE
         .into_iter()
         .map(|(label, color)| PickerItem {
             label: label.into(),
-            description: format!(
-                "\x1b[48;2;{};{};{}m   \x1b[0m {}",
-                color.red,
-                color.green,
-                color.blue,
-                color.config_value()
-            ),
+            description: swatch_description(color),
             action: PickerAction::SetAccentColor(color),
         })
         .collect::<Vec<_>>();
@@ -450,6 +488,43 @@ pub(super) fn color_picker(current: UiColor) -> Picker {
         .unwrap_or(items.len().saturating_sub(1));
     Picker {
         title: "Accent color".into(),
+        hint: "↑/↓ move  Enter select  Esc cancel".into(),
+        items,
+        selected,
+        editing: None,
+    }
+}
+
+pub(super) fn selection_color_picker(current: Option<UiColor>) -> Picker {
+    let mut items = vec![PickerItem {
+        label: "Accent".into(),
+        description: "Follow the accent color".into(),
+        action: PickerAction::SetSelectionColor(None),
+    }];
+    items.extend(COLOR_PALETTE.into_iter().map(|(label, color)| PickerItem {
+        label: label.into(),
+        description: swatch_description(color),
+        action: PickerAction::SetSelectionColor(Some(color)),
+    }));
+    items.push(PickerItem {
+        label: "Custom RGB…".into(),
+        description: "Enter accent or #RRGGBB".into(),
+        action: PickerAction::EditSetting {
+            key: "selection_color".into(),
+            initial: UiColor::selection_config_value(current),
+        },
+    });
+    let selected = items
+        .iter()
+        .position(|item| {
+            matches!(
+                item.action,
+                PickerAction::SetSelectionColor(color) if color == current
+            )
+        })
+        .unwrap_or(items.len().saturating_sub(1));
+    Picker {
+        title: "Selection color".into(),
         hint: "↑/↓ move  Enter select  Esc cancel".into(),
         items,
         selected,
@@ -547,6 +622,9 @@ pub(super) fn take_picker_action(
                         PickerEdit::Setting(key) if key == "accent_color" => {
                             SETTINGS_ACCENT_COLOR_INDEX
                         }
+                        PickerEdit::Setting(key) if key == "selection_color" => {
+                            SETTINGS_SELECTION_COLOR_INDEX
+                        }
                         _ => picker.selected,
                     };
                     state.picker = None;
@@ -620,6 +698,7 @@ pub(super) fn select_picker_item(state: &mut ViewState, selected: usize) {
 pub(super) fn render_picker(
     picker: &Picker,
     editor: &Editor,
+    selection: &str,
     columns: usize,
     height: usize,
 ) -> Vec<String> {
@@ -659,9 +738,9 @@ pub(super) fn render_picker(
         };
         let text = format!(" {marker} {}  ·  {description}", item.label);
         if absolute == picker.selected {
-            panel.push(boxed(&format!(
-                "\x1b[7m{}\x1b[0m",
-                markdown::fit_width(&text, inner)
+            panel.push(boxed(&super::render::selected_row(
+                &markdown::fit_width(&text, inner),
+                selection,
             )));
         } else {
             panel.push(boxed(&text));

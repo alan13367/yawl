@@ -46,7 +46,8 @@ fn display_settings_apply_during_an_active_turn() {
         settings,
         reasoning: picker.clone(),
         default_reasoning: picker.clone(),
-        accent_color: picker,
+        accent_color: picker.clone(),
+        selection_color: picker,
     };
     let mut state = ViewState {
         transcript: Transcript::from_messages(&[]),
@@ -55,6 +56,7 @@ fn display_settings_apply_during_an_active_turn() {
         reasoning_effort: None,
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -71,6 +73,8 @@ fn display_settings_apply_during_an_active_turn() {
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::default(),
         picker: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),

@@ -9,6 +9,7 @@ mod completion;
 #[cfg(test)]
 mod completion_tests;
 pub mod events;
+mod files;
 pub mod highlight;
 pub mod input;
 pub mod markdown;
@@ -60,12 +61,19 @@ use self::commands::{
     format_copy_all, handle_queue_picker_action, last_assistant_reply, open_queue_picker,
 };
 #[cfg(test)]
-use self::completion::Completion;
+use self::completion::{
+    COMPLETION_MENU_ROWS, Completion, completion_window, matching_completions,
+    sync_completion_filter,
+};
 #[cfg(test)]
-use self::picker::{ActivePickers, Picker, PickerAction, PickerItem, color_picker, render_picker};
+use self::picker::{
+    ActivePickers, Picker, PickerAction, PickerItem, color_picker, render_picker,
+    selection_color_picker,
+};
 #[cfg(test)]
 use self::render::{
     RenderCache, build_frame, render_entries, render_loading_state, render_queued_panel,
+    selected_row, selection_style,
 };
 #[cfg(test)]
 use self::state::Update;
@@ -245,7 +253,7 @@ fn handle_submission<R: Read>(
             });
         let skills = crate::skills::scan(agent.config());
         if let Some(skill) = skills.iter().find(|skill| skill.name == name) {
-            let expanded = crate::skills::expand(skill, &editor.expand_pastes(arguments));
+            let expanded = crate::skills::expand(skill, &editor.expand_submission(arguments));
             run_agent_submission(agent, input, expanded, state, editor, terminal, events)?;
         } else {
             state.notice(format!(
@@ -334,7 +342,7 @@ fn handle_submission<R: Read>(
     run_agent_submission(
         agent,
         input.clone(),
-        editor.expand_pastes(&input),
+        editor.expand_submission(&input),
         state,
         editor,
         terminal,

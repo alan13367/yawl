@@ -3,7 +3,9 @@
 use crate::config::UiColor;
 use crate::provider::ReasoningKind;
 
-use super::completion::matching_completions;
+use super::completion::{
+    COMPLETION_MENU_ROWS, completion_window, menu_rows, sync_completion_filter,
+};
 use super::input::Editor;
 use super::picker::render_picker;
 use super::state::{ScrollGeometry, scroll_bar_position, scroll_bar_span};
@@ -314,13 +316,38 @@ pub(super) fn foreground_color(color: UiColor) -> String {
     format!("\x1b[38;2;{};{};{}m", color.red, color.green, color.blue)
 }
 
-pub(super) fn status_style(color: UiColor) -> String {
+/// Selection highlight for menu, picker, and dashboard rows: the configured
+/// selection color as the background with near-black or near-white text
+/// chosen by luminance. The 120,000 threshold (of a 255,000 maximum) is
+/// where both text choices contrast about equally, so every color keeps the
+/// selected row readable.
+pub(super) fn selection_style(color: UiColor) -> String {
     let luminance =
         u32::from(color.red) * 299 + u32::from(color.green) * 587 + u32::from(color.blue) * 114;
-    let text = if luminance >= 150_000 { 24 } else { 245 };
+    let text = if luminance >= 120_000 { 16 } else { 250 };
     format!(
         "\x1b[38;2;{text};{text};{text};48;2;{};{};{}m",
         color.red, color.green, color.blue
+    )
+}
+
+/// Paints one already-fitted row with the selection style, re-arming the
+/// highlight after embedded resets so colored fragments (swatches, status
+/// squares) cannot cut the bar short.
+pub(super) fn selected_row(line: &str, style: &str) -> String {
+    let continuation = format!("\x1b[0m{style}");
+    format!("{style}{}\x1b[0m", line.replace("\x1b[0m", &continuation))
+}
+
+/// Muted accent foreground for status and hint lines: the accent blended
+/// toward light gray so dark accents stay legible without a background.
+pub(super) fn status_style(color: UiColor) -> String {
+    let channel = |value: u8| ((u16::from(value) + 200) / 2) as u8;
+    format!(
+        "\x1b[38;2;{};{};{}m",
+        channel(color.red),
+        channel(color.green),
+        channel(color.blue)
     )
 }
 
@@ -475,33 +502,63 @@ pub(super) fn build_frame(
     let input_lines = &layout.lines[input_start..input_end];
     let cursor_input_row = layout.cursor_row.saturating_sub(input_start);
     let input_height = input_lines.len() + 2;
-    let menu_capacity = rows.saturating_sub(input_height + 1);
-    let completions = if state.picker.is_none() {
-        matching_completions(&state.completions, editor)
+    let menu_capacity = COMPLETION_MENU_ROWS.min(rows.saturating_sub(input_height + 1));
+    let menu_entries = if state.picker.is_none() {
+        sync_completion_filter(state, editor);
+        menu_rows(state, editor)
     } else {
         Vec::new()
     };
-    let match_count = completions.len().min(menu_capacity);
-    if match_count > 0 {
-        state.completion_index = state.completion_index.min(match_count - 1);
+    if !menu_entries.is_empty() {
+        state.completion_index = state.completion_index.min(menu_entries.len() - 1);
     }
-    let menu = if state.picker.is_none() {
-        completions
-            .into_iter()
-            .take(menu_capacity)
-            .enumerate()
-            .map(|(index, completion)| {
-                let line = format!("  {:<18} {}", completion.command, completion.description);
-                if index == state.completion_index {
-                    format!("\x1b[7m{}\x1b[0m", markdown::fit_width(&line, columns))
-                } else {
-                    markdown::fit_width(&line, columns)
-                }
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let window = completion_window(menu_entries.len(), state.completion_index, menu_capacity);
+    let mut menu = menu_entries[window.clone()]
+        .iter()
+        .zip(window.clone())
+        .map(|((label, detail), index)| {
+            let line = format!("  {label:<18} {detail}");
+            if index == state.completion_index {
+                selected_row(
+                    &markdown::fit_width(&line, columns),
+                    &selection_style(state.selection_color),
+                )
+            } else {
+                markdown::fit_width(&line, columns)
+            }
+        })
+        .collect::<Vec<_>>();
+    if menu_entries.len() > window.len() {
+        let accent = foreground_color(state.accent_color);
+        let above = window.start;
+        let below = menu_entries.len() - window.end;
+        let describe = |count: usize, wraps_to: &str| {
+            if count > 0 {
+                format!("{count} more")
+            } else {
+                format!("wraps to {wraps_to}")
+            }
+        };
+        menu.insert(
+            0,
+            markdown::fit_width(
+                &format!(
+                    "  {accent}↑\x1b[0m \x1b[2m{}\x1b[0m",
+                    describe(above, "end")
+                ),
+                columns,
+            ),
+        );
+        menu.push(markdown::fit_width(
+            &format!(
+                "  {accent}↓\x1b[0m \x1b[2m{} · {}/{}\x1b[0m",
+                describe(below, "start"),
+                state.completion_index + 1,
+                menu_entries.len()
+            ),
+            columns,
+        ));
+    }
     let menu_height = menu.len();
     let transcript_height = rows.saturating_sub(input_height + menu_height + 1);
     let mut transcript = render_transcript(state, columns);
@@ -525,7 +582,13 @@ pub(super) fn build_frame(
 
     let mut region = Vec::with_capacity(transcript_height);
     if let Some(picker) = &state.picker {
-        region.extend(render_picker(picker, editor, columns, transcript_height));
+        region.extend(render_picker(
+            picker,
+            editor,
+            &selection_style(state.selection_color),
+            columns,
+            transcript_height,
+        ));
     } else {
         region.extend(std::iter::repeat_n(
             " ".repeat(transcript_width),
@@ -539,7 +602,6 @@ pub(super) fn build_frame(
     }
     apply_scroll_bar(&mut region, state, transcript.len(), max_scroll, columns);
     let mut frame = region;
-    frame.extend(menu);
     let text_box_color = foreground_color(state.accent_color);
     frame.push(format!(
         "{text_box_color}┌{}┐\x1b[0m",
@@ -555,6 +617,7 @@ pub(super) fn build_frame(
         "{text_box_color}└{}┘\x1b[0m",
         "─".repeat(inner_width)
     ));
+    frame.extend(menu);
 
     let percentage = state
         .context_tokens
@@ -566,8 +629,8 @@ pub(super) fn build_frame(
         .as_deref()
         .map_or(String::new(), |effort| format!(" · {effort}"));
     let mut status = format!(
-        " {}{}  {}/{} tokens ({}%)",
-        state.model, reasoning, state.context_tokens, state.context_window, percentage
+        "{}  {}/{} tokens ({}%)",
+        reasoning, state.context_tokens, state.context_window, percentage
     );
     if !state.activity.is_empty() {
         status.push_str("  ");
@@ -605,17 +668,21 @@ pub(super) fn build_frame(
             ));
         }
     }
-    frame.push(format!(
-        "{}{}\x1b[0m",
-        status_style(state.accent_color),
-        markdown::fit_width(&status, columns)
+    frame.push(markdown::fit_width(
+        &format!(
+            " {}\x1b[1m{}\x1b[22m{}{status}\x1b[0m",
+            foreground_color(state.accent_color),
+            state.model,
+            status_style(state.accent_color),
+        ),
+        columns,
     ));
 
     if state.copy_toast_ticks > 0 {
         render_copy_toast(&mut frame, columns, state.accent_color);
     }
 
-    let cursor_row = transcript_height + menu_height + 2 + cursor_input_row;
+    let cursor_row = transcript_height + 2 + cursor_input_row;
     let cursor_col = (2 + layout.cursor_col).min(columns.saturating_sub(1));
     (frame, (cursor_row, cursor_col))
 }

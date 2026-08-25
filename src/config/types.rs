@@ -53,6 +53,21 @@ impl UiColor {
         ))
     }
 
+    /// Parses a selection-color value: `accent` yields `None` (follow the
+    /// accent color), anything else must be a palette name or `#RRGGBB`.
+    pub(crate) fn parse_selection(value: &str) -> Result<Option<Self>, String> {
+        if value.trim().eq_ignore_ascii_case("accent") {
+            return Ok(None);
+        }
+        Self::parse(value).map(Some)
+    }
+
+    /// Stored form of a selection-color value, the inverse of
+    /// [`UiColor::parse_selection`].
+    pub(crate) fn selection_config_value(selection: Option<Self>) -> String {
+        selection.map_or_else(|| "accent".into(), Self::config_value)
+    }
+
     pub(crate) fn config_value(self) -> String {
         let named = [
             ("white", Self::WHITE),

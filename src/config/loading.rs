@@ -47,6 +47,7 @@ impl Config {
             reasoning_effort: None,
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
+            selection_color: None,
             scroll_bar: true,
             scroll_bar_auto_hide: true,
             context_windows: HashMap::new(),
@@ -110,6 +111,9 @@ impl Config {
             .or(file.text_box_color)
         {
             self.accent_color = value;
+        }
+        if let Some(value) = file.selection_color {
+            self.selection_color = UiColor::parse_selection(&value).map_err(Error::Config)?;
         }
         if let Some(value) = file.scroll_bar {
             self.scroll_bar = value;

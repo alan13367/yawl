@@ -23,6 +23,7 @@ const KNOWN_KEYS: &[&str] = &[
     "reasoning_effort",
     "hide_reasoning",
     "accent_color",
+    "selection_color",
     "status_bar_color",
     "text_box_color",
     "scroll_bar",

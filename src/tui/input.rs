@@ -27,6 +27,9 @@ pub struct Editor {
     history_index: Option<usize>,
     history_draft: Vec<char>,
     pastes: Vec<String>,
+    /// `@` mention tags inserted by completion: `(display, relative path)`.
+    /// The short display stays visible; the path is substituted on submit.
+    mentions: Vec<(String, String)>,
 }
 
 impl Editor {
@@ -52,6 +55,13 @@ impl Editor {
         expand_paste_placeholders(text, &self.pastes)
     }
 
+    /// Prepares submitted text for the agent: `@` mention tags become
+    /// relative paths, then long-paste placeholders are expanded. Mentions
+    /// run first so pasted content is never rewritten.
+    pub fn expand_submission(&self, text: &str) -> String {
+        self.expand_pastes(&self.expand_mentions(text))
+    }
+
     /// Current slash-command token while the cursor is editing it.
     pub fn command_prefix(&self) -> Option<String> {
         if self.buffer.first() != Some(&'/') {
@@ -63,6 +73,116 @@ impl Editor {
             .position(|character| character.is_whitespace())
             .unwrap_or(self.buffer.len());
         (self.cursor <= end).then(|| self.buffer[..end].iter().collect())
+    }
+
+    /// Query of the `@` mention token the cursor is editing, without the
+    /// leading `@`.
+    pub fn mention_prefix(&self) -> Option<String> {
+        self.mention_token_range()
+            .map(|(start, end)| self.buffer[start + 1..end].iter().collect())
+    }
+
+    /// Bounds of the whitespace-delimited `@` token containing the cursor.
+    fn mention_token_range(&self) -> Option<(usize, usize)> {
+        let start = self.buffer[..self.cursor]
+            .iter()
+            .rposition(|character| character.is_whitespace())
+            .map_or(0, |index| index + 1);
+        if self.buffer.get(start) != Some(&'@') {
+            return None;
+        }
+        let end = self.buffer[start..]
+            .iter()
+            .position(|character| character.is_whitespace())
+            .map_or(self.buffer.len(), |index| start + index);
+        (self.cursor <= end).then_some((start, end))
+    }
+
+    /// Replaces the mention token under the cursor with a short display tag
+    /// for `path` and records the tag for expansion on submit.
+    pub fn complete_mention(&mut self, path: &str) {
+        let Some((start, end)) = self.mention_token_range() else {
+            return;
+        };
+        let display = self.unique_mention_display(path);
+        let replacement: Vec<char> = format!("@{display}").chars().collect();
+        let length = replacement.len();
+        self.buffer.splice(start..end, replacement);
+        self.cursor = start + length;
+        if !self
+            .buffer
+            .get(self.cursor)
+            .is_some_and(|character| character.is_whitespace())
+        {
+            self.buffer.insert(self.cursor, ' ');
+        }
+        self.cursor += 1;
+        if !self
+            .mentions
+            .iter()
+            .any(|(existing, existing_path)| existing == &display && existing_path == path)
+        {
+            self.mentions.push((display, path.to_string()));
+        }
+        self.leave_history();
+    }
+
+    /// Shortest path suffix that does not collide with a tag already mapped
+    /// to a different file, so `@render.rs` and `@other/render.rs` coexist.
+    fn unique_mention_display(&self, path: &str) -> String {
+        let components: Vec<&str> = path.split('/').collect();
+        for take in 1..=components.len() {
+            let display = components[components.len() - take..].join("/");
+            let conflict = self
+                .mentions
+                .iter()
+                .any(|(existing, existing_path)| existing == &display && existing_path != path);
+            if !conflict {
+                return display;
+            }
+        }
+        path.to_string()
+    }
+
+    /// Replaces recorded `@` mention tags with `@` plus the relative path.
+    /// Unrecognized `@` tokens pass through untouched.
+    pub fn expand_mentions(&self, text: &str) -> String {
+        if self.mentions.is_empty() || !text.contains('@') {
+            return text.to_string();
+        }
+        let mut mentions: Vec<&(String, String)> = self.mentions.iter().collect();
+        mentions.sort_by_key(|(display, _)| std::cmp::Reverse(display.chars().count()));
+        let mut result = String::with_capacity(text.len());
+        let mut rest = text;
+        let mut at_token_start = true;
+        while let Some(offset) = rest.find('@') {
+            let (before, from_marker) = rest.split_at(offset);
+            result.push_str(before);
+            let token_start =
+                (at_token_start && before.is_empty()) || before.ends_with(char::is_whitespace);
+            let matched = token_start
+                .then(|| {
+                    mentions.iter().find(|(display, _)| {
+                        from_marker[1..].starts_with(display.as_str())
+                            && from_marker[1 + display.len()..]
+                                .chars()
+                                .next()
+                                .is_none_or(char::is_whitespace)
+                    })
+                })
+                .flatten();
+            if let Some((display, path)) = matched {
+                result.push('@');
+                result.push_str(path);
+                rest = &from_marker[1 + display.len()..];
+            } else {
+                result.push('@');
+                rest = &from_marker[1..];
+            }
+            at_token_start = false;
+        }
+        result.push_str(rest);
+        result
     }
 
     pub fn complete_command(&mut self, command: &str) {
@@ -445,6 +565,63 @@ mod tests {
             format!("[Pasted #1 {} characters]", pasted.chars().count())
         );
         assert_eq!(editor.expand_pastes(&editor.text()), pasted);
+    }
+
+    #[test]
+    fn mention_prefix_tracks_the_token_under_the_cursor() {
+        let mut editor = Editor::default();
+        editor.paste("fix @ren please");
+        assert_eq!(editor.mention_prefix(), None);
+        editor.handle_key(Key::Home);
+        for _ in 0..8 {
+            editor.handle_key(Key::Right);
+        }
+        assert_eq!(editor.mention_prefix().as_deref(), Some("ren"));
+    }
+
+    #[test]
+    fn mention_prefix_ignores_at_signs_inside_words() {
+        let mut editor = Editor::default();
+        editor.paste("mail me@example.com");
+        assert_eq!(editor.mention_prefix(), None);
+    }
+
+    #[test]
+    fn completed_mentions_expand_to_relative_paths_on_submit() {
+        let mut editor = Editor::default();
+        editor.paste("compare @ren");
+        editor.complete_mention("src/tui/render.rs");
+        assert_eq!(editor.text(), "compare @render.rs ");
+
+        editor.paste("with @ren");
+        editor.complete_mention("src/other/render.rs");
+        assert_eq!(editor.text(), "compare @render.rs with @other/render.rs ");
+        assert_eq!(
+            editor.expand_submission(&editor.text()),
+            "compare @src/tui/render.rs with @src/other/render.rs "
+        );
+    }
+
+    #[test]
+    fn unrecorded_at_tokens_pass_through_unchanged() {
+        let mut editor = Editor::default();
+        editor.paste("ping @ren");
+        editor.complete_mention("src/tui/render.rs");
+        assert_eq!(
+            editor.expand_submission("see @render.rs and @unknown and me@example.com"),
+            "see @src/tui/render.rs and @unknown and me@example.com"
+        );
+    }
+
+    #[test]
+    fn mention_expansion_requires_a_full_token_match() {
+        let mut editor = Editor::default();
+        editor.paste("@ren");
+        editor.complete_mention("src/tui/render.rs");
+        assert_eq!(
+            editor.expand_submission("@render.rs.bak stays"),
+            "@render.rs.bak stays"
+        );
     }
 
     #[test]
