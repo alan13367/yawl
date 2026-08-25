@@ -288,6 +288,7 @@ pub(super) fn handle_event(state: &mut ViewState, editor: &mut Editor, event: Ev
                     }
                     Event::Key(key) => {
                         if let EditAction::Submit(message) = editor.handle_key(key) {
+                            let message = editor.expand_pastes(&message);
                             match state
                                 .subagent_manager
                                 .send(&id, &message, RunOrigin::PrivateUser)

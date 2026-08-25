@@ -54,9 +54,8 @@ Run `yawl --help` for the complete command-line reference.
 ## Terminal controls
 
 - `Enter` submits the editor contents.
-- `Shift+Enter` inserts a newline in terminals that support the kitty keyboard protocol.
-- `Alt+Enter` is the multiline fallback.
-- Pasted multiline text stays multiline through bracketed paste mode.
+- `Shift+Enter` inserts a newline. `Ctrl+J` and `Alt+Enter` also insert a newline if the terminal does not report Shift.
+- Pasted multiline text stays multiline through bracketed paste mode. Pastes longer than 400 characters or 8 lines appear as `[Pasted #N 1234 characters]` in the editor and transcript; the model still receives the full text.
 - Typing `/` opens a filtered command and skill menu. `Up`/`Down` select an item and `Tab` completes it. Enter completes and runs the command when only one match remains, so `/qui` runs `/quit`.
 - Outside the completion menu, `Up` and `Down` browse input history.
 - `Ctrl+U`, `Ctrl+K`, and `Ctrl+W` delete text.

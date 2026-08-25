@@ -29,7 +29,7 @@ Commands
   /quit                leave Yawl
 
 Input
-  Enter submits. Shift+Enter or Alt+Enter inserts a newline.
+  Enter submits. Shift+Enter, Alt+Enter, or Ctrl+J inserts a newline.
   Type / for commands; Up/Down select, Tab completes, and Enter accepts a sole match.
   Model and settings pickers remain available during an active response.
   Messages submitted during a response appear below it as queued.

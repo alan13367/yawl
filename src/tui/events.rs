@@ -1,5 +1,5 @@
 //! Terminal input decoding for keys, bracketed paste, kitty CSI-u events,
-//! and SGR mouse reports.
+//! xterm modifyOtherKeys (Shift+Enter), and SGR mouse reports.
 
 use std::collections::VecDeque;
 use std::io::{self, Read};
@@ -8,7 +8,7 @@ use std::io::{self, Read};
 pub enum Key {
     Char(char),
     Enter,
-    /// Shift+Enter or Alt+Enter.
+    /// Shift+Enter, Alt+Enter, or Ctrl+J.
     Newline,
     Backspace,
     Delete,
@@ -75,7 +75,18 @@ impl<R: Read> EventReader<R> {
             return Ok(Event::Tick);
         };
         match byte {
-            b'\r' | b'\n' => Ok(Event::Key(Key::Enter)),
+            b'\r' => {
+                // Shift+Enter is CR+LF in some macOS terminals (VS Code, Cursor,
+                // and a few iTerm2 mappings). A lone CR is still submit.
+                if self.pending.front() == Some(&b'\n') {
+                    self.pending.pop_front();
+                    Ok(Event::Key(Key::Newline))
+                } else {
+                    Ok(Event::Key(Key::Enter))
+                }
+            }
+            // Ctrl+J and terminals that send LF for Shift+Enter.
+            b'\n' => Ok(Event::Key(Key::Newline)),
             b'\t' => Ok(Event::Key(Key::Tab)),
             0x7f | 0x08 => Ok(Event::Key(Key::Backspace)),
             0x1b => self.read_escape(),
@@ -138,6 +149,11 @@ impl<R: Read> EventReader<R> {
         let body = String::from_utf8_lossy(&body);
         if final_byte == b'~' && body == "200" {
             return self.read_paste();
+        }
+        if final_byte == b'~'
+            && let Some(key) = parse_modify_other_key(&body)
+        {
+            return Ok(Event::Key(key));
         }
         if body.starts_with('<') && matches!(final_byte, b'M' | b'm') {
             return Ok(parse_mouse(&body, final_byte).unwrap_or(Event::Tick));
@@ -239,15 +255,37 @@ fn parse_kitty_key(body: &str) -> Option<Key> {
         .and_then(|field| field.split(':').next())
         .and_then(|field| field.parse::<u8>().ok())
         .unwrap_or(1);
-    let shift = modifier.saturating_sub(1) & 1 != 0;
-    let alt = modifier.saturating_sub(1) & 2 != 0;
-    let ctrl = modifier.saturating_sub(1) & 4 != 0;
+    key_from_encoded(code, modifier)
+}
+
+/// xterm `modifyOtherKeys`: `CSI 27 ; modifier ; key ~`.
+fn parse_modify_other_key(body: &str) -> Option<Key> {
+    let mut fields = body.split(';');
+    if fields.next()? != "27" {
+        return None;
+    }
+    let modifier = fields.next()?.parse::<u8>().ok()?;
+    let code = fields.next()?.parse::<u32>().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    key_from_encoded(code, modifier)
+}
+
+fn key_from_encoded(code: u32, modifier: u8) -> Option<Key> {
+    let bits = modifier.saturating_sub(1);
+    let shift = bits & 1 != 0;
+    let alt = bits & 2 != 0;
+    let ctrl = bits & 4 != 0;
     if code == 13 {
         return Some(if shift || alt {
             Key::Newline
         } else {
             Key::Enter
         });
+    }
+    if code == 10 {
+        return Some(Key::Newline);
     }
     if ctrl
         && let Some(character) = char::from_u32(code)
@@ -303,6 +341,29 @@ mod tests {
     fn decodes_kitty_shift_enter() -> std::io::Result<()> {
         let mut reader = EventReader::new(Cursor::new(b"\x1b[13;2u"));
         assert_eq!(reader.read_event()?, Event::Key(Key::Newline));
+        Ok(())
+    }
+
+    #[test]
+    fn cr_submits_and_lf_inserts_a_newline() -> std::io::Result<()> {
+        let mut reader = EventReader::new(Cursor::new(b"\r\na"));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Newline));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Char('a')));
+
+        let mut reader = EventReader::new(Cursor::new(b"\r"));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Enter));
+
+        let mut reader = EventReader::new(Cursor::new(b"\n"));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Newline));
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_xterm_modify_other_keys_shift_enter() -> std::io::Result<()> {
+        let mut reader = EventReader::new(Cursor::new(b"\x1b[27;2;13~\x1b[27;3;13~\x1b[27;1;13~"));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Newline));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Newline));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Enter));
         Ok(())
     }
 

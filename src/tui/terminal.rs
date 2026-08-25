@@ -71,7 +71,7 @@ impl Terminal {
             selection: None,
         };
         terminal.stdout.write_all(
-            b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>1u",
+            b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>1u\x1b[=1;1u\x1b[>4;1m",
         )?;
         terminal.stdout.flush()?;
         Ok(terminal)
@@ -163,7 +163,7 @@ impl Drop for Terminal {
             return;
         }
         let _ = self.stdout.write_all(
-            b"\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l",
+            b"\x1b[>4;0m\x1b[=0;1u\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l",
         );
         let _ = self.stdout.flush();
         // SAFETY: `original` came from a successful `tcgetattr` call for

@@ -243,7 +243,7 @@ fn handle_submission<R: Read>(
             });
         let skills = crate::skills::scan(agent.config());
         if let Some(skill) = skills.iter().find(|skill| skill.name == name) {
-            let expanded = crate::skills::expand(skill, arguments);
+            let expanded = crate::skills::expand(skill, &editor.expand_pastes(arguments));
             run_agent_submission(agent, input, expanded, state, editor, terminal, events)?;
         } else {
             state.notice(format!(
@@ -318,7 +318,15 @@ fn handle_submission<R: Read>(
         return Ok(false);
     }
 
-    run_agent_submission(agent, input.clone(), input, state, editor, terminal, events)?;
+    run_agent_submission(
+        agent,
+        input.clone(),
+        editor.expand_pastes(&input),
+        state,
+        editor,
+        terminal,
+        events,
+    )?;
     Ok(false)
 }
 
