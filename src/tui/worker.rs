@@ -8,7 +8,10 @@ use crate::cancellation::CancellationToken;
 use crate::config::{Config, ConfigChange};
 use crate::error::Error;
 
-use super::commands::{handle_queue_picker_action, notice_config_effect, unqueue};
+use super::commands::{
+    copy_all_from_transcript, copy_last_reply, handle_queue_picker_action, notice_config_effect,
+    unqueue,
+};
 use super::completion::handle_completion_key;
 use super::events::{Event, EventReader, Key, MouseEvent};
 use super::input::{EditAction, Editor};
@@ -242,7 +245,7 @@ pub(super) fn pump_events<R: Read, T>(
                     if handle_completion_key(state, editor, key) {
                         // Keep accepting and completing input while the agent runs.
                     } else if let EditAction::Submit(input) = editor.handle_key(key) {
-                        handle_submission_while_busy(input, state, active_pickers);
+                        handle_submission_while_busy(input, state, active_pickers, terminal)?;
                     }
                 }
             }
@@ -286,17 +289,21 @@ pub(super) fn handle_submission_while_busy(
     input: String,
     state: &mut ViewState,
     active_pickers: &ActivePickers,
-) {
+    terminal: &mut Terminal,
+) -> Result<(), Error> {
     match busy_command(&input) {
         Some(BusyCommand::Settings) => state.picker = Some(active_pickers.settings.clone()),
         Some(BusyCommand::Model) => state.picker = Some(active_pickers.model.clone()),
         Some(BusyCommand::Unqueue(argument)) => unqueue(&argument, state),
         Some(BusyCommand::Subagents) => super::subagents::open_dashboard(state),
+        Some(BusyCommand::Copy) => copy_last_reply(terminal, state, &[])?,
+        Some(BusyCommand::CopyAll) => copy_all_from_transcript(terminal, state)?,
         None => {
             state.queued_inputs.push_back(input);
             state.scroll_offset = 0;
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -305,6 +312,8 @@ pub(super) enum BusyCommand {
     Model,
     Unqueue(String),
     Subagents,
+    Copy,
+    CopyAll,
 }
 
 pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
@@ -317,6 +326,8 @@ pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
         "model" if argument.is_empty() => Some(BusyCommand::Model),
         "unqueue" => Some(BusyCommand::Unqueue(argument.to_string())),
         "subagents" if argument.is_empty() => Some(BusyCommand::Subagents),
+        "copy" if argument.is_empty() => Some(BusyCommand::Copy),
+        "copy-all" if argument.is_empty() => Some(BusyCommand::CopyAll),
         _ => None,
     }
 }

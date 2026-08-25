@@ -57,6 +57,7 @@ Run `yawl --help` for the complete command-line reference.
 - `Shift+Enter` inserts a newline. `Ctrl+J` and `Alt+Enter` also insert a newline if the terminal does not report Shift.
 - Pasted multiline text stays multiline through bracketed paste mode. Pastes longer than 400 characters or 8 lines appear as `[Pasted #N 1234 characters]` in the editor and transcript; the model still receives the full text.
 - Typing `/` opens a filtered command and skill menu. `Up`/`Down` select an item and `Tab` completes it. Enter completes and runs the command when only one match remains, so `/qui` runs `/quit`.
+- `/undo` restores the working directory to how it looked before the last prompt, including when the folder is not a git repository. If this directory is a git repo and the agent moved `HEAD`, `/undo` also resets local `HEAD` to the pre-turn commit. It then removes that user prompt and the assistant reply from the conversation. `/copy` puts the last assistant reply on the clipboard; `/copy-all` copies the full user/assistant transcript without reasoning so you can paste it into another harness.
 - Outside the completion menu, `Up` and `Down` browse input history.
 - `Ctrl+U`, `Ctrl+K`, and `Ctrl+W` delete text.
 - `Ctrl+O` expands or collapses tool arguments and output. Tool blocks start compact.
@@ -79,6 +80,9 @@ Messages submitted during an active response are queued automatically. Each pend
 | `/new` | Start a new session without changing the current working directory |
 | `/clear` | Alias for `/new` |
 | `/compact` | Summarize older messages now |
+| `/undo` | Restore files from before the last prompt and drop that user/assistant turn |
+| `/copy` | Copy the last assistant reply |
+| `/copy-all` | Copy the conversation (user and assistant text, no reasoning) |
 | `/tools` | List builtin and discovered tools |
 | `/skills` | List discovered skills and their search directories |
 | `/skill:NAME [ARGS]` | Run a discovered Markdown skill |
@@ -218,6 +222,8 @@ The doctor also reports problems it will not touch automatically: a `model` nami
 ## Sessions and compaction
 
 Yawl stores append-only JSONL session files in `~/.yawl/sessions/projects/<project-key>/<id>.jsonl`, scoped to the canonical working directory. The first line records the session ID, creation timestamp, working directory, and model. Both `-c` (`--continue`) and the `/resume` picker list sessions only for the active working directory. Passing `--session ID` or `/resume ID` searches the current and other project directories, so an ID can be resumed from any directory. Session IDs must be unique across project directories; Yawl reports duplicate matches as ambiguous instead of choosing one. Each user message, assistant response, reasoning block, tool result, and compaction event is written as it happens. The original history remains in the log after compaction. `/new` starts a blank session without changing the current working directory. Leaving the terminal interface prints `yawl --session ID` so you can resume that conversation.
+
+`/undo` restores tracked files in the working directory from a snapshot taken at the start of the last prompt. The snapshot uses a shadow git store under `~/.yawl/checkpoints/` when `git` is available, or a file copy otherwise, so a project does not need to be a git repository. Ignored build directories such as `target/` are left alone. Tool calls and shell commands outside the working directory are only reversed for `write_file` and `edit_file`. Remotes are never updated.
 
 Yawl checks the last provider-reported token usage before each request. At the configured threshold, 85 percent by default, it asks the current model to summarize the older conversation and keeps roughly the last ten messages unchanged. Use `/compact` to do this manually. If automatic compaction fails, Yawl shows a warning and continues without compacting; the next request may still fit.
 

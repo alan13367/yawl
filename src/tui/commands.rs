@@ -3,6 +3,7 @@
 use crate::agent::Agent;
 use crate::config::{Config, ConfigChange, ConfigChangeEffect, SkillDirectoryAction};
 use crate::error::Error;
+use crate::provider::{Message, Role};
 
 use super::picker::{
     Picker, PickerAction, PickerItem, SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_AUTO_COMPACT_INDEX,
@@ -19,6 +20,9 @@ Commands
   /new                 start a new session without changing directories
   /clear               alias for /new
   /compact             summarize older messages now
+  /undo                restore files and drop the last turn
+  /copy                copy the last assistant reply
+  /copy-all            copy the conversation without reasoning
   /tools               list builtin and discovered tools
   /skills              list discovered skills and search directories
   /subagents           open the subagent dashboard
@@ -590,6 +594,130 @@ pub(super) fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
             .collect(),
         editing: None,
     });
+}
+
+pub(super) fn last_assistant_reply<'a>(
+    messages: &'a [Message],
+    streaming: Option<&'a str>,
+) -> Option<&'a str> {
+    if let Some(text) = streaming.filter(|text| !text.is_empty()) {
+        return Some(text);
+    }
+    messages.iter().rev().find_map(|message| {
+        (message.role == Role::Assistant && !message.content.is_empty())
+            .then_some(message.content.as_str())
+    })
+}
+
+pub(super) fn format_copy_all(messages: &[Message], streaming: Option<&str>) -> String {
+    let mut blocks = Vec::new();
+    for message in messages {
+        match message.role {
+            Role::User => blocks.push(format!("User:\n{}", message.content)),
+            Role::Assistant if !message.content.is_empty() => {
+                blocks.push(format!("Assistant:\n{}", message.content));
+            }
+            _ => {}
+        }
+    }
+    if let Some(text) = streaming.filter(|text| !text.is_empty()) {
+        blocks.push(format!("Assistant:\n{text}"));
+    }
+    blocks.join("\n\n")
+}
+
+pub(super) fn format_copy_all_from_transcript(
+    transcript: &super::transcript::Transcript,
+) -> String {
+    let mut blocks = Vec::new();
+    for entry in transcript.entries() {
+        match entry {
+            super::transcript::Entry::User(content) => {
+                blocks.push(format!("User:\n{content}"));
+            }
+            super::transcript::Entry::Assistant(content) if !content.is_empty() => {
+                blocks.push(format!("Assistant:\n{content}"));
+            }
+            super::transcript::Entry::SubagentResult {
+                id,
+                name,
+                status,
+                content,
+            } => blocks.push(format!("User:\n[{id} {status}] {name}\n{content}")),
+            _ => {}
+        }
+    }
+    blocks.join("\n\n")
+}
+
+pub(super) fn copy_to_clipboard(
+    terminal: &mut super::terminal::Terminal,
+    state: &mut ViewState,
+    text: &str,
+) -> Result<(), Error> {
+    if text.is_empty() {
+        state.notice("Nothing to copy.");
+        return Ok(());
+    }
+    if terminal.copy_text(text)? {
+        state.copy_toast_ticks = super::state::COPY_TOAST_TICKS;
+    }
+    Ok(())
+}
+
+pub(super) fn copy_last_reply(
+    terminal: &mut super::terminal::Terminal,
+    state: &mut ViewState,
+    messages: &[Message],
+) -> Result<(), Error> {
+    let text = state
+        .transcript
+        .last_assistant_text()
+        .map(str::to_string)
+        .or_else(|| last_assistant_reply(messages, None).map(str::to_string))
+        .unwrap_or_default();
+    copy_to_clipboard(terminal, state, &text)
+}
+
+pub(super) fn copy_all_messages(
+    terminal: &mut super::terminal::Terminal,
+    state: &mut ViewState,
+    messages: &[Message],
+) -> Result<(), Error> {
+    let streaming = state
+        .transcript
+        .has_streaming_assistant()
+        .then(|| state.transcript.last_assistant_text().map(str::to_string))
+        .flatten();
+    let text = format_copy_all(messages, streaming.as_deref());
+    copy_to_clipboard(terminal, state, &text)
+}
+
+pub(super) fn copy_all_from_transcript(
+    terminal: &mut super::terminal::Terminal,
+    state: &mut ViewState,
+) -> Result<(), Error> {
+    let text = format_copy_all_from_transcript(&state.transcript);
+    copy_to_clipboard(terminal, state, &text)
+}
+
+pub(super) fn notice_undo(state: &mut ViewState, report: crate::agent::UndoReport) {
+    if report.dropped == 0 {
+        state.notice("Nothing to undo.");
+        return;
+    }
+    let mut text = "Undid the last turn.".to_string();
+    if report.reset_head {
+        text.push_str(" Reset git HEAD.");
+    }
+    if !report.restored_files {
+        text.push_str(" File changes could not be restored.");
+    }
+    if let Some(warning) = report.warning {
+        text.push(' ');
+        text.push_str(&warning);
+    }
+    state.notice(text);
 }
 
 pub(super) fn resume(agent: &mut Agent, selector: &str, state: &mut ViewState) {

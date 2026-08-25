@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub(crate) mod cancellation;
+pub(crate) mod checkpoint;
 pub mod compaction;
 pub mod config;
 pub mod doctor;

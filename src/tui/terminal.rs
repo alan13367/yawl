@@ -116,11 +116,7 @@ impl Terminal {
                 if text.is_empty() {
                     return Ok(false);
                 }
-                if !copy_with_platform_command(&text) {
-                    let encoded = base64_encode(text.as_bytes());
-                    write!(self.stdout, "\x1b]52;c;{encoded}\x07")?;
-                    self.stdout.flush()?;
-                }
+                self.copy_text(&text)?;
                 Ok(true)
             }
         }
@@ -154,6 +150,23 @@ impl Terminal {
         self.last_frame = frame;
         self.last_size = (columns, rows);
         Ok(())
+    }
+
+    /// Copies `text` via a platform clipboard command, falling back to OSC 52.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from writing the OSC 52 sequence.
+    pub(super) fn copy_text(&mut self, text: &str) -> Result<bool, Error> {
+        if text.is_empty() {
+            return Ok(false);
+        }
+        if !copy_with_platform_command(text) {
+            let encoded = base64_encode(text.as_bytes());
+            write!(self.stdout, "\x1b]52;c;{encoded}\x07")?;
+            self.stdout.flush()?;
+        }
+        Ok(true)
     }
 }
 

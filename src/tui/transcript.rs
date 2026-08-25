@@ -146,6 +146,17 @@ impl Transcript {
         self.entries.is_empty()
     }
 
+    pub(super) fn last_assistant_text(&self) -> Option<&str> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            Entry::Assistant(text) if !text.is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    pub(super) fn has_streaming_assistant(&self) -> bool {
+        self.streaming_assistant.is_some()
+    }
+
     pub(super) fn streaming_index(&self) -> Option<usize> {
         self.streaming_assistant
             .or_else(|| self.streaming_reasoning.map(|(_, index)| index))

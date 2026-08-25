@@ -106,3 +106,63 @@ fn resume_picker_is_scoped_but_explicit_ids_search_other_projects() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn help_lists_undo_and_copy_commands() {
+    assert!(HELP.contains("/undo"));
+    assert!(HELP.contains("/copy"));
+    assert!(HELP.contains("/copy-all"));
+}
+
+#[test]
+fn last_assistant_reply_skips_empty_tool_only_messages() {
+    let messages = [
+        crate::provider::Message::user("hi"),
+        crate::provider::Message::assistant(
+            String::new(),
+            vec![crate::provider::ToolCall {
+                id: "1".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+            }],
+        ),
+        crate::provider::Message::assistant("final answer".into(), vec![]),
+    ];
+    assert_eq!(last_assistant_reply(&messages, None), Some("final answer"));
+    assert_eq!(
+        last_assistant_reply(&messages, Some("streaming")),
+        Some("streaming")
+    );
+    assert_eq!(last_assistant_reply(&[], None), None);
+}
+
+#[test]
+fn format_copy_all_keeps_user_and_assistant_and_drops_tools_and_reasoning() {
+    let mut assistant = crate::provider::Message::assistant(
+        "done".into(),
+        vec![crate::provider::ToolCall {
+            id: "1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }],
+    );
+    assistant.reasoning.push(crate::provider::Reasoning {
+        kind: crate::provider::ReasoningKind::Summary,
+        content: "secret thoughts".into(),
+    });
+    let summary = crate::compaction::summary_message("earlier work");
+    let messages = [
+        summary,
+        crate::provider::Message::user("please edit"),
+        assistant,
+        crate::provider::Message::tool_result("1", "shell", "ok".into(), false),
+        crate::provider::Message::assistant(String::new(), vec![]),
+    ];
+    let text = format_copy_all(&messages, None);
+    assert!(text.contains("User:\n[conversation summary]"));
+    assert!(text.contains("User:\nplease edit"));
+    assert!(text.contains("Assistant:\ndone"));
+    assert!(!text.contains("secret thoughts"));
+    assert!(!text.contains("ok"));
+    assert_eq!(format_copy_all(&[], None), "");
+}

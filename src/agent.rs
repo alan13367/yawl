@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use crate::cancellation::CancellationToken;
+use crate::checkpoint::{Checkpoints, RestoreReport};
 use crate::compaction;
 use crate::config::{Config, ConfigChange, ConfigChangeEffect};
 use crate::error::Error;
@@ -100,6 +101,33 @@ impl Journal {
             None => Ok(()),
         }
     }
+
+    fn append_undo(&mut self, dropped: usize) -> Result<(), Error> {
+        match self.persistent.as_mut() {
+            Some(session) => session.append_undo(dropped),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Result of `/undo`: how many messages were dropped and whether files/HEAD
+/// were restored.
+#[derive(Debug, Default)]
+pub struct UndoReport {
+    pub dropped: usize,
+    pub restored_files: bool,
+    pub reset_head: bool,
+    pub warning: Option<String>,
+}
+
+pub(crate) fn is_undoable_user_prompt(message: &Message) -> bool {
+    message.role == crate::provider::Role::User
+        && message.subagent_results.is_empty()
+        && !compaction::is_summary_message(message)
+}
+
+pub(crate) fn last_undoable_user_index(messages: &[Message]) -> Option<usize> {
+    messages.iter().rposition(is_undoable_user_prompt)
 }
 
 /// Provider-neutral conversation state shared by the main agent and
@@ -124,11 +152,19 @@ pub(crate) struct Conversation {
     tool_allowlist: Option<Vec<String>>,
     /// Extra instruction appended to the subagent role block by a preset.
     role_fragment: Option<String>,
+    checkpoints: Option<Checkpoints>,
 }
 
 impl Conversation {
-    fn persistent(config: Config, model: String, session: Session, messages: Vec<Message>) -> Self {
+    fn persistent(
+        config: Config,
+        model: String,
+        session: Session,
+        messages: Vec<Message>,
+        work_tree: std::path::PathBuf,
+    ) -> Self {
         let subagents = SubagentManager::new(session.id.clone(), config.max_subagents);
+        let checkpoints = Some(Checkpoints::open(&config.home_dir, &session.id, work_tree));
         Self {
             config,
             model,
@@ -143,6 +179,7 @@ impl Conversation {
             run_limits: None,
             tool_allowlist: None,
             role_fragment: None,
+            checkpoints,
         }
     }
 
@@ -161,6 +198,7 @@ impl Conversation {
             run_limits: None,
             tool_allowlist: None,
             role_fragment: None,
+            checkpoints: None,
         }
     }
 
@@ -241,6 +279,7 @@ impl Conversation {
         if let Some(manager) = &self.subagents {
             manager.shutdown_and_discard();
         }
+        let old_id = self.session.id.clone();
         self.subagents = Some(SubagentManager::new(
             session.id.clone(),
             self.config.max_subagents,
@@ -249,6 +288,12 @@ impl Conversation {
         self.messages.clear();
         self.context_tokens = 0;
         self.latest_turn_result.clear();
+        Checkpoints::remove(&self.config.home_dir, &old_id);
+        self.checkpoints = Some(Checkpoints::open(
+            &self.config.home_dir,
+            self.session.id.as_str(),
+            cwd,
+        ));
         Ok(())
     }
 
@@ -268,6 +313,11 @@ impl Conversation {
         self.messages = messages;
         self.context_tokens = 0;
         self.latest_turn_result.clear();
+        self.checkpoints = Some(Checkpoints::open(
+            &self.config.home_dir,
+            self.session.id.as_str(),
+            cwd,
+        ));
         Ok(())
     }
 
@@ -465,6 +515,13 @@ impl Conversation {
     {
         self.latest_turn_result.clear();
         if let Some(input) = user_input {
+            if let Some(checkpoints) = &mut self.checkpoints
+                && let Err(error) = checkpoints.snapshot()
+            {
+                sink(TurnEvent::Warning(format!(
+                    "Could not checkpoint for /undo: {error}"
+                )));
+            }
             self.append_input_message(Message::user(input))?;
         }
         let system = if self.subagents.is_some() {
@@ -595,6 +652,16 @@ impl Conversation {
                     name: &call.name,
                     args: &call.arguments,
                 });
+                if let Some(path) =
+                    crate::checkpoint::mutating_tool_path(&call.name, &call.arguments)
+                    && let Some(checkpoints) = &mut self.checkpoints
+                    && let Err(error) = checkpoints.remember_path(&path)
+                {
+                    sink(TurnEvent::Warning(format!(
+                        "Could not record {} for /undo: {error}",
+                        path.display()
+                    )));
+                }
                 let outcome = registry.execute(&call.name, &call.arguments, &self.session.id);
                 sink(TurnEvent::ToolEnd {
                     name: &call.name,
@@ -689,6 +756,34 @@ impl Conversation {
         sink(TurnEvent::Compacted { replaced });
         Ok(())
     }
+
+    /// Reverts the last user-initiated turn: restore files, then drop that
+    /// prompt and every message after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns session or checkpoint I/O errors. A missing turn is not an
+    /// error; [`UndoReport::dropped`] is zero.
+    pub fn undo_last_turn(&mut self) -> Result<UndoReport, Error> {
+        let Some(start) = last_undoable_user_index(&self.messages) else {
+            return Ok(UndoReport::default());
+        };
+        let dropped = self.messages.len() - start;
+        let restore = match &mut self.checkpoints {
+            Some(checkpoints) => checkpoints.restore_last()?,
+            None => RestoreReport::default(),
+        };
+        self.session.append_undo(dropped)?;
+        self.messages.truncate(start);
+        self.context_tokens = 0;
+        self.latest_turn_result.clear();
+        Ok(UndoReport {
+            dropped,
+            restored_files: restore.restored,
+            reset_head: restore.reset_head,
+            warning: restore.warning,
+        })
+    }
 }
 
 /// A persistent user-facing conversation.
@@ -699,7 +794,13 @@ pub struct Agent {
 impl Agent {
     pub fn new(config: Config, model: String, session: Session, messages: Vec<Message>) -> Self {
         Self {
-            conversation: Conversation::persistent(config, model, session, messages),
+            conversation: Conversation::persistent(
+                config,
+                model,
+                session,
+                messages,
+                crate::config::working_dir(),
+            ),
         }
     }
 
@@ -765,6 +866,15 @@ impl Agent {
 
     pub fn load_session(&mut self, id: &str) -> Result<(), Error> {
         self.conversation.load_session(id)
+    }
+
+    /// Reverts the last user-initiated turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns session or checkpoint I/O errors.
+    pub fn undo_last_turn(&mut self) -> Result<UndoReport, Error> {
+        self.conversation.undo_last_turn()
     }
 
     pub fn scan_tools(&mut self) -> Registry {
@@ -948,13 +1058,14 @@ mod tests {
                 ..Config::test_default()
             };
             let cwd = root.join("cwd");
+            let _ = std::fs::create_dir_all(&cwd);
             let dirs = config.session_dirs(&cwd);
             let session = Session::create(&dirs.project, &cwd, "test")
                 .expect("test session should be created");
             Self {
                 root,
                 sessions_dir: dirs.project,
-                agent: Conversation::persistent(config, "test".into(), session, Vec::new()),
+                agent: Conversation::persistent(config, "test".into(), session, Vec::new(), cwd),
             }
         }
     }
@@ -1279,5 +1390,63 @@ mod tests {
         }));
         assert_eq!(test.agent.messages[0].tool_call_id.as_deref(), Some("one"));
         assert_eq!(test.agent.messages[1].tool_call_id.as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn last_undoable_user_skips_summaries_and_subagent_results() {
+        let summary = compaction::summary_message("old");
+        let subagent = Message::subagent_results(vec![crate::provider::SubagentResult {
+            id: "sa-1".into(),
+            name: "scout".into(),
+            status: "completed".into(),
+            run_number: 1,
+            content: "ok".into(),
+        }]);
+        let messages = [
+            Message::user("keep"),
+            Message::assistant("a".into(), vec![]),
+            summary,
+            Message::assistant("b".into(), vec![]),
+            Message::user("undo-me"),
+            Message::assistant("c".into(), vec![]),
+            subagent,
+        ];
+        assert_eq!(last_undoable_user_index(&messages), Some(4));
+        assert!(is_undoable_user_prompt(&messages[0]));
+        assert!(!is_undoable_user_prompt(&messages[2]));
+        assert!(!is_undoable_user_prompt(&messages[6]));
+    }
+
+    #[test]
+    fn undo_last_turn_drops_the_prompt_and_restores_files() {
+        let mut test = TestAgent::new("undo-turn");
+        let file = test.root.join("cwd").join("note.txt");
+        std::fs::write(&file, "before").expect("write");
+        test.agent
+            .checkpoints
+            .as_mut()
+            .expect("persistent")
+            .snapshot()
+            .expect("snapshot");
+        test.agent
+            .append_input_message(Message::user("edit the file"))
+            .expect("user");
+        test.agent
+            .append_input_message(Message::assistant("done".into(), vec![]))
+            .expect("assistant");
+        std::fs::write(&file, "after").expect("mutate");
+
+        let report = test.agent.undo_last_turn().expect("undo");
+        assert_eq!(report.dropped, 2);
+        assert!(test.agent.messages.is_empty());
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "before");
+    }
+
+    #[test]
+    fn undo_without_a_user_turn_is_a_no_op() {
+        let mut test = TestAgent::new("undo-empty");
+        let report = test.agent.undo_last_turn().expect("undo");
+        assert_eq!(report.dropped, 0);
+        assert!(test.agent.messages.is_empty());
     }
 }

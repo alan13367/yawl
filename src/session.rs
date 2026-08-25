@@ -36,6 +36,10 @@ enum SessionEvent {
         summary: String,
         replaced: usize,
     },
+    /// The last `dropped` messages were removed by `/undo`.
+    Undo {
+        dropped: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -149,6 +153,10 @@ impl Session {
         })
     }
 
+    pub fn append_undo(&mut self, dropped: usize) -> Result<(), Error> {
+        self.append(&SessionEvent::Undo { dropped })
+    }
+
     fn append(&mut self, event: &SessionEvent) -> Result<(), Error> {
         let mut line = serde_json::to_string(event)?;
         line.push('\n');
@@ -204,6 +212,10 @@ fn replay(path: &Path) -> Result<Vec<Message>, Error> {
                 let tail = messages.split_off(replaced);
                 messages = vec![crate::compaction::summary_message(&summary)];
                 messages.extend(tail);
+            }
+            SessionEvent::Undo { dropped } => {
+                let keep = messages.len().saturating_sub(dropped);
+                messages.truncate(keep);
             }
         }
     }
@@ -349,6 +361,30 @@ mod tests {
         assert!(messages[0].content.contains("summary of one+two"));
         assert_eq!(messages[1].content, "three");
         assert_eq!(messages[2].content, "four");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn session_roundtrip_with_undo() -> Result<(), Error> {
+        let dir = std::env::temp_dir().join(format!("yawl-undo-session-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
+        let id = session.id.clone();
+        session.append_message(&Message::user("one"))?;
+        session.append_message(&Message::assistant("two".into(), vec![]))?;
+        session.append_message(&Message::user("three"))?;
+        session.append_message(&Message::assistant("four".into(), vec![]))?;
+        session.append_undo(2)?;
+        session.append_message(&Message::user("five"))?;
+        session.append_message(&Message::assistant("six".into(), vec![]))?;
+        session.append_undo(2)?;
+        drop(session);
+
+        let (_, messages) = Session::open(&dir, &id)?;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "one");
+        assert_eq!(messages[1].content, "two");
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

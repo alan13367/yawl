@@ -19,6 +19,10 @@ pub fn summary_message(summary: &str) -> Message {
     ))
 }
 
+pub(crate) fn is_summary_message(message: &Message) -> bool {
+    message.role == Role::User && message.content.starts_with(SUMMARY_MARKER)
+}
+
 /// True once the last known context usage crosses the threshold.
 pub fn should_compact(context_tokens: u64, context_window: u64, threshold: f64) -> bool {
     context_tokens > 0 && (context_tokens as f64) >= (context_window as f64) * threshold

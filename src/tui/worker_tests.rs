@@ -11,6 +11,8 @@ fn settings_and_model_pickers_are_recognized_during_an_active_turn() {
     assert_eq!(busy_command(" /settings "), Some(BusyCommand::Settings));
     assert_eq!(busy_command("/model"), Some(BusyCommand::Model));
     assert_eq!(busy_command("/subagents"), Some(BusyCommand::Subagents));
+    assert_eq!(busy_command("/copy"), Some(BusyCommand::Copy));
+    assert_eq!(busy_command("/copy-all"), Some(BusyCommand::CopyAll));
     assert_eq!(
         busy_command("/unqueue 2"),
         Some(BusyCommand::Unqueue("2".into()))

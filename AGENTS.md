@@ -22,7 +22,7 @@ Yawl is one Cargo package with a Rust 2024 library target and binary target for 
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
 - `src/tools/`: built-in tools and executable tool discovery
-- `src/session.rs`, `src/compaction.rs`: append-only sessions and context compaction
+- `src/session.rs`, `src/compaction.rs`, `src/checkpoint.rs`: append-only sessions, context compaction, and `/undo` working-tree snapshots
 - `README.md`: user-facing behavior, contracts, and a concise architecture map
 
 Most tests live in `#[cfg(test)]` modules beside their implementation. TUI cross-module tests use focused `*_tests.rs` modules under `src/tui/` so production visibility stays narrow.

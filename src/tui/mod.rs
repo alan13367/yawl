@@ -37,8 +37,8 @@ use crate::agent::Agent;
 use crate::error::Error;
 
 use self::commands::{
-    HELP, activate_picker_action, is_new_session_command, open_resume_picker, resume, settings,
-    show_skills, unqueue,
+    HELP, activate_picker_action, copy_all_messages, copy_last_reply, is_new_session_command,
+    notice_undo, open_resume_picker, resume, settings, show_skills, unqueue,
 };
 use self::completion::handle_completion_key;
 use self::events::{Event, EventReader, Key};
@@ -56,7 +56,9 @@ use self::worker::{
 };
 
 #[cfg(test)]
-use self::commands::{handle_queue_picker_action, open_queue_picker};
+use self::commands::{
+    format_copy_all, handle_queue_picker_action, last_assistant_reply, open_queue_picker,
+};
 #[cfg(test)]
 use self::completion::Completion;
 #[cfg(test)]
@@ -312,6 +314,17 @@ fn handle_submission<R: Read>(
             "resume" if argument.is_empty() => open_resume_picker(agent, state),
             "resume" => resume(agent, argument, state),
             "unqueue" => unqueue(argument, state),
+            "undo" => match agent.undo_last_turn() {
+                Ok(report) => {
+                    state.transcript = Transcript::from_messages(agent.messages());
+                    state.render_cache.invalidate();
+                    state.context_tokens = agent.context_tokens();
+                    notice_undo(state, report);
+                }
+                Err(error) => state.notice(format!("Could not undo: {error}")),
+            },
+            "copy" => copy_last_reply(terminal, state, agent.messages())?,
+            "copy-all" => copy_all_messages(terminal, state, agent.messages())?,
             "" => {}
             other => state.notice(format!("Unknown command '/{other}'. Type /help.")),
         }
