@@ -1,7 +1,8 @@
 //! Focused tests for the corresponding TUI responsibility.
 
 use super::picker::{
-    SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_REASONING_DISPLAY_INDEX, SETTINGS_SCROLL_BAR_INDEX,
+    SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_REASONING_DISPLAY_INDEX,
+    SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX, SETTINGS_SCROLL_BAR_INDEX,
 };
 use super::*;
 
@@ -28,7 +29,7 @@ fn display_settings_apply_during_an_active_turn() {
         editing: None,
     };
     let settings = Picker {
-        items: (0..=SETTINGS_SCROLL_BAR_INDEX)
+        items: (0..=SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX)
             .map(|index| PickerItem {
                 label: format!("Setting {index}"),
                 description: String::new(),
@@ -53,6 +54,9 @@ fn display_settings_apply_during_an_active_turn() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         show_scroll_bar: true,
+        scroll_bar_enabled: true,
+        scroll_bar_auto_hide: false,
+        scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
@@ -159,6 +163,28 @@ fn display_settings_apply_during_an_active_turn() {
     assert!(matches!(
         settings.items[SETTINGS_SCROLL_BAR_INDEX].action,
         PickerAction::SetScrollBar(true)
+    ));
+
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::SetScrollBarAutoHide(false),
+        &mut active_pickers,
+        &mut config,
+    );
+
+    assert!(!config.scroll_bar_auto_hide);
+    let settings = state
+        .picker
+        .as_ref()
+        .expect("settings picker should reopen");
+    assert_eq!(settings.selected, SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX);
+    assert_eq!(
+        settings.items[SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX].description,
+        "Off · Enter to toggle"
+    );
+    assert!(matches!(
+        settings.items[SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX].action,
+        PickerAction::SetScrollBarAutoHide(true)
     ));
 
     activate_picker_action_while_busy(

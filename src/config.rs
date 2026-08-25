@@ -47,6 +47,8 @@ pub struct Config {
     pub(crate) accent_color: UiColor,
     /// Whether the TUI draws a transcript scroll bar.
     pub scroll_bar: bool,
+    /// Whether an idle transcript scroll bar hides itself after a pause.
+    pub scroll_bar_auto_hide: bool,
     pub context_windows: HashMap<String, u64>,
     pub auto_compact: bool,
     pub compact_threshold: f64,
@@ -202,6 +204,7 @@ impl Config {
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
             scroll_bar: true,
+            scroll_bar_auto_hide: true,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,

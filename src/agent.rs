@@ -230,6 +230,7 @@ impl Conversation {
         self.config.hide_reasoning = config.hide_reasoning;
         self.config.accent_color = config.accent_color;
         self.config.scroll_bar = config.scroll_bar;
+        self.config.scroll_bar_auto_hide = config.scroll_bar_auto_hide;
     }
 
     /// Starts a fresh session (used by `/new` and `/clear`).

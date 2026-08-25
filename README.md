@@ -103,6 +103,7 @@ Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`
   "hide_reasoning": false,
   "accent_color": "white",
   "scroll_bar": true,
+  "scroll_bar_auto_hide": true,
   "auto_compact": true,
   "compact_threshold": 0.85,
   "subagents": false,
@@ -171,7 +172,7 @@ Set `hide_reasoning` to `true`, choose "Reasoning display" in `/settings`, or ru
 
 Choose "Accent color" in `/settings` to set the status bar and text-box border from one palette. The same value can be set directly with `/settings accent_color blue` or `/settings accent_color '#7aa2f7'`. Palette names and `#RRGGBB` values are accepted; the default is white.
 
-When the transcript overflows the screen, Yawl draws a solid scroll bar along its right edge: a muted track in the accent color with a darker rectangle as the thumb. Click anywhere on it to jump, or press and drag to scrub through the history. Set `scroll_bar` to `false`, choose "Scroll bar" in `/settings`, or run `/settings scroll_bar off` to hide it. The default is on.
+When the transcript overflows the screen, Yawl draws a solid scroll bar along its right edge: a muted track in the accent color with a darker rectangle as the thumb. Click anywhere on it to jump, or press and drag to scrub through the history. With auto-hide on (the default), the bar appears while you scroll — mouse wheel, PageUp/PageDown, or dragging the bar — and fades out of the layout after two idle seconds so text reclaims the full width; it reappears on the next scroll. Set `scroll_bar` to `false`, choose "Scroll bar" in `/settings`, or run `/settings scroll_bar off` to hide it entirely. Set `scroll_bar_auto_hide` to `false`, choose "Auto-hide scroll bar" in `/settings`, or run `/settings scroll_bar_auto_hide off` to keep it permanently visible. Both default to on.
 
 Provider keys and header values accept `$ENV_VAR` and `${ENV_VAR}` references. If `apiKey` is omitted, Yawl also checks an environment variable derived from the provider name, such as `OMLX_API_KEY` or `LMSTUDIO_API_KEY`. Keyless local servers need no placeholder key. Extra pi model fields such as `cost`, `input`, and `reasoning` are ignored.
 

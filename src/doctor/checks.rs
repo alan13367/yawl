@@ -26,6 +26,7 @@ const KNOWN_KEYS: &[&str] = &[
     "status_bar_color",
     "text_box_color",
     "scroll_bar",
+    "scroll_bar_auto_hide",
     "context_windows",
     "auto_compact",
     "compact_threshold",

@@ -18,6 +18,7 @@ pub(crate) enum ConfigChange {
     HideReasoning(String),
     AccentColor(String),
     ScrollBar(String),
+    ScrollBarAutoHide(String),
     AutoCompact(String),
     CompactThreshold(String),
     Subagents(String),
@@ -74,6 +75,7 @@ enum ValidatedChange {
     HideReasoning(bool),
     AccentColor(UiColor),
     ScrollBar(bool),
+    ScrollBarAutoHide(bool),
     AutoCompact(bool),
     CompactThreshold(f64),
     Subagents(bool),
@@ -156,6 +158,9 @@ impl ValidatedChange {
                 .map(Self::AccentColor)
                 .map_err(Error::Config),
             ConfigChange::ScrollBar(value) => Ok(Self::ScrollBar(parse_on_off(&value)?)),
+            ConfigChange::ScrollBarAutoHide(value) => {
+                Ok(Self::ScrollBarAutoHide(parse_on_off(&value)?))
+            }
             ConfigChange::AutoCompact(value) => Ok(Self::AutoCompact(parse_on_off(&value)?)),
             ConfigChange::CompactThreshold(value) => {
                 Ok(Self::CompactThreshold(parse_threshold(&value)?))
@@ -274,6 +279,9 @@ impl ValidatedChange {
                 Ok(())
             }),
             Self::ScrollBar(enabled) => insert_scalar(config, "scroll_bar", json!(enabled)),
+            Self::ScrollBarAutoHide(enabled) => {
+                insert_scalar(config, "scroll_bar_auto_hide", json!(enabled))
+            }
             Self::AutoCompact(enabled) => insert_scalar(config, "auto_compact", json!(enabled)),
             Self::CompactThreshold(threshold) => {
                 insert_scalar(config, "compact_threshold", json!(threshold))
@@ -365,6 +373,7 @@ impl ValidatedChange {
             Self::HideReasoning(hidden) => config.hide_reasoning == *hidden,
             Self::AccentColor(color) => config.accent_color == *color,
             Self::ScrollBar(enabled) => config.scroll_bar == *enabled,
+            Self::ScrollBarAutoHide(enabled) => config.scroll_bar_auto_hide == *enabled,
             Self::AutoCompact(enabled) => config.auto_compact == *enabled,
             Self::CompactThreshold(threshold) => config.compact_threshold == *threshold,
             Self::Subagents(enabled) => config.subagents == *enabled,
@@ -650,6 +659,33 @@ mod tests {
         let error = outcome
             .config
             .change_global(ConfigChange::ScrollBar("maybe".into()))
+            .err()
+            .expect("non-boolean values should fail validation");
+        assert!(error.to_string().contains("on or off"));
+    }
+
+    #[test]
+    fn scroll_bar_auto_hide_change_is_validated_persisted_and_reloaded() {
+        let dirs = TestDirs::new("scroll-bar-auto-hide");
+        let config = dirs.config();
+        assert!(config.scroll_bar_auto_hide);
+
+        let outcome = config
+            .change_global(ConfigChange::ScrollBarAutoHide("off".into()))
+            .expect("a valid on/off value should apply");
+
+        assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
+        assert!(!outcome.config.scroll_bar_auto_hide);
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(dirs.home.join("config.json"))
+                .expect("saved config should be readable"),
+        )
+        .expect("saved config should remain JSON");
+        assert_eq!(saved["scroll_bar_auto_hide"], false);
+
+        let error = outcome
+            .config
+            .change_global(ConfigChange::ScrollBarAutoHide("maybe".into()))
             .err()
             .expect("non-boolean values should fail validation");
         assert!(error.to_string().contains("on or off"));

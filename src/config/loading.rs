@@ -48,6 +48,7 @@ impl Config {
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
             scroll_bar: true,
+            scroll_bar_auto_hide: true,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
@@ -112,6 +113,9 @@ impl Config {
         }
         if let Some(value) = file.scroll_bar {
             self.scroll_bar = value;
+        }
+        if let Some(value) = file.scroll_bar_auto_hide {
+            self.scroll_bar_auto_hide = value;
         }
         if let Some(map) = file.context_windows {
             for (model, window) in &map {
@@ -375,6 +379,18 @@ mod tests {
 
         cfg.apply(serde_json::from_value(json!({"scroll_bar": false}))?)?;
         assert!(!cfg.scroll_bar);
+        Ok(())
+    }
+
+    #[test]
+    fn scroll_bar_auto_hide_is_on_unless_disabled() -> Result<(), Error> {
+        let mut cfg = test_config();
+        assert!(cfg.scroll_bar_auto_hide);
+
+        cfg.apply(serde_json::from_value(
+            json!({"scroll_bar_auto_hide": false}),
+        )?)?;
+        assert!(!cfg.scroll_bar_auto_hide);
         Ok(())
     }
 

@@ -1,7 +1,10 @@
 //! Focused tests for the corresponding TUI responsibility.
 
 use super::events::{MouseEvent, MouseKind};
-use super::state::{ScrollGeometry, ViewState, handle_scroll_bar_mouse};
+use super::state::{
+    SCROLL_BAR_AUTO_HIDE_TICKS, ScrollGeometry, ViewState, advance_ticks, handle_scroll_bar_mouse,
+    scroll,
+};
 use super::transcript::Transcript;
 use crate::config::UiColor;
 
@@ -28,6 +31,9 @@ fn state_with(geometry: Option<ScrollGeometry>) -> ViewState {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         show_scroll_bar: true,
+        scroll_bar_enabled: true,
+        scroll_bar_auto_hide: false,
+        scroll_bar_idle_ticks: 0,
         scroll_geometry: geometry,
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
@@ -116,4 +122,148 @@ fn presses_are_ignored_when_no_bar_is_rendered() {
         mouse(MouseKind::Press, 39, 7)
     ));
     assert_eq!(state.scroll_offset, 0);
+}
+
+fn auto_hidden_state(geometry: Option<ScrollGeometry>) -> ViewState {
+    let mut state = state_with(geometry);
+    state.scroll_bar_auto_hide = true;
+    state
+}
+
+#[test]
+fn scroll_bar_auto_hide_engages_after_the_idle_window() {
+    let mut state = auto_hidden_state(None);
+    assert!(state.show_scroll_bar);
+
+    for _ in 1..SCROLL_BAR_AUTO_HIDE_TICKS {
+        advance_ticks(&mut state);
+        assert!(state.show_scroll_bar);
+    }
+    advance_ticks(&mut state);
+    assert!(!state.show_scroll_bar);
+}
+
+#[test]
+fn scrolling_resets_the_auto_hide_timer_and_reveals_the_bar() {
+    let mut state = auto_hidden_state(None);
+    for _ in 0..SCROLL_BAR_AUTO_HIDE_TICKS {
+        advance_ticks(&mut state);
+    }
+    assert!(!state.show_scroll_bar);
+
+    scroll(&mut state, 3);
+    assert!(state.show_scroll_bar);
+    assert_eq!(state.scroll_bar_idle_ticks, 0);
+
+    for _ in 0..SCROLL_BAR_AUTO_HIDE_TICKS - 1 {
+        advance_ticks(&mut state);
+    }
+    assert!(state.show_scroll_bar);
+    advance_ticks(&mut state);
+    assert!(!state.show_scroll_bar);
+}
+
+#[test]
+fn an_active_scroll_bar_drag_pauses_auto_hide() {
+    let mut state = auto_hidden_state(Some(geometry()));
+    assert!(handle_scroll_bar_mouse(
+        &mut state,
+        mouse(MouseKind::Press, 39, 0)
+    ));
+
+    for _ in 0..SCROLL_BAR_AUTO_HIDE_TICKS * 2 {
+        advance_ticks(&mut state);
+    }
+    assert!(state.show_scroll_bar);
+
+    assert!(handle_scroll_bar_mouse(
+        &mut state,
+        mouse(MouseKind::Release, 39, 0)
+    ));
+    for _ in 0..SCROLL_BAR_AUTO_HIDE_TICKS - 1 {
+        advance_ticks(&mut state);
+    }
+    assert!(state.show_scroll_bar);
+    advance_ticks(&mut state);
+    assert!(!state.show_scroll_bar);
+}
+
+#[test]
+fn auto_hide_stays_off_when_the_setting_is_disabled() {
+    let mut state = state_with(None);
+    state.scroll_bar_auto_hide = false;
+
+    for _ in 0..SCROLL_BAR_AUTO_HIDE_TICKS * 2 {
+        advance_ticks(&mut state);
+    }
+    assert!(state.show_scroll_bar);
+}
+
+#[test]
+fn auto_hide_never_reveals_a_disabled_scroll_bar() {
+    let mut state = state_with(None);
+    state.scroll_bar_enabled = false;
+    state.show_scroll_bar = false;
+    state.scroll_bar_auto_hide = true;
+
+    scroll(&mut state, 3);
+    assert!(!state.show_scroll_bar);
+    for _ in 0..SCROLL_BAR_AUTO_HIDE_TICKS * 2 {
+        advance_ticks(&mut state);
+    }
+    assert!(!state.show_scroll_bar);
+}
+
+#[test]
+fn sync_scroll_bar_config_reapplies_settings_and_clears_the_timer() {
+    let mut state = state_with(None);
+    state.scroll_bar_enabled = false;
+    state.scroll_bar_auto_hide = true;
+    state.show_scroll_bar = false;
+    state.scroll_bar_idle_ticks = SCROLL_BAR_AUTO_HIDE_TICKS;
+
+    let mut config = crate::config::Config::test_default();
+    config.scroll_bar = true;
+    state.sync_scroll_bar_config(&config);
+
+    assert!(state.scroll_bar_enabled);
+    assert!(state.scroll_bar_auto_hide);
+    assert!(state.show_scroll_bar);
+    assert_eq!(state.scroll_bar_idle_ticks, 0);
+}
+
+#[test]
+fn sync_scroll_bar_config_leaves_an_auto_hidden_bar_hidden() {
+    let mut state = auto_hidden_state(None);
+    for _ in 0..SCROLL_BAR_AUTO_HIDE_TICKS {
+        advance_ticks(&mut state);
+    }
+    assert!(!state.show_scroll_bar);
+    let idle = state.scroll_bar_idle_ticks;
+
+    let mut config = crate::config::Config::test_default();
+    config.scroll_bar = true;
+    config.scroll_bar_auto_hide = true;
+    state.sync_scroll_bar_config(&config);
+
+    assert!(!state.show_scroll_bar);
+    assert_eq!(state.scroll_bar_idle_ticks, idle);
+}
+
+#[test]
+fn sync_scroll_bar_config_shows_the_bar_when_auto_hide_turns_off() {
+    let mut state = auto_hidden_state(None);
+    for _ in 0..SCROLL_BAR_AUTO_HIDE_TICKS {
+        advance_ticks(&mut state);
+    }
+    assert!(!state.show_scroll_bar);
+
+    let mut config = crate::config::Config::test_default();
+    config.scroll_bar = true;
+    config.scroll_bar_auto_hide = false;
+    state.sync_scroll_bar_config(&config);
+
+    assert!(state.show_scroll_bar);
+    assert!(!state.scroll_bar_auto_hide);
+    assert_eq!(state.scroll_bar_idle_ticks, 0);
 }

@@ -14,7 +14,8 @@ use super::events::{Event, EventReader, Key, MouseEvent};
 use super::input::{EditAction, Editor};
 use super::picker::{
     ActivePickers, PickerAction, SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_REASONING_DISPLAY_INDEX,
-    SETTINGS_SCROLL_BAR_INDEX, picker_is_editing, select_picker_item, take_picker_action,
+    SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX, SETTINGS_SCROLL_BAR_INDEX, picker_is_editing,
+    select_picker_item, take_picker_action,
 };
 use super::state::{
     COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, scroll,
@@ -372,6 +373,10 @@ pub(super) fn display_config_change(action: &PickerAction) -> Option<(ConfigChan
             ConfigChange::ScrollBar(if *enabled { "on" } else { "off" }.into()),
             SETTINGS_SCROLL_BAR_INDEX,
         )),
+        PickerAction::SetScrollBarAutoHide(enabled) => Some((
+            ConfigChange::ScrollBarAutoHide(if *enabled { "on" } else { "off" }.into()),
+            SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX,
+        )),
         PickerAction::ApplySetting { argument, selected } => argument
             .strip_prefix("accent_color ")
             .map(|value| (ConfigChange::AccentColor(value.to_string()), *selected)),
@@ -391,7 +396,7 @@ pub(super) fn apply_display_config_while_busy(
             *config = outcome.config;
             state.hide_reasoning = config.hide_reasoning;
             state.accent_color = config.accent_color;
-            state.show_scroll_bar = config.scroll_bar;
+            state.sync_scroll_bar_config(config);
             state.subagents_enabled = config.subagents;
             notice_config_effect(config, outcome.effect, state);
             active_pickers.refresh_display_settings(config);

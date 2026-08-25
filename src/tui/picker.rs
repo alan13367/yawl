@@ -11,9 +11,10 @@ use super::markdown;
 pub(super) const SETTINGS_REASONING_DISPLAY_INDEX: usize = 3;
 pub(super) const SETTINGS_ACCENT_COLOR_INDEX: usize = 4;
 pub(super) const SETTINGS_SCROLL_BAR_INDEX: usize = 5;
-pub(super) const SETTINGS_AUTO_COMPACT_INDEX: usize = 6;
-pub(super) const SETTINGS_SUBAGENTS_INDEX: usize = 13;
-pub(super) const SETTINGS_RELOAD_INDEX: usize = 18;
+pub(super) const SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX: usize = 6;
+pub(super) const SETTINGS_AUTO_COMPACT_INDEX: usize = 7;
+pub(super) const SETTINGS_SUBAGENTS_INDEX: usize = 14;
+pub(super) const SETTINGS_RELOAD_INDEX: usize = 19;
 
 #[derive(Clone)]
 pub(super) enum PickerAction {
@@ -26,6 +27,7 @@ pub(super) enum PickerAction {
     OpenAccentColor,
     SetAccentColor(UiColor),
     SetScrollBar(bool),
+    SetScrollBarAutoHide(bool),
     ResumeSession(String),
     EditSetting { key: String, initial: String },
     EditModel { save: bool, initial: String },
@@ -106,6 +108,19 @@ impl ActivePickers {
             };
             item.description = format!("{visibility} · Enter to toggle");
             item.action = PickerAction::SetScrollBar(!config.scroll_bar);
+        }
+        if let Some(item) = self
+            .settings
+            .items
+            .get_mut(SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX)
+        {
+            let state = if config.scroll_bar_auto_hide {
+                "On"
+            } else {
+                "Off"
+            };
+            item.description = format!("{state} · Enter to toggle");
+            item.action = PickerAction::SetScrollBarAutoHide(!config.scroll_bar_auto_hide);
         }
         if let Some(item) = self.settings.items.get_mut(SETTINGS_SUBAGENTS_INDEX) {
             let state = if config.subagents { "On" } else { "Off" };
@@ -196,6 +211,11 @@ pub(super) fn settings_picker(agent: &Agent) -> Picker {
     } else {
         "Hidden"
     };
+    let scroll_bar_auto_hide = if agent.config().scroll_bar_auto_hide {
+        "On"
+    } else {
+        "Off"
+    };
     Picker {
         title: "Settings".into(),
         hint: "↑/↓ move  Enter change  Esc close".into(),
@@ -252,6 +272,11 @@ pub(super) fn settings_picker(agent: &Agent) -> Picker {
                 label: "Scroll bar".into(),
                 description: format!("{scroll_bar_visibility} · Enter to toggle"),
                 action: PickerAction::SetScrollBar(!agent.config().scroll_bar),
+            },
+            PickerItem {
+                label: "Auto-hide scroll bar".into(),
+                description: format!("{scroll_bar_auto_hide} · Enter to toggle"),
+                action: PickerAction::SetScrollBarAutoHide(!agent.config().scroll_bar_auto_hide),
             },
             PickerItem {
                 label: "Automatic compaction".into(),

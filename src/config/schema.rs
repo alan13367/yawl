@@ -20,6 +20,8 @@ pub(super) struct ConfigFile {
     pub(super) accent_color: Option<UiColor>,
     /// Whether the transcript scroll bar is drawn in the TUI.
     pub(super) scroll_bar: Option<bool>,
+    /// Whether an idle transcript scroll bar hides itself after a pause.
+    pub(super) scroll_bar_auto_hide: Option<bool>,
     /// Compatibility with the brief two-color settings format.
     pub(super) status_bar_color: Option<UiColor>,
     /// Compatibility with the brief two-color settings format.

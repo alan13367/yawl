@@ -1,7 +1,7 @@
 //! Mutable UI state and owned agent-event updates.
 
 use crate::agent::{Agent, TurnEvent};
-use crate::config::UiColor;
+use crate::config::{Config, UiColor};
 use crate::subagent::{SubagentManager, SubagentSnapshot};
 
 use super::completion::{Completion, command_completions};
@@ -11,6 +11,10 @@ use super::subagents::SubagentView;
 use super::transcript::{Transcript, TranscriptEvent};
 
 pub(super) const COPY_TOAST_TICKS: u8 = 15;
+
+/// Ticks an idle transcript scroll bar stays visible before auto-hide
+/// engages (~2s at the terminal's 100 ms raw-mode read timeout).
+pub(super) const SCROLL_BAR_AUTO_HIDE_TICKS: u32 = 20;
 
 /// Layout facts the scroll bar needs to render and hit-test. Captured each
 /// frame while the bar is drawn.
@@ -31,6 +35,11 @@ pub(super) struct ViewState {
     pub(super) hide_reasoning: bool,
     pub(super) accent_color: UiColor,
     pub(super) show_scroll_bar: bool,
+    /// Whether the config enables the scroll bar at all. Kept beside the
+    /// effective `show_scroll_bar` so auto-hide can re-show it on activity.
+    pub(super) scroll_bar_enabled: bool,
+    pub(super) scroll_bar_auto_hide: bool,
+    pub(super) scroll_bar_idle_ticks: u32,
     pub(super) scroll_geometry: Option<ScrollGeometry>,
     pub(super) scroll_bar_drag: Option<usize>,
     pub(super) copy_toast_ticks: u8,
@@ -64,7 +73,10 @@ impl ViewState {
             reasoning_effort: agent.config().reasoning_effort.clone(),
             hide_reasoning: agent.config().hide_reasoning,
             accent_color: agent.config().accent_color,
+            scroll_bar_enabled: agent.config().scroll_bar,
+            scroll_bar_auto_hide: agent.config().scroll_bar_auto_hide,
             show_scroll_bar: agent.config().scroll_bar,
+            scroll_bar_idle_ticks: 0,
             scroll_geometry: None,
             scroll_bar_drag: None,
             copy_toast_ticks: 0,
@@ -90,6 +102,22 @@ impl ViewState {
     pub(super) fn refresh_completions(&mut self, agent: &Agent) {
         self.completions = command_completions(agent);
         self.completion_index = 0;
+    }
+
+    /// Mirrors scroll-bar settings from the config into runtime state and
+    /// recomputes effective visibility after a settings change or reload.
+    /// Unrelated settings leave an auto-hidden bar hidden.
+    pub(super) fn sync_scroll_bar_config(&mut self, config: &Config) {
+        let enabling = config.scroll_bar && !self.scroll_bar_enabled;
+        self.scroll_bar_enabled = config.scroll_bar;
+        self.scroll_bar_auto_hide = config.scroll_bar_auto_hide;
+        if !config.scroll_bar {
+            self.show_scroll_bar = false;
+            self.scroll_bar_idle_ticks = 0;
+        } else if !config.scroll_bar_auto_hide || enabling {
+            self.show_scroll_bar = true;
+            self.scroll_bar_idle_ticks = 0;
+        }
     }
 
     pub(super) fn notice(&mut self, text: impl Into<String>) {
@@ -231,9 +259,27 @@ impl Update {
 pub(super) fn advance_ticks(state: &mut ViewState) {
     state.copy_toast_ticks = state.copy_toast_ticks.saturating_sub(1);
     state.spinner_tick = state.spinner_tick.wrapping_add(1);
+    if state.scroll_bar_enabled && state.scroll_bar_auto_hide && state.scroll_bar_drag.is_none() {
+        state.scroll_bar_idle_ticks = state.scroll_bar_idle_ticks.saturating_add(1);
+        if state.scroll_bar_idle_ticks >= SCROLL_BAR_AUTO_HIDE_TICKS {
+            state.show_scroll_bar = false;
+        }
+    }
     super::subagents::refresh(state);
 }
+
+/// Re-shows the scroll bar and restarts its idle timer after scrolling
+/// activity. A no-op when the bar is disabled entirely.
+fn wake_scroll_bar(state: &mut ViewState) {
+    if !state.scroll_bar_enabled {
+        return;
+    }
+    state.show_scroll_bar = true;
+    state.scroll_bar_idle_ticks = 0;
+}
+
 pub(super) fn scroll(state: &mut ViewState, amount: i32) {
+    wake_scroll_bar(state);
     if amount >= 0 {
         state.scroll_offset = state.scroll_offset.saturating_add(amount as usize);
     } else {
@@ -278,6 +324,7 @@ pub(super) fn handle_scroll_bar_mouse(state: &mut ViewState, event: MouseEvent) 
             };
             state.scroll_bar_drag = Some(grab);
             scroll_bar_jump(state, geometry, event.row, grab);
+            wake_scroll_bar(state);
             true
         }
         MouseKind::Drag => {
@@ -286,6 +333,7 @@ pub(super) fn handle_scroll_bar_mouse(state: &mut ViewState, event: MouseEvent) 
             };
             if let Some(geometry) = state.scroll_geometry {
                 scroll_bar_jump(state, geometry, event.row, grab);
+                wake_scroll_bar(state);
             }
             true
         }

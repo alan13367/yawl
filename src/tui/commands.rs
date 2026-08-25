@@ -6,8 +6,9 @@ use crate::error::Error;
 
 use super::picker::{
     Picker, PickerAction, PickerItem, SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_AUTO_COMPACT_INDEX,
-    SETTINGS_RELOAD_INDEX, SETTINGS_SCROLL_BAR_INDEX, SETTINGS_SUBAGENTS_INDEX, color_picker,
-    open_model_picker, open_reasoning_picker, open_settings_picker, select_picker_item,
+    SETTINGS_RELOAD_INDEX, SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX, SETTINGS_SCROLL_BAR_INDEX,
+    SETTINGS_SUBAGENTS_INDEX, color_picker, open_model_picker, open_reasoning_picker,
+    open_settings_picker, select_picker_item,
 };
 use super::state::ViewState;
 
@@ -227,6 +228,19 @@ pub(super) fn activate_picker_action(
                 select_picker_item(state, SETTINGS_SCROLL_BAR_INDEX);
             }
         }
+        PickerAction::SetScrollBarAutoHide(enabled) => {
+            if settings(
+                agent,
+                &format!(
+                    "scroll_bar_auto_hide {}",
+                    if enabled { "on" } else { "off" }
+                ),
+                state,
+            ) {
+                open_settings_picker(agent, state);
+                select_picker_item(state, SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX);
+            }
+        }
         PickerAction::SetAccentColor(color) => {
             if settings(
                 agent,
@@ -310,6 +324,10 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
         }
         "scroll_bar" => one_value(&mut parts, "usage: /settings scroll_bar on|off")
             .map(|value| ConfigChange::ScrollBar(value.to_string())),
+        "scroll_bar_auto_hide" => {
+            one_value(&mut parts, "usage: /settings scroll_bar_auto_hide on|off")
+                .map(|value| ConfigChange::ScrollBarAutoHide(value.to_string()))
+        }
         "auto_compact" => one_value(&mut parts, "usage: /settings auto_compact on|off")
             .map(|value| ConfigChange::AutoCompact(value.to_string())),
         "compact_threshold" => one_value(
@@ -408,7 +426,7 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
             state.hide_reasoning = agent.config().hide_reasoning;
             state.accent_color = agent.config().accent_color;
             state.subagents_enabled = agent.config().subagents;
-            state.show_scroll_bar = agent.config().scroll_bar;
+            state.sync_scroll_bar_config(agent.config());
             state.context_window = agent.context_window();
             notice_config_effect(agent.config(), effect, state);
             true
@@ -446,7 +464,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- scroll_bar: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -457,6 +475,11 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         agent.config().hide_reasoning,
         agent.config().accent_color.config_value(),
         if agent.config().scroll_bar {
+            "on"
+        } else {
+            "off"
+        },
+        if agent.config().scroll_bar_auto_hide {
             "on"
         } else {
             "off"
@@ -515,7 +538,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);

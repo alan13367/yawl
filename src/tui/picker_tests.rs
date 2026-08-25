@@ -2,7 +2,8 @@
 
 use super::picker::{
     SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_AUTO_COMPACT_INDEX, SETTINGS_REASONING_DISPLAY_INDEX,
-    SETTINGS_RELOAD_INDEX, SETTINGS_SCROLL_BAR_INDEX, settings_picker,
+    SETTINGS_RELOAD_INDEX, SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX, SETTINGS_SCROLL_BAR_INDEX,
+    settings_picker,
 };
 use super::*;
 
@@ -63,6 +64,9 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         show_scroll_bar: true,
+        scroll_bar_enabled: true,
+        scroll_bar_auto_hide: false,
+        scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
@@ -125,6 +129,9 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         show_scroll_bar: true,
+        scroll_bar_enabled: true,
+        scroll_bar_auto_hide: false,
+        scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
@@ -212,6 +219,14 @@ fn settings_picker_indexes_keep_their_action_contracts() {
     assert!(matches!(
         picker.items[SETTINGS_SCROLL_BAR_INDEX].action,
         PickerAction::SetScrollBar(false)
+    ));
+    assert_eq!(
+        picker.items[SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX].label,
+        "Auto-hide scroll bar"
+    );
+    assert!(matches!(
+        picker.items[SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX].action,
+        PickerAction::SetScrollBarAutoHide(false)
     ));
     assert_eq!(
         picker.items[SETTINGS_AUTO_COMPACT_INDEX].label,
