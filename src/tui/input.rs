@@ -242,6 +242,19 @@ impl Editor {
     }
 
     pub fn layout(&self, width: usize) -> InputLayout {
+        self.layout_with_buffer(width, &self.buffer)
+    }
+
+    pub fn masked_layout(&self, width: usize) -> InputLayout {
+        let masked = self
+            .buffer
+            .iter()
+            .map(|character| if *character == '\n' { '\n' } else { '•' })
+            .collect::<Vec<_>>();
+        self.layout_with_buffer(width, &masked)
+    }
+
+    fn layout_with_buffer(&self, width: usize, buffer: &[char]) -> InputLayout {
         let width = width.max(3);
         let mut lines = Vec::new();
         let mut line = String::from("> ");
@@ -249,7 +262,7 @@ impl Editor {
         let mut cursor_row = 0usize;
         let mut cursor_col = 2usize;
 
-        for (index, character) in self.buffer.iter().copied().enumerate() {
+        for (index, character) in buffer.iter().copied().enumerate() {
             if index == self.cursor {
                 cursor_row = lines.len();
                 cursor_col = column;
@@ -276,7 +289,7 @@ impl Editor {
             });
             column += 1;
         }
-        if self.cursor == self.buffer.len() {
+        if self.cursor == buffer.len() {
             cursor_row = lines.len();
             cursor_col = column;
         }

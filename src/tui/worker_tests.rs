@@ -1,15 +1,13 @@
 //! Focused tests for the corresponding TUI responsibility.
 
-use super::picker::{
-    SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_REASONING_DISPLAY_INDEX,
-    SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX, SETTINGS_SCROLL_BAR_INDEX,
-};
+use super::picker::{SettingsCategory, SettingsItem, settings_item_index};
 use super::*;
 
 #[test]
 fn settings_and_model_pickers_are_recognized_during_an_active_turn() {
     assert_eq!(busy_command(" /settings "), Some(BusyCommand::Settings));
     assert_eq!(busy_command("/model"), Some(BusyCommand::Model));
+    assert_eq!(busy_command("/connect"), Some(BusyCommand::Connect));
     assert_eq!(busy_command("/subagents"), Some(BusyCommand::Subagents));
     assert_eq!(busy_command("/copy"), Some(BusyCommand::Copy));
     assert_eq!(busy_command("/copy-all"), Some(BusyCommand::CopyAll));
@@ -29,9 +27,11 @@ fn display_settings_apply_during_an_active_turn() {
         selected: 0,
         items: Vec::new(),
         editing: None,
+        parent: None,
     };
+    let interface_count = 5;
     let settings = Picker {
-        items: (0..=SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX)
+        items: (0..interface_count)
             .map(|index| PickerItem {
                 label: format!("Setting {index}"),
                 description: String::new(),
@@ -44,6 +44,7 @@ fn display_settings_apply_during_an_active_turn() {
         model: picker.clone(),
         default_model: picker.clone(),
         settings,
+        settings_categories: Vec::new(),
         reasoning: picker.clone(),
         default_reasoning: picker.clone(),
         accent_color: picker.clone(),
@@ -76,6 +77,7 @@ fn display_settings_apply_during_an_active_turn() {
         completion_filter: None,
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,
@@ -97,6 +99,16 @@ fn display_settings_apply_during_an_active_turn() {
         project_dir: root.join("project/.yawl"),
         ..Config::test_default()
     };
+    active_pickers.settings_categories = vec![(
+        SettingsCategory::Interface,
+        super::picker::settings_category_picker_from(
+            &config,
+            "test",
+            100,
+            SettingsCategory::Interface,
+            0,
+        ),
+    )];
 
     activate_picker_action_while_busy(
         &mut state,
@@ -113,13 +125,15 @@ fn display_settings_apply_during_an_active_turn() {
         .picker
         .as_ref()
         .expect("settings picker should reopen");
-    assert_eq!(settings.selected, SETTINGS_REASONING_DISPLAY_INDEX);
+    let reasoning =
+        settings_item_index(SettingsCategory::Interface, SettingsItem::ReasoningDisplay);
+    assert_eq!(settings.selected, reasoning);
     assert_eq!(
-        settings.items[SETTINGS_REASONING_DISPLAY_INDEX].description,
+        settings.items[reasoning].description,
         "Hidden · Enter to toggle"
     );
     assert!(matches!(
-        settings.items[SETTINGS_REASONING_DISPLAY_INDEX].action,
+        settings.items[reasoning].action,
         PickerAction::SetHideReasoning(false)
     ));
 
@@ -138,11 +152,9 @@ fn display_settings_apply_during_an_active_turn() {
         .picker
         .as_ref()
         .expect("settings picker should reopen");
-    assert_eq!(settings.selected, SETTINGS_ACCENT_COLOR_INDEX);
-    assert_eq!(
-        settings.items[SETTINGS_ACCENT_COLOR_INDEX].description,
-        "blue"
-    );
+    let accent = settings_item_index(SettingsCategory::Interface, SettingsItem::AccentColor);
+    assert_eq!(settings.selected, accent);
+    assert_eq!(settings.items[accent].description, "blue");
     assert!(matches!(
         active_pickers.accent_color.items[active_pickers.accent_color.selected].action,
         PickerAction::SetAccentColor(color) if color == blue
@@ -161,13 +173,14 @@ fn display_settings_apply_during_an_active_turn() {
         .picker
         .as_ref()
         .expect("settings picker should reopen");
-    assert_eq!(settings.selected, SETTINGS_SCROLL_BAR_INDEX);
+    let scroll = settings_item_index(SettingsCategory::Interface, SettingsItem::ScrollBar);
+    assert_eq!(settings.selected, scroll);
     assert_eq!(
-        settings.items[SETTINGS_SCROLL_BAR_INDEX].description,
+        settings.items[scroll].description,
         "Hidden · Enter to toggle"
     );
     assert!(matches!(
-        settings.items[SETTINGS_SCROLL_BAR_INDEX].action,
+        settings.items[scroll].action,
         PickerAction::SetScrollBar(true)
     ));
 
@@ -183,13 +196,15 @@ fn display_settings_apply_during_an_active_turn() {
         .picker
         .as_ref()
         .expect("settings picker should reopen");
-    assert_eq!(settings.selected, SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX);
+    let auto_hide =
+        settings_item_index(SettingsCategory::Interface, SettingsItem::ScrollBarAutoHide);
+    assert_eq!(settings.selected, auto_hide);
     assert_eq!(
-        settings.items[SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX].description,
+        settings.items[auto_hide].description,
         "Off · Enter to toggle"
     );
     assert!(matches!(
-        settings.items[SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX].action,
+        settings.items[auto_hide].action,
         PickerAction::SetScrollBarAutoHide(true)
     ));
 
@@ -204,6 +219,31 @@ fn display_settings_apply_during_an_active_turn() {
     );
 
     assert_eq!(state.pending_actions.len(), 1);
+
+    state.pending_actions.clear();
+    state.queued_inputs.push_back("queued prompt".into());
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::ApplyConnectionPlan(crate::onboarding::provider::ConnectionPlan {
+            changes: vec![crate::config::ConfigChange::Provider {
+                name: "new-provider".into(),
+                base_url: "http://127.0.0.1:9999/v1".into(),
+                api_key: Some("-".into()),
+            }],
+            model: "new-provider:test".into(),
+            activation: crate::onboarding::provider::ConnectionActivation::Session,
+            provider_label: "new-provider".into(),
+        }),
+        &mut active_pickers,
+        &mut config,
+    );
+
+    assert_eq!(state.pending_actions.len(), 1);
+    assert_eq!(
+        state.queued_inputs.front().map(String::as_str),
+        Some("queued prompt")
+    );
+    assert!(!config.providers.contains_key("new-provider"));
 
     let _ = std::fs::remove_dir_all(root);
 }

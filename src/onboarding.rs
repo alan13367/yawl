@@ -2,6 +2,7 @@
 
 mod discovery;
 mod flow;
+pub(crate) mod provider;
 mod select;
 mod terminal;
 

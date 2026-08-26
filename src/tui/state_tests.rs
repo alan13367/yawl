@@ -56,6 +56,7 @@ fn state_with(geometry: Option<ScrollGeometry>) -> ViewState {
         completion_filter: None,
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,

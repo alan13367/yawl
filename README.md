@@ -16,7 +16,7 @@ cd yawl
 cargo install --path .
 ```
 
-Run `yawl` after installation. On first use a setup wizard starts: pick a provider with the arrow keys, confirm its endpoint and key, and choose a model from the list the server reports. Yawl does not assume a default model. Choosing "Skip setup" (or pressing Escape) defers configuration and writes `"setup": "skipped"`, so a later bare `yawl` run will not ask again; `yawl --setup` restarts the wizard and clears the marker. Run `yawl --doctor` at any time to check or repair the configuration files.
+Run `yawl` after installation. On first use a setup wizard starts: pick a built-in or previously configured provider with the arrow keys, confirm its endpoint and authentication, and choose a discovered or manually entered model. Failed discovery can be retried without restarting setup. Yawl does not assume a default model. Choosing "Skip setup" (or pressing Escape) defers configuration and writes `"setup": "skipped"`, so a later bare `yawl` run will not ask again; `yawl --setup` restarts the wizard and clears the marker. Run `yawl --doctor` at any time to check or repair the configuration files.
 
 Built-in Anthropic and OpenAI read `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` when those variables are set. The wizard can also store either key in `~/.yawl/config.json` with mode `0600` as `anthropic_api_key` or `openai_api_key`; the environment variable wins when both exist.
 
@@ -72,13 +72,16 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 
 ## Slash commands
 
-`/model` and `/settings` open lightweight keyboard pickers, including while a model response is still running. Use the arrow keys and Enter to choose, or Escape to close. Editable settings stay in the picker: Enter starts editing the current value, Enter again saves it, and the refreshed value is shown in the menu. Reasoning visibility, accent color, and selection color changes apply immediately during an active response. Settings that can affect generation, including the model and reasoning effort, apply as soon as the response releases the agent and before the next message starts.
+`/model`, `/settings`, and `/connect` open keyboard pickers, including while a model response is still running. Settings are grouped under Model, Interface, Context, Providers, Subagents, Skills, and Advanced. Use the arrow keys and Enter to choose; Escape returns to the parent category before closing settings. Editable settings stay in the picker: Enter starts editing the current value, Enter again saves it, and the refreshed value is shown in the menu. Reasoning visibility, accent color, and selection color changes apply immediately during an active response. Settings that can affect generation apply as soon as the response releases the agent and before the next queued message starts.
+
+`/connect` and Settings > Providers use the same guided setup. Fixed providers appear first, followed by configured custom providers in name order. Existing endpoints are prefilled and credentials are preserved unless you choose an environment variable, enter a replacement key, or explicitly use no key. The no-key option appears only for providers that support keyless requests and do not have an active fallback environment credential. Secret input is masked. Discovery and Codex device login remain interactive while a model response continues; Escape cancels only the setup job. The review can save and use the model globally, save and use it for this session, or save only the connection.
 
 Messages submitted during an active response are queued automatically. Each pending message is shown below the live transcript with a `Queued` label, and the status bar shows the queue length. Run `/unqueue` to open the queue editor: `K`/`J` reorder the selected message, `e` edits it, `d` or Delete removes it, and Enter stops the active turn and sends that message next. `/unqueue NUMBER` still removes one directly, and `/unqueue all` clears the queue.
 
 | Command | Effect |
 | --- | --- |
 | `/model [MODEL]` | Open a model picker, or switch the current session directly when `MODEL` is given |
+| `/connect` | Configure a provider and model with guided authentication and discovery |
 | `/settings [KEY ...]` | Open the settings picker, or change a setting directly when arguments are given |
 | `/new` | Start a new session without changing the current working directory |
 | `/clear` | Alias for `/new` |
@@ -199,7 +202,7 @@ These compatibility fields are supported at provider or model level:
 }
 ```
 
-You can configure an endpoint from the TUI without editing JSON:
+You can configure an endpoint interactively with `/connect` or Settings > Providers. The direct settings forms remain available for scripts and compatibility:
 
 ```text
 /settings provider omlx http://127.0.0.1:8000/v1 $OMLX_API_KEY

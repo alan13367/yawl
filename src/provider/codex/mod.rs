@@ -5,6 +5,7 @@ mod auth;
 mod responses;
 
 pub use auth::{CodexLoginStatus, credential_status, login};
+pub(crate) use auth::{DeviceLoginPrompt, login_with_callback};
 
 use super::http_agent;
 use crate::config::Config;

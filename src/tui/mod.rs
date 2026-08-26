@@ -8,6 +8,7 @@ mod commands_tests;
 mod completion;
 #[cfg(test)]
 mod completion_tests;
+mod connection;
 pub mod events;
 mod files;
 pub mod highlight;
@@ -182,7 +183,10 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                     Event::Mouse(mouse) => {
                         handle_mouse_selection(&mut terminal, &mut state, mouse)?
                     }
-                    Event::Tick => needs_draw |= advance_ticks(&mut state),
+                    Event::Tick => {
+                        needs_draw |= advance_ticks(&mut state);
+                        needs_draw |= connection::poll(&mut state);
+                    }
                     Event::MouseScroll(_) | Event::Paste(_) => {}
                 }
                 break;
@@ -190,6 +194,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
             match event {
                 Event::Tick => {
                     needs_draw |= advance_ticks(&mut state);
+                    needs_draw |= connection::poll(&mut state);
                 }
                 Event::MouseScroll(amount) => scroll(&mut state, amount),
                 Event::Mouse(mouse) => handle_mouse_selection(&mut terminal, &mut state, mouse)?,
@@ -318,6 +323,8 @@ fn handle_submission<R: Read>(
                 let _ = settings(agent, argument, state);
                 state.refresh_completions(agent);
             }
+            "connect" if argument.is_empty() => connection::open(state, agent.config(), false),
+            "connect" => state.notice("Usage: /connect"),
             name if is_new_session_command(name) => match agent.reset() {
                 Ok(()) => {
                     let queued_inputs = std::mem::take(&mut state.queued_inputs);

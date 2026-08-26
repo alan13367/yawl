@@ -4,18 +4,97 @@ use crate::agent::Agent;
 use crate::config::{Config, UiColor};
 
 use super::ViewState;
+use super::connection::{ConnectEditField, ConnectStep};
 use super::events::Key;
 use super::input::Editor;
 use super::markdown;
+use crate::onboarding::provider::{
+    ConnectionActivation, ConnectionPlan, CredentialChoice, ProviderId,
+};
 
-pub(super) const SETTINGS_REASONING_DISPLAY_INDEX: usize = 3;
-pub(super) const SETTINGS_ACCENT_COLOR_INDEX: usize = 4;
-pub(super) const SETTINGS_SELECTION_COLOR_INDEX: usize = 5;
-pub(super) const SETTINGS_SCROLL_BAR_INDEX: usize = 6;
-pub(super) const SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX: usize = 7;
-pub(super) const SETTINGS_AUTO_COMPACT_INDEX: usize = 8;
-pub(super) const SETTINGS_SUBAGENTS_INDEX: usize = 15;
-pub(super) const SETTINGS_RELOAD_INDEX: usize = 20;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettingsCategory {
+    Model,
+    Interface,
+    Context,
+    Providers,
+    Subagents,
+    Skills,
+    Advanced,
+}
+
+impl SettingsCategory {
+    pub(super) const ALL: [Self; 7] = [
+        Self::Model,
+        Self::Interface,
+        Self::Context,
+        Self::Providers,
+        Self::Subagents,
+        Self::Skills,
+        Self::Advanced,
+    ];
+
+    pub(super) const fn title(self) -> &'static str {
+        match self {
+            Self::Model => "Model",
+            Self::Interface => "Interface",
+            Self::Context => "Context",
+            Self::Providers => "Providers",
+            Self::Subagents => "Subagents",
+            Self::Skills => "Skills",
+            Self::Advanced => "Advanced",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Model => "Default model, output, and reasoning",
+            Self::Interface => "Colors, reasoning display, and scroll bar",
+            Self::Context => "Compaction and context windows",
+            Self::Providers => "Add or update model providers",
+            Self::Subagents => "Concurrency, models, budgets, and timeouts",
+            Self::Skills => "Search directories for reusable skills",
+            Self::Advanced => "Reload and inspect configuration",
+        }
+    }
+
+    pub(super) fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|category| *category == self)
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettingsItem {
+    DefaultModel,
+    MaxOutputTokens,
+    ReasoningEffort,
+    ReasoningDisplay,
+    AccentColor,
+    SelectionColor,
+    ScrollBar,
+    ScrollBarAutoHide,
+    AutoCompact,
+    CompactThreshold,
+    ContextWindow,
+    ProviderSetup,
+    SubagentsEnabled,
+    MaxSubagents,
+    SubagentModel,
+    SubagentRequestBudget,
+    SubagentTimeout,
+    AddSkillDirectory,
+    Reload,
+    ConfigurationDetails,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SettingsLocation {
+    pub(super) category: SettingsCategory,
+    pub(super) item: SettingsItem,
+}
 
 /// Named colors offered by the accent and selection pickers, mirroring
 /// `UiColor::parse`.
@@ -70,9 +149,38 @@ pub(super) enum PickerAction {
     OpenResume {
         selected: usize,
     },
+    OpenSettingsRoot {
+        selected: usize,
+    },
+    OpenSettingsCategory {
+        category: SettingsCategory,
+        selected: usize,
+    },
+    OpenConnect {
+        from_settings: bool,
+    },
+    ConnectChooseProvider(ProviderId),
+    EditConnect {
+        field: ConnectEditField,
+        initial: String,
+        secret: bool,
+    },
+    ApplyConnect {
+        field: ConnectEditField,
+        value: String,
+    },
+    ConnectCredential(CredentialChoice),
+    ConnectChooseModel(String),
+    ConnectRetry,
+    ConnectCancelJob,
+    CloseConnect,
+    ConnectBack(ConnectStep),
+    ConnectActivation(ConnectionActivation),
+    ApplyConnectionPlan(ConnectionPlan),
     EditSetting {
         key: String,
         initial: String,
+        location: Option<SettingsLocation>,
     },
     EditModel {
         save: bool,
@@ -80,7 +188,7 @@ pub(super) enum PickerAction {
     },
     ApplySetting {
         argument: String,
-        selected: usize,
+        location: Option<SettingsLocation>,
     },
     SetAutoCompact(bool),
     SetSubagents(bool),
@@ -113,19 +221,28 @@ pub(super) struct Picker {
     pub(super) items: Vec<PickerItem>,
     pub(super) selected: usize,
     pub(super) editing: Option<PickerEdit>,
+    /// Action performed by Escape. Standalone pickers leave this unset.
+    pub(super) parent: Option<PickerAction>,
 }
 
 #[derive(Clone)]
 pub(super) enum PickerEdit {
     Setting(String),
-    Model { save: bool },
+    Model {
+        save: bool,
+    },
     Queued(usize),
+    Connect {
+        field: ConnectEditField,
+        secret: bool,
+    },
 }
 
 pub(super) struct ActivePickers {
     pub(super) model: Picker,
     pub(super) default_model: Picker,
     pub(super) settings: Picker,
+    pub(super) settings_categories: Vec<(SettingsCategory, Picker)>,
     pub(super) reasoning: Picker,
     pub(super) default_reasoning: Picker,
     pub(super) accent_color: Picker,
@@ -138,6 +255,10 @@ impl ActivePickers {
             model: model_picker(agent, false),
             default_model: model_picker(agent, true),
             settings: settings_picker(agent),
+            settings_categories: SettingsCategory::ALL
+                .into_iter()
+                .map(|category| (category, settings_category_picker(agent, category, 0)))
+                .collect(),
             reasoning: reasoning_picker(agent, false),
             default_reasoning: reasoning_picker(agent, true),
             accent_color: color_picker(agent.config().accent_color),
@@ -146,51 +267,18 @@ impl ActivePickers {
     }
 
     pub(super) fn refresh_display_settings(&mut self, config: &Config) {
-        let visibility = if config.hide_reasoning {
-            "Hidden"
-        } else {
-            "Visible"
-        };
-        if let Some(item) = self
-            .settings
-            .items
-            .get_mut(SETTINGS_REASONING_DISPLAY_INDEX)
+        if let Some((_, picker)) = self
+            .settings_categories
+            .iter_mut()
+            .find(|(category, _)| *category == SettingsCategory::Interface)
         {
-            item.description = format!("{visibility} · Enter to toggle");
-            item.action = PickerAction::SetHideReasoning(!config.hide_reasoning);
-        }
-        if let Some(item) = self.settings.items.get_mut(SETTINGS_ACCENT_COLOR_INDEX) {
-            item.description = config.accent_color.config_value();
-        }
-        if let Some(item) = self.settings.items.get_mut(SETTINGS_SELECTION_COLOR_INDEX) {
-            item.description = UiColor::selection_config_value(config.selection_color);
-        }
-        if let Some(item) = self.settings.items.get_mut(SETTINGS_SCROLL_BAR_INDEX) {
-            let visibility = if config.scroll_bar {
-                "Visible"
-            } else {
-                "Hidden"
-            };
-            item.description = format!("{visibility} · Enter to toggle");
-            item.action = PickerAction::SetScrollBar(!config.scroll_bar);
-        }
-        if let Some(item) = self
-            .settings
-            .items
-            .get_mut(SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX)
-        {
-            let state = if config.scroll_bar_auto_hide {
-                "On"
-            } else {
-                "Off"
-            };
-            item.description = format!("{state} · Enter to toggle");
-            item.action = PickerAction::SetScrollBarAutoHide(!config.scroll_bar_auto_hide);
-        }
-        if let Some(item) = self.settings.items.get_mut(SETTINGS_SUBAGENTS_INDEX) {
-            let state = if config.subagents { "On" } else { "Off" };
-            item.description = format!("{state} · Enter to toggle");
-            item.action = PickerAction::SetSubagents(!config.subagents);
+            *picker = settings_category_picker_from(
+                config,
+                "",
+                0,
+                SettingsCategory::Interface,
+                picker.selected,
+            );
         }
         self.accent_color = color_picker(config.accent_color);
         self.selection_color = selection_color_picker(config.selection_color);
@@ -254,6 +342,10 @@ pub(super) fn model_picker(agent: &Agent, save: bool) -> Picker {
         items,
         selected,
         editing: None,
+        parent: save.then_some(PickerAction::OpenSettingsCategory {
+            category: SettingsCategory::Model,
+            selected: settings_item_index(SettingsCategory::Model, SettingsItem::DefaultModel),
+        }),
     }
 }
 
@@ -261,205 +353,227 @@ pub(super) fn open_settings_picker(agent: &Agent, state: &mut ViewState) {
     state.picker = Some(settings_picker(agent));
 }
 
-pub(super) fn settings_picker(agent: &Agent) -> Picker {
-    let on_off = if agent.config().auto_compact {
-        "On"
-    } else {
-        "Off"
-    };
-    let reasoning_visibility = if agent.config().hide_reasoning {
-        "Hidden"
-    } else {
-        "Visible"
-    };
-    let scroll_bar_visibility = if agent.config().scroll_bar {
-        "Visible"
-    } else {
-        "Hidden"
-    };
-    let scroll_bar_auto_hide = if agent.config().scroll_bar_auto_hide {
-        "On"
-    } else {
-        "Off"
-    };
+pub(super) fn settings_picker(_agent: &Agent) -> Picker {
     Picker {
         title: "Settings".into(),
-        hint: "↑/↓ move  Enter change  Esc close".into(),
+        hint: "↑/↓ move  Enter open  Esc close".into(),
         selected: 0,
-        items: vec![
+        items: SettingsCategory::ALL
+            .into_iter()
+            .map(|category| PickerItem {
+                label: category.title().into(),
+                description: category.description().into(),
+                action: PickerAction::OpenSettingsCategory {
+                    category,
+                    selected: 0,
+                },
+            })
+            .collect(),
+        editing: None,
+        parent: None,
+    }
+}
+
+pub(super) fn settings_category_picker(
+    agent: &Agent,
+    category: SettingsCategory,
+    selected: usize,
+) -> Picker {
+    settings_category_picker_from(
+        agent.config(),
+        agent.model(),
+        agent.context_window(),
+        category,
+        selected,
+    )
+}
+
+pub(super) fn settings_category_picker_from(
+    config: &Config,
+    model: &str,
+    context_window: u64,
+    category: SettingsCategory,
+    selected: usize,
+) -> Picker {
+    let location = |item| Some(SettingsLocation { category, item });
+    let edit = |item, label: &str, value: String| PickerItem {
+        label: label.into(),
+        description: value.clone(),
+        action: PickerAction::EditSetting {
+            key: setting_key(item).into(),
+            initial: value,
+            location: location(item),
+        },
+    };
+    let on_off = |enabled| if enabled { "On" } else { "Off" };
+    let mut items = match category {
+        SettingsCategory::Model => vec![
             PickerItem {
                 label: "Default model".into(),
-                description: agent
-                    .config()
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| agent.model().to_string()),
+                description: config.model.clone().unwrap_or_else(|| model.to_string()),
                 action: PickerAction::OpenModels { save: true },
             },
-            PickerItem {
-                label: "Max output tokens".into(),
-                description: agent.config().max_tokens.to_string(),
-                action: PickerAction::EditSetting {
-                    key: "max_tokens".into(),
-                    initial: agent.config().max_tokens.to_string(),
-                },
-            },
+            edit(
+                SettingsItem::MaxOutputTokens,
+                "Max output tokens",
+                config.max_tokens.to_string(),
+            ),
             PickerItem {
                 label: "Codex reasoning effort".into(),
-                description: agent
-                    .config()
+                description: config
                     .reasoning_effort
                     .clone()
                     .unwrap_or_else(|| "provider default".into()),
-                action: if crate::model::is_codex(agent.config(), agent.model()) {
+                action: if crate::model::is_codex(config, model) {
                     PickerAction::OpenReasoning { save: true }
                 } else {
                     PickerAction::EditSetting {
                         key: "reasoning_effort".into(),
-                        initial: agent
-                            .config()
+                        initial: config
                             .reasoning_effort
                             .clone()
                             .unwrap_or_else(|| "default".into()),
+                        location: location(SettingsItem::ReasoningEffort),
                     }
                 },
             },
+        ],
+        SettingsCategory::Interface => vec![
             PickerItem {
                 label: "Reasoning display".into(),
-                description: format!("{reasoning_visibility} · Enter to toggle"),
-                action: PickerAction::SetHideReasoning(!agent.config().hide_reasoning),
+                description: format!(
+                    "{} · Enter to toggle",
+                    if config.hide_reasoning {
+                        "Hidden"
+                    } else {
+                        "Visible"
+                    }
+                ),
+                action: PickerAction::SetHideReasoning(!config.hide_reasoning),
             },
             PickerItem {
                 label: "Accent color".into(),
-                description: agent.config().accent_color.config_value(),
+                description: config.accent_color.config_value(),
                 action: PickerAction::OpenAccentColor,
             },
             PickerItem {
                 label: "Selection color".into(),
-                description: UiColor::selection_config_value(agent.config().selection_color),
+                description: UiColor::selection_config_value(config.selection_color),
                 action: PickerAction::OpenSelectionColor,
             },
             PickerItem {
                 label: "Scroll bar".into(),
-                description: format!("{scroll_bar_visibility} · Enter to toggle"),
-                action: PickerAction::SetScrollBar(!agent.config().scroll_bar),
+                description: format!(
+                    "{} · Enter to toggle",
+                    if config.scroll_bar {
+                        "Visible"
+                    } else {
+                        "Hidden"
+                    }
+                ),
+                action: PickerAction::SetScrollBar(!config.scroll_bar),
             },
             PickerItem {
                 label: "Auto-hide scroll bar".into(),
-                description: format!("{scroll_bar_auto_hide} · Enter to toggle"),
-                action: PickerAction::SetScrollBarAutoHide(!agent.config().scroll_bar_auto_hide),
+                description: format!("{} · Enter to toggle", on_off(config.scroll_bar_auto_hide)),
+                action: PickerAction::SetScrollBarAutoHide(!config.scroll_bar_auto_hide),
             },
+        ],
+        SettingsCategory::Context => vec![
             PickerItem {
                 label: "Automatic compaction".into(),
-                description: format!("{on_off} · Enter to toggle"),
-                action: PickerAction::SetAutoCompact(!agent.config().auto_compact),
+                description: format!("{} · Enter to toggle", on_off(config.auto_compact)),
+                action: PickerAction::SetAutoCompact(!config.auto_compact),
             },
-            PickerItem {
-                label: "Compaction threshold".into(),
-                description: format!("{:.0}%", agent.config().compact_threshold * 100.0),
-                action: PickerAction::EditSetting {
-                    key: "compact_threshold".into(),
-                    initial: format!("{:.0}%", agent.config().compact_threshold * 100.0),
+            edit(
+                SettingsItem::CompactThreshold,
+                "Compaction threshold",
+                format!("{:.0}%", config.compact_threshold * 100.0),
+            ),
+            edit(
+                SettingsItem::ContextWindow,
+                "Current model context window",
+                context_window.to_string(),
+            ),
+        ],
+        SettingsCategory::Providers => {
+            let mut entries = vec![PickerItem {
+                label: "Add or update provider…".into(),
+                description: "Guided authentication and model discovery".into(),
+                action: PickerAction::OpenConnect {
+                    from_settings: true,
                 },
-            },
-            PickerItem {
-                label: "Current model context window".into(),
-                description: agent.context_window().to_string(),
-                action: PickerAction::EditSetting {
-                    key: "context_window".into(),
-                    initial: agent.context_window().to_string(),
-                },
-            },
-            PickerItem {
-                label: "Skill directories".into(),
-                description: format!(
-                    "{} configured · add or remove",
-                    agent.config().skill_dirs.len()
-                ),
-                action: PickerAction::EditSetting {
-                    key: "skills".into(),
-                    initial: "add ".into(),
-                },
-            },
-            PickerItem {
-                label: "OpenAI-compatible provider".into(),
-                description: "Add or update a provider".into(),
-                action: PickerAction::EditSetting {
-                    key: "provider".into(),
-                    initial: String::new(),
-                },
-            },
-            PickerItem {
-                label: "OpenAI endpoint".into(),
-                description: agent.config().openai_base_url.clone(),
-                action: PickerAction::EditSetting {
-                    key: "openai_base_url".into(),
-                    initial: agent.config().openai_base_url.clone(),
-                },
-            },
-            PickerItem {
-                label: "Anthropic endpoint".into(),
-                description: agent.config().anthropic_base_url.clone(),
-                action: PickerAction::EditSetting {
-                    key: "anthropic_base_url".into(),
-                    initial: agent.config().anthropic_base_url.clone(),
-                },
-            },
+            }];
+            entries.extend(
+                crate::onboarding::provider::provider_catalog(config)
+                    .into_iter()
+                    .filter(|provider| provider.id != ProviderId::Other)
+                    .map(|provider| PickerItem {
+                        label: provider.label,
+                        description: format!(
+                            "{} · {}",
+                            if provider.configured {
+                                "Configured"
+                            } else {
+                                "Not configured"
+                            },
+                            provider.description
+                        ),
+                        action: PickerAction::OpenConnect {
+                            from_settings: true,
+                        },
+                    }),
+            );
+            entries
+        }
+        SettingsCategory::Subagents => vec![
             PickerItem {
                 label: "Parallel subagents".into(),
-                description: format!(
-                    "{} · Enter to toggle",
-                    if agent.config().subagents {
-                        "On"
-                    } else {
-                        "Off"
-                    }
-                ),
-                action: PickerAction::SetSubagents(!agent.config().subagents),
+                description: format!("{} · Enter to toggle", on_off(config.subagents)),
+                action: PickerAction::SetSubagents(!config.subagents),
             },
-            PickerItem {
-                label: "Maximum active subagents".into(),
-                description: agent.config().max_subagents.to_string(),
+            edit(
+                SettingsItem::MaxSubagents,
+                "Maximum active subagents",
+                config.max_subagents.to_string(),
+            ),
+            edit(
+                SettingsItem::SubagentModel,
+                "Default subagent model",
+                config.subagent_model.clone(),
+            ),
+            edit(
+                SettingsItem::SubagentRequestBudget,
+                "Subagent request budget",
+                config.subagent_request_budget.to_string(),
+            ),
+            edit(
+                SettingsItem::SubagentTimeout,
+                "Subagent timeout",
+                config.subagent_timeout_secs.to_string(),
+            ),
+        ],
+        SettingsCategory::Skills => {
+            let mut entries = vec![PickerItem {
+                label: "Add directory…".into(),
+                description: format!("{} configured", config.skill_dirs.len()),
                 action: PickerAction::EditSetting {
-                    key: "max_subagents".into(),
-                    initial: agent.config().max_subagents.to_string(),
+                    key: "skills add".into(),
+                    initial: String::new(),
+                    location: location(SettingsItem::AddSkillDirectory),
                 },
-            },
-            PickerItem {
-                label: "Default subagent model".into(),
-                description: agent.config().subagent_model.clone(),
-                action: PickerAction::EditSetting {
-                    key: "subagent_model".into(),
-                    initial: agent.config().subagent_model.clone(),
+            }];
+            entries.extend(config.skill_dirs.iter().map(|directory| PickerItem {
+                label: format!("Remove {}", directory.display()),
+                description: "Stop searching this directory".into(),
+                action: PickerAction::ApplySetting {
+                    argument: format!("skills remove {}", directory.display()),
+                    location: location(SettingsItem::AddSkillDirectory),
                 },
-            },
-            PickerItem {
-                label: "Subagent request budget".into(),
-                description: if agent.config().subagent_request_budget == 0 {
-                    "unlimited".into()
-                } else {
-                    format!(
-                        "{} requests per run",
-                        agent.config().subagent_request_budget
-                    )
-                },
-                action: PickerAction::EditSetting {
-                    key: "subagent_request_budget".into(),
-                    initial: agent.config().subagent_request_budget.to_string(),
-                },
-            },
-            PickerItem {
-                label: "Subagent timeout".into(),
-                description: if agent.config().subagent_timeout_secs == 0 {
-                    "unlimited".into()
-                } else {
-                    format!("{}s per run", agent.config().subagent_timeout_secs)
-                },
-                action: PickerAction::EditSetting {
-                    key: "subagent_timeout_secs".into(),
-                    initial: agent.config().subagent_timeout_secs.to_string(),
-                },
-            },
+            }));
+            entries
+        }
+        SettingsCategory::Advanced => vec![
             PickerItem {
                 label: "Reload configuration".into(),
                 description: "Read global and project files again".into(),
@@ -467,11 +581,34 @@ pub(super) fn settings_picker(agent: &Agent) -> Picker {
             },
             PickerItem {
                 label: "Configuration details".into(),
-                description: "Show paths, providers, and all commands".into(),
+                description: "Show paths, providers, and command forms".into(),
                 action: PickerAction::ShowSettings,
             },
         ],
+    };
+    let selected = selected.min(items.len().saturating_sub(1));
+    Picker {
+        title: format!("Settings · {}", category.title()),
+        hint: "↑/↓ move  Enter change  Esc back".into(),
+        items: std::mem::take(&mut items),
+        selected,
         editing: None,
+        parent: Some(PickerAction::OpenSettingsRoot {
+            selected: category.index(),
+        }),
+    }
+}
+
+fn setting_key(item: SettingsItem) -> &'static str {
+    match item {
+        SettingsItem::MaxOutputTokens => "max_tokens",
+        SettingsItem::CompactThreshold => "compact_threshold",
+        SettingsItem::ContextWindow => "context_window",
+        SettingsItem::MaxSubagents => "max_subagents",
+        SettingsItem::SubagentModel => "subagent_model",
+        SettingsItem::SubagentRequestBudget => "subagent_request_budget",
+        SettingsItem::SubagentTimeout => "subagent_timeout_secs",
+        _ => "",
     }
 }
 
@@ -490,6 +627,10 @@ pub(super) fn color_picker(current: UiColor) -> Picker {
         action: PickerAction::EditSetting {
             key: "accent_color".into(),
             initial: current.config_value(),
+            location: Some(SettingsLocation {
+                category: SettingsCategory::Interface,
+                item: SettingsItem::AccentColor,
+            }),
         },
     });
     let selected = items
@@ -507,6 +648,10 @@ pub(super) fn color_picker(current: UiColor) -> Picker {
         items,
         selected,
         editing: None,
+        parent: Some(PickerAction::OpenSettingsCategory {
+            category: SettingsCategory::Interface,
+            selected: settings_item_index(SettingsCategory::Interface, SettingsItem::AccentColor),
+        }),
     }
 }
 
@@ -527,6 +672,10 @@ pub(super) fn selection_color_picker(current: Option<UiColor>) -> Picker {
         action: PickerAction::EditSetting {
             key: "selection_color".into(),
             initial: UiColor::selection_config_value(current),
+            location: Some(SettingsLocation {
+                category: SettingsCategory::Interface,
+                item: SettingsItem::SelectionColor,
+            }),
         },
     });
     let selected = items
@@ -544,6 +693,13 @@ pub(super) fn selection_color_picker(current: Option<UiColor>) -> Picker {
         items,
         selected,
         editing: None,
+        parent: Some(PickerAction::OpenSettingsCategory {
+            category: SettingsCategory::Interface,
+            selected: settings_item_index(
+                SettingsCategory::Interface,
+                SettingsItem::SelectionColor,
+            ),
+        }),
     }
 }
 
@@ -588,6 +744,10 @@ pub(super) fn reasoning_picker(agent: &Agent, save: bool) -> Picker {
         items,
         selected,
         editing: None,
+        parent: save.then_some(PickerAction::OpenSettingsCategory {
+            category: SettingsCategory::Model,
+            selected: settings_item_index(SettingsCategory::Model, SettingsItem::ReasoningEffort),
+        }),
     }
 }
 
@@ -618,6 +778,15 @@ pub(super) fn picker_is_editing(state: &ViewState) -> bool {
         .is_some_and(|picker| picker.editing.is_some())
 }
 
+pub(super) fn picker_is_secret(state: &ViewState) -> bool {
+    state.picker.as_ref().is_some_and(|picker| {
+        matches!(
+            picker.editing,
+            Some(PickerEdit::Connect { secret: true, .. })
+        )
+    })
+}
+
 pub(super) fn take_picker_action(
     state: &mut ViewState,
     editor: &mut Editor,
@@ -633,20 +802,19 @@ pub(super) fn take_picker_action(
             }
             Key::Enter => {
                 if let Some(value) = editor.take_text() {
-                    let selected = match &editing {
-                        PickerEdit::Setting(key) if key == "accent_color" => {
-                            SETTINGS_ACCENT_COLOR_INDEX
-                        }
-                        PickerEdit::Setting(key) if key == "selection_color" => {
-                            SETTINGS_SELECTION_COLOR_INDEX
-                        }
-                        _ => picker.selected,
-                    };
+                    let location =
+                        picker
+                            .items
+                            .get(picker.selected)
+                            .and_then(|item| match &item.action {
+                                PickerAction::EditSetting { location, .. } => *location,
+                                _ => None,
+                            });
                     state.picker = None;
                     return Some(match editing {
                         PickerEdit::Setting(key) => PickerAction::ApplySetting {
                             argument: format!("{key} {}", value.trim()),
-                            selected,
+                            location,
                         },
                         PickerEdit::Model { save } => {
                             if save {
@@ -656,6 +824,10 @@ pub(super) fn take_picker_action(
                             }
                         }
                         PickerEdit::Queued(index) => PickerAction::ApplyQueued { index, value },
+                        PickerEdit::Connect { field, .. } => PickerAction::ApplyConnect {
+                            field,
+                            value: value.trim().to_string(),
+                        },
                     });
                 }
             }
@@ -687,7 +859,7 @@ pub(super) fn take_picker_action(
                 .get(picker.selected)
                 .map(|item| item.action.clone());
             match action {
-                Some(PickerAction::EditSetting { key, initial }) => {
+                Some(PickerAction::EditSetting { key, initial, .. }) => {
                     editor.clear();
                     editor.paste(&initial);
                     picker.editing = Some(PickerEdit::Setting(key));
@@ -696,6 +868,15 @@ pub(super) fn take_picker_action(
                     editor.clear();
                     editor.paste(&initial);
                     picker.editing = Some(PickerEdit::Model { save });
+                }
+                Some(PickerAction::EditConnect {
+                    field,
+                    initial,
+                    secret,
+                }) => {
+                    editor.clear();
+                    editor.paste(&initial);
+                    picker.editing = Some(PickerEdit::Connect { field, secret });
                 }
                 Some(action) => {
                     state.picker = None;
@@ -774,14 +955,53 @@ fn delete_session_confirm(
             },
         ],
         editing: None,
+        parent: Some(PickerAction::OpenResume {
+            selected: resume_selected,
+        }),
     }
 }
 
 fn picker_cancel_action(picker: &Picker) -> Option<PickerAction> {
-    picker.items.iter().find_map(|item| match &item.action {
-        PickerAction::OpenResume { .. } => Some(item.action.clone()),
-        _ => None,
-    })
+    picker.parent.clone()
+}
+
+pub(super) fn settings_item_index(category: SettingsCategory, item: SettingsItem) -> usize {
+    settings_items(category)
+        .iter()
+        .position(|candidate| *candidate == item)
+        .unwrap_or(0)
+}
+
+fn settings_items(category: SettingsCategory) -> &'static [SettingsItem] {
+    match category {
+        SettingsCategory::Model => &[
+            SettingsItem::DefaultModel,
+            SettingsItem::MaxOutputTokens,
+            SettingsItem::ReasoningEffort,
+        ],
+        SettingsCategory::Interface => &[
+            SettingsItem::ReasoningDisplay,
+            SettingsItem::AccentColor,
+            SettingsItem::SelectionColor,
+            SettingsItem::ScrollBar,
+            SettingsItem::ScrollBarAutoHide,
+        ],
+        SettingsCategory::Context => &[
+            SettingsItem::AutoCompact,
+            SettingsItem::CompactThreshold,
+            SettingsItem::ContextWindow,
+        ],
+        SettingsCategory::Providers => &[SettingsItem::ProviderSetup],
+        SettingsCategory::Subagents => &[
+            SettingsItem::SubagentsEnabled,
+            SettingsItem::MaxSubagents,
+            SettingsItem::SubagentModel,
+            SettingsItem::SubagentRequestBudget,
+            SettingsItem::SubagentTimeout,
+        ],
+        SettingsCategory::Skills => &[SettingsItem::AddSkillDirectory],
+        SettingsCategory::Advanced => &[SettingsItem::Reload, SettingsItem::ConfigurationDetails],
+    }
 }
 
 pub(super) fn select_picker_item(state: &mut ViewState, selected: usize) {
@@ -794,13 +1014,14 @@ pub(super) fn render_picker(
     picker: &Picker,
     editor: &Editor,
     selection: &str,
+    outline: &str,
     columns: usize,
     height: usize,
 ) -> Vec<String> {
     if height == 0 {
         return Vec::new();
     }
-    let box_width = columns.saturating_sub(4).clamp(16, 76);
+    let box_width = columns.saturating_sub(4).max(16).min(columns);
     let inner = box_width.saturating_sub(2);
     let capacity = height
         .saturating_sub(5)
@@ -810,10 +1031,15 @@ pub(super) fn render_picker(
     start = start.min(picker.items.len().saturating_sub(capacity));
     let end = (start + capacity).min(picker.items.len());
     let left = " ".repeat(columns.saturating_sub(box_width) / 2);
-    let boxed = |content: &str| format!("{left}│{}│", markdown::fit_width(content, inner));
-    let mut panel = vec![format!("{left}┌{}┐", "─".repeat(inner))];
+    let boxed = |content: &str| {
+        format!(
+            "{left}{outline}│\x1b[0m{}{outline}│\x1b[0m",
+            markdown::fit_width(content, inner)
+        )
+    };
+    let mut panel = vec![format!("{left}{outline}┌{}┐\x1b[0m", "─".repeat(inner))];
     panel.push(boxed(&format!(" \x1b[1m{}\x1b[0m", picker.title)));
-    panel.push(format!("{left}├{}┤", "─".repeat(inner)));
+    panel.push(format!("{left}{outline}├{}┤\x1b[0m", "─".repeat(inner)));
     for (index, item) in picker.items[start..end].iter().enumerate() {
         let absolute = start + index;
         let marker = if absolute == picker.selected {
@@ -825,6 +1051,11 @@ pub(super) fn render_picker(
             let value = editor.text();
             if value.is_empty() {
                 "type a value below…".into()
+            } else if matches!(
+                picker.editing,
+                Some(PickerEdit::Connect { secret: true, .. })
+            ) {
+                "•".repeat(value.chars().count())
             } else {
                 value.replace('\n', " ")
             }
@@ -847,7 +1078,7 @@ pub(super) fn render_picker(
         &picker.hint
     };
     panel.push(boxed(&format!(" \x1b[2m{hint}\x1b[0m")));
-    panel.push(format!("{left}└{}┘", "─".repeat(inner)));
+    panel.push(format!("{left}{outline}└{}┘\x1b[0m", "─".repeat(inner)));
 
     if panel.len() > height {
         panel.truncate(height);

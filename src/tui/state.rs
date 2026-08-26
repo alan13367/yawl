@@ -61,6 +61,7 @@ pub(super) struct ViewState {
     /// Lazily-built project file index behind `@` mention completion.
     pub(super) file_index: super::files::FileIndex,
     pub(super) picker: Option<Picker>,
+    pub(super) connection: Option<super::connection::ConnectFlow>,
     /// Whether subagent orchestration is enabled, mirrored from the config
     /// so busy-path commands can answer without the agent.
     pub(super) subagents_enabled: bool,
@@ -101,6 +102,7 @@ impl ViewState {
             completion_filter: None,
             file_index: super::files::FileIndex::default(),
             picker: None,
+            connection: None,
             subagents_enabled: agent.config().subagents,
             subagent_manager: agent.subagents(),
             subagent_snapshots: agent.subagents().snapshots(),

@@ -6,16 +6,16 @@ use crate::error::Error;
 use crate::provider::{Message, Role};
 
 use super::picker::{
-    Picker, PickerAction, PickerItem, SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_AUTO_COMPACT_INDEX,
-    SETTINGS_RELOAD_INDEX, SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX, SETTINGS_SCROLL_BAR_INDEX,
-    SETTINGS_SELECTION_COLOR_INDEX, SETTINGS_SUBAGENTS_INDEX, color_picker, open_model_picker,
-    open_reasoning_picker, open_settings_picker, select_picker_item, selection_color_picker,
+    Picker, PickerAction, PickerItem, SettingsCategory, SettingsItem, SettingsLocation,
+    color_picker, open_model_picker, open_reasoning_picker, select_picker_item,
+    selection_color_picker, settings_category_picker, settings_item_index, settings_picker,
 };
 use super::state::ViewState;
 
 pub(super) const HELP: &str = "\
 Commands
   /model [MODEL]       open the model picker or switch directly
+  /connect             configure a model provider interactively
   /settings [KEY ...]  open the settings picker or change directly
   /new                 start a new session without changing directories
   /clear               alias for /new
@@ -36,7 +36,7 @@ Input
   Enter submits. Shift+Enter, Alt+Enter, or Ctrl+J inserts a newline.
     Type / for commands; Up/Down select, Tab completes, and Enter runs the selected
     command or an exact name such as /copy.
-  Model and settings pickers remain available during an active response.
+  Model, settings, and provider setup remain available during an active response.
   Messages submitted during a response appear below it as queued. /unqueue opens
     an editor: K/J reorder, e edits, d deletes, and Enter stops the turn to send.
   Outside the menu, Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
@@ -96,6 +96,7 @@ pub(super) fn queue_picker(state: &ViewState, selected: usize) -> Option<Picker>
         selected: selected.min(items.len().saturating_sub(1)),
         items,
         editing: None,
+        parent: None,
     })
 }
 
@@ -214,6 +215,13 @@ pub(super) fn activate_picker_action(
     let Some(action) = handle_queue_picker_action(state, action) else {
         return;
     };
+    if let PickerAction::OpenConnect { from_settings } = action {
+        super::connection::open(state, agent.config(), from_settings);
+        return;
+    }
+    let Some(action) = super::connection::handle_action(state, action) else {
+        return;
+    };
     match action {
         PickerAction::SwitchModel(model) => {
             agent.switch_model(model);
@@ -231,8 +239,14 @@ pub(super) fn activate_picker_action(
                 if crate::model::is_codex(agent.config(), agent.model()) {
                     open_reasoning_picker(agent, state, true);
                 } else {
-                    open_settings_picker(agent, state);
-                    select_picker_item(state, 0);
+                    open_settings_location(
+                        agent,
+                        state,
+                        SettingsLocation {
+                            category: SettingsCategory::Model,
+                            item: SettingsItem::DefaultModel,
+                        },
+                    );
                 }
             }
         }
@@ -242,8 +256,14 @@ pub(super) fn activate_picker_action(
             if save {
                 let value = effort.as_deref().unwrap_or("default");
                 if settings(agent, &format!("reasoning_effort {value}"), state) {
-                    open_settings_picker(agent, state);
-                    select_picker_item(state, 2);
+                    open_settings_location(
+                        agent,
+                        state,
+                        SettingsLocation {
+                            category: SettingsCategory::Model,
+                            item: SettingsItem::ReasoningEffort,
+                        },
+                    );
                 }
             } else {
                 agent.set_reasoning_effort(effort.clone());
@@ -261,8 +281,11 @@ pub(super) fn activate_picker_action(
                 &format!("hide_reasoning {}", if enabled { "on" } else { "off" }),
                 state,
             ) {
-                open_settings_picker(agent, state);
-                select_picker_item(state, 3);
+                open_settings_location(
+                    agent,
+                    state,
+                    interface_location(SettingsItem::ReasoningDisplay),
+                );
             }
         }
         PickerAction::OpenAccentColor => {
@@ -280,8 +303,11 @@ pub(super) fn activate_picker_action(
                 ),
                 state,
             ) {
-                open_settings_picker(agent, state);
-                select_picker_item(state, SETTINGS_SELECTION_COLOR_INDEX);
+                open_settings_location(
+                    agent,
+                    state,
+                    interface_location(SettingsItem::SelectionColor),
+                );
             }
         }
         PickerAction::SetScrollBar(enabled) => {
@@ -290,8 +316,7 @@ pub(super) fn activate_picker_action(
                 &format!("scroll_bar {}", if enabled { "on" } else { "off" }),
                 state,
             ) {
-                open_settings_picker(agent, state);
-                select_picker_item(state, SETTINGS_SCROLL_BAR_INDEX);
+                open_settings_location(agent, state, interface_location(SettingsItem::ScrollBar));
             }
         }
         PickerAction::SetScrollBarAutoHide(enabled) => {
@@ -303,8 +328,11 @@ pub(super) fn activate_picker_action(
                 ),
                 state,
             ) {
-                open_settings_picker(agent, state);
-                select_picker_item(state, SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX);
+                open_settings_location(
+                    agent,
+                    state,
+                    interface_location(SettingsItem::ScrollBarAutoHide),
+                );
             }
         }
         PickerAction::SetAccentColor(color) => {
@@ -313,8 +341,7 @@ pub(super) fn activate_picker_action(
                 &format!("accent_color {}", color.config_value()),
                 state,
             ) {
-                open_settings_picker(agent, state);
-                select_picker_item(state, SETTINGS_ACCENT_COLOR_INDEX);
+                open_settings_location(agent, state, interface_location(SettingsItem::AccentColor));
             }
         }
         PickerAction::ResumeSession(id) => load_session(agent, &id, state),
@@ -323,10 +350,36 @@ pub(super) fn activate_picker_action(
             open_resume_picker(agent, state);
             select_picker_item(state, selected);
         }
-        PickerAction::ApplySetting { argument, selected } => {
-            if settings(agent, &argument, state) {
-                open_settings_picker(agent, state);
-                select_picker_item(state, selected);
+        PickerAction::OpenSettingsRoot { selected } => {
+            state.picker = Some(settings_picker(agent));
+            select_picker_item(state, selected);
+        }
+        PickerAction::OpenSettingsCategory { category, selected } => {
+            state.picker = Some(settings_category_picker(agent, category, selected));
+        }
+        PickerAction::ApplyConnectionPlan(plan) => {
+            let session_model = plan.session_model().map(str::to_string);
+            match agent.change_global_config_batch(plan.changes_for_save()) {
+                Ok(effects) => {
+                    for effect in effects {
+                        notice_config_effect(agent.config(), effect, state);
+                    }
+                    if let Some(model) = session_model {
+                        agent.switch_model(model);
+                    }
+                    state.model = agent.model().to_string();
+                    state.context_window = agent.context_window();
+                    state.context_tokens = 0;
+                    state.notice(format!("{} connection saved.", plan.provider_label));
+                }
+                Err(error) => state.notice(format!("Could not save connection: {error}")),
+            }
+        }
+        PickerAction::ApplySetting { argument, location } => {
+            if settings(agent, &argument, state)
+                && let Some(location) = location
+            {
+                open_settings_location(agent, state, location);
             }
         }
         PickerAction::SetAutoCompact(enabled) => {
@@ -335,8 +388,14 @@ pub(super) fn activate_picker_action(
                 &format!("auto_compact {}", if enabled { "on" } else { "off" }),
                 state,
             ) {
-                open_settings_picker(agent, state);
-                select_picker_item(state, SETTINGS_AUTO_COMPACT_INDEX);
+                open_settings_location(
+                    agent,
+                    state,
+                    SettingsLocation {
+                        category: SettingsCategory::Context,
+                        item: SettingsItem::AutoCompact,
+                    },
+                );
             }
         }
         PickerAction::SetSubagents(enabled) => {
@@ -345,18 +404,42 @@ pub(super) fn activate_picker_action(
                 &format!("subagents {}", if enabled { "on" } else { "off" }),
                 state,
             ) {
-                open_settings_picker(agent, state);
-                select_picker_item(state, SETTINGS_SUBAGENTS_INDEX);
+                open_settings_location(
+                    agent,
+                    state,
+                    SettingsLocation {
+                        category: SettingsCategory::Subagents,
+                        item: SettingsItem::SubagentsEnabled,
+                    },
+                );
             }
         }
         PickerAction::Reload => {
             if settings(agent, "reload", state) {
-                open_settings_picker(agent, state);
-                select_picker_item(state, SETTINGS_RELOAD_INDEX);
+                open_settings_location(
+                    agent,
+                    state,
+                    SettingsLocation {
+                        category: SettingsCategory::Advanced,
+                        item: SettingsItem::Reload,
+                    },
+                );
             }
         }
         PickerAction::ShowSettings => show_settings(agent, state),
-        PickerAction::EditSetting { .. } | PickerAction::EditModel { .. } => {}
+        PickerAction::EditSetting { .. }
+        | PickerAction::EditModel { .. }
+        | PickerAction::EditConnect { .. }
+        | PickerAction::ApplyConnect { .. }
+        | PickerAction::ConnectChooseProvider(_)
+        | PickerAction::ConnectCredential(_)
+        | PickerAction::ConnectChooseModel(_)
+        | PickerAction::ConnectRetry
+        | PickerAction::ConnectCancelJob
+        | PickerAction::CloseConnect
+        | PickerAction::ConnectBack(_)
+        | PickerAction::ConnectActivation(_)
+        | PickerAction::OpenConnect { .. } => {}
         PickerAction::SendQueued(index) => {
             let _ = promote_queued(state, index);
         }
@@ -366,6 +449,21 @@ pub(super) fn activate_picker_action(
         | PickerAction::ClearQueued => {}
     }
     state.refresh_completions(agent);
+}
+
+fn interface_location(item: SettingsItem) -> SettingsLocation {
+    SettingsLocation {
+        category: SettingsCategory::Interface,
+        item,
+    }
+}
+
+fn open_settings_location(agent: &Agent, state: &mut ViewState, location: SettingsLocation) {
+    state.picker = Some(settings_category_picker(
+        agent,
+        location.category,
+        settings_item_index(location.category, location.item),
+    ));
 }
 
 pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState) -> bool {
@@ -674,6 +772,7 @@ pub(super) fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
             })
             .collect(),
         editing: None,
+        parent: None,
     });
 }
 

@@ -5,41 +5,58 @@ use crate::error::Error;
 use super::select::{self, Choice};
 
 pub(super) enum Authentication {
+    Keep(String),
     None,
     Environment { reference: String, value: String },
     Literal(String),
 }
 
 impl Authentication {
-    pub(super) fn config_value(&self) -> &str {
+    pub(super) fn config_value(&self) -> Option<&str> {
         match self {
-            Authentication::None => "-",
-            Authentication::Environment { reference, .. } => reference,
-            Authentication::Literal(value) => value,
+            Authentication::Keep(_) => None,
+            Authentication::None => Some("-"),
+            Authentication::Environment { reference, .. } => Some(reference),
+            Authentication::Literal(value) => Some(value),
         }
     }
 
     pub(super) fn request_key(&self) -> &str {
         match self {
             Authentication::None => "",
-            Authentication::Environment { value, .. } | Authentication::Literal(value) => value,
+            Authentication::Keep(value)
+            | Authentication::Environment { value, .. }
+            | Authentication::Literal(value) => value,
         }
     }
 }
 
 /// Asks how the provider authenticates. `None` means the user canceled and
 /// wants to go back.
-pub(super) fn choose_authentication() -> Result<Option<Authentication>, Error> {
-    let choices = [
-        Choice::new("No API key", "the server trusts local requests"),
+pub(super) fn choose_authentication(
+    existing: Option<String>,
+    allow_no_key: bool,
+) -> Result<Option<Authentication>, Error> {
+    let mut choices = Vec::new();
+    if existing.is_some() {
+        choices.push(Choice::new(
+            "Keep current credential",
+            "reuse it without displaying or changing it",
+        ));
+    }
+    choices.extend([
         Choice::new("Environment variable", "stores a $NAME reference"),
         Choice::new("Enter the key now", "stored in config.json"),
-    ];
+    ]);
+    if allow_no_key {
+        choices.push(Choice::new("No API key", "clears any saved credential"));
+    }
     let choice = select::select("Authentication", &choices)?;
+    let offset = usize::from(existing.is_some());
     match choice {
         None => Ok(None),
-        Some(0) => Ok(Some(Authentication::None)),
-        Some(1) => {
+        Some(0) if existing.is_some() => Ok(existing.map(Authentication::Keep)),
+        Some(index) if index == offset => {
             let name = loop {
                 let name = prompt("Environment variable name, without '$'")?;
                 if validate_environment_name(&name).is_ok() {
@@ -56,7 +73,7 @@ pub(super) fn choose_authentication() -> Result<Option<Authentication>, Error> {
                 value,
             }))
         }
-        Some(_) => {
+        Some(index) if index == offset + 1 => {
             let key = loop {
                 let key = prompt_secret("API key")?;
                 if !key.is_empty() {
@@ -66,6 +83,8 @@ pub(super) fn choose_authentication() -> Result<Option<Authentication>, Error> {
             };
             Ok(Some(Authentication::Literal(key)))
         }
+        Some(index) if allow_no_key && index == offset + 2 => Ok(Some(Authentication::None)),
+        Some(_) => Ok(None),
     }
 }
 
@@ -147,15 +166,7 @@ fn read_line() -> Result<String, Error> {
 }
 
 pub(super) fn validate_environment_name(name: &str) -> Result<(), Error> {
-    let mut bytes = name.bytes();
-    let valid_start = bytes
-        .next()
-        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
-    if valid_start && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
-        Ok(())
-    } else {
-        Err(Error::Config("invalid environment variable name".into()))
-    }
+    super::provider::validate_environment_name(name)
 }
 
 #[cfg(test)]

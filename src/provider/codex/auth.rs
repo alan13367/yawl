@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::cancellation::CancellationToken;
 use crate::config::Config;
 use crate::error::Error;
 
@@ -69,20 +70,87 @@ struct TokenResponse {
 /// responses, cancellation, or credential persistence failures.
 pub fn login(config: &Config) -> Result<(), Error> {
     crate::set_interrupted(false);
-    let agent = oauth_agent();
-    let device = start_device_auth(&agent)?;
-    println!(
-        "\nOpen {DEVICE_VERIFICATION_URI} and enter this code:\n\n    {}\n\nWaiting for authorization...",
-        device.user_code
-    );
-    let token = poll_device_auth(&agent, &device)?;
-    let credential = exchange_code(&agent, &token.authorization_code, &token.code_verifier)?;
-    save_credential(config, &credential)?;
+    let token = CancellationToken::default();
+    login_with_callback(config, &token, std::io::stdout().is_terminal(), |prompt| {
+        println!(
+            "\nOpen {} and enter this code:\n\n    {}\n\nWaiting for authorization...",
+            prompt.url, prompt.code
+        );
+        if let Some(error) = &prompt.browser_error {
+            println!("Could not open the browser automatically: {error}");
+        }
+    })?;
     println!(
         "OpenAI Codex login saved to {}.",
         auth_path(config).display()
     );
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeviceLoginPrompt {
+    pub(crate) url: &'static str,
+    pub(crate) code: String,
+    pub(crate) browser_error: Option<String>,
+}
+
+pub(crate) fn login_with_callback(
+    config: &Config,
+    cancellation: &CancellationToken,
+    launch_browser: bool,
+    mut on_prompt: impl FnMut(DeviceLoginPrompt),
+) -> Result<(), Error> {
+    crate::cancellation::scope(cancellation, || {
+        let agent = oauth_agent();
+        let device = start_device_auth(&agent)?;
+        ensure_login_active(cancellation)?;
+        let browser_error = launch_browser
+            .then(open_device_browser)
+            .and_then(Result::err);
+        on_prompt(DeviceLoginPrompt {
+            url: DEVICE_VERIFICATION_URI,
+            code: device.user_code.clone(),
+            browser_error,
+        });
+        let token = poll_device_auth(&agent, &device)?;
+        ensure_login_active(cancellation)?;
+        let credential = exchange_code(&agent, &token.authorization_code, &token.code_verifier)?;
+        save_credential_if_active(config, cancellation, &credential)?;
+        Ok(())
+    })
+}
+
+fn ensure_login_active(cancellation: &CancellationToken) -> Result<(), Error> {
+    if cancellation.is_canceled() || crate::cancellation::interrupted() {
+        Err(Error::Interrupted)
+    } else {
+        Ok(())
+    }
+}
+
+fn save_credential_if_active(
+    config: &Config,
+    cancellation: &CancellationToken,
+    credential: &CodexCredential,
+) -> Result<(), Error> {
+    ensure_login_active(cancellation)?;
+    save_credential(config, credential)
+}
+
+fn open_device_browser() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("xdg-open");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return Err("automatic browser opening is unavailable on this platform".into());
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    command
+        .arg(DEVICE_VERIFICATION_URI)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn oauth_agent() -> ureq::Agent {
@@ -130,7 +198,7 @@ fn poll_device_auth(
     let deadline = std::time::Instant::now() + DEVICE_TIMEOUT;
     let mut interval = device.interval;
     while std::time::Instant::now() < deadline {
-        if crate::interrupted() {
+        if crate::cancellation::interrupted() {
             return Err(Error::Interrupted);
         }
         let body = json!({
@@ -172,7 +240,7 @@ fn poll_device_auth(
 fn interruptible_sleep(duration: Duration) -> Result<(), Error> {
     let deadline = std::time::Instant::now() + duration;
     while std::time::Instant::now() < deadline {
-        if crate::interrupted() {
+        if crate::cancellation::interrupted() {
             return Err(Error::Interrupted);
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -419,5 +487,37 @@ mod tests {
     #[test]
     fn percent_encodes_form_values() {
         assert_eq!(percent_encode("a+b/c="), "a%2Bb%2Fc%3D");
+    }
+
+    #[test]
+    fn canceled_login_does_not_persist_exchanged_credentials() {
+        crate::set_interrupted(false);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "yawl-canceled-login-{}-{nonce}",
+            std::process::id()
+        ));
+        let config = Config {
+            home_dir: root.join(".yawl"),
+            ..Config::test_default()
+        };
+        let credential = CodexCredential {
+            credential_type: oauth_type(),
+            access: "access".into(),
+            refresh: "refresh".into(),
+            expires: 1,
+            account_id: "account".into(),
+        };
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let result = save_credential_if_active(&config, &cancellation, &credential);
+
+        assert!(matches!(result, Err(Error::Interrupted)));
+        assert!(!auth_path(&config).exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -73,6 +73,7 @@ fn frame_keeps_input_and_status_pinned() {
         completion_filter: None,
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,
@@ -250,6 +251,7 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         completion_filter: None,
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,
@@ -301,6 +303,7 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         completion_filter: None,
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,
@@ -382,6 +385,7 @@ fn loading_state_ignores_status_activity() {
         completion_filter: None,
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,
@@ -438,6 +442,7 @@ fn overflow_state() -> ViewState {
         completion_filter: None,
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,
@@ -728,6 +733,7 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         completion_filter: None,
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,
@@ -745,18 +751,25 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
 #[test]
 fn scroll_bar_does_not_overlay_an_open_picker() {
     let mut state = overflow_state();
+    state.accent_color = UiColor::new(12, 34, 56);
     state.picker = Some(Picker {
         title: "Settings".into(),
         hint: String::new(),
         selected: 0,
         items: Vec::new(),
         editing: None,
+        parent: None,
     });
     let editor = Editor::default();
     let (frame, _) = build_frame(&mut state, &editor, 40, 12);
 
     assert!(!frame[..8].iter().any(|line| line.contains("\x1b[48;2;")));
     assert!(state.scroll_geometry.is_none());
+    assert!(
+        frame
+            .iter()
+            .any(|line| line.contains("\x1b[38;2;12;34;56m┌"))
+    );
 }
 
 #[test]
@@ -896,6 +909,7 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         completion_filter: None,
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,
@@ -1038,6 +1052,7 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
             "README.md".into(),
         ]),
         picker: None,
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,
@@ -1097,6 +1112,7 @@ fn empty_session_state() -> ViewState {
         completion_filter: None,
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,

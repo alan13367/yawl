@@ -16,9 +16,8 @@ use super::completion::handle_completion_key;
 use super::events::{Event, EventReader, Key, MouseEvent};
 use super::input::{EditAction, Editor};
 use super::picker::{
-    ActivePickers, PickerAction, SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_REASONING_DISPLAY_INDEX,
-    SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX, SETTINGS_SCROLL_BAR_INDEX, SETTINGS_SELECTION_COLOR_INDEX,
-    picker_is_editing, select_picker_item, take_picker_action,
+    ActivePickers, PickerAction, SettingsCategory, SettingsItem, SettingsLocation,
+    picker_is_editing, select_picker_item, settings_item_index, take_picker_action,
 };
 use super::state::{
     COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, scroll,
@@ -236,7 +235,10 @@ pub(super) fn pump_events<R: Read, T>(
                     }
                     Event::Paste(text) if picker_is_editing(state) => editor.paste(&text),
                     Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
-                    Event::Tick => needs_draw |= advance_ticks(state),
+                    Event::Tick => {
+                        needs_draw |= advance_ticks(state);
+                        needs_draw |= super::connection::poll(state);
+                    }
                     Event::MouseScroll(_) | Event::Paste(_) => {}
                 }
                 break;
@@ -244,6 +246,7 @@ pub(super) fn pump_events<R: Read, T>(
             match event {
                 Event::Tick => {
                     needs_draw |= advance_ticks(state);
+                    needs_draw |= super::connection::poll(state);
                 }
                 Event::MouseScroll(amount) => scroll(state, amount),
                 Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
@@ -282,6 +285,7 @@ pub(super) fn pump_events<R: Read, T>(
                                         input,
                                         state,
                                         active_pickers,
+                                        active_config,
                                         terminal,
                                     )?;
                                 }
@@ -330,11 +334,13 @@ pub(super) fn handle_submission_while_busy(
     input: String,
     state: &mut ViewState,
     active_pickers: &ActivePickers,
+    active_config: &Config,
     terminal: &mut Terminal,
 ) -> Result<(), Error> {
     match busy_command(&input) {
         Some(BusyCommand::Settings) => state.picker = Some(active_pickers.settings.clone()),
         Some(BusyCommand::Model) => state.picker = Some(active_pickers.model.clone()),
+        Some(BusyCommand::Connect) => super::connection::open(state, active_config, false),
         Some(BusyCommand::Unqueue(argument)) => unqueue(&argument, state),
         Some(BusyCommand::Subagents) => super::subagents::open_dashboard(state),
         Some(BusyCommand::Copy) => copy_last_reply(terminal, state, &[])?,
@@ -351,6 +357,7 @@ pub(super) fn handle_submission_while_busy(
 pub(super) enum BusyCommand {
     Settings,
     Model,
+    Connect,
     Unqueue(String),
     Subagents,
     Copy,
@@ -365,6 +372,7 @@ pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
     match name {
         "settings" if argument.is_empty() => Some(BusyCommand::Settings),
         "model" if argument.is_empty() => Some(BusyCommand::Model),
+        "connect" if argument.is_empty() => Some(BusyCommand::Connect),
         "unqueue" => Some(BusyCommand::Unqueue(argument.to_string())),
         "subagents" if argument.is_empty() => Some(BusyCommand::Subagents),
         "copy" if argument.is_empty() => Some(BusyCommand::Copy),
@@ -380,6 +388,13 @@ pub(super) fn activate_picker_action_while_busy(
     active_config: &mut Config,
 ) {
     let Some(action) = handle_queue_picker_action(state, action) else {
+        return;
+    };
+    if let PickerAction::OpenConnect { from_settings } = action {
+        super::connection::open(state, active_config, from_settings);
+        return;
+    }
+    let Some(action) = super::connection::handle_action(state, action) else {
         return;
     };
     if let Some((change, selected)) = display_config_change(&action) {
@@ -405,6 +420,21 @@ pub(super) fn activate_picker_action_while_busy(
         PickerAction::OpenSelectionColor => {
             state.picker = Some(active_pickers.selection_color.clone());
         }
+        PickerAction::OpenSettingsRoot { selected } => {
+            state.picker = Some(active_pickers.settings.clone());
+            select_picker_item(state, selected);
+        }
+        PickerAction::OpenSettingsCategory { category, selected } => {
+            state.picker = active_pickers
+                .settings_categories
+                .iter()
+                .find(|(candidate, _)| *candidate == category)
+                .map(|(_, picker)| {
+                    let mut picker = picker.clone();
+                    picker.selected = selected.min(picker.items.len().saturating_sub(1));
+                    picker
+                });
+        }
         PickerAction::EditSetting { .. } | PickerAction::EditModel { .. } => {}
         PickerAction::SendQueued(_)
         | PickerAction::ApplyQueued { .. }
@@ -418,37 +448,46 @@ pub(super) fn activate_picker_action_while_busy(
     }
 }
 
-pub(super) fn display_config_change(action: &PickerAction) -> Option<(ConfigChange, usize)> {
+pub(super) fn display_config_change(
+    action: &PickerAction,
+) -> Option<(ConfigChange, SettingsLocation)> {
+    let interface = |item| SettingsLocation {
+        category: SettingsCategory::Interface,
+        item,
+    };
     match action {
         PickerAction::SetHideReasoning(enabled) => Some((
             ConfigChange::HideReasoning(if *enabled { "on" } else { "off" }.into()),
-            SETTINGS_REASONING_DISPLAY_INDEX,
+            interface(SettingsItem::ReasoningDisplay),
         )),
         PickerAction::SetAccentColor(color) => Some((
             ConfigChange::AccentColor(color.config_value()),
-            SETTINGS_ACCENT_COLOR_INDEX,
+            interface(SettingsItem::AccentColor),
         )),
         PickerAction::SetSelectionColor(selection) => Some((
             ConfigChange::SelectionColor(crate::config::UiColor::selection_config_value(
                 *selection,
             )),
-            SETTINGS_SELECTION_COLOR_INDEX,
+            interface(SettingsItem::SelectionColor),
         )),
         PickerAction::SetScrollBar(enabled) => Some((
             ConfigChange::ScrollBar(if *enabled { "on" } else { "off" }.into()),
-            SETTINGS_SCROLL_BAR_INDEX,
+            interface(SettingsItem::ScrollBar),
         )),
         PickerAction::SetScrollBarAutoHide(enabled) => Some((
             ConfigChange::ScrollBarAutoHide(if *enabled { "on" } else { "off" }.into()),
-            SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX,
+            interface(SettingsItem::ScrollBarAutoHide),
         )),
-        PickerAction::ApplySetting { argument, selected } => argument
+        PickerAction::ApplySetting { argument, location } => argument
             .strip_prefix("accent_color ")
-            .map(|value| (ConfigChange::AccentColor(value.to_string()), *selected))
+            .and_then(|value| {
+                location.map(|location| (ConfigChange::AccentColor(value.to_string()), location))
+            })
             .or_else(|| {
-                argument
-                    .strip_prefix("selection_color ")
-                    .map(|value| (ConfigChange::SelectionColor(value.to_string()), *selected))
+                argument.strip_prefix("selection_color ").and_then(|value| {
+                    location
+                        .map(|location| (ConfigChange::SelectionColor(value.to_string()), location))
+                })
             }),
         _ => None,
     }
@@ -459,7 +498,7 @@ pub(super) fn apply_display_config_while_busy(
     state: &mut ViewState,
     active_pickers: &mut ActivePickers,
     change: ConfigChange,
-    selected: usize,
+    location: SettingsLocation,
 ) {
     match config.change_global(change) {
         Ok(outcome) => {
@@ -471,8 +510,16 @@ pub(super) fn apply_display_config_while_busy(
             state.subagents_enabled = config.subagents;
             notice_config_effect(config, outcome.effect, state);
             active_pickers.refresh_display_settings(config);
-            state.picker = Some(active_pickers.settings.clone());
-            select_picker_item(state, selected);
+            state.picker = active_pickers
+                .settings_categories
+                .iter()
+                .find(|(category, _)| *category == location.category)
+                .map(|(_, picker)| {
+                    let mut picker = picker.clone();
+                    picker.selected = settings_item_index(location.category, location.item)
+                        .min(picker.items.len().saturating_sub(1));
+                    picker
+                });
         }
         Err(error) => state.notice(format!("Could not change setting: {error}")),
     }

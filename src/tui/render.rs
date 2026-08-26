@@ -813,7 +813,11 @@ pub(super) fn build_frame(
         return render_block_viewer(state, columns, rows);
     }
     let inner_width = columns.saturating_sub(2);
-    let layout = editor.layout(inner_width);
+    let layout = if super::picker::picker_is_secret(state) {
+        editor.masked_layout(inner_width)
+    } else {
+        editor.layout(inner_width)
+    };
     let max_input_lines = (rows / 3).max(1);
     let input_start = layout
         .cursor_row
@@ -890,10 +894,12 @@ pub(super) fn build_frame(
 
     let mut region = Vec::with_capacity(transcript_height);
     if let Some(picker) = &state.picker {
+        let outline = foreground_color(state.accent_color);
         region.extend(render_picker(
             picker,
             editor,
             &selection_style(state.selection_color),
+            &outline,
             columns,
             transcript_height,
         ));

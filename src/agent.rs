@@ -394,6 +394,29 @@ impl Conversation {
         Ok(outcome.effect)
     }
 
+    pub(crate) fn change_global_config_batch(
+        &mut self,
+        changes: Vec<ConfigChange>,
+    ) -> Result<Vec<ConfigChangeEffect>, Error> {
+        let changes_model = changes
+            .iter()
+            .any(|change| matches!(change, ConfigChange::Model(_)));
+        let outcome = self.config.change_global_batch(changes)?;
+        self.config = outcome.config;
+        if let Some(manager) = &self.subagents {
+            manager.set_limit(self.config.max_subagents);
+        }
+        if changes_model {
+            self.model = self
+                .config
+                .model
+                .clone()
+                .ok_or_else(|| Error::Config("no model configured".into()))?;
+            self.context_tokens = 0;
+        }
+        Ok(outcome.effects)
+    }
+
     /// Runs one full turn. `user_input` is `None` when re-driving an existing
     /// conversation (not used by the current front ends, but harmless).
     ///
@@ -930,6 +953,13 @@ impl Agent {
         change: ConfigChange,
     ) -> Result<ConfigChangeEffect, Error> {
         self.conversation.change_global_config(change)
+    }
+
+    pub(crate) fn change_global_config_batch(
+        &mut self,
+        changes: Vec<ConfigChange>,
+    ) -> Result<Vec<ConfigChangeEffect>, Error> {
+        self.conversation.change_global_config_batch(changes)
     }
 
     pub fn run_turn(

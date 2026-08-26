@@ -10,6 +10,7 @@ use super::{
 use crate::error::Error;
 
 /// One requested change to the global configuration.
+#[derive(Debug, Clone)]
 pub(crate) enum ConfigChange {
     Reload,
     Model(String),
@@ -47,7 +48,7 @@ pub(crate) enum ConfigChange {
     SetupSkipped(bool),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum SkillDirectoryAction {
     Add,
     Remove,
@@ -63,6 +64,11 @@ pub(crate) enum ConfigChangeEffect {
 pub(crate) struct ConfigChangeOutcome {
     pub(crate) config: Config,
     pub(crate) effect: ConfigChangeEffect,
+}
+
+pub(crate) struct ConfigChangeBatchOutcome {
+    pub(crate) config: Config,
+    pub(crate) effects: Vec<ConfigChangeEffect>,
 }
 
 enum ValidatedChange {
@@ -107,17 +113,48 @@ impl Config {
     /// Applies one validated global change, then reloads the merged effective
     /// configuration. The result says whether a project value overrode it.
     pub(crate) fn change_global(&self, change: ConfigChange) -> Result<ConfigChangeOutcome, Error> {
-        let change = ValidatedChange::parse(self, change)?;
-        change.persist(self)?;
+        let outcome = self.change_global_batch(vec![change])?;
+        let effect = outcome
+            .effects
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Config("configuration change produced no result".into()))?;
+        Ok(ConfigChangeOutcome {
+            config: outcome.config,
+            effect,
+        })
+    }
+
+    /// Validates every change before writing, updates the global JSON once,
+    /// then reloads the merged effective configuration.
+    pub(crate) fn change_global_batch(
+        &self,
+        changes: Vec<ConfigChange>,
+    ) -> Result<ConfigChangeBatchOutcome, Error> {
+        let changes = changes
+            .into_iter()
+            .map(|change| ValidatedChange::parse(self, change))
+            .collect::<Result<Vec<_>, _>>()?;
+        if changes.iter().any(ValidatedChange::writes) {
+            self.update_global_json(|root| {
+                for change in &changes {
+                    change.apply_to_root(root, self)?;
+                }
+                Ok(())
+            })?;
+        }
         let config = self.reload()?;
-        let effect = match &change {
-            ValidatedChange::SkillDirectoryNotConfigured(path) => {
-                ConfigChangeEffect::SkillDirectoryNotConfigured(path.clone())
-            }
-            _ if change.is_effective(&config) => ConfigChangeEffect::Applied,
-            _ => ConfigChangeEffect::Overridden,
-        };
-        Ok(ConfigChangeOutcome { config, effect })
+        let effects = changes
+            .iter()
+            .map(|change| match change {
+                ValidatedChange::SkillDirectoryNotConfigured(path) => {
+                    ConfigChangeEffect::SkillDirectoryNotConfigured(path.clone())
+                }
+                _ if change.is_effective(&config) => ConfigChangeEffect::Applied,
+                _ => ConfigChangeEffect::Overridden,
+            })
+            .collect();
+        Ok(ConfigChangeBatchOutcome { config, effects })
     }
 }
 
@@ -268,47 +305,51 @@ impl ValidatedChange {
         }
     }
 
-    fn persist(&self, config: &Config) -> Result<(), Error> {
+    fn writes(&self) -> bool {
+        !matches!(self, Self::Reload | Self::SkillDirectoryNotConfigured(_))
+    }
+
+    fn apply_to_root(&self, root: &mut Map<String, Value>, config: &Config) -> Result<(), Error> {
         match self {
             Self::Reload => Ok(()),
-            Self::Model(model) => insert_scalar(config, "model", json!(model)),
-            Self::MaxTokens(tokens) => insert_scalar(config, "max_tokens", json!(tokens)),
+            Self::Model(model) => insert_root(root, "model", json!(model)),
+            Self::MaxTokens(tokens) => insert_root(root, "max_tokens", json!(tokens)),
             Self::ReasoningEffort { stored, .. } => {
-                insert_scalar(config, "reasoning_effort", json!(stored))
+                insert_root(root, "reasoning_effort", json!(stored))
             }
-            Self::HideReasoning(hidden) => insert_scalar(config, "hide_reasoning", json!(hidden)),
-            Self::AccentColor(color) => config.update_global_json(|root| {
+            Self::HideReasoning(hidden) => insert_root(root, "hide_reasoning", json!(hidden)),
+            Self::AccentColor(color) => {
                 root.insert("accent_color".into(), json!(color.config_value()));
                 root.remove("status_bar_color");
                 root.remove("text_box_color");
                 Ok(())
-            }),
-            Self::SelectionColor(selection) => insert_scalar(
-                config,
+            }
+            Self::SelectionColor(selection) => insert_root(
+                root,
                 "selection_color",
                 json!(UiColor::selection_config_value(*selection)),
             ),
-            Self::ScrollBar(enabled) => insert_scalar(config, "scroll_bar", json!(enabled)),
+            Self::ScrollBar(enabled) => insert_root(root, "scroll_bar", json!(enabled)),
             Self::ScrollBarAutoHide(enabled) => {
-                insert_scalar(config, "scroll_bar_auto_hide", json!(enabled))
+                insert_root(root, "scroll_bar_auto_hide", json!(enabled))
             }
-            Self::AutoCompact(enabled) => insert_scalar(config, "auto_compact", json!(enabled)),
+            Self::AutoCompact(enabled) => insert_root(root, "auto_compact", json!(enabled)),
             Self::CompactThreshold(threshold) => {
-                insert_scalar(config, "compact_threshold", json!(threshold))
+                insert_root(root, "compact_threshold", json!(threshold))
             }
-            Self::Subagents(enabled) => insert_scalar(config, "subagents", json!(enabled)),
-            Self::MaxSubagents(limit) => insert_scalar(config, "max_subagents", json!(limit)),
-            Self::SubagentModel(model) => insert_scalar(config, "subagent_model", json!(model)),
+            Self::Subagents(enabled) => insert_root(root, "subagents", json!(enabled)),
+            Self::MaxSubagents(limit) => insert_root(root, "max_subagents", json!(limit)),
+            Self::SubagentModel(model) => insert_root(root, "subagent_model", json!(model)),
             Self::SubagentRequestBudget(budget) => {
-                insert_scalar(config, "subagent_request_budget", json!(budget))
+                insert_root(root, "subagent_request_budget", json!(budget))
             }
             Self::SubagentTimeoutSecs(timeout) => {
-                insert_scalar(config, "subagent_timeout_secs", json!(timeout))
+                insert_root(root, "subagent_timeout_secs", json!(timeout))
             }
-            Self::ContextWindow { model, window } => config.update_global_json(|root| {
+            Self::ContextWindow { model, window } => {
                 object_field(root, "context_windows")?.insert(model.clone(), json!(window));
                 Ok(())
-            }),
+            }
             Self::SkillDirectories(dirs) => {
                 let home = config.home_dir.parent();
                 let values = dirs
@@ -321,14 +362,14 @@ impl ValidatedChange {
                             )
                     })
                     .collect::<Vec<_>>();
-                insert_scalar(config, "skill_dirs", json!(values))
+                insert_root(root, "skill_dirs", json!(values))
             }
             Self::SkillDirectoryNotConfigured(_) => Ok(()),
             Self::Provider {
                 name,
                 base_url,
                 api_key,
-            } => config.update_global_json(|root| {
+            } => {
                 let providers = object_field(root, "providers")?;
                 let provider = providers
                     .entry(name.clone())
@@ -353,22 +394,22 @@ impl ValidatedChange {
                     }
                 }
                 Ok(())
-            }),
-            Self::AnthropicBaseUrl(url) => insert_scalar(config, "anthropic_base_url", json!(url)),
-            Self::OpenAiBaseUrl(url) => insert_scalar(config, "openai_base_url", json!(url)),
+            }
+            Self::AnthropicBaseUrl(url) => insert_root(root, "anthropic_base_url", json!(url)),
+            Self::OpenAiBaseUrl(url) => insert_root(root, "openai_base_url", json!(url)),
             Self::AnthropicApiKey(key) => match key {
-                Some(key) => insert_scalar(config, "anthropic_api_key", json!(key)),
-                None => remove_scalar(config, "anthropic_api_key"),
+                Some(key) => insert_root(root, "anthropic_api_key", json!(key)),
+                None => remove_root(root, "anthropic_api_key"),
             },
             Self::OpenAiApiKey(key) => match key {
-                Some(key) => insert_scalar(config, "openai_api_key", json!(key)),
-                None => remove_scalar(config, "openai_api_key"),
+                Some(key) => insert_root(root, "openai_api_key", json!(key)),
+                None => remove_root(root, "openai_api_key"),
             },
             Self::SetupSkipped(skipped) => {
                 if *skipped {
-                    insert_scalar(config, "setup", json!("skipped"))
+                    insert_root(root, "setup", json!("skipped"))
                 } else {
-                    remove_scalar(config, "setup")
+                    remove_root(root, "setup")
                 }
             }
         }
@@ -413,18 +454,14 @@ impl ValidatedChange {
     }
 }
 
-fn insert_scalar(config: &Config, key: &str, value: Value) -> Result<(), Error> {
-    config.update_global_json(|root| {
-        root.insert(key.to_string(), value);
-        Ok(())
-    })
+fn insert_root(root: &mut Map<String, Value>, key: &str, value: Value) -> Result<(), Error> {
+    root.insert(key.to_string(), value);
+    Ok(())
 }
 
-fn remove_scalar(config: &Config, key: &str) -> Result<(), Error> {
-    config.update_global_json(|root| {
-        root.remove(key);
-        Ok(())
-    })
+fn remove_root(root: &mut Map<String, Value>, key: &str) -> Result<(), Error> {
+    root.remove(key);
+    Ok(())
 }
 
 /// Validates a built-in API key. `-` removes the stored key; otherwise the
@@ -612,6 +649,80 @@ mod tests {
 
         assert!(error.to_string().contains("between 0.1 and 0.99"));
         assert!(!dirs.home.join("config.json").exists());
+    }
+
+    #[test]
+    fn batch_validation_is_atomic_and_writes_nothing_on_error() {
+        let dirs = TestDirs::new("invalid-batch");
+        fs::create_dir_all(&dirs.home).expect("home config directory should be created");
+        let original = r#"{"unknown":{"keep":true},"max_tokens":100}"#;
+        fs::write(dirs.home.join("config.json"), original)
+            .expect("global config should be written");
+        let config = dirs.config();
+
+        let result = config.change_global_batch(vec![
+            ConfigChange::MaxTokens("2048".into()),
+            ConfigChange::CompactThreshold("5%".into()),
+        ]);
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(dirs.home.join("config.json"))
+                .expect("global config should remain readable"),
+            original
+        );
+    }
+
+    #[test]
+    fn valid_batch_preserves_unrelated_provider_metadata() {
+        let dirs = TestDirs::new("provider-batch");
+        fs::create_dir_all(&dirs.home).expect("home config directory should be created");
+        fs::write(
+            dirs.home.join("config.json"),
+            r#"{
+                "providers": {
+                    "local": {
+                        "base_url": "http://old.test/v1",
+                        "api": "openai-completions",
+                        "headers": {"x-custom": "keep"},
+                        "models": [{"id": "listed"}],
+                        "compat": {"max_tokens_field": "max_completion_tokens"}
+                    }
+                },
+                "unknown": true
+            }"#,
+        )
+        .expect("global config should be written");
+        let config = dirs.config();
+
+        let outcome = config
+            .change_global_batch(vec![
+                ConfigChange::Provider {
+                    name: "local".into(),
+                    base_url: "http://new.test/v1".into(),
+                    api_key: None,
+                },
+                ConfigChange::Model("local:listed".into()),
+            ])
+            .expect("valid batch should apply");
+
+        assert_eq!(outcome.effects.len(), 2);
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(dirs.home.join("config.json"))
+                .expect("saved config should be readable"),
+        )
+        .expect("saved config should remain JSON");
+        assert_eq!(
+            saved["providers"]["local"]["base_url"],
+            "http://new.test/v1"
+        );
+        assert_eq!(saved["providers"]["local"]["headers"]["x-custom"], "keep");
+        assert_eq!(saved["providers"]["local"]["models"][0]["id"], "listed");
+        assert_eq!(
+            saved["providers"]["local"]["compat"]["max_tokens_field"],
+            "max_completion_tokens"
+        );
+        assert_eq!(saved["unknown"], true);
     }
 
     #[test]

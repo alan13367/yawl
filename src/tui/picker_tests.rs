@@ -1,10 +1,6 @@
 //! Focused tests for the corresponding TUI responsibility.
 
-use super::picker::{
-    SETTINGS_ACCENT_COLOR_INDEX, SETTINGS_AUTO_COMPACT_INDEX, SETTINGS_REASONING_DISPLAY_INDEX,
-    SETTINGS_RELOAD_INDEX, SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX, SETTINGS_SCROLL_BAR_INDEX,
-    settings_picker,
-};
+use super::picker::{SettingsCategory, SettingsItem, settings_category_picker, settings_picker};
 use super::*;
 
 #[test]
@@ -26,8 +22,16 @@ fn picker_is_bounded_and_highlights_selection() {
             },
         ],
         editing: None,
+        parent: None,
     };
-    let rendered = render_picker(&picker, &Editor::default(), "\x1b[7m", 50, 10);
+    let rendered = render_picker(
+        &picker,
+        &Editor::default(),
+        "\x1b[7m",
+        "\x1b[38;2;116;199;213m",
+        50,
+        10,
+    );
     assert_eq!(rendered.len(), 10);
     assert!(
         rendered
@@ -38,6 +42,45 @@ fn picker_is_bounded_and_highlights_selection() {
         rendered
             .iter()
             .any(|line| { line.contains("Second") && line.contains("\x1b[7m") })
+    );
+}
+
+#[test]
+fn picker_uses_available_width_and_accent_colored_outline() {
+    let model = "omlx:mtplx-qwen38-27b-optimized-speed-with-a-long-model-name";
+    let picker = Picker {
+        title: "Choose model".into(),
+        hint: "Enter select".into(),
+        selected: 0,
+        items: vec![PickerItem {
+            label: "MTPLX Qwen3.8-27B Optimized Speed".into(),
+            description: model.into(),
+            action: PickerAction::SwitchModel(model.into()),
+        }],
+        editing: None,
+        parent: None,
+    };
+    let outline = "\x1b[38;2;117;169;255m";
+
+    let rendered = render_picker(&picker, &Editor::default(), "\x1b[7m", outline, 129, 8);
+    let panel = rendered.join("\n");
+
+    assert!(panel.contains(model));
+    assert!(panel.contains(&format!("{outline}┌")));
+    assert!(panel.contains(&format!("{outline}│")));
+    assert!(panel.contains(&format!("{outline}└")));
+    assert!(
+        rendered
+            .iter()
+            .all(|line| markdown::visible_width(line) == 129)
+    );
+    let top_border = rendered
+        .iter()
+        .find(|line| line.contains('┌'))
+        .expect("picker should render a top border");
+    assert_eq!(
+        markdown::strip_ansi(top_border).trim_end().chars().count(),
+        127
     );
 }
 
@@ -71,6 +114,89 @@ fn selection_picker_defaults_to_following_the_accent() {
         PickerAction::SetSelectionColor(Some(color)) if color == green
     ));
     assert!(picker.items.iter().any(|item| item.label == "Custom RGB…"));
+}
+
+#[test]
+fn escape_returns_the_typed_parent_action() {
+    let parent = PickerAction::OpenSettingsRoot { selected: 3 };
+    let mut state = test_picker_state(Picker {
+        title: "Settings · Providers".into(),
+        hint: "Esc back".into(),
+        items: Vec::new(),
+        selected: 0,
+        editing: None,
+        parent: Some(parent),
+    });
+
+    let action = take_picker_action(&mut state, &mut Editor::default(), Key::Escape);
+
+    assert!(matches!(
+        action,
+        Some(PickerAction::OpenSettingsRoot { selected: 3 })
+    ));
+}
+
+#[test]
+fn secret_picker_edit_masks_the_row_and_editor_layout() {
+    let secret = "sk-secret-value";
+    let mut editor = Editor::default();
+    editor.paste(secret);
+    let picker = Picker {
+        title: "API key".into(),
+        hint: String::new(),
+        items: vec![PickerItem {
+            label: "API key".into(),
+            description: "masked".into(),
+            action: PickerAction::ShowSettings,
+        }],
+        selected: 0,
+        editing: Some(super::picker::PickerEdit::Connect {
+            field: super::connection::ConnectEditField::Secret,
+            secret: true,
+        }),
+        parent: None,
+    };
+
+    let panel = render_picker(
+        &picker,
+        &editor,
+        "\x1b[7m",
+        "\x1b[38;2;116;199;213m",
+        60,
+        10,
+    )
+    .join("\n");
+    let input = editor.masked_layout(60).lines.join("\n");
+
+    assert!(!panel.contains(secret));
+    assert!(!input.contains(secret));
+    assert!(panel.contains('•'));
+    assert!(input.contains('•'));
+}
+
+fn test_picker_state(picker: Picker) -> ViewState {
+    let mut state = ViewState::from_agent(&test_agent());
+    state.picker = Some(picker);
+    state
+}
+
+fn test_agent() -> Agent {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root =
+        std::env::temp_dir().join(format!("yawl-picker-agent-{}-{nonce}", std::process::id()));
+    let config = Config {
+        model: Some("test".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
+    };
+    let cwd = root.join("project");
+    let session = crate::session::Session::create(&config.session_dirs(&cwd).project, &cwd, "test")
+        .expect("test session should be created");
+    Agent::new(config, "test".into(), session, Vec::new())
 }
 
 #[test]
@@ -111,10 +237,13 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
                 action: PickerAction::EditSetting {
                     key: "max_tokens".into(),
                     initial: "8192".into(),
+                    location: None,
                 },
             }],
             editing: None,
+            parent: None,
         }),
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,
@@ -135,7 +264,7 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         action,
         Some(PickerAction::ApplySetting {
             argument,
-            selected: 0
+            location: None
         }) if argument == "max_tokens 16384"
     ));
     assert!(state.picker.is_none());
@@ -179,10 +308,13 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
                 action: PickerAction::EditSetting {
                     key: "max_tokens".into(),
                     initial: "8192".into(),
+                    location: None,
                 },
             }],
             editing: None,
+            parent: None,
         }),
+        connection: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,
@@ -209,7 +341,7 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
 }
 
 #[test]
-fn settings_picker_indexes_keep_their_action_contracts() {
+fn settings_picker_categories_and_items_keep_their_action_contracts() {
     let root = std::env::temp_dir().join(format!(
         "yawl-tui-picker-contract-{}-{}",
         std::process::id(),
@@ -231,36 +363,42 @@ fn settings_picker_indexes_keep_their_action_contracts() {
     let agent = Agent::new(config, "test".into(), session, Vec::new());
 
     let picker = settings_picker(&agent);
+    assert_eq!(picker.items.len(), 7);
+    assert_eq!(
+        picker.items[SettingsCategory::Providers.index()].label,
+        "Providers"
+    );
 
-    assert_eq!(
-        picker.items[SETTINGS_REASONING_DISPLAY_INDEX].label,
-        "Reasoning display"
+    let interface = settings_category_picker(&agent, SettingsCategory::Interface, 0);
+    let reasoning = super::picker::settings_item_index(
+        SettingsCategory::Interface,
+        SettingsItem::ReasoningDisplay,
     );
-    assert_eq!(
-        picker.items[SETTINGS_ACCENT_COLOR_INDEX].label,
-        "Accent color"
+    let accent =
+        super::picker::settings_item_index(SettingsCategory::Interface, SettingsItem::AccentColor);
+    let scroll =
+        super::picker::settings_item_index(SettingsCategory::Interface, SettingsItem::ScrollBar);
+    let auto_hide = super::picker::settings_item_index(
+        SettingsCategory::Interface,
+        SettingsItem::ScrollBarAutoHide,
     );
-    assert_eq!(picker.items[SETTINGS_SCROLL_BAR_INDEX].label, "Scroll bar");
+    assert_eq!(interface.items[reasoning].label, "Reasoning display");
+    assert_eq!(interface.items[accent].label, "Accent color");
+    assert_eq!(interface.items[scroll].label, "Scroll bar");
     assert!(matches!(
-        picker.items[SETTINGS_SCROLL_BAR_INDEX].action,
+        interface.items[scroll].action,
         PickerAction::SetScrollBar(false)
     ));
-    assert_eq!(
-        picker.items[SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX].label,
-        "Auto-hide scroll bar"
-    );
+    assert_eq!(interface.items[auto_hide].label, "Auto-hide scroll bar");
     assert!(matches!(
-        picker.items[SETTINGS_SCROLL_BAR_AUTO_HIDE_INDEX].action,
+        interface.items[auto_hide].action,
         PickerAction::SetScrollBarAutoHide(false)
     ));
-    assert_eq!(
-        picker.items[SETTINGS_AUTO_COMPACT_INDEX].label,
-        "Automatic compaction"
-    );
-    assert_eq!(
-        picker.items[SETTINGS_RELOAD_INDEX].label,
-        "Reload configuration"
-    );
+
+    let context = settings_category_picker(&agent, SettingsCategory::Context, 0);
+    assert_eq!(context.items[0].label, "Automatic compaction");
+    let advanced = settings_category_picker(&agent, SettingsCategory::Advanced, 0);
+    assert_eq!(advanced.items[0].label, "Reload configuration");
 
     drop(agent);
     let _ = std::fs::remove_dir_all(root);
