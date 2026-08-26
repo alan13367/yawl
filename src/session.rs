@@ -157,6 +157,17 @@ impl Session {
         self.append(&SessionEvent::Undo { dropped })
     }
 
+    /// Removes a session log from `dir`. Missing files are treated as success.
+    pub fn delete(dir: &Path, id: &str) -> Result<(), Error> {
+        validate_id(id)?;
+        let path = dir.join(format!("{id}.jsonl"));
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::Io(error)),
+        }
+    }
+
     fn append(&mut self, event: &SessionEvent) -> Result<(), Error> {
         let mut line = serde_json::to_string(event)?;
         line.push('\n');
@@ -236,6 +247,11 @@ pub struct SessionInfo {
     pub model: String,
 }
 
+/// Whether the session log contains at least one message event.
+pub fn has_message(dir: &Path, id: &str) -> bool {
+    read_header(&dir.join(format!("{id}.jsonl"))).has_message
+}
+
 /// Lists sessions, most recently modified first.
 pub fn list(dir: &Path) -> Result<Vec<SessionInfo>, Error> {
     let entries = match fs::read_dir(dir) {
@@ -257,6 +273,10 @@ pub fn list(dir: &Path) -> Result<Vec<SessionInfo>, Error> {
             .and_then(|m| m.modified())
             .unwrap_or(UNIX_EPOCH);
         let header = read_header(&path);
+        // Meta-only logs (opened then quit with no turn) are not resumable.
+        if !header.has_message {
+            continue;
+        }
         infos.push(SessionInfo {
             id: id.to_string(),
             modified,
@@ -274,6 +294,7 @@ struct SessionHeader {
     cwd: String,
     model: String,
     preview: String,
+    has_message: bool,
 }
 
 fn read_header(path: &Path) -> SessionHeader {
@@ -281,6 +302,7 @@ fn read_header(path: &Path) -> SessionHeader {
         cwd: String::new(),
         model: String::new(),
         preview: String::new(),
+        has_message: false,
     };
     let Ok(file) = File::open(path) else {
         return header;
@@ -294,10 +316,13 @@ fn read_header(path: &Path) -> SessionHeader {
                 header.cwd = cwd;
                 header.model = model;
             }
-            Ok(SessionEvent::Message { message }) if message.role == Role::User => {
-                let first = message.content.lines().next().unwrap_or("");
-                header.preview = crate::error::truncate(first, 60);
-                return header;
+            Ok(SessionEvent::Message { message }) => {
+                header.has_message = true;
+                if message.role == Role::User && header.preview.is_empty() {
+                    let first = message.content.lines().next().unwrap_or("");
+                    header.preview = crate::error::truncate(first, 60);
+                    return header;
+                }
             }
             _ => {}
         }
@@ -462,6 +487,40 @@ mod tests {
         assert_eq!(infos[0].cwd, "/projects/yawl");
         assert_eq!(infos[0].model, "glm-5.3");
         assert_eq!(infos[0].preview, "hello there");
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn list_skips_meta_only_sessions() -> Result<(), Error> {
+        let root = temp_root("empty-list");
+        let dir = root.join("sessions");
+        let empty = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
+        drop(empty);
+        let mut kept = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
+        let kept_id = kept.id.clone();
+        kept.append_message(&Message::user("real turn"))?;
+        drop(kept);
+
+        let infos = list(&dir)?;
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, kept_id);
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn delete_removes_session_file() -> Result<(), Error> {
+        let root = temp_root("delete");
+        let dir = root.join("sessions");
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
+        let id = session.id.clone();
+        session.append_message(&Message::user("bye"))?;
+        drop(session);
+
+        Session::delete(&dir, &id)?;
+        assert!(!dir.join(format!("{id}.jsonl")).exists());
+        Session::delete(&dir, &id)?;
         let _ = fs::remove_dir_all(&root);
         Ok(())
     }

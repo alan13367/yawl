@@ -13,12 +13,14 @@ mod files;
 pub mod highlight;
 pub mod input;
 pub mod markdown;
+mod navigation;
 mod picker;
 #[cfg(test)]
 mod picker_tests;
 mod render;
 #[cfg(test)]
 mod render_tests;
+mod search;
 mod state;
 #[cfg(test)]
 mod state_tests;
@@ -72,8 +74,8 @@ use self::picker::{
 };
 #[cfg(test)]
 use self::render::{
-    RenderCache, build_frame, render_entries, render_loading_state, render_queued_panel,
-    selected_row, selection_style,
+    RenderCache, WELCOME_ANIMATION_TICKS, build_frame, render_entries, render_loading_state,
+    render_queued_panel, selected_row, selection_style,
 };
 #[cfg(test)]
 use self::state::Update;
@@ -105,9 +107,6 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
     let mut events = EventReader::new(stdin.lock());
     let mut editor = Editor::default();
     let mut state = ViewState::from_agent(agent);
-    if state.transcript.is_empty() {
-        state.notice("Yawl is ready. Type /help for commands.");
-    }
     terminal.draw(&mut state, &editor)?;
 
     loop {
@@ -154,7 +153,9 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
         }
 
         let mut event = events.read_event()?;
+        let mut needs_draw = false;
         loop {
+            needs_draw |= !matches!(&event, Event::Tick);
             if matches!(&event, Event::Tick) && crate::interrupted() {
                 state.subagent_manager.interrupt_all();
                 crate::set_interrupted(false);
@@ -162,8 +163,10 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                     editor.clear();
                 }
                 state.activity = "input cleared".into();
+                needs_draw = true;
             }
             if state.subagent_view.is_some() {
+                needs_draw = true;
                 subagents::handle_event(&mut state, &mut editor, event);
                 break;
             }
@@ -179,43 +182,58 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                     Event::Mouse(mouse) => {
                         handle_mouse_selection(&mut terminal, &mut state, mouse)?
                     }
-                    Event::Tick => advance_ticks(&mut state),
+                    Event::Tick => needs_draw |= advance_ticks(&mut state),
                     Event::MouseScroll(_) | Event::Paste(_) => {}
                 }
                 break;
             }
             match event {
                 Event::Tick => {
-                    advance_ticks(&mut state);
+                    needs_draw |= advance_ticks(&mut state);
                 }
                 Event::MouseScroll(amount) => scroll(&mut state, amount),
                 Event::Mouse(mouse) => handle_mouse_selection(&mut terminal, &mut state, mouse)?,
                 Event::Paste(text) => {
-                    editor.paste(&text);
-                    state.scroll_offset = 0;
+                    if state.transcript.search_active() {
+                        state.transcript.search_paste(&text);
+                    } else {
+                        state.transcript.blur();
+                        editor.paste(&text);
+                        state.scroll_offset = 0;
+                    }
                 }
-                Event::Key(Key::PageUp) => scroll(&mut state, 10),
-                Event::Key(Key::PageDown) => scroll(&mut state, -10),
-                Event::Key(Key::Ctrl('c')) => {
-                    editor.clear();
-                    state.activity = "input cleared".into();
-                }
-                Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
-                Event::Key(Key::Ctrl('o')) => toggle_tool_expansion(&mut state),
                 Event::Key(key) => {
-                    if handle_completion_key(&mut state, &mut editor, key) {
-                        // The completion menu consumed navigation or Tab.
-                    } else if let EditAction::Submit(input) = editor.handle_key(key)
-                        && handle_submission(
-                            agent,
-                            input,
-                            &mut state,
-                            &mut editor,
-                            &mut terminal,
-                            &mut events,
-                        )?
-                    {
-                        return Ok(());
+                    if navigation::handle_key(&mut state, &mut terminal, key)? {
+                        // Transcript search, focus, or the block viewer owns the key.
+                    } else {
+                        match key {
+                            Key::PageUp => scroll(&mut state, 10),
+                            Key::PageDown => scroll(&mut state, -10),
+                            Key::Ctrl('c') => {
+                                editor.clear();
+                                state.activity = "input cleared".into();
+                            }
+                            Key::Ctrl('l') => terminal.invalidate(),
+                            Key::Ctrl('o') => toggle_tool_expansion(&mut state),
+                            _ if handle_completion_key(&mut state, &mut editor, key) => {
+                                // The completion menu consumed navigation or Tab.
+                            }
+                            Key::Tab => navigation::focus_transcript(&mut state),
+                            _ => {
+                                if let EditAction::Submit(input) = editor.handle_key(key)
+                                    && handle_submission(
+                                        agent,
+                                        input,
+                                        &mut state,
+                                        &mut editor,
+                                        &mut terminal,
+                                        &mut events,
+                                    )?
+                                {
+                                    return Ok(());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -224,7 +242,9 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
             }
             event = events.read_event()?;
         }
-        terminal.draw(&mut state, &editor)?;
+        if needs_draw || terminal.size_changed() {
+            terminal.draw(&mut state, &editor)?;
+        }
     }
 }
 
@@ -234,6 +254,10 @@ fn rebuild_transcript_after_deferred_follow_up(
 ) {
     state.transcript = Transcript::from_messages(messages);
     state.render_cache.invalidate();
+}
+
+fn displayed_submission(editor: &Editor, input: &str) -> String {
+    editor.expand_pastes(input)
 }
 
 fn handle_submission<R: Read>(
@@ -254,7 +278,15 @@ fn handle_submission<R: Read>(
         let skills = crate::skills::scan(agent.config());
         if let Some(skill) = skills.iter().find(|skill| skill.name == name) {
             let expanded = crate::skills::expand(skill, &editor.expand_submission(arguments));
-            run_agent_submission(agent, input, expanded, state, editor, terminal, events)?;
+            run_agent_submission(
+                agent,
+                displayed_submission(editor, &input),
+                expanded,
+                state,
+                editor,
+                terminal,
+                events,
+            )?;
         } else {
             state.notice(format!(
                 "Unknown skill '{name}'. Type /skills to list skills."
@@ -293,7 +325,6 @@ fn handle_submission<R: Read>(
                     *state = ViewState::from_agent(agent);
                     state.queued_inputs = queued_inputs;
                     state.pending_actions = pending_actions;
-                    state.notice("Started a new session.");
                 }
                 Err(error) => state.notice(format!("Could not start a session: {error}")),
             },
@@ -339,10 +370,12 @@ fn handle_submission<R: Read>(
         return Ok(false);
     }
 
+    let displayed_input = displayed_submission(editor, &input);
+    let agent_input = editor.expand_submission(&input);
     run_agent_submission(
         agent,
-        input.clone(),
-        editor.expand_submission(&input),
+        displayed_input,
+        agent_input,
         state,
         editor,
         terminal,

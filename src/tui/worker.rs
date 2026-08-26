@@ -10,7 +10,7 @@ use crate::error::Error;
 
 use super::commands::{
     copy_all_from_transcript, copy_last_reply, handle_queue_picker_action, notice_config_effect,
-    unqueue,
+    promote_queued, unqueue,
 };
 use super::completion::handle_completion_key;
 use super::events::{Event, EventReader, Key, MouseEvent};
@@ -178,9 +178,11 @@ pub(super) fn pump_events<R: Read, T>(
     active_pickers: &mut ActivePickers,
     active_config: &mut Config,
 ) -> Result<T, Error> {
+    let mut needs_draw = false;
     loop {
         while let Ok(update) = worker.updates.try_recv() {
             state.apply(update);
+            needs_draw = true;
         }
         match worker.done.try_recv() {
             Ok(result) => {
@@ -195,15 +197,21 @@ pub(super) fn pump_events<R: Read, T>(
             }
             Err(TryRecvError::Empty) => {}
         }
-        terminal.draw(state, editor)?;
+        if needs_draw || terminal.size_changed() {
+            terminal.draw(state, editor)?;
+            needs_draw = false;
+        }
         let mut event = events.read_event()?;
         loop {
+            needs_draw |= !matches!(&event, Event::Tick);
             if matches!(&event, Event::Tick) && crate::interrupted() {
                 state.subagent_manager.interrupt_all();
                 cancel_worker(worker.thread, &worker.cancellation, state);
                 crate::set_interrupted(false);
+                needs_draw = true;
             }
             if state.subagent_view.is_some() {
+                needs_draw = true;
                 super::subagents::handle_event(state, editor, event);
                 break;
             }
@@ -212,40 +220,73 @@ pub(super) fn pump_events<R: Read, T>(
                     Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
                     Event::Key(key) => {
                         if let Some(action) = take_picker_action(state, editor, key) {
-                            activate_picker_action_while_busy(
-                                state,
-                                action,
-                                active_pickers,
-                                active_config,
-                            );
+                            if let PickerAction::SendQueued(index) = action {
+                                if promote_queued(state, index) {
+                                    cancel_worker(worker.thread, &worker.cancellation, state);
+                                }
+                            } else {
+                                activate_picker_action_while_busy(
+                                    state,
+                                    action,
+                                    active_pickers,
+                                    active_config,
+                                );
+                            }
                         }
                     }
                     Event::Paste(text) if picker_is_editing(state) => editor.paste(&text),
                     Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
-                    Event::Tick => advance_ticks(state),
+                    Event::Tick => needs_draw |= advance_ticks(state),
                     Event::MouseScroll(_) | Event::Paste(_) => {}
                 }
                 break;
             }
             match event {
                 Event::Tick => {
-                    advance_ticks(state);
+                    needs_draw |= advance_ticks(state);
                 }
                 Event::MouseScroll(amount) => scroll(state, amount),
                 Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
-                Event::Paste(text) => editor.paste(&text),
-                Event::Key(key) if is_cancel_key(key) => {
+                Event::Paste(text) => {
+                    if state.transcript.search_active() {
+                        state.transcript.search_paste(&text);
+                    } else {
+                        state.transcript.blur();
+                        editor.paste(&text);
+                    }
+                }
+                Event::Key(key)
+                    if is_cancel_key(key)
+                        && !state.transcript.search_active()
+                        && !state.transcript.viewer_open() =>
+                {
                     cancel_worker(worker.thread, &worker.cancellation, state)
                 }
-                Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
-                Event::Key(Key::Ctrl('o')) => toggle_tool_expansion(state),
-                Event::Key(Key::PageUp) => scroll(state, 10),
-                Event::Key(Key::PageDown) => scroll(state, -10),
                 Event::Key(key) => {
-                    if handle_completion_key(state, editor, key) {
-                        // Keep accepting and completing input while the agent runs.
-                    } else if let EditAction::Submit(input) = editor.handle_key(key) {
-                        handle_submission_while_busy(input, state, active_pickers, terminal)?;
+                    if super::navigation::handle_key(state, terminal, key)? {
+                        // Transcript navigation owns the key.
+                    } else {
+                        match key {
+                            Key::Ctrl('l') => terminal.invalidate(),
+                            Key::Ctrl('o') => toggle_tool_expansion(state),
+                            Key::PageUp => scroll(state, 10),
+                            Key::PageDown => scroll(state, -10),
+                            _ if handle_completion_key(state, editor, key) => {
+                                // Keep accepting and completing input while the agent runs.
+                            }
+                            Key::Tab => super::navigation::focus_transcript(state),
+                            _ => {
+                                if let EditAction::Submit(input) = editor.handle_key(key) {
+                                    let input = super::displayed_submission(editor, &input);
+                                    handle_submission_while_busy(
+                                        input,
+                                        state,
+                                        active_pickers,
+                                        terminal,
+                                    )?;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -365,7 +406,11 @@ pub(super) fn activate_picker_action_while_busy(
             state.picker = Some(active_pickers.selection_color.clone());
         }
         PickerAction::EditSetting { .. } | PickerAction::EditModel { .. } => {}
-        PickerAction::RemoveQueued(_) | PickerAction::ClearQueued => {}
+        PickerAction::SendQueued(_)
+        | PickerAction::ApplyQueued { .. }
+        | PickerAction::MoveQueued { .. }
+        | PickerAction::RemoveQueued(_)
+        | PickerAction::ClearQueued => {}
         action => {
             state.pending_actions.push_back(action);
             state.activity = "change queued until the active response finishes".into();

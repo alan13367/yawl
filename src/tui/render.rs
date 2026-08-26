@@ -17,27 +17,42 @@ struct CacheSlot {
     width: usize,
     tools_expanded: bool,
     hide_reasoning: bool,
+    accent_color: UiColor,
     entry_lines: Vec<Option<Vec<String>>>,
-    flattened: Vec<String>,
+    /// Absolute starting line for every entry, plus one total-height sentinel.
+    entry_starts: Vec<usize>,
     frozen_count: usize,
 }
 
 impl CacheSlot {
-    fn new(width: usize, tools_expanded: bool, hide_reasoning: bool) -> Self {
+    fn new(
+        width: usize,
+        tools_expanded: bool,
+        hide_reasoning: bool,
+        accent_color: UiColor,
+    ) -> Self {
         Self {
             width,
             tools_expanded,
             hide_reasoning,
+            accent_color,
             entry_lines: Vec::new(),
-            flattened: Vec::new(),
+            entry_starts: vec![0],
             frozen_count: 0,
         }
     }
 
-    fn matches(&self, width: usize, tools_expanded: bool, hide_reasoning: bool) -> bool {
+    fn matches(
+        &self,
+        width: usize,
+        tools_expanded: bool,
+        hide_reasoning: bool,
+        accent_color: UiColor,
+    ) -> bool {
         self.width == width
             && self.tools_expanded == tools_expanded
             && self.hide_reasoning == hide_reasoning
+            && self.accent_color == accent_color
     }
 
     fn update(
@@ -56,12 +71,13 @@ impl CacheSlot {
             .or_else(|| transcript.running_tool_index());
         let frozen_boundary = mutable_index.unwrap_or(entries.len()).min(entries.len());
 
-        let mut changed = false;
+        let mut changed_from = None;
         if self.entry_lines.len() < entries.len() {
+            changed_from = Some(self.entry_lines.len());
             self.entry_lines.resize_with(entries.len(), || None);
         } else if self.entry_lines.len() > entries.len() {
             self.entry_lines.truncate(entries.len());
-            changed = true;
+            changed_from = Some(entries.len());
         }
 
         for (i, entry) in entries
@@ -70,27 +86,86 @@ impl CacheSlot {
             .take(frozen_boundary)
             .skip(self.frozen_count)
         {
-            self.entry_lines[i] = render_entry(entry, self.width, tools_expanded, hide_reasoning);
-            changed = true;
+            let expanded =
+                transcript.entry_expanded(i, entry_default_expanded(entry, tools_expanded));
+            self.entry_lines[i] = render_entry(
+                entry,
+                self.width,
+                expanded,
+                hide_reasoning,
+                self.accent_color,
+            );
+            changed_from = Some(changed_from.map_or(i, |changed| changed.min(i)));
         }
         self.frozen_count = frozen_boundary;
 
         if let Some(idx) = mutable_index
             && idx < entries.len()
         {
-            self.entry_lines[idx] =
-                render_entry(&entries[idx], self.width, tools_expanded, hide_reasoning);
-            changed = true;
+            let expanded = transcript
+                .entry_expanded(idx, entry_default_expanded(&entries[idx], tools_expanded));
+            self.entry_lines[idx] = render_entry(
+                &entries[idx],
+                self.width,
+                expanded,
+                hide_reasoning,
+                self.accent_color,
+            );
+            changed_from = Some(changed_from.map_or(idx, |changed| changed.min(idx)));
         }
 
-        if changed || (self.flattened.is_empty() && !entries.is_empty()) {
-            self.flattened.clear();
-            for lines in self.entry_lines.iter().flatten() {
-                self.flattened.extend(lines.iter().cloned());
-                self.flattened.push(String::new());
+        if let Some(start) = changed_from {
+            self.entry_starts.resize(self.entry_lines.len() + 1, 0);
+            if start == 0 {
+                self.entry_starts[0] = 0;
+            }
+            for index in start..self.entry_lines.len() {
+                let height = self.entry_lines[index]
+                    .as_ref()
+                    .map_or(0, |lines| lines.len() + 1);
+                self.entry_starts[index + 1] = self.entry_starts[index] + height;
             }
         }
     }
+
+    fn total_lines(&self) -> usize {
+        self.entry_starts.last().copied().unwrap_or(0)
+    }
+
+    fn entry_range(&self, index: usize) -> Option<std::ops::Range<usize>> {
+        let start = *self.entry_starts.get(index)?;
+        let end = *self.entry_starts.get(index + 1)?;
+        (start < end).then_some(start..end)
+    }
+
+    fn line_at(&self, row: usize) -> Option<(String, Option<usize>)> {
+        if row >= self.total_lines() {
+            return None;
+        }
+        let index = self
+            .entry_starts
+            .partition_point(|start| *start <= row)
+            .saturating_sub(1)
+            .min(self.entry_lines.len().saturating_sub(1));
+        let offset = row.saturating_sub(self.entry_starts[index]);
+        let lines = self.entry_lines.get(index)?.as_ref()?;
+        if offset < lines.len() {
+            Some((lines[offset].clone(), Some(index)))
+        } else {
+            Some((String::new(), None))
+        }
+    }
+
+    #[cfg(test)]
+    fn flattened(&self) -> Vec<String> {
+        (0..self.total_lines())
+            .filter_map(|row| self.line_at(row).map(|(line, _)| line))
+            .collect()
+    }
+}
+
+fn entry_default_expanded(entry: &Entry, tools_expanded: bool) -> bool {
+    !matches!(entry, Entry::Tool { .. }) || tools_expanded
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -103,44 +178,73 @@ impl RenderCache {
         self.slots = Default::default();
     }
 
-    pub(super) fn get_or_render<'a>(
+    fn get_or_render_slot<'a>(
         &'a mut self,
         transcript: &super::transcript::Transcript,
         tools_expanded: bool,
         hide_reasoning: bool,
+        accent_color: UiColor,
         width: usize,
-    ) -> &'a [String] {
+    ) -> &'a CacheSlot {
         let slot_idx = self.slots.iter().position(|slot| {
             slot.as_ref()
-                .is_some_and(|s| s.matches(width, tools_expanded, hide_reasoning))
+                .is_some_and(|s| s.matches(width, tools_expanded, hide_reasoning, accent_color))
         });
 
         let idx = match slot_idx {
             Some(i) => i,
             None => {
                 let empty_idx = self.slots.iter().position(|s| s.is_none()).unwrap_or(1);
-                self.slots[empty_idx] = Some(CacheSlot::new(width, tools_expanded, hide_reasoning));
+                self.slots[empty_idx] = Some(CacheSlot::new(
+                    width,
+                    tools_expanded,
+                    hide_reasoning,
+                    accent_color,
+                ));
                 empty_idx
             }
         };
 
         let slot = self.slots[idx].as_mut().expect("slot was set above");
         slot.update(transcript, tools_expanded, hide_reasoning);
-        &slot.flattened
+        slot
+    }
+
+    #[cfg(test)]
+    pub(super) fn get_or_render(
+        &mut self,
+        transcript: &super::transcript::Transcript,
+        tools_expanded: bool,
+        hide_reasoning: bool,
+        accent_color: UiColor,
+        width: usize,
+    ) -> Vec<String> {
+        self.get_or_render_slot(
+            transcript,
+            tools_expanded,
+            hide_reasoning,
+            accent_color,
+            width,
+        )
+        .flattened()
     }
 }
 
 fn render_entry(
     entry: &Entry,
     width: usize,
-    tools_expanded: bool,
+    expanded: bool,
     hide_reasoning: bool,
+    accent_color: UiColor,
 ) -> Option<Vec<String>> {
     match entry {
+        Entry::User(content) if !expanded => Some(render_collapsed("Prompt", content, width)),
         Entry::User(content) => Some(render_user_panel(content, width)),
         Entry::Assistant(content) => {
             if content.trim().is_empty() {
                 None
+            } else if !expanded {
+                Some(render_collapsed("Reply", content, width))
             } else {
                 Some(markdown::render(content.trim(), width))
             }
@@ -148,6 +252,8 @@ fn render_entry(
         Entry::Reasoning { kind, content } => {
             if hide_reasoning || content.trim().is_empty() {
                 None
+            } else if !expanded {
+                Some(render_collapsed("Reasoning", content, width))
             } else {
                 Some(render_reasoning(*kind, content, width))
             }
@@ -159,16 +265,11 @@ fn render_entry(
             is_error,
             running,
         } => Some(tool_view::render(
-            name,
-            args,
-            output,
-            *is_error,
-            *running,
-            width,
-            tools_expanded,
+            name, args, output, *is_error, *running, width, expanded,
         )),
+        Entry::Notice(content) if !expanded => Some(render_collapsed("Notice", content, width)),
         Entry::Notice(content) => {
-            let mut lines = vec!["\x1b[1;33mYawl\x1b[0m".into()];
+            let mut lines = vec![yawl_label(accent_color)];
             lines.extend(markdown::render(content, width));
             Some(lines)
         }
@@ -177,15 +278,33 @@ fn render_entry(
             name,
             status,
             content,
-        } => Some(render_subagent_result(
+        } if !expanded => Some(render_collapsed(name, content, width)),
+        Entry::SubagentResult {
             id,
             name,
             status,
             content,
-            width,
-            tools_expanded,
+        } => Some(render_subagent_result(
+            id, name, status, content, width, true,
         )),
     }
+}
+
+fn render_collapsed(label: &str, content: &str, width: usize) -> Vec<String> {
+    let preview = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let preview = markdown::render(preview, width)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let label = crate::subagent::sanitize_preview(label, 128);
+    vec![markdown::fit_width(
+        &format!("\x1b[2m▸ {label}\x1b[0m  {preview}"),
+        width,
+    )]
 }
 
 #[cfg(test)]
@@ -197,7 +316,13 @@ pub(super) fn render_entries(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     for entry in entries {
-        if let Some(rendered) = render_entry(entry, width, tools_expanded, hide_reasoning) {
+        if let Some(rendered) = render_entry(
+            entry,
+            width,
+            entry_default_expanded(entry, tools_expanded),
+            hide_reasoning,
+            UiColor::WHITE,
+        ) {
             lines.extend(rendered);
             lines.push(String::new());
         }
@@ -351,6 +476,159 @@ pub(super) fn status_style(color: UiColor) -> String {
     )
 }
 
+fn yawl_label(accent: UiColor) -> String {
+    format!("{}\x1b[1mYawl\x1b[0m", foreground_color(accent))
+}
+
+/// Block letters for typical terminal widths. Falls back to the smaller
+/// figlet wordmark, then to the word itself, when the region is tight.
+const WELCOME_LOGO_LARGE: &[&str] = &[
+    "██    ██   █████   ██     ██  ██",
+    " ██  ██   ██   ██  ██     ██  ██",
+    "  ████    ███████  ██  █  ██  ██",
+    "   ██     ██   ██  ██ ███ ██  ██",
+    "   ██     ██   ██   ███ ███   ███████",
+];
+
+const WELCOME_LOGO_SMALL: &[&str] = &[
+    r"__   __            _",
+    r"\ \ / /_ ___      _| |",
+    r" \ V / _` \ \ /\ / / |",
+    r"  | | (_| |\ V  V /| |",
+    r"  |_|\__,_| \_/\_/ |_|",
+];
+
+fn logo_fits(lines: &[&str], width: usize) -> bool {
+    lines
+        .iter()
+        .map(|line| markdown::visible_width(line))
+        .max()
+        .unwrap_or(0)
+        <= width
+}
+
+fn welcome_logo(width: usize, height: usize) -> &'static [&'static str] {
+    const COMPACT: &[&str] = &["Yawl"];
+    if height >= WELCOME_LOGO_LARGE.len() && logo_fits(WELCOME_LOGO_LARGE, width) {
+        WELCOME_LOGO_LARGE
+    } else if height >= WELCOME_LOGO_SMALL.len() && logo_fits(WELCOME_LOGO_SMALL, width) {
+        WELCOME_LOGO_SMALL
+    } else {
+        COMPACT
+    }
+}
+
+/// Columns of the wordmark (and hint characters) revealed per 100ms tick.
+const WELCOME_COLUMNS_PER_TICK: usize = 3;
+
+/// Ticks after which the large wordmark and hint have finished typing.
+pub(super) const WELCOME_ANIMATION_TICKS: usize = 40;
+
+fn pad_to_width(text: &str, width: usize) -> String {
+    let visible = markdown::visible_width(text);
+    if visible >= width {
+        text.to_string()
+    } else {
+        format!("{text}{}", " ".repeat(width - visible))
+    }
+}
+
+fn center_styled(text: &str, style: &str, width: usize) -> String {
+    let visible = markdown::visible_width(text);
+    let left = width.saturating_sub(visible) / 2;
+    markdown::fit_width(&format!("{}{style}{text}\x1b[0m", " ".repeat(left)), width)
+}
+
+fn prefix_visible(text: &str, columns: usize) -> &str {
+    if columns == 0 {
+        return "";
+    }
+    let mut end = 0;
+    for (index, character) in text.char_indices() {
+        let next = index + character.len_utf8();
+        if markdown::visible_width(&text[..next]) > columns {
+            break;
+        }
+        end = next;
+    }
+    &text[..end]
+}
+
+fn typed_amount(tick: usize, total: usize) -> usize {
+    tick.saturating_add(1)
+        .saturating_mul(WELCOME_COLUMNS_PER_TICK)
+        .min(total)
+}
+
+fn typed_hint(tick: usize, logo_ticks: usize, hint: &str) -> &str {
+    let Some(elapsed) = tick.saturating_add(1).checked_sub(logo_ticks) else {
+        return "";
+    };
+    if elapsed == 0 {
+        return "";
+    }
+    let keep = typed_amount(elapsed - 1, hint.chars().count());
+    hint.char_indices()
+        .nth(keep)
+        .map_or(hint, |(index, _)| &hint[..index])
+}
+
+fn mask_logo_line(padded: &str, revealed: usize, show_cursor: bool) -> String {
+    let total = markdown::visible_width(padded);
+    if revealed >= total {
+        return padded.to_string();
+    }
+    let mut line = String::with_capacity(padded.len() + 1);
+    line.push_str(prefix_visible(padded, revealed));
+    let width = markdown::visible_width(&line);
+    if width < revealed {
+        line.extend(std::iter::repeat_n(' ', revealed - width));
+    }
+    if show_cursor {
+        line.push('|');
+    }
+    pad_to_width(&line, total)
+}
+
+fn render_welcome(accent: UiColor, width: usize, height: usize, tick: usize) -> Vec<String> {
+    let color = format!("{}\x1b[1m", foreground_color(accent));
+    let logo = welcome_logo(width, height);
+    let block_width = logo
+        .iter()
+        .map(|line| markdown::visible_width(line))
+        .max()
+        .unwrap_or(0);
+    let revealed = typed_amount(tick, block_width);
+    let show_cursor = revealed < block_width && tick.is_multiple_of(2);
+    let mut content: Vec<String> = logo
+        .iter()
+        .map(|line| {
+            let padded = pad_to_width(line, block_width);
+            let typed = mask_logo_line(&padded, revealed, show_cursor);
+            center_styled(&typed, &color, width)
+        })
+        .collect();
+    const HINT: &str = "Type /help for commands.";
+    if height >= content.len() + 2 && markdown::visible_width(HINT) <= width {
+        let blank = markdown::fit_width("", width);
+        content.push(blank.clone());
+        let logo_ticks = block_width.div_ceil(WELCOME_COLUMNS_PER_TICK);
+        let hint = typed_hint(tick, logo_ticks, HINT);
+        if hint.is_empty() {
+            content.push(blank);
+        } else {
+            content.push(center_styled(hint, &status_style(accent), width));
+        }
+    }
+    let blank = markdown::fit_width("", width);
+    let top = height.saturating_sub(content.len()) / 2;
+    let mut lines = Vec::with_capacity(height);
+    lines.resize(top, blank.clone());
+    lines.extend(content);
+    lines.resize(height, blank);
+    lines
+}
+
 pub(super) fn render_copy_toast(frame: &mut [String], columns: usize, accent: UiColor) {
     const WIDTH: usize = 11;
     let color = foreground_color(accent);
@@ -365,9 +643,7 @@ pub(super) fn render_copy_toast(frame: &mut [String], columns: usize, accent: Ui
     }
 }
 
-/// Track and thumb shading as a fraction of the accent color. The thumb stays
-/// brighter than the track so it cannot disappear into a dark background.
-const SCROLL_TRACK_INTENSITY: f32 = 0.38;
+/// Thumb shading as a fraction of the accent color.
 const SCROLL_THUMB_INTENSITY: f32 = 0.65;
 
 fn shaded_background(color: UiColor, intensity: f32) -> String {
@@ -393,7 +669,7 @@ pub(super) fn apply_scroll_bar(
         || max_scroll == 0
         || height == 0
         || total_lines <= height
-        || columns < 2
+        || columns == 0
     {
         state.scroll_geometry = None;
         return;
@@ -407,39 +683,82 @@ pub(super) fn apply_scroll_bar(
         thumb_length,
     });
     let start = scroll_bar_position(travel, max_scroll, state.scroll_offset);
-    let track = shaded_background(state.accent_color, SCROLL_TRACK_INTENSITY);
     let thumb = shaded_background(state.accent_color, SCROLL_THUMB_INTENSITY);
     for (row, line) in region.iter_mut().enumerate() {
-        let style = if row >= start && row < start + thumb_length {
-            &thumb
-        } else {
-            &track
-        };
-        debug_assert_eq!(markdown::visible_width(line), columns - 1);
-        line.push_str("\x1b[0m");
-        line.push_str(style);
-        line.push_str(" \x1b[0m");
+        debug_assert_eq!(markdown::visible_width(line), columns);
+        if row >= start && row < start + thumb_length {
+            *line = markdown::overlay_last_cell_background(line, &thumb);
+        }
     }
 }
 
-fn render_transcript(state: &mut ViewState, width: usize) -> Vec<String> {
-    let mut transcript = state
-        .render_cache
-        .get_or_render(
+struct TranscriptWindow {
+    lines: Vec<(String, Option<usize>)>,
+    total_lines: usize,
+    max_scroll: usize,
+}
+
+fn render_transcript_window(
+    state: &mut ViewState,
+    width: usize,
+    height: usize,
+) -> TranscriptWindow {
+    let mut tail = Vec::new();
+    if let Some(loading) = render_loading_state(state, width) {
+        tail.push(loading);
+        tail.push(String::new());
+    }
+    for (index, input) in state.queued_inputs.iter().enumerate() {
+        tail.extend(render_queued_panel(input, index + 1, width));
+    }
+
+    let selected = state.transcript.selected_index();
+    let reveal = state.transcript.take_reveal_selected();
+    let (cached_lines, selected_range) = {
+        let slot = state.render_cache.get_or_render_slot(
             &state.transcript,
             state.tools_expanded,
             state.hide_reasoning,
+            state.accent_color,
             width,
+        );
+        (
+            slot.total_lines(),
+            selected.and_then(|index| slot.entry_range(index)),
         )
-        .to_vec();
-    if let Some(loading) = render_loading_state(state, width) {
-        transcript.push(loading);
-        transcript.push(String::new());
+    };
+    let total_lines = cached_lines + tail.len();
+    let max_scroll = total_lines.saturating_sub(height);
+    if reveal && let Some(range) = selected_range {
+        state.scroll_offset = max_scroll.saturating_sub(range.start);
+    } else {
+        state.scroll_offset = state.scroll_offset.min(max_scroll);
     }
-    for (index, input) in state.queued_inputs.iter().enumerate() {
-        transcript.extend(render_queued_panel(input, index + 1, width));
+    let end = total_lines.saturating_sub(state.scroll_offset);
+    let start = end.saturating_sub(height);
+
+    let slot = state.render_cache.get_or_render_slot(
+        &state.transcript,
+        state.tools_expanded,
+        state.hide_reasoning,
+        state.accent_color,
+        width,
+    );
+    let mut lines = Vec::with_capacity(end - start);
+    for row in start..end {
+        if row < cached_lines {
+            if let Some(line) = slot.line_at(row) {
+                lines.push(line);
+            }
+        } else if let Some(line) = tail.get(row - cached_lines) {
+            lines.push((line.clone(), None));
+        }
     }
-    transcript
+    TranscriptWindow {
+        lines,
+        total_lines,
+        max_scroll,
+    }
 }
 
 pub(super) fn has_visible_in_flight_content(state: &ViewState) -> bool {
@@ -490,6 +809,9 @@ pub(super) fn build_frame(
     }
     let columns = columns.max(20);
     let rows = rows.max(8);
+    if state.transcript.viewer_open() {
+        return render_block_viewer(state, columns, rows);
+    }
     let inner_width = columns.saturating_sub(2);
     let layout = editor.layout(inner_width);
     let max_input_lines = (rows / 3).max(1);
@@ -560,25 +882,11 @@ pub(super) fn build_frame(
         ));
     }
     let menu_height = menu.len();
-    let transcript_height = rows.saturating_sub(input_height + menu_height + 1);
-    let mut transcript = render_transcript(state, columns);
-    let show_scroll_bar = state.show_scroll_bar
-        && state.picker.is_none()
-        && columns >= 2
-        && transcript.len() > transcript_height;
-    let transcript_width = if show_scroll_bar {
-        columns - 1
-    } else {
-        columns
-    };
-    if show_scroll_bar {
-        transcript = render_transcript(state, transcript_width);
-    }
-    let max_scroll = transcript.len().saturating_sub(transcript_height);
-    state.scroll_offset = state.scroll_offset.min(max_scroll);
-    let end = transcript.len().saturating_sub(state.scroll_offset);
-    let start = end.saturating_sub(transcript_height);
-    let visible = &transcript[start..end];
+    let search_height = usize::from(state.transcript.search_active());
+    let transcript_height = rows.saturating_sub(input_height + menu_height + search_height + 1);
+    let transcript = render_transcript_window(state, columns, transcript_height);
+    let transcript_width = columns;
+    let visible = &transcript.lines;
 
     let mut region = Vec::with_capacity(transcript_height);
     if let Some(picker) = &state.picker {
@@ -589,19 +897,54 @@ pub(super) fn build_frame(
             columns,
             transcript_height,
         ));
+    } else if visible.is_empty() && state.transcript.is_empty() {
+        region.extend(render_welcome(
+            state.accent_color,
+            transcript_width,
+            transcript_height,
+            state.spinner_tick,
+        ));
     } else {
         region.extend(std::iter::repeat_n(
             " ".repeat(transcript_width),
             transcript_height.saturating_sub(visible.len()),
         ));
-        region.extend(
-            visible
-                .iter()
-                .map(|line| markdown::fit_width(line, transcript_width)),
-        );
+        let selected = state.transcript.selected_index();
+        let focused = state.transcript.is_focused();
+        region.extend(visible.iter().map(|(line, owner)| {
+            let line = markdown::fit_width(line, transcript_width);
+            if focused && *owner == selected && transcript_width > 1 {
+                format!(
+                    "{}▌\x1b[0m{}",
+                    foreground_color(state.accent_color),
+                    markdown::fit_width(&line, transcript_width - 1)
+                )
+            } else {
+                line
+            }
+        }));
     }
-    apply_scroll_bar(&mut region, state, transcript.len(), max_scroll, columns);
+    apply_scroll_bar(
+        &mut region,
+        state,
+        transcript.total_lines,
+        transcript.max_scroll,
+        columns,
+    );
     let mut frame = region;
+    if let Some(query) = state.transcript.search_query() {
+        let position = state.transcript.search_position().map_or_else(
+            || "0/0".to_string(),
+            |(current, total)| format!("{current}/{total}"),
+        );
+        frame.push(markdown::fit_width(
+            &format!(
+                " {}Find\x1b[0m  {query}  \x1b[2m{position} · Enter next · ↑ previous · Esc close\x1b[0m",
+                foreground_color(state.accent_color)
+            ),
+            columns,
+        ));
+    }
     let text_box_color = foreground_color(state.accent_color);
     frame.push(format!(
         "{text_box_color}┌{}┐\x1b[0m",
@@ -682,9 +1025,71 @@ pub(super) fn build_frame(
         render_copy_toast(&mut frame, columns, state.accent_color);
     }
 
-    let cursor_row = transcript_height + 2 + cursor_input_row;
-    let cursor_col = (2 + layout.cursor_col).min(columns.saturating_sub(1));
+    let (cursor_row, cursor_col) = if let Some(query) = state.transcript.search_query() {
+        (
+            transcript_height + 1,
+            (8 + markdown::visible_width(query)).min(columns.saturating_sub(1)),
+        )
+    } else {
+        (
+            transcript_height + search_height + 2 + cursor_input_row,
+            (2 + layout.cursor_col).min(columns.saturating_sub(1)),
+        )
+    };
     (frame, (cursor_row, cursor_col))
+}
+
+fn render_block_viewer(
+    state: &mut ViewState,
+    columns: usize,
+    rows: usize,
+) -> (Vec<String>, (usize, usize)) {
+    let Some(index) = state.transcript.selected_index() else {
+        state.transcript.close_viewer();
+        return build_frame(state, &Editor::default(), columns, rows);
+    };
+    let Some(entry) = state.transcript.entry(index) else {
+        state.transcript.close_viewer();
+        return build_frame(state, &Editor::default(), columns, rows);
+    };
+    let label = crate::subagent::sanitize_preview(entry.label(), 128);
+    let title = format!(
+        " {}{} {} · Esc close · y copy\x1b[0m",
+        foreground_color(state.accent_color),
+        label,
+        index + 1,
+    );
+    let body = render_entry(
+        entry,
+        columns,
+        true,
+        state.hide_reasoning,
+        state.accent_color,
+    )
+    .unwrap_or_default();
+    let body_height = rows.saturating_sub(2);
+    let total = body.len();
+    let max_scroll = total.saturating_sub(body_height);
+    state.scroll_offset = state.scroll_offset.min(max_scroll);
+    let end = total.saturating_sub(state.scroll_offset);
+    let start = end.saturating_sub(body_height);
+    let visible = &body[start..end];
+    let mut frame = Vec::with_capacity(rows);
+    frame.push(markdown::fit_width(&title, columns));
+    frame.extend(std::iter::repeat_n(
+        " ".repeat(columns),
+        body_height.saturating_sub(visible.len()),
+    ));
+    frame.extend(
+        visible
+            .iter()
+            .map(|line| markdown::fit_width(line, columns)),
+    );
+    frame.push(markdown::fit_width(
+        &format!(" \x1b[2m{end}/{total} lines\x1b[0m"),
+        columns,
+    ));
+    (frame, (rows, 1))
 }
 
 /// Compact token counts for the status bar: raw below 10,000, then 12.3k

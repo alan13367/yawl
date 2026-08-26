@@ -268,16 +268,42 @@ impl Update {
     }
 }
 
-pub(super) fn advance_ticks(state: &mut ViewState) {
-    state.copy_toast_ticks = state.copy_toast_ticks.saturating_sub(1);
-    state.spinner_tick = state.spinner_tick.wrapping_add(1);
+pub(super) fn advance_ticks(state: &mut ViewState) -> bool {
+    let mut changed = false;
+    if state.copy_toast_ticks > 0 {
+        state.copy_toast_ticks -= 1;
+        changed |= state.copy_toast_ticks == 0;
+    }
+    let has_active_subagent = state
+        .subagent_snapshots
+        .iter()
+        .any(|snapshot| snapshot.status.is_active());
+    let animate = super::render::loading_label(&state.activity).is_some()
+        || (state.transcript.is_empty()
+            && state.spinner_tick < super::render::WELCOME_ANIMATION_TICKS)
+        || state.subagent_view.is_some()
+        || has_active_subagent;
+    if animate {
+        state.spinner_tick = state.spinner_tick.wrapping_add(1);
+        changed = true;
+    }
     if state.scroll_bar_enabled && state.scroll_bar_auto_hide && state.scroll_bar_drag.is_none() {
         state.scroll_bar_idle_ticks = state.scroll_bar_idle_ticks.saturating_add(1);
-        if state.scroll_bar_idle_ticks >= SCROLL_BAR_AUTO_HIDE_TICKS {
+        if state.show_scroll_bar && state.scroll_bar_idle_ticks >= SCROLL_BAR_AUTO_HIDE_TICKS {
             state.show_scroll_bar = false;
+            changed = true;
         }
     }
     super::subagents::refresh(state);
+    if state.transcript.poll_search() {
+        changed = true;
+        if state.transcript.search_position().is_some()
+            && state.transcript.set_selected_expanded(true)
+        {
+            state.render_cache.invalidate();
+        }
+    }
+    changed
 }
 
 /// Re-shows the scroll bar and restarts its idle timer after scrolling
@@ -304,7 +330,8 @@ pub(super) fn scroll(state: &mut ViewState, amount: i32) {
 /// Thumb length and travel range for a viewport of `height` rows over
 /// `total_lines` of content.
 pub(super) fn scroll_bar_span(height: usize, total_lines: usize) -> (usize, usize) {
-    let length = (height * height / total_lines).clamp(1, height);
+    let minimum = height.min(3);
+    let length = (height * height / total_lines).clamp(minimum, height);
     (length, height - length)
 }
 
@@ -363,6 +390,8 @@ fn scroll_bar_jump(state: &mut ViewState, geometry: ScrollGeometry, row: usize, 
 }
 pub(super) fn toggle_tool_expansion(state: &mut ViewState) {
     state.tools_expanded = !state.tools_expanded;
+    state.transcript.clear_expansion_overrides();
+    state.render_cache.invalidate();
     state.scroll_offset = 0;
     state.activity = if state.tools_expanded {
         "tool output expanded".into()

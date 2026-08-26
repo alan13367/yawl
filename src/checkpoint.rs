@@ -1,10 +1,10 @@
-//! Per-session working-tree checkpoints for `/undo`.
+//! Per-session touched-file checkpoints for `/undo`.
 //!
-//! Snapshots live under `~/.yawl/checkpoints/<session-id>/` and do not use
-//! the project's git repository as the restore engine. When `git` is on
-//! PATH a shadow repository records the tree; otherwise files are copied.
-//! If the working directory is a git repo, the user's HEAD is recorded so
-//! `/undo` can reset it when the agent moved it.
+//! A turn starts with an empty record. Before `write_file` or `edit_file`
+//! runs, Yawl saves that path's pre-image under
+//! `~/.yawl/checkpoints/<session-id>/`. Untouched paths are never scanned or
+//! copied. If the working directory is a git repo, the user's HEAD is also
+//! recorded so `/undo` can reset it when the agent moved it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,48 +15,18 @@ use serde::{Deserialize, Serialize};
 use crate::error::Error;
 
 const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    ".yawl",
-    "target",
-    "node_modules",
-    "dist",
-    "build",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".next",
-    ".cache",
-];
-const EXCLUDE_FILE: &str = "\
-.git
-.yawl
-target
-node_modules
-dist
-build
-.venv
-venv
-__pycache__
-.DS_Store
-*.pyc
-.next
-.cache
-";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SnapshotKind {
-    Git,
-    Copy,
-}
+const STORE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum UserHead {
     None,
     Unborn,
-    Sha { sha: String },
+    Sha {
+        sha: String,
+        #[serde(default)]
+        staged: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,11 +38,20 @@ struct Overlay {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TurnRecord {
-    kind: SnapshotKind,
-    commit: Option<String>,
-    copy_rel: Option<String>,
     user_head: UserHead,
     overlays: Vec<Overlay>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredCheckpoints {
+    version: u32,
+    turns: Vec<TurnRecord>,
+}
+
+#[derive(Serialize)]
+struct StoredCheckpointsRef<'a> {
+    version: u32,
+    turns: &'a [TurnRecord],
 }
 
 #[derive(Debug, Default)]
@@ -82,116 +61,64 @@ pub struct RestoreReport {
     pub warning: Option<String>,
 }
 
-/// Stack of pre-turn snapshots for one session.
+/// Stack of touched-file restore points for one session.
 pub struct Checkpoints {
     dir: PathBuf,
     work_tree: PathBuf,
     stack: Vec<TurnRecord>,
-    git_available: bool,
 }
 
 impl Checkpoints {
     pub fn open(home_dir: &Path, session_id: &str, work_tree: PathBuf) -> Self {
         let dir = home_dir.join("checkpoints").join(session_id);
-        let stack = read_stack(&dir).unwrap_or_default();
+        let stack = match read_stack(&dir) {
+            Ok(Some(stack)) => stack,
+            Ok(None) if !dir.exists() => Vec::new(),
+            Ok(None) | Err(_) => {
+                let _ = fs::remove_dir_all(&dir);
+                Vec::new()
+            }
+        };
         Self {
             dir,
             work_tree,
             stack,
-            git_available: git_available(),
         }
-    }
-
-    #[cfg(test)]
-    fn open_with_git(
-        home_dir: &Path,
-        session_id: &str,
-        work_tree: PathBuf,
-        git_available: bool,
-    ) -> Self {
-        let mut checkpoints = Self::open(home_dir, session_id, work_tree);
-        checkpoints.git_available = git_available;
-        checkpoints
     }
 
     pub fn remove(home_dir: &Path, session_id: &str) {
         let _ = fs::remove_dir_all(home_dir.join("checkpoints").join(session_id));
     }
 
-    /// Records the current working tree as a restore point for the next turn.
+    /// Opens an empty touched-file restore point for the next turn.
     ///
     /// # Errors
     ///
-    /// Returns I/O or git errors when the snapshot cannot be written.
+    /// Returns I/O errors when the restore point cannot be written.
     pub fn snapshot(&mut self) -> Result<(), Error> {
         fs::create_dir_all(&self.dir)?;
-        let user_head = read_user_head(&self.work_tree);
         let index = self.stack.len();
-        let record = if self.git_available {
-            match self.snapshot_git(user_head.clone()) {
-                Ok(record) => record,
-                Err(_) => self.snapshot_copy(index, user_head)?,
-            }
-        } else {
-            self.snapshot_copy(index, user_head)?
+        let _ = fs::remove_dir_all(self.dir.join("overlays").join(index.to_string()));
+        let record = TurnRecord {
+            user_head: read_user_head(&self.work_tree),
+            overlays: Vec::new(),
         };
         self.stack.push(record);
         persist_stack(&self.dir, &self.stack)
     }
 
-    fn snapshot_git(&self, user_head: UserHead) -> Result<TurnRecord, Error> {
-        let git_dir = self.git_dir();
-        ensure_shadow_repo(&git_dir, &self.work_tree)?;
-        shadow_git(&git_dir, &self.work_tree, &["add", "-A"])?;
-        shadow_git(
-            &git_dir,
-            &self.work_tree,
-            &["commit", "--allow-empty", "-m", "checkpoint"],
-        )?;
-        let commit = shadow_git(&git_dir, &self.work_tree, &["rev-parse", "HEAD"])?
-            .trim()
-            .to_string();
-        Ok(TurnRecord {
-            kind: SnapshotKind::Git,
-            commit: Some(commit),
-            copy_rel: None,
-            user_head,
-            overlays: Vec::new(),
-        })
-    }
-
-    fn snapshot_copy(&self, index: usize, user_head: UserHead) -> Result<TurnRecord, Error> {
-        let rel = format!("copies/{index}");
-        let dest = self.dir.join(&rel);
-        let _ = fs::remove_dir_all(&dest);
-        copy_tree(&self.work_tree, &dest)?;
-        Ok(TurnRecord {
-            kind: SnapshotKind::Copy,
-            commit: None,
-            copy_rel: Some(rel),
-            user_head,
-            overlays: Vec::new(),
-        })
-    }
-
-    fn git_dir(&self) -> PathBuf {
-        self.dir.join("shadow.git")
-    }
-
-    /// Saves the pre-image of a `write_file`/`edit_file` path when it lies
-    /// outside the snapshot root. No-op when there is no current turn.
+    /// Saves the first pre-image of a `write_file`/`edit_file` path in this
+    /// turn. No-op when there is no current turn or the path was already saved.
     ///
     /// # Errors
     ///
-    /// Returns I/O errors while reading or storing the overlay.
+    /// Returns I/O errors while reading or storing the pre-image, or a protocol
+    /// error when the target is not a regular file or exceeds the size limit.
     pub fn remember_path(&mut self, path: &Path) -> Result<(), Error> {
         let Some(index) = self.stack.len().checked_sub(1) else {
             return Ok(());
         };
         let abs = absolute(path, &self.work_tree);
-        if is_inside(&abs, &self.work_tree) {
-            return Ok(());
-        }
         let path_str = abs.to_string_lossy().into_owned();
         let overlay_count = self.stack[index].overlays.len();
         if self.stack[index]
@@ -207,12 +134,24 @@ impl Checkpoints {
             fs::create_dir_all(parent)?;
         }
         let existed = match fs::metadata(&abs) {
-            Ok(meta) if meta.len() > MAX_FILE_BYTES => return Ok(()),
-            Ok(_) => {
+            Ok(meta) if meta.len() > MAX_FILE_BYTES => {
+                return Err(Error::Protocol(format!(
+                    "{} exceeds the 32 MiB /undo file limit",
+                    abs.display()
+                )));
+            }
+            Ok(meta) if meta.is_file() => {
                 fs::copy(&abs, &dest)?;
                 true
             }
-            Err(_) => false,
+            Ok(_) => {
+                return Err(Error::Protocol(format!(
+                    "{} is not a regular file",
+                    abs.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
         };
         self.stack[index].overlays.push(Overlay {
             path: path_str,
@@ -230,6 +169,7 @@ impl Checkpoints {
     /// Returns I/O errors while updating the stack file. Restore failures are
     /// reported on [`RestoreReport::warning`] so messages can still be dropped.
     pub fn restore_last(&mut self) -> Result<RestoreReport, Error> {
+        let turn_index = self.stack.len().checked_sub(1);
         let Some(turn) = self.stack.pop() else {
             return Ok(RestoreReport::default());
         };
@@ -239,38 +179,24 @@ impl Checkpoints {
             reset_head: false,
             warning: None,
         };
-        if let UserHead::Sha { sha } = &turn.user_head {
+        let mut staged_to_restore = None;
+        if let UserHead::Sha { sha, staged } = &turn.user_head {
             let current = read_user_head(&self.work_tree);
-            if let UserHead::Sha { sha: current_sha } = current
+            if let UserHead::Sha {
+                sha: current_sha, ..
+            } = current
                 && current_sha != *sha
             {
-                match user_git(
-                    &self.work_tree,
-                    &["-c", "core.hooksPath=/dev/null", "reset", "--hard", sha],
-                ) {
-                    Ok(_) => report.reset_head = true,
+                match prepare_user_head_restore(&self.work_tree, sha) {
+                    Ok(()) => {
+                        report.reset_head = true;
+                        staged_to_restore = Some(staged.as_slice());
+                    }
                     Err(error) => {
                         report.warning = Some(format!("could not reset git HEAD: {error}"));
                     }
                 }
             }
-        }
-        let file_result = match turn.kind {
-            SnapshotKind::Git => match turn.commit.as_deref() {
-                Some(commit) => restore_git(&self.git_dir(), &self.work_tree, commit),
-                None => Err(Error::Protocol("checkpoint is missing a git commit".into())),
-            },
-            SnapshotKind::Copy => match turn.copy_rel.as_deref() {
-                Some(rel) => restore_copy(&self.dir.join(rel), &self.work_tree),
-                None => Err(Error::Protocol("checkpoint is missing a copy tree".into())),
-            },
-        };
-        if let Err(error) = file_result {
-            report.restored = false;
-            report.warning = Some(match report.warning.take() {
-                Some(existing) => format!("{existing}; {error}"),
-                None => error.to_string(),
-            });
         }
         for overlay in &turn.overlays {
             if let Err(error) = restore_overlay(&self.dir, overlay) {
@@ -280,6 +206,18 @@ impl Checkpoints {
                     None => detail,
                 });
             }
+        }
+        if let Some(staged) = staged_to_restore
+            && let Err(error) = restore_staged_paths(&self.work_tree, staged)
+        {
+            let detail = format!("could not restore staged paths: {error}");
+            report.warning = Some(match report.warning.take() {
+                Some(existing) => format!("{existing}; {detail}"),
+                None => detail,
+            });
+        }
+        if let Some(index) = turn_index {
+            let _ = fs::remove_dir_all(self.dir.join("overlays").join(index.to_string()));
         }
         Ok(report)
     }
@@ -294,22 +232,34 @@ pub fn mutating_tool_path(name: &str, args_json: &str) -> Option<PathBuf> {
     value.get("path")?.as_str().map(PathBuf::from)
 }
 
-fn read_stack(dir: &Path) -> Result<Vec<TurnRecord>, Error> {
+fn read_stack(dir: &Path) -> Result<Option<Vec<TurnRecord>>, Error> {
     let path = dir.join("stack.json");
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    Ok(serde_json::from_slice(&bytes)?)
+    let stored: StoredCheckpoints = serde_json::from_slice(&bytes)?;
+    if stored.version != STORE_VERSION {
+        return Err(Error::Protocol(format!(
+            "unsupported checkpoint store version {}",
+            stored.version
+        )));
+    }
+    Ok(Some(stored.turns))
 }
 
 fn persist_stack(dir: &Path, stack: &[TurnRecord]) -> Result<(), Error> {
     fs::create_dir_all(dir)?;
-    fs::write(dir.join("stack.json"), serde_json::to_vec(stack)?)?;
+    let stored = StoredCheckpointsRef {
+        version: STORE_VERSION,
+        turns: stack,
+    };
+    fs::write(dir.join("stack.json"), serde_json::to_vec(&stored)?)?;
     Ok(())
 }
 
+#[cfg(test)]
 fn git_available() -> bool {
     Command::new("git")
         .arg("--version")
@@ -318,43 +268,6 @@ fn git_available() -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
-}
-
-fn ensure_shadow_repo(git_dir: &Path, work_tree: &Path) -> Result<(), Error> {
-    if !git_dir.join("HEAD").exists() {
-        fs::create_dir_all(git_dir)?;
-        shadow_git(git_dir, work_tree, &["init", "--template="])?;
-        let info = git_dir.join("info");
-        fs::create_dir_all(&info)?;
-        fs::write(info.join("exclude"), EXCLUDE_FILE)?;
-    }
-    Ok(())
-}
-
-fn restore_git(git_dir: &Path, work_tree: &Path, commit: &str) -> Result<(), Error> {
-    let restored = shadow_git(
-        git_dir,
-        work_tree,
-        &[
-            "restore",
-            "--source",
-            commit,
-            "--worktree",
-            "--staged",
-            "--",
-            ".",
-        ],
-    );
-    if restored.is_err() {
-        shadow_git(git_dir, work_tree, &["checkout", "-f", commit, "--", "."])?;
-    }
-    let _ = shadow_git(git_dir, work_tree, &["clean", "-fd"]);
-    Ok(())
-}
-
-fn restore_copy(snapshot: &Path, work_tree: &Path) -> Result<(), Error> {
-    remove_untracked(work_tree, snapshot, work_tree)?;
-    copy_tree(snapshot, work_tree)
 }
 
 fn restore_overlay(dir: &Path, overlay: &Overlay) -> Result<(), Error> {
@@ -374,101 +287,6 @@ fn restore_overlay(dir: &Path, overlay: &Overlay) -> Result<(), Error> {
     Ok(())
 }
 
-fn copy_tree(src: &Path, dest: &Path) -> Result<(), Error> {
-    fs::create_dir_all(dest)?;
-    copy_walk(src, src, dest)
-}
-
-fn copy_walk(src_root: &Path, current: &Path, dest_root: &Path) -> Result<(), Error> {
-    let entries = match fs::read_dir(current) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        if skip_dir(name_str) {
-            continue;
-        }
-        let path = entry.path();
-        let meta = match fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        if meta.is_dir() {
-            copy_walk(src_root, &path, dest_root)?;
-            continue;
-        }
-        if skip_file(name_str) || meta.len() > MAX_FILE_BYTES {
-            continue;
-        }
-        let rel = path.strip_prefix(src_root).unwrap_or(&path);
-        let dest = dest_root.join(rel);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(&path, &dest)?;
-    }
-    Ok(())
-}
-
-fn remove_untracked(current: &Path, snapshot: &Path, work_tree: &Path) -> Result<(), Error> {
-    let entries = match fs::read_dir(current) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        if skip_dir(name_str) {
-            continue;
-        }
-        let path = entry.path();
-        let meta = match fs::symlink_metadata(&path) {
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        let rel = path.strip_prefix(work_tree).unwrap_or(&path);
-        let snap_path = snapshot.join(rel);
-        if meta.is_dir() {
-            remove_untracked(&path, snapshot, work_tree)?;
-            if !snap_path.exists() {
-                let _ = fs::remove_dir(&path);
-            }
-            continue;
-        }
-        if skip_file(name_str) {
-            continue;
-        }
-        if !snap_path.exists() {
-            fs::remove_file(&path)?;
-        }
-    }
-    Ok(())
-}
-
-fn skip_dir(name: &str) -> bool {
-    SKIP_DIRS.contains(&name)
-}
-
-fn skip_file(name: &str) -> bool {
-    name == ".DS_Store" || name.ends_with(".pyc")
-}
-
 fn absolute(path: &Path, cwd: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -477,51 +295,60 @@ fn absolute(path: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
-fn is_inside(path: &Path, root: &Path) -> bool {
-    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let resolved = if path.exists() {
-        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    } else if let Some(parent) = path.parent().filter(|parent| parent.exists()) {
-        let file_name = path.file_name().unwrap_or_default();
-        fs::canonicalize(parent)
-            .unwrap_or_else(|_| parent.to_path_buf())
-            .join(file_name)
-    } else {
-        path.to_path_buf()
-    };
-    resolved.starts_with(&root)
-}
-
 fn read_user_head(work_tree: &Path) -> UserHead {
-    match user_git(work_tree, &["rev-parse", "--is-inside-work-tree"]) {
-        Ok(value) if value.trim() == "true" => {}
-        _ => return UserHead::None,
-    }
-    match user_git(work_tree, &["rev-parse", "--verify", "HEAD"]) {
+    let Ok(root) = git_root(work_tree) else {
+        return UserHead::None;
+    };
+    match user_git(&root, &["rev-parse", "--verify", "HEAD"]) {
         Ok(sha) => UserHead::Sha {
             sha: sha.trim().to_string(),
+            staged: match user_git(&root, &["diff", "--cached", "--name-only", "-z"]) {
+                Ok(paths) => paths
+                    .split('\0')
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                Err(_) => Vec::new(),
+            },
         },
         Err(_) => UserHead::Unborn,
     }
 }
 
-fn shadow_git(git_dir: &Path, work_tree: &Path, args: &[&str]) -> Result<String, Error> {
+fn git_root(work_tree: &Path) -> Result<PathBuf, Error> {
+    let root = user_git(work_tree, &["rev-parse", "--show-toplevel"])?;
+    let root = root.trim();
+    if root.is_empty() {
+        return Err(Error::Protocol(
+            "git returned an empty work-tree root".into(),
+        ));
+    }
+    Ok(PathBuf::from(root))
+}
+
+fn prepare_user_head_restore(work_tree: &Path, sha: &str) -> Result<(), Error> {
+    let root = git_root(work_tree)?;
+    user_git(
+        &root,
+        &["-c", "core.hooksPath=/dev/null", "reset", "--soft", sha],
+    )?;
+    user_git(&root, &["reset", "--", "."])?;
+    Ok(())
+}
+
+fn restore_staged_paths(work_tree: &Path, staged: &[String]) -> Result<(), Error> {
+    if staged.is_empty() {
+        return Ok(());
+    }
+    let root = git_root(work_tree)?;
     run_git(
         Command::new("git")
-            .arg("-c")
-            .arg("user.name=yawl")
-            .arg("-c")
-            .arg("user.email=yawl@localhost")
-            .arg("-c")
-            .arg("commit.gpgsign=false")
-            .arg("-c")
-            .arg("init.defaultBranch=yawl")
-            .arg("--git-dir")
-            .arg(git_dir)
-            .arg("--work-tree")
-            .arg(work_tree)
-            .args(args),
-    )
+            .arg("-C")
+            .arg(root)
+            .args(["add", "--"])
+            .args(staged),
+    )?;
+    Ok(())
 }
 
 fn user_git(work_tree: &Path, args: &[&str]) -> Result<String, Error> {
@@ -593,15 +420,38 @@ mod tests {
     }
 
     #[test]
-    fn copy_fallback_restores_create_modify_and_delete() -> Result<(), Error> {
-        let root = temp_root("copy");
+    fn versioned_store_round_trips_current_turns() -> Result<(), Error> {
+        let root = temp_root("versioned-store");
+        let home = root.join("home");
+        let work = root.join("work");
+        fs::create_dir_all(&work)?;
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
+        checkpoints.snapshot()?;
+
+        let reopened = Checkpoints::open(&home, "sess", work);
+
+        assert_eq!(reopened.stack.len(), 1);
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(home.join("checkpoints/sess/stack.json"))?)?;
+        assert_eq!(stored["version"], STORE_VERSION);
+        assert_eq!(stored["turns"].as_array().map(Vec::len), Some(1));
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn touched_files_restore_create_modify_and_delete() -> Result<(), Error> {
+        let root = temp_root("touched-files");
         let home = root.join("home");
         let work = root.join("work");
         write(&work.join("keep.txt"), "keep");
         write(&work.join("edit.txt"), "before");
         write(&work.join("gone.txt"), "delete-me");
-        let mut checkpoints = Checkpoints::open_with_git(&home, "sess", work.clone(), false);
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
         checkpoints.snapshot()?;
+        checkpoints.remember_path(&work.join("edit.txt"))?;
+        checkpoints.remember_path(&work.join("gone.txt"))?;
+        checkpoints.remember_path(&work.join("new.txt"))?;
 
         write(&work.join("edit.txt"), "after");
         write(&work.join("new.txt"), "created");
@@ -619,22 +469,95 @@ mod tests {
     }
 
     #[test]
-    fn copy_fallback_skips_target_dir() -> Result<(), Error> {
-        let root = temp_root("skip-target");
+    fn untouched_files_are_left_alone() -> Result<(), Error> {
+        let root = temp_root("untouched");
         let home = root.join("home");
         let work = root.join("work");
         write(&work.join("src.rs"), "src");
         write(&work.join("target/built"), "artifact");
-        let mut checkpoints = Checkpoints::open_with_git(&home, "sess", work.clone(), false);
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
         checkpoints.snapshot()?;
         write(&work.join("src.rs"), "changed");
         write(&work.join("target/built"), "new-artifact");
         checkpoints.restore_last()?;
-        assert_eq!(fs::read_to_string(work.join("src.rs"))?, "src");
+        assert_eq!(fs::read_to_string(work.join("src.rs"))?, "changed");
         assert_eq!(
             fs::read_to_string(work.join("target/built"))?,
             "new-artifact"
         );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_checkpoint_does_not_walk_unmodified_socket() -> Result<(), Error> {
+        use std::os::unix::net::UnixListener;
+
+        let root = std::env::temp_dir().join(format!("ys-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let work = root.join("work");
+        fs::create_dir_all(&work)?;
+        let _socket = UnixListener::bind(work.join("server.sock"))?;
+        let mut checkpoints = Checkpoints::open(&home, "sess", work);
+
+        let result = checkpoints.snapshot();
+
+        assert!(result.is_ok(), "checkpoint failed: {result:?}");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn remembered_work_tree_file_records_one_preimage() -> Result<(), Error> {
+        let root = temp_root("work-tree-preimage");
+        let home = root.join("home");
+        let work = root.join("work");
+        let file = work.join("note.txt");
+        write(&file, "before");
+        let mut checkpoints = Checkpoints::open(&home, "sess", work);
+        checkpoints.snapshot()?;
+
+        checkpoints.remember_path(&file)?;
+
+        assert_eq!(checkpoints.stack[0].overlays.len(), 1);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn open_discards_orphaned_legacy_snapshot_data() -> Result<(), Error> {
+        let root = temp_root("legacy-orphan");
+        let home = root.join("home");
+        let work = root.join("work");
+        let checkpoint_dir = home.join("checkpoints/sess");
+        write(&checkpoint_dir.join("shadow.git/objects/orphan"), "git");
+        write(&checkpoint_dir.join("copies/0/orphan"), "copy");
+        fs::create_dir_all(&work)?;
+
+        let checkpoints = Checkpoints::open(&home, "sess", work);
+
+        assert!(checkpoints.stack.is_empty());
+        assert!(!checkpoint_dir.exists());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn open_discards_legacy_array_store() -> Result<(), Error> {
+        let root = temp_root("legacy-array");
+        let home = root.join("home");
+        let work = root.join("work");
+        let checkpoint_dir = home.join("checkpoints/sess");
+        write(&checkpoint_dir.join("stack.json"), "[]");
+        write(&checkpoint_dir.join("shadow.git/objects/legacy"), "git");
+        fs::create_dir_all(&work)?;
+
+        let checkpoints = Checkpoints::open(&home, "sess", work);
+
+        assert!(checkpoints.stack.is_empty());
+        assert!(!checkpoint_dir.exists());
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
@@ -647,7 +570,7 @@ mod tests {
         fs::create_dir_all(&work)?;
         let outside = root.join("outside.txt");
         write(&outside, "original");
-        let mut checkpoints = Checkpoints::open_with_git(&home, "sess", work.clone(), false);
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
         checkpoints.snapshot()?;
         checkpoints.remember_path(&outside)?;
         write(&outside, "mutated");
@@ -664,8 +587,7 @@ mod tests {
     #[test]
     fn restore_without_snapshot_is_a_no_op() -> Result<(), Error> {
         let root = temp_root("empty");
-        let mut checkpoints =
-            Checkpoints::open_with_git(&root.join("home"), "sess", root.join("work"), false);
+        let mut checkpoints = Checkpoints::open(&root.join("home"), "sess", root.join("work"));
         let report = checkpoints.restore_last()?;
         assert!(!report.restored);
         let _ = fs::remove_dir_all(root);
@@ -673,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn git_shadow_restores_files_and_resets_moved_head() -> Result<(), Error> {
+    fn touched_files_restore_after_agent_moves_git_head() -> Result<(), Error> {
         if !git_available() {
             return Ok(());
         }
@@ -699,8 +621,10 @@ mod tests {
         write(&work.join("dirty.txt"), "user-dirty");
         let original_head = user_git(&work, &["rev-parse", "HEAD"])?.trim().to_string();
 
-        let mut checkpoints = Checkpoints::open_with_git(&home, "sess", work.clone(), true);
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
         checkpoints.snapshot()?;
+        checkpoints.remember_path(&work.join("tracked.txt"))?;
+        checkpoints.remember_path(&work.join("added.txt"))?;
         write(&work.join("tracked.txt"), "agent");
         write(&work.join("added.txt"), "new");
         user_git(&work, &["add", "-A"])?;
@@ -732,6 +656,122 @@ mod tests {
     }
 
     #[test]
+    fn git_head_restore_recreates_preturn_staged_paths() -> Result<(), Error> {
+        if !git_available() {
+            return Ok(());
+        }
+        let root = temp_root("git-staged");
+        let home = root.join("home");
+        let work = root.join("work");
+        fs::create_dir_all(&work)?;
+        write(&work.join("staged.txt"), "base staged");
+        write(&work.join("unstaged.txt"), "base unstaged");
+        user_git(&work, &["init", "--template="])?;
+        user_git(&work, &["add", "staged.txt", "unstaged.txt"])?;
+        run_git(
+            Command::new("git")
+                .arg("-C")
+                .arg(&work)
+                .arg("-c")
+                .arg("user.name=yawl")
+                .arg("-c")
+                .arg("user.email=yawl@localhost")
+                .arg("-c")
+                .arg("commit.gpgsign=false")
+                .args(["commit", "-m", "base"]),
+        )?;
+        let original_head = user_git(&work, &["rev-parse", "HEAD"])?.trim().to_string();
+        write(&work.join("staged.txt"), "user staged");
+        user_git(&work, &["add", "staged.txt"])?;
+        write(&work.join("unstaged.txt"), "user unstaged");
+
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
+        checkpoints.snapshot()?;
+        checkpoints.remember_path(&work.join("staged.txt"))?;
+        checkpoints.remember_path(&work.join("unstaged.txt"))?;
+        write(&work.join("staged.txt"), "agent staged");
+        write(&work.join("unstaged.txt"), "agent unstaged");
+        user_git(&work, &["add", "-A"])?;
+        run_git(
+            Command::new("git")
+                .arg("-C")
+                .arg(&work)
+                .arg("-c")
+                .arg("user.name=yawl")
+                .arg("-c")
+                .arg("user.email=yawl@localhost")
+                .arg("-c")
+                .arg("commit.gpgsign=false")
+                .args(["commit", "-m", "agent"]),
+        )?;
+
+        let report = checkpoints.restore_last()?;
+
+        assert!(report.restored);
+        assert!(report.reset_head);
+        assert_eq!(
+            user_git(&work, &["rev-parse", "HEAD"])?.trim(),
+            original_head
+        );
+        assert_eq!(fs::read_to_string(work.join("staged.txt"))?, "user staged");
+        assert_eq!(
+            fs::read_to_string(work.join("unstaged.txt"))?,
+            "user unstaged"
+        );
+        assert_eq!(
+            user_git(&work, &["diff", "--cached", "--name-only"])?.trim(),
+            "staged.txt"
+        );
+        assert_eq!(
+            user_git(&work, &["diff", "--name-only"])?.trim(),
+            "unstaged.txt"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn git_head_is_kept_when_staged_listing_fails() -> Result<(), Error> {
+        if !git_available() {
+            return Ok(());
+        }
+        let root = temp_root("git-index-fail");
+        let home = root.join("home");
+        let work = root.join("work");
+        fs::create_dir_all(&work)?;
+        write(&work.join("tracked.txt"), "v1");
+        user_git(&work, &["init", "--template="])?;
+        user_git(&work, &["add", "tracked.txt"])?;
+        run_git(
+            Command::new("git")
+                .arg("-C")
+                .arg(&work)
+                .arg("-c")
+                .arg("user.name=yawl")
+                .arg("-c")
+                .arg("user.email=yawl@localhost")
+                .arg("-c")
+                .arg("commit.gpgsign=false")
+                .args(["commit", "-m", "init"]),
+        )?;
+        let original_head = user_git(&work, &["rev-parse", "HEAD"])?.trim().to_string();
+        fs::write(work.join(".git/index"), b"not a git index")?;
+
+        let mut checkpoints = Checkpoints::open(&home, "sess", work);
+        checkpoints.snapshot()?;
+
+        match &checkpoints.stack[0].user_head {
+            UserHead::Sha { sha, staged } => {
+                assert_eq!(sha, &original_head);
+                assert!(staged.is_empty());
+            }
+            other => panic!("expected recorded HEAD, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn unborn_head_skips_reset() -> Result<(), Error> {
         if !git_available() {
             return Ok(());
@@ -742,8 +782,9 @@ mod tests {
         fs::create_dir_all(&work)?;
         user_git(&work, &["init", "--template="])?;
         write(&work.join("file.txt"), "before");
-        let mut checkpoints = Checkpoints::open_with_git(&home, "sess", work.clone(), true);
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
         checkpoints.snapshot()?;
+        checkpoints.remember_path(&work.join("file.txt"))?;
         write(&work.join("file.txt"), "after");
         let report = checkpoints.restore_last()?;
         assert!(report.restored);

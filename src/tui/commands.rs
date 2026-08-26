@@ -37,8 +37,11 @@ Input
     Type / for commands; Up/Down select, Tab completes, and Enter runs the selected
     command or an exact name such as /copy.
   Model and settings pickers remain available during an active response.
-  Messages submitted during a response appear below it as queued.
+  Messages submitted during a response appear below it as queued. /unqueue opens
+    an editor: K/J reorder, e edits, d deletes, and Enter stops the turn to send.
   Outside the menu, Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
+  Tab focuses transcript blocks. Up/Down move, Left/Right fold, Enter opens,
+    y copies, and Esc returns to the editor. Ctrl+F searches the transcript.
   Ctrl+O expands or collapses tool output. Esc or Ctrl+C aborts the active turn.
    Mouse wheel and PageUp/PageDown scroll. Click or drag the right-edge
    scroll bar to move through the transcript. Drag selects text; release copies it.
@@ -79,7 +82,7 @@ pub(super) fn queue_picker(state: &ViewState, selected: usize) -> Option<Picker>
         .map(|(index, input)| PickerItem {
             label: format!("Queued {}", index + 1),
             description: input.replace('\n', " "),
-            action: PickerAction::RemoveQueued(index),
+            action: PickerAction::SendQueued(index),
         })
         .collect::<Vec<_>>();
     items.push(PickerItem {
@@ -89,7 +92,7 @@ pub(super) fn queue_picker(state: &ViewState, selected: usize) -> Option<Picker>
     });
     Some(Picker {
         title: "Queued messages".into(),
-        hint: "↑/↓ move  Enter remove  Esc close".into(),
+        hint: "↑/↓ select  K/J reorder  e edit  d delete  Enter send now".into(),
         selected: selected.min(items.len().saturating_sub(1)),
         items,
         editing: None,
@@ -125,6 +128,35 @@ pub(super) fn clear_queued(state: &mut ViewState) {
     state.scroll_offset = 0;
 }
 
+pub(super) fn move_queued(state: &mut ViewState, index: usize, direction: isize) -> usize {
+    if state.queued_inputs.is_empty() || index >= state.queued_inputs.len() {
+        return index;
+    }
+    let target = if direction < 0 {
+        index.saturating_sub(direction.unsigned_abs())
+    } else {
+        index
+            .saturating_add(direction as usize)
+            .min(state.queued_inputs.len() - 1)
+    };
+    if target != index
+        && let Some(input) = state.queued_inputs.remove(index)
+    {
+        state.queued_inputs.insert(target, input);
+        state.activity = format!("moved queued message {} to {}", index + 1, target + 1);
+    }
+    target
+}
+
+pub(super) fn promote_queued(state: &mut ViewState, index: usize) -> bool {
+    if index >= state.queued_inputs.len() {
+        return false;
+    }
+    let _ = move_queued(state, index, -(index as isize));
+    state.activity = "stopping the active turn to send queued message".into();
+    true
+}
+
 pub(super) fn unqueue(argument: &str, state: &mut ViewState) {
     match argument {
         "" => open_queue_picker(state),
@@ -147,6 +179,19 @@ pub(super) fn handle_queue_picker_action(
     action: PickerAction,
 ) -> Option<PickerAction> {
     match action {
+        PickerAction::ApplyQueued { index, value } => {
+            if let Some(input) = state.queued_inputs.get_mut(index) {
+                *input = value;
+                state.activity = format!("updated queued message {}", index + 1);
+            }
+            state.picker = queue_picker(state, index);
+            None
+        }
+        PickerAction::MoveQueued { index, direction } => {
+            let selected = move_queued(state, index, direction);
+            state.picker = queue_picker(state, selected);
+            None
+        }
         PickerAction::RemoveQueued(index) => {
             if remove_queued(state, index) {
                 state.picker = queue_picker(state, index);
@@ -273,6 +318,11 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::ResumeSession(id) => load_session(agent, &id, state),
+        PickerAction::DeleteSession(id) => delete_session(agent, &id, state),
+        PickerAction::OpenResume { selected } => {
+            open_resume_picker(agent, state);
+            select_picker_item(state, selected);
+        }
         PickerAction::ApplySetting { argument, selected } => {
             if settings(agent, &argument, state) {
                 open_settings_picker(agent, state);
@@ -307,7 +357,13 @@ pub(super) fn activate_picker_action(
         }
         PickerAction::ShowSettings => show_settings(agent, state),
         PickerAction::EditSetting { .. } | PickerAction::EditModel { .. } => {}
-        PickerAction::RemoveQueued(_) | PickerAction::ClearQueued => {}
+        PickerAction::SendQueued(index) => {
+            let _ = promote_queued(state, index);
+        }
+        PickerAction::ApplyQueued { .. }
+        | PickerAction::MoveQueued { .. }
+        | PickerAction::RemoveQueued(_)
+        | PickerAction::ClearQueued => {}
     }
     state.refresh_completions(agent);
 }
@@ -596,12 +652,13 @@ pub(super) fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
         }
     };
     if sessions.is_empty() {
+        state.picker = None;
         state.notice("No saved sessions for this directory.");
         return;
     }
     state.picker = Some(Picker {
         title: "Resume session".into(),
-        hint: "↑/↓ move  Enter resume  Esc cancel".into(),
+        hint: "↑/↓ move  Enter resume  d delete…  Esc cancel".into(),
         selected: 0,
         items: sessions
             .into_iter()
@@ -863,5 +920,47 @@ pub(super) fn load_session(agent: &mut Agent, id: &str, state: &mut ViewState) {
             state.notice(format!("Resumed session {id}."));
         }
         Err(error) => state.notice(format!("Could not resume '{id}': {error}")),
+    }
+}
+
+pub(super) fn delete_session(agent: &mut Agent, id: &str, state: &mut ViewState) {
+    let selected = state
+        .picker
+        .as_ref()
+        .map(|picker| picker.selected)
+        .unwrap_or(0);
+    let deleting_current = agent.session_id() == id;
+    match agent.delete_session(id) {
+        Ok(()) => {
+            if deleting_current {
+                let queued_inputs = std::mem::take(&mut state.queued_inputs);
+                let pending_actions = std::mem::take(&mut state.pending_actions);
+                *state = ViewState::from_agent(agent);
+                state.queued_inputs = queued_inputs;
+                state.pending_actions = pending_actions;
+            }
+            let cwd = crate::config::working_dir();
+            let dirs = agent.config().session_dirs(&cwd);
+            match crate::session::list(&dirs.project) {
+                Ok(sessions) if sessions.is_empty() => {
+                    state.picker = None;
+                    state.notice(format!("Deleted session {id}. No saved sessions left."));
+                }
+                Ok(_) => {
+                    open_resume_picker(agent, state);
+                    if let Some(picker) = state.picker.as_mut() {
+                        picker.selected = selected.min(picker.items.len().saturating_sub(1));
+                    }
+                    state.notice(format!("Deleted session {id}."));
+                }
+                Err(error) => {
+                    state.picker = None;
+                    state.notice(format!(
+                        "Deleted session {id}. Could not refresh the list: {error}"
+                    ));
+                }
+            }
+        }
+        Err(error) => state.notice(format!("Could not delete '{id}': {error}")),
     }
 }

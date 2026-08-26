@@ -81,6 +81,7 @@ Tools:
         };
         prompt.push_str(r#"
 <subagent_guidance>
+- Before the first subagent_spawn for a user request, inspect the working directory yourself with a quick local check: identify the repository root, list the top-level files, detect an empty or uninitialized directory, and read applicable instructions. Decide whether delegation is useful only after this check. Do not spawn Scout just to discover the layout or that the directory is empty.
 - Delegate only self-contained work. Include paths, constraints, file ownership, and expected output.
 - Give concurrent agents disjoint editing scopes. Spawn them in the background and keep working.
 "#);
@@ -234,6 +235,22 @@ mod tests {
             child.contains("Project-wide validation is the parent's job"),
             "the mid-flight validation ban must reach the child"
         );
+    }
+
+    #[test]
+    fn subagent_guidance_requires_a_local_repository_check_before_delegation() {
+        let dirs = TestDirs::new();
+        let prompt = build_system_prompt_from(Some(&dirs.0), &dirs.0, true, false, false, None);
+        let local_check = prompt
+            .find("Before the first subagent_spawn")
+            .expect("the parent must check the working directory before spawning");
+        let delegation = prompt
+            .find("Delegate only self-contained work")
+            .expect("the delegation guidance should be present");
+
+        assert!(local_check < delegation);
+        assert!(prompt.contains("detect an empty or uninitialized directory"));
+        assert!(prompt.contains("Do not spawn Scout just to discover the layout"));
     }
 
     #[test]

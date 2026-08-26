@@ -214,3 +214,19 @@ fn escape_and_ctrl_c_cancel_an_active_turn() {
     assert!(is_cancel_key(Key::Ctrl('c')));
     assert!(!is_cancel_key(Key::Enter));
 }
+
+#[test]
+fn submitted_long_paste_is_expanded_before_transcript_display() {
+    let prompt = "long prompt ".repeat(400);
+    let mut editor = Editor::default();
+    editor.paste(&prompt);
+    let EditAction::Submit(input) = editor.handle_key(Key::Enter) else {
+        panic!("the non-empty editor should submit");
+    };
+
+    let displayed_input = displayed_submission(&editor, &input);
+    let mut transcript = Transcript::from_messages(&[]);
+    transcript.push_user(displayed_input);
+
+    assert_eq!(transcript.entries(), &[Entry::User(prompt)]);
+}

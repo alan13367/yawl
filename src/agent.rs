@@ -275,11 +275,12 @@ impl Conversation {
     pub fn reset(&mut self) -> Result<(), Error> {
         let cwd = crate::config::working_dir();
         let dirs = self.config.session_dirs(&cwd);
+        let old_id = self.session.id.clone();
+        let abandon_empty = !crate::session::has_message(&dirs.project, &old_id);
         let session = Session::create(&dirs.project, &cwd, &self.model)?;
         if let Some(manager) = &self.subagents {
             manager.shutdown_and_discard();
         }
-        let old_id = self.session.id.clone();
         self.subagents = Some(SubagentManager::new(
             session.id.clone(),
             self.config.max_subagents,
@@ -289,12 +290,47 @@ impl Conversation {
         self.context_tokens = 0;
         self.latest_turn_result.clear();
         Checkpoints::remove(&self.config.home_dir, &old_id);
+        if abandon_empty {
+            let _ = Session::delete(&dirs.project, &old_id);
+        }
         self.checkpoints = Some(Checkpoints::open(
             &self.config.home_dir,
             self.session.id.as_str(),
             cwd,
         ));
         Ok(())
+    }
+
+    /// Deletes a saved session. If it is the active session, starts a fresh one.
+    pub fn delete_session(&mut self, id: &str) -> Result<(), Error> {
+        let cwd = crate::config::working_dir();
+        let dirs = self.config.session_dirs(&cwd);
+        if self.session.id == id {
+            let deleted_id = id.to_string();
+            self.reset()?;
+            // `reset` only removes an abandoned empty log; always unlink here.
+            Session::delete(&dirs.project, &deleted_id)?;
+            Checkpoints::remove(&self.config.home_dir, &deleted_id);
+        } else {
+            Session::delete(&dirs.project, id)?;
+            Checkpoints::remove(&self.config.home_dir, id);
+        }
+        Ok(())
+    }
+
+    /// Removes the current session log when it never received a turn.
+    pub fn discard_if_empty(&mut self) -> Result<bool, Error> {
+        let cwd = crate::config::working_dir();
+        let dirs = self.config.session_dirs(&cwd);
+        let id = self.session.id.clone();
+        if !self.messages.is_empty() || crate::session::has_message(&dirs.project, &id) {
+            return Ok(false);
+        }
+        // Drop the open file handle before unlinking.
+        self.session = Journal::memory(id.clone());
+        Session::delete(&dirs.project, &id)?;
+        Checkpoints::remove(&self.config.home_dir, &id);
+        Ok(true)
     }
 
     /// Replaces the conversation with a saved session (used by `/resume`).
@@ -864,6 +900,14 @@ impl Agent {
         self.conversation.reset()
     }
 
+    pub fn delete_session(&mut self, id: &str) -> Result<(), Error> {
+        self.conversation.delete_session(id)
+    }
+
+    pub fn discard_if_empty(&mut self) -> Result<bool, Error> {
+        self.conversation.discard_if_empty()
+    }
+
     pub fn load_session(&mut self, id: &str) -> Result<(), Error> {
         self.conversation.load_session(id)
     }
@@ -1428,6 +1472,12 @@ mod tests {
             .expect("persistent")
             .snapshot()
             .expect("snapshot");
+        test.agent
+            .checkpoints
+            .as_mut()
+            .expect("persistent")
+            .remember_path(&file)
+            .expect("pre-image");
         test.agent
             .append_input_message(Message::user("edit the file"))
             .expect("user");

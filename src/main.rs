@@ -93,6 +93,9 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
 
     if cli.prompt.is_empty() && stdin_is_terminal {
         yawl::tui::run(&mut agent)?;
+        if agent.discard_if_empty()? {
+            return Ok(0);
+        }
         println!("{}", resume_command(agent.session_id()));
         return Ok(0);
     }
@@ -169,15 +172,17 @@ mod tests {
         root
     }
 
-    /// Writes a minimal header-only session log; replay tolerates the missing
-    /// message lines.
+    /// Writes a session log with a single user message so `-c` / list treat it
+    /// as resumable.
     fn write_session(dir: &Path, id: &str) {
         std::fs::create_dir_all(dir).unwrap();
+        let meta = format!(
+            r#"{{"type":"meta","id":"{id}","created_unix":1,"cwd":"/proj","model":"test-model"}}"#
+        );
+        let message = r#"{"type":"message","message":{"role":"user","content":"hello"}}"#;
         std::fs::write(
             dir.join(format!("{id}.jsonl")),
-            format!(
-                r#"{{"type":"meta","id":"{id}","created_unix":1,"cwd":"/proj","model":"test-model"}}"#
-            ),
+            format!("{meta}\n{message}\n"),
         )
         .unwrap();
     }
@@ -201,7 +206,8 @@ mod tests {
         let (session, messages) =
             select_session(&parse(&["-c"]), Path::new("/proj"), &dirs, "test-model").unwrap();
         assert_eq!(session.id, "20260102-000000-0001");
-        assert!(messages.is_empty());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "hello");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -248,12 +254,33 @@ mod tests {
         let (session, messages) =
             select_session(&parse(&[]), Path::new("/proj"), &dirs, "test-model").unwrap();
         assert!(messages.is_empty());
+        assert!(project.join(format!("{}.jsonl", session.id)).exists());
 
+        // Meta-only sessions are not listed until a turn is written.
         let infos = yawl::session::list(&project).unwrap();
-        assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].id, session.id);
-        assert_eq!(infos[0].cwd, "/proj");
-        assert_eq!(infos[0].model, "test-model");
+        assert!(infos.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn continue_skips_meta_only_sessions() {
+        let root = temp_root("continue-skip-empty");
+        let project = root.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("20260101-000000-0001.jsonl"),
+            r#"{"type":"meta","id":"20260101-000000-0001","created_unix":1,"cwd":"/proj","model":"test-model"}"#,
+        )
+        .unwrap();
+        let dirs = SessionDirs {
+            project: project.clone(),
+            search: vec![project.clone()],
+        };
+
+        let (session, messages) =
+            select_session(&parse(&["-c"]), Path::new("/proj"), &dirs, "test-model").unwrap();
+        assert!(messages.is_empty());
+        assert_ne!(session.id, "20260101-000000-0001");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

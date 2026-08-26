@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 
 use crate::provider::{Message, ReasoningKind, Role};
 
+use super::search::TranscriptSearch;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Entry {
     User(String),
@@ -51,6 +53,12 @@ pub(super) struct Transcript {
     streaming_assistant: Option<usize>,
     streaming_reasoning: Option<(ReasoningKind, usize)>,
     running_tool: Option<usize>,
+    focused: bool,
+    selected: Option<usize>,
+    expansion_overrides: std::collections::BTreeMap<usize, bool>,
+    viewer_open: bool,
+    search: Option<TranscriptSearch>,
+    reveal_selected: bool,
 }
 
 impl Transcript {
@@ -135,6 +143,12 @@ impl Transcript {
             streaming_assistant: None,
             streaming_reasoning: None,
             running_tool: None,
+            focused: false,
+            selected: None,
+            expansion_overrides: std::collections::BTreeMap::new(),
+            viewer_open: false,
+            search: None,
+            reveal_selected: false,
         }
     }
 
@@ -144,6 +158,154 @@ impl Transcript {
 
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub(super) fn entry(&self, index: usize) -> Option<&Entry> {
+        self.entries.get(index)
+    }
+
+    pub(super) fn selected_index(&self) -> Option<usize> {
+        self.selected.filter(|index| *index < self.entries.len())
+    }
+
+    pub(super) fn selected_entry(&self) -> Option<&Entry> {
+        self.selected_index()
+            .and_then(|index| self.entries.get(index))
+    }
+
+    pub(super) fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    pub(super) fn focus(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.focused = true;
+        if self.selected_index().is_none() {
+            self.selected = Some(self.entries.len() - 1);
+        }
+        self.reveal_selected = true;
+    }
+
+    pub(super) fn blur(&mut self) {
+        self.focused = false;
+    }
+
+    pub(super) fn move_selection(&mut self, amount: isize) {
+        if self.entries.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let current = self.selected_index().unwrap_or(self.entries.len() - 1);
+        self.selected = Some(if amount < 0 {
+            current.saturating_sub(amount.unsigned_abs())
+        } else {
+            current
+                .saturating_add(amount as usize)
+                .min(self.entries.len() - 1)
+        });
+        self.reveal_selected = true;
+    }
+
+    pub(super) fn set_selected_expanded(&mut self, expanded: bool) -> bool {
+        let Some(index) = self.selected_index() else {
+            return false;
+        };
+        self.expansion_overrides.insert(index, expanded) != Some(expanded)
+    }
+
+    pub(super) fn entry_expanded(&self, index: usize, default: bool) -> bool {
+        self.expansion_overrides
+            .get(&index)
+            .copied()
+            .unwrap_or(default)
+    }
+
+    pub(super) fn clear_expansion_overrides(&mut self) {
+        self.expansion_overrides.clear();
+    }
+
+    pub(super) fn viewer_open(&self) -> bool {
+        self.viewer_open
+    }
+
+    pub(super) fn open_viewer(&mut self) {
+        if self.selected_entry().is_some() {
+            self.viewer_open = true;
+        }
+    }
+
+    pub(super) fn close_viewer(&mut self) {
+        self.viewer_open = false;
+    }
+
+    pub(super) fn open_search(&mut self) {
+        let corpus = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (index, entry.searchable_text()))
+            .collect();
+        self.search = Some(TranscriptSearch::open(corpus));
+        self.viewer_open = false;
+        self.focused = true;
+    }
+
+    pub(super) fn close_search(&mut self) {
+        self.search = None;
+    }
+
+    pub(super) fn search_active(&self) -> bool {
+        self.search.is_some()
+    }
+
+    pub(super) fn search_query(&self) -> Option<&str> {
+        self.search.as_ref().map(TranscriptSearch::query)
+    }
+
+    pub(super) fn search_position(&self) -> Option<(usize, usize)> {
+        self.search.as_ref().and_then(TranscriptSearch::position)
+    }
+
+    pub(super) fn search_push(&mut self, character: char) {
+        if let Some(search) = self.search.as_mut() {
+            search.push(character);
+        }
+    }
+
+    pub(super) fn search_backspace(&mut self) {
+        if let Some(search) = self.search.as_mut() {
+            search.backspace();
+        }
+    }
+
+    pub(super) fn search_paste(&mut self, text: &str) {
+        if let Some(search) = self.search.as_mut() {
+            search.paste(text);
+        }
+    }
+
+    pub(super) fn search_next(&mut self, reverse: bool) {
+        if let Some(index) = self.search.as_mut().and_then(|search| search.next(reverse)) {
+            self.selected = Some(index);
+            self.reveal_selected = true;
+        }
+    }
+
+    pub(super) fn poll_search(&mut self) -> bool {
+        let Some(result) = self.search.as_mut().and_then(TranscriptSearch::poll) else {
+            return false;
+        };
+        if let Some(index) = result {
+            self.selected = Some(index);
+            self.reveal_selected = true;
+        }
+        true
+    }
+
+    pub(super) fn take_reveal_selected(&mut self) -> bool {
+        std::mem::take(&mut self.reveal_selected)
     }
 
     pub(super) fn last_assistant_text(&self) -> Option<&str> {
@@ -168,6 +330,9 @@ impl Transcript {
 
     pub(super) fn push_user(&mut self, content: String) {
         self.entries.push(Entry::User(content));
+        if self.focused {
+            self.selected = Some(self.entries.len() - 1);
+        }
     }
 
     pub(super) fn notice(&mut self, text: String) {
@@ -219,6 +384,9 @@ impl Transcript {
                 }
                 self.streaming_assistant = None;
                 self.streaming_reasoning = None;
+                self.selected = self.selected.filter(|index| *index < self.entries.len());
+                self.expansion_overrides
+                    .retain(|index, _| *index < self.entries.len());
             }
             TranscriptEvent::AssistantDone => {
                 self.streaming_entries_start = None;
@@ -255,6 +423,49 @@ impl Transcript {
                     *running = false;
                 }
             }
+        }
+    }
+}
+
+impl Entry {
+    pub(super) fn searchable_text(&self) -> String {
+        match self {
+            Self::User(text)
+            | Self::Assistant(text)
+            | Self::Notice(text)
+            | Self::Reasoning { content: text, .. } => text.clone(),
+            Self::Tool {
+                name, args, output, ..
+            } => format!("{name}\n{args}\n{output}"),
+            Self::SubagentResult {
+                id,
+                name,
+                status,
+                content,
+            } => format!("{id}\n{name}\n{status}\n{content}"),
+        }
+    }
+
+    pub(super) fn copy_text(&self) -> String {
+        match self {
+            Self::Tool { output, args, .. } if output.is_empty() => args.clone(),
+            Self::Tool { output, .. } => output.clone(),
+            Self::User(text)
+            | Self::Assistant(text)
+            | Self::Notice(text)
+            | Self::Reasoning { content: text, .. } => text.clone(),
+            Self::SubagentResult { content, .. } => content.clone(),
+        }
+    }
+
+    pub(super) fn label(&self) -> &str {
+        match self {
+            Self::User(_) => "Prompt",
+            Self::Assistant(_) => "Reply",
+            Self::Reasoning { .. } => "Reasoning",
+            Self::Tool { name, .. } => name,
+            Self::Notice(_) => "Notice",
+            Self::SubagentResult { name, .. } => name,
         }
     }
 }
@@ -369,5 +580,34 @@ mod tests {
                 content: "done".into(),
             }]
         );
+    }
+
+    #[test]
+    fn focus_does_nothing_when_the_transcript_is_empty() {
+        let mut transcript = Transcript::from_messages(&[]);
+        transcript.focus();
+        assert!(!transcript.is_focused());
+        assert_eq!(transcript.selected_index(), None);
+    }
+
+    #[test]
+    fn search_selects_the_matching_entry_for_reveal() {
+        let mut transcript = Transcript::from_messages(&[
+            Message::assistant("alpha".into(), vec![]),
+            Message::assistant("beta unique".into(), vec![]),
+        ]);
+        transcript.open_search();
+        for character in "unique".chars() {
+            transcript.search_push(character);
+        }
+        for _ in 0..100 {
+            if transcript.poll_search() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(transcript.selected_index(), Some(1));
+        assert!(transcript.take_reveal_selected());
+        assert!(transcript.set_selected_expanded(true));
     }
 }

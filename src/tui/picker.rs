@@ -65,6 +65,11 @@ pub(super) enum PickerAction {
     SetScrollBar(bool),
     SetScrollBarAutoHide(bool),
     ResumeSession(String),
+    DeleteSession(String),
+    /// Reopen the resume picker, restoring `selected` after a canceled delete.
+    OpenResume {
+        selected: usize,
+    },
     EditSetting {
         key: String,
         initial: String,
@@ -79,6 +84,15 @@ pub(super) enum PickerAction {
     },
     SetAutoCompact(bool),
     SetSubagents(bool),
+    SendQueued(usize),
+    ApplyQueued {
+        index: usize,
+        value: String,
+    },
+    MoveQueued {
+        index: usize,
+        direction: isize,
+    },
     RemoveQueued(usize),
     ClearQueued,
     Reload,
@@ -105,6 +119,7 @@ pub(super) struct Picker {
 pub(super) enum PickerEdit {
     Setting(String),
     Model { save: bool },
+    Queued(usize),
 }
 
 pub(super) struct ActivePickers {
@@ -640,6 +655,7 @@ pub(super) fn take_picker_action(
                                 PickerAction::SwitchModel(value.trim().to_string())
                             }
                         }
+                        PickerEdit::Queued(index) => PickerAction::ApplyQueued { index, value },
                     });
                 }
             }
@@ -652,7 +668,11 @@ pub(super) fn take_picker_action(
     }
 
     match key {
-        Key::Escape | Key::Ctrl('c') => state.picker = None,
+        Key::Escape | Key::Ctrl('c') => {
+            let cancel = picker_cancel_action(picker);
+            state.picker = None;
+            return cancel;
+        }
         Key::Up | Key::Char('k') => picker.selected = picker.selected.saturating_sub(1),
         Key::Down | Key::Char('j') => {
             picker.selected = (picker.selected + 1).min(picker.items.len().saturating_sub(1));
@@ -684,9 +704,84 @@ pub(super) fn take_picker_action(
                 None => {}
             }
         }
+        Key::Char('e') => {
+            if let Some(PickerAction::SendQueued(index)) = picker
+                .items
+                .get(picker.selected)
+                .map(|item| item.action.clone())
+                && let Some(initial) = state.queued_inputs.get(index)
+            {
+                editor.clear();
+                editor.paste(initial);
+                picker.editing = Some(PickerEdit::Queued(index));
+            }
+        }
+        Key::Char('K') | Key::Char('J') => {
+            if let Some(PickerAction::SendQueued(index)) = picker
+                .items
+                .get(picker.selected)
+                .map(|item| item.action.clone())
+            {
+                state.picker = None;
+                return Some(PickerAction::MoveQueued {
+                    index,
+                    direction: if key == Key::Char('K') { -1 } else { 1 },
+                });
+            }
+        }
+        Key::Delete | Key::Char('d') => {
+            let selected = picker.selected;
+            let action = picker.items.get(selected).map(|item| item.action.clone());
+            match action {
+                Some(PickerAction::ResumeSession(id)) => {
+                    let label = picker.items[selected].label.clone();
+                    let description = picker.items[selected].description.clone();
+                    *picker = delete_session_confirm(id, label, description, selected);
+                }
+                Some(PickerAction::SendQueued(index)) => {
+                    return Some(PickerAction::RemoveQueued(index));
+                }
+                _ => {}
+            }
+        }
         _ => {}
     }
     None
+}
+
+fn delete_session_confirm(
+    id: String,
+    label: String,
+    description: String,
+    resume_selected: usize,
+) -> Picker {
+    Picker {
+        title: "Delete session?".into(),
+        hint: "Enter confirm  Esc back".into(),
+        selected: 0,
+        items: vec![
+            PickerItem {
+                label: "Cancel".into(),
+                description: "Keep this session".into(),
+                action: PickerAction::OpenResume {
+                    selected: resume_selected,
+                },
+            },
+            PickerItem {
+                label: "Delete".into(),
+                description: format!("{label} · {description}"),
+                action: PickerAction::DeleteSession(id),
+            },
+        ],
+        editing: None,
+    }
+}
+
+fn picker_cancel_action(picker: &Picker) -> Option<PickerAction> {
+    picker.items.iter().find_map(|item| match &item.action {
+        PickerAction::OpenResume { .. } => Some(item.action.clone()),
+        _ => None,
+    })
 }
 
 pub(super) fn select_picker_item(state: &mut ViewState, selected: usize) {

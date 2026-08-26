@@ -425,6 +425,42 @@ pub(crate) fn strip_ansi(text: &str) -> String {
     output
 }
 
+/// Applies a background color to the final visible character without
+/// replacing it or changing the line's terminal width.
+pub(crate) fn overlay_last_cell_background(text: &str, background: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    let mut last_visible = None;
+    while index < bytes.len() {
+        if let Some(end) = ansi_sequence_end(bytes, index) {
+            index = end;
+            continue;
+        }
+        let character = text[index..]
+            .chars()
+            .next()
+            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        let end = index + character.len_utf8();
+        if terminal_character_width(character) > 0 {
+            last_visible = Some((index, end));
+        } else if let Some((_, last_end)) = &mut last_visible {
+            *last_end = end;
+        }
+        index = end;
+    }
+
+    let Some((start, end)) = last_visible else {
+        return text.to_string();
+    };
+    let mut overlaid = String::with_capacity(text.len() + background.len() + 5);
+    overlaid.push_str(&text[..start]);
+    overlaid.push_str(background);
+    overlaid.push_str(&text[start..end]);
+    overlaid.push_str("\x1b[49m");
+    overlaid.push_str(&text[end..]);
+    overlaid
+}
+
 fn ansi_sequence_end(bytes: &[u8], start: usize) -> Option<usize> {
     if bytes.get(start) != Some(&0x1b) || bytes.get(start + 1) != Some(&b'[') {
         return None;
@@ -703,6 +739,16 @@ mod tests {
 
         assert_eq!(lines, ["abcdefgh", "ijkl end"]);
         assert_eq!(strip_ansi(&fit_width("alpha beta", 7)), "alpha b");
+    }
+
+    #[test]
+    fn background_overlay_preserves_the_last_character_and_width() {
+        let line = fit_width("\x1b[3mabcdefgh\x1b[0m", 8);
+        let overlaid = overlay_last_cell_background(&line, "\x1b[48;2;1;2;3m");
+
+        assert_eq!(strip_ansi(&overlaid), "abcdefgh");
+        assert_eq!(visible_width(&overlaid), 8);
+        assert!(overlaid.contains("\x1b[48;2;1;2;3mh\x1b[49m"));
     }
 
     #[test]

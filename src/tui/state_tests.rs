@@ -3,7 +3,7 @@
 use super::events::{MouseEvent, MouseKind};
 use super::state::{
     SCROLL_BAR_AUTO_HIDE_TICKS, ScrollGeometry, ViewState, advance_ticks, handle_scroll_bar_mouse,
-    scroll,
+    scroll, scroll_bar_span,
 };
 use super::transcript::Transcript;
 use crate::config::UiColor;
@@ -20,6 +20,12 @@ fn geometry() -> ScrollGeometry {
         travel: 7,
         thumb_length: 1,
     }
+}
+
+#[test]
+fn scroll_bar_thumb_keeps_a_three_row_minimum_when_space_allows() {
+    assert_eq!(scroll_bar_span(8, 1_000), (3, 5));
+    assert_eq!(scroll_bar_span(2, 1_000), (2, 0));
 }
 
 fn state_with(geometry: Option<ScrollGeometry>) -> ViewState {

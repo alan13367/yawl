@@ -448,32 +448,88 @@ fn overflow_state() -> ViewState {
 }
 
 #[test]
-fn scroll_bar_follows_the_accent_color_when_content_overflows() {
+fn scroll_bar_draws_only_a_larger_thumb_over_the_transcript() {
     let mut state = overflow_state();
     let editor = Editor::default();
     let columns = 40;
     let (frame, _) = build_frame(&mut state, &editor, columns, 12);
     let transcript_rows = &frame[..8];
 
-    // Every transcript row carries a solid background cell in the last
-    // column. The brighter thumb must remain distinct from both the muted
-    // track and the dark terminal background.
     let track = "\x1b[48;2;90;90;90m";
     let thumb = "\x1b[48;2;155;155;155m";
     for line in transcript_rows {
         assert_eq!(markdown::visible_width(line), columns);
-        assert!(line.ends_with(" \x1b[0m"), "{line:?}");
-        assert!(line.contains(track) || line.contains(thumb), "{line:?}");
     }
-    // At the bottom the thumb sits on the last transcript row.
+    assert!(!frame.join("\n").contains(track));
     assert!(
         transcript_rows[7].contains(thumb),
         "{:?}",
         transcript_rows[7]
     );
+    assert_eq!(
+        transcript_rows
+            .iter()
+            .filter(|line| line.contains(thumb))
+            .count(),
+        3,
+        "the thumb should stay easy to grab even for long transcripts"
+    );
+}
+
+#[test]
+fn scroll_bar_overlays_reasoning_without_replacing_its_text() {
+    let mut state = overflow_state();
+    state.apply(Update::Transcript(TranscriptEvent::ReasoningDelta {
+        kind: ReasoningKind::Full,
+        text: "r".repeat(200),
+    }));
+    let editor = Editor::default();
+
+    let (with_thumb, _) = build_frame(&mut state, &editor, 40, 12);
+    state.scroll_bar_enabled = false;
+    state.show_scroll_bar = false;
+    let (without_thumb, _) = build_frame(&mut state, &editor, 40, 12);
+
+    let plain = |frame: &[String]| {
+        frame[..8]
+            .iter()
+            .map(|line| markdown::strip_ansi(line))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(plain(&with_thumb), plain(&without_thumb));
+    assert!(with_thumb[..8].iter().any(|line| {
+        line.contains("\x1b[2;3;38;2;148;148;158m") && line.contains("\x1b[48;2;155;155;155m")
+    }));
+}
+
+#[test]
+fn scroll_bar_thumb_overlays_tool_panels_without_replacing_their_content() {
+    let mut state = overflow_state();
+    state.apply(Update::Transcript(TranscriptEvent::ToolStart {
+        name: "shell".into(),
+        args: r#"{"command":"printf tool-output"}"#.into(),
+    }));
+    state.apply(Update::Transcript(TranscriptEvent::ToolEnd {
+        name: "shell".into(),
+        output: "tool-output".into(),
+        is_error: false,
+    }));
+    state.activity.clear();
+    let editor = Editor::default();
+
+    let (with_thumb, _) = build_frame(&mut state, &editor, 40, 12);
+    state.scroll_bar_enabled = false;
+    state.show_scroll_bar = false;
+    let (without_thumb, _) = build_frame(&mut state, &editor, 40, 12);
+
+    let plain = |frame: &[String]| markdown::strip_ansi(&frame[..8].join("\n"));
+    assert_eq!(plain(&with_thumb), plain(&without_thumb));
     assert!(
-        transcript_rows[..7].iter().all(|line| line.contains(track)),
-        "{transcript_rows:?}"
+        with_thumb[..8].iter().any(|line| {
+            line.contains("\x1b[48;2;42;50;41m") && line.contains("\x1b[48;2;155;155;155m")
+        }),
+        "thumb should overlay the tool panel: {:?}",
+        &with_thumb[..8]
     );
 }
 
@@ -481,12 +537,11 @@ fn scroll_bar_follows_the_accent_color_when_content_overflows() {
 fn scroll_bar_thumb_tracks_the_viewport_position() {
     let mut state = overflow_state();
     let editor = Editor::default();
-    let track = "\x1b[48;2;90;90;90m";
     let thumb = "\x1b[48;2;155;155;155m";
     let (frame_bottom, _) = build_frame(&mut state, &editor, 40, 12);
 
-    // At the bottom the top transcript row is track.
-    assert!(frame_bottom[0].contains(track));
+    // At the bottom the top transcript row has no thumb.
+    assert!(!frame_bottom[0].contains(thumb));
 
     // Scrolling to the top moves the thumb to the first transcript row.
     state.scroll_offset = usize::MAX;
@@ -495,7 +550,44 @@ fn scroll_bar_thumb_tracks_the_viewport_position() {
 }
 
 #[test]
-fn scroll_bar_reflows_transcript_without_dropping_the_last_column() {
+fn search_hit_scrolls_to_the_start_of_the_block() {
+    let body = format!("unique-hit\n{}", "later line\n".repeat(40));
+    let mut state = overflow_state();
+    state.transcript = Transcript::from_messages(&[
+        crate::provider::Message::assistant(body, Vec::new()),
+        crate::provider::Message::assistant("tail-marker".into(), Vec::new()),
+    ]);
+    state.scroll_bar_enabled = false;
+    state.show_scroll_bar = false;
+    state.scroll_offset = 0;
+    state.transcript.open_search();
+    for character in "unique-hit".chars() {
+        state.transcript.search_push(character);
+    }
+    let mut found = false;
+    for _ in 0..100 {
+        if advance_ticks(&mut state) && state.transcript.search_position().is_some() {
+            found = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(found, "search worker did not publish a hit");
+
+    let editor = Editor::default();
+    let (frame, _) = build_frame(&mut state, &editor, 40, 12);
+    let visible = markdown::strip_ansi(&frame[..7].join("\n"));
+
+    assert!(visible.contains("unique-hit"), "{visible:?}");
+    assert!(visible.contains("later line"), "{visible:?}");
+    assert!(
+        !visible.contains("tail-marker"),
+        "search should pin the start of the hit, not the end: {visible:?}"
+    );
+}
+
+#[test]
+fn scroll_bar_overlay_preserves_the_last_column() {
     let mut state = overflow_state();
     let content = format!("{}Z{}", "a".repeat(39), "b".repeat(400));
     state.transcript =
@@ -555,6 +647,7 @@ fn scroll_bar_stays_in_the_last_column_beside_tables_with_wide_glyphs() {
 fn scroll_bar_setting_hides_the_bar_and_preserves_content() {
     let mut state = overflow_state();
     state.show_scroll_bar = false;
+    state.scroll_bar_enabled = false;
     let editor = Editor::default();
     let (frame, _) = build_frame(&mut state, &editor, 40, 12);
 
@@ -564,6 +657,42 @@ fn scroll_bar_setting_hides_the_bar_and_preserves_content() {
         frame[..8]
             .iter()
             .all(|line| markdown::visible_width(line) == 40)
+    );
+}
+
+#[test]
+fn auto_hiding_scroll_bar_keeps_the_scrolled_transcript_stationary() {
+    let mut state = overflow_state();
+    let content = (0..400)
+        .map(|index| char::from(b'a' + (index % 26) as u8))
+        .collect::<String>();
+    state.transcript =
+        Transcript::from_messages(&[crate::provider::Message::assistant(content, Vec::new())]);
+    state.scroll_bar_auto_hide = true;
+    state.scroll_bar_idle_ticks = super::state::SCROLL_BAR_AUTO_HIDE_TICKS - 1;
+    state.scroll_offset = 3;
+    let editor = Editor::default();
+
+    let (visible_bar, _) = build_frame(&mut state, &editor, 40, 12);
+    advance_ticks(&mut state);
+    assert!(!state.show_scroll_bar);
+    let (hidden_bar, _) = build_frame(&mut state, &editor, 40, 12);
+
+    let transcript_text = |frame: &[String]| {
+        frame[..8]
+            .iter()
+            .map(|line| {
+                markdown::strip_ansi(line)
+                    .chars()
+                    .take(39)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        transcript_text(&hidden_bar),
+        transcript_text(&visible_bar),
+        "hiding the bar must not move the scrolled transcript"
     );
 }
 
@@ -651,9 +780,10 @@ fn reconstructed_deferred_follow_up_replaces_frozen_cache_entries() {
         "stale follow-up".into(),
     )));
     state.apply(Update::Transcript(TranscriptEvent::AssistantDone));
-    let cached = state
-        .render_cache
-        .get_or_render(&state.transcript, false, false, 80);
+    let cached =
+        state
+            .render_cache
+            .get_or_render(&state.transcript, false, false, UiColor::WHITE, 80);
     assert!(cached.iter().any(|line| line.contains("stale follow-up")));
 
     let rebuilt_messages = [
@@ -672,7 +802,7 @@ fn reconstructed_deferred_follow_up_replaces_frozen_cache_entries() {
 
     let rendered = state
         .render_cache
-        .get_or_render(&state.transcript, false, false, 80)
+        .get_or_render(&state.transcript, false, false, UiColor::WHITE, 80)
         .join("\n");
     let plain = markdown::strip_ansi(&rendered);
     assert!(
@@ -695,7 +825,7 @@ fn retry_reset_immediately_removes_partial_output_from_render_cache() {
     transcript.apply(TranscriptEvent::TextDelta("partial answer".into()));
 
     let partial = cache
-        .get_or_render(&transcript, false, false, 80)
+        .get_or_render(&transcript, false, false, UiColor::WHITE, 80)
         .join("\n");
     assert!(partial.contains("partial reasoning"));
     assert!(partial.contains("partial answer"));
@@ -703,7 +833,7 @@ fn retry_reset_immediately_removes_partial_output_from_render_cache() {
     transcript.apply(TranscriptEvent::RetryReset);
 
     let reset = cache
-        .get_or_render(&transcript, false, false, 80)
+        .get_or_render(&transcript, false, false, UiColor::WHITE, 80)
         .join("\n");
     assert!(reset.contains("request"));
     assert!(!reset.contains("partial reasoning"), "{reset:?}");
@@ -716,17 +846,17 @@ fn render_cache_preserves_and_updates_incremental_entries() {
     let mut transcript =
         Transcript::from_messages(&[crate::provider::Message::user("first message")]);
 
-    let lines1 = cache.get_or_render(&transcript, false, false, 80);
+    let lines1 = cache.get_or_render(&transcript, false, false, UiColor::WHITE, 80);
     assert!(lines1.iter().any(|line| line.contains("first message")));
     let len1 = lines1.len();
 
     // Cache hit should return identical lines
-    let lines2 = cache.get_or_render(&transcript, false, false, 80);
+    let lines2 = cache.get_or_render(&transcript, false, false, UiColor::WHITE, 80);
     assert_eq!(lines2.len(), len1);
 
     // Appending a notice should incrementally extend the cache
     transcript.notice("system notice".into());
-    let lines3 = cache.get_or_render(&transcript, false, false, 80);
+    let lines3 = cache.get_or_render(&transcript, false, false, UiColor::WHITE, 80);
     assert!(lines3.len() > len1);
     assert!(lines3.iter().any(|line| line.contains("system notice")));
     assert!(lines3.iter().any(|line| line.contains("first message")));
@@ -936,5 +1066,171 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
     assert!(
         !plain.contains('↑') && !plain.contains('↓'),
         "cycle indicators only appear when matches overflow the menu"
+    );
+}
+
+fn empty_session_state() -> ViewState {
+    ViewState {
+        transcript: Transcript::from_messages(&[]),
+        tools_expanded: false,
+        model: "test".into(),
+        reasoning_effort: None,
+        hide_reasoning: false,
+        accent_color: UiColor::WHITE,
+        selection_color: UiColor::WHITE,
+        show_scroll_bar: false,
+        scroll_bar_enabled: false,
+        scroll_bar_auto_hide: false,
+        scroll_bar_idle_ticks: 0,
+        scroll_geometry: None,
+        scroll_bar_drag: None,
+        copy_toast_ticks: 0,
+        spinner_tick: 0,
+        context_tokens: 0,
+        context_window: 100,
+        activity: String::new(),
+        scroll_offset: 0,
+        queued_inputs: std::collections::VecDeque::new(),
+        pending_actions: std::collections::VecDeque::new(),
+        completions: Vec::new(),
+        completion_index: 0,
+        completion_filter: None,
+        file_index: crate::tui::files::FileIndex::default(),
+        picker: None,
+        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
+        subagent_snapshots: Vec::new(),
+        subagent_tokens: 0,
+        subagents_enabled: false,
+        subagent_view: None,
+        render_cache: RenderCache::default(),
+    }
+}
+
+#[test]
+fn system_notices_use_the_accent_color_instead_of_yellow() {
+    let mut transcript = Transcript::from_messages(&[]);
+    transcript.notice("Saved and applied.".into());
+    let blue = UiColor::parse("blue").expect("palette names parse");
+    let mut cache = RenderCache::default();
+    let rendered = cache
+        .get_or_render(&transcript, false, false, blue, 80)
+        .join("\n");
+
+    assert!(
+        rendered.contains("38;2;117;169;255"),
+        "the Yawl notice label should use the accent color, got {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("\x1b[1;33m"),
+        "system notices should not use hardcoded yellow"
+    );
+    let plain = markdown::strip_ansi(&rendered);
+    assert!(plain.contains("Yawl"));
+    assert!(plain.contains("Saved and applied."));
+}
+
+#[test]
+fn changing_accent_color_recolors_cached_notices() {
+    let mut transcript = Transcript::from_messages(&[]);
+    transcript.notice("hello".into());
+    let mut cache = RenderCache::default();
+    let white = cache
+        .get_or_render(&transcript, false, false, UiColor::WHITE, 80)
+        .join("\n");
+    assert!(white.contains("38;2;238;238;238"));
+
+    let blue = UiColor::parse("blue").expect("palette names parse");
+    let recolored = cache
+        .get_or_render(&transcript, false, false, blue, 80)
+        .join("\n");
+    assert!(recolored.contains("38;2;117;169;255"));
+    assert!(!recolored.contains("38;2;238;238;238"));
+}
+
+#[test]
+fn empty_session_shows_a_large_accent_colored_welcome() {
+    let mut state = empty_session_state();
+    state.spinner_tick = WELCOME_ANIMATION_TICKS;
+    state.accent_color = UiColor::parse("blue").expect("palette names parse");
+    let editor = Editor::default();
+    let (frame, _) = build_frame(&mut state, &editor, 80, 24);
+    let joined = frame.join("\n");
+    let plain = markdown::strip_ansi(&joined);
+
+    assert!(
+        plain.contains("██    ██   █████   ██     ██  ██"),
+        "fresh sessions should show the large Yawl wordmark, got {plain:?}"
+    );
+    assert!(plain.contains("Type /help for commands."));
+    assert!(
+        joined.contains("38;2;117;169;255"),
+        "the welcome wordmark should use the accent color"
+    );
+}
+
+#[test]
+fn narrow_empty_session_falls_back_to_the_yawl_name() {
+    let mut state = empty_session_state();
+    state.spinner_tick = WELCOME_ANIMATION_TICKS;
+    let editor = Editor::default();
+    let (frame, _) = build_frame(&mut state, &editor, 20, 12);
+    let plain = markdown::strip_ansi(&frame.join("\n"));
+    assert!(plain.contains("Yawl"));
+    assert!(!plain.contains("█████"));
+}
+
+#[test]
+fn conversation_hides_the_welcome_banner() {
+    let mut state = empty_session_state();
+    state.transcript = Transcript::from_messages(&[crate::provider::Message::assistant(
+        "hello".into(),
+        Vec::new(),
+    )]);
+    let editor = Editor::default();
+    let (frame, _) = build_frame(&mut state, &editor, 80, 24);
+    let plain = markdown::strip_ansi(&frame.join("\n"));
+    assert!(plain.contains("hello"));
+    assert!(!plain.contains("█████"));
+    assert!(!plain.contains("Type /help for commands."));
+}
+
+#[test]
+fn welcome_types_the_wordmark_then_the_hint() {
+    let mut state = empty_session_state();
+    let editor = Editor::default();
+    let blocks = |frame: &[String]| {
+        markdown::strip_ansi(&frame.join("\n"))
+            .chars()
+            .filter(|character| *character == '█')
+            .count()
+    };
+
+    let (start, _) = build_frame(&mut state, &editor, 80, 24);
+    let start_plain = markdown::strip_ansi(&start.join("\n"));
+    assert!(
+        !start_plain.contains("██    ██   █████   ██     ██  ██"),
+        "the first tick should not show the finished wordmark, got {start_plain:?}"
+    );
+    assert!(!start_plain.contains("Type /help for commands."));
+    let start_blocks = blocks(&start);
+    assert!(start_blocks > 0, "the first tick should show some of the Y");
+
+    state.spinner_tick = 4;
+    let (mid, _) = build_frame(&mut state, &editor, 80, 24);
+    let mid_blocks = blocks(&mid);
+    assert!(
+        mid_blocks > start_blocks,
+        "later ticks should reveal more of the wordmark ({start_blocks} -> {mid_blocks})"
+    );
+    assert!(!markdown::strip_ansi(&mid.join("\n")).contains("Type /help for commands."));
+
+    state.spinner_tick = WELCOME_ANIMATION_TICKS;
+    let (done, _) = build_frame(&mut state, &editor, 80, 24);
+    let done_plain = markdown::strip_ansi(&done.join("\n"));
+    assert!(done_plain.contains("██    ██   █████   ██     ██  ██"));
+    assert!(done_plain.contains("Type /help for commands."));
+    assert!(
+        !done_plain.contains('|'),
+        "the typing caret should disappear once the wordmark is finished"
     );
 }

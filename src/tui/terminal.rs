@@ -83,6 +83,10 @@ impl Terminal {
         self.last_size = (0, 0);
     }
 
+    pub(super) fn size_changed(&self) -> bool {
+        terminal_size() != self.last_size
+    }
+
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Result<bool, Error> {
         let point = ScreenPoint {
             row: event.row,
