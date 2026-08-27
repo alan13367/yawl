@@ -1,10 +1,68 @@
 # Yawl
 
-Yawl is a small AI agent runner for macOS and Linux. It has a full-screen terminal interface, a scriptable print mode, Anthropic and OpenAI-compatible providers, persistent sessions, tool calling, and automatic context compaction.
+<div align="center">
+  <img src="Assets/WelcomeScreen.png" alt="Yawl welcome screen in a terminal" width="1000">
+  <p><sub>The welcome screen, shown first and at full size.</sub></p>
+  <p>
+    <strong>A small AI coding harness that stays in your terminal.</strong><br>
+    Stream answers, run tools, keep sessions, and bring your own model.
+  </p>
+  <p>
+    <a href="https://github.com/alan13367/yawl/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-7aa2f7?style=flat-square" alt="MIT license"></a>
+    <img src="https://img.shields.io/badge/Rust-1.97%2B-orange?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.97 or newer">
+    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-8fbcbb?style=flat-square" alt="macOS and Linux">
+  </p>
+</div>
 
-The model can add tools without recompiling Yawl. Any executable in `~/.yawl/tools/` or `./.yawl/tools/` becomes a callable tool when it implements the exec-tool contract below.
+Yawl is a small AI agent runner for macOS and Linux. It gives you a full-screen terminal interface, a scriptable print mode, provider selection, persistent sessions, tool calling, and automatic context compaction.
 
-Yawl is one Cargo package with library and binary targets, blocking I/O, and four direct dependencies: `ureq`, `serde`, `serde_json`, and `libc`.
+The model can add tools without recompiling Yawl. Put an executable in `~/.yawl/tools/` or `./.yawl/tools/`, implement the exec-tool contract, and Yawl discovers it before the next model step.
+
+## What you get
+
+- **A focused terminal UI.** Browse the transcript, inspect tool calls, search history, edit queued prompts, and copy responses without leaving the terminal.
+- **The provider you already use.** Connect Anthropic, OpenAI, OpenAI Codex, Ollama, LM Studio, OMLX, or any compatible OpenAI endpoint.
+- **Tools that can grow with the project.** The built-in file and shell tools are joined by executable tools you add locally.
+- **Skills with an explicit trust boundary.** Project instructions and Markdown skills remain disabled until you trust their source.
+- **Parallel work when you need it.** Start subagents, watch them in the dashboard, take over a child, or cancel one without losing the main conversation.
+- **Sessions that remain useful.** Resume a conversation later, compact old context when it grows, and use `/undo` for changes made through Yawl's file tools.
+
+## Screenshots
+
+The interface is intentionally dense without being noisy. These are real views from the terminal UI.
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="Assets/CommandsList.png" alt="Yawl slash command and skill completion menu">
+      <br><sub><b>Commands and skills</b><br>Type <code>/</code> to search commands and skills.</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="Assets/SettingsView.png" alt="Yawl settings picker">
+      <br><sub><b>Settings</b><br>Change model, appearance, context, providers, and subagents.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="Assets/SkillLoading.png" alt="Yawl loading a skill">
+      <br><sub><b>Skills in the loop</b><br>Load focused instructions when a task calls for them.</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="Assets/SubagentsDashboard.png" alt="Yawl subagent dashboard">
+      <br><sub><b>Subagent dashboard</b><br>See parallel runs, their status, and their token use.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="Assets/SubagentsWaiting.png" alt="Yawl waiting for subagents to finish">
+      <br><sub><b>Waiting on parallel work</b><br>Keep the main turn visible while children finish.</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="Assets/WordSearch.png" alt="Yawl transcript search opened with Ctrl+F">
+      <br><sub><b>Search with <code>Ctrl+F</code></b><br>Find anything in the transcript without losing your place.</sub>
+    </td>
+  </tr>
+</table>
 
 ## Install
 
