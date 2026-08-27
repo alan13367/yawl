@@ -47,6 +47,8 @@ pub(super) struct ViewState {
     pub(super) scroll_bar_drag: Option<usize>,
     pub(super) copy_toast_ticks: u8,
     pub(super) spinner_tick: usize,
+    /// Start of the in-flight turn, driving the status-bar turn timer.
+    pub(super) turn_started: Option<std::time::Instant>,
     pub(super) context_tokens: u64,
     pub(super) context_window: u64,
     pub(super) activity: String,
@@ -91,6 +93,7 @@ impl ViewState {
             scroll_bar_drag: None,
             copy_toast_ticks: 0,
             spinner_tick: 0,
+            turn_started: None,
             context_tokens: agent.context_tokens(),
             context_window: agent.context_window(),
             activity: String::new(),
@@ -149,6 +152,9 @@ impl ViewState {
                         "reasoning".into()
                     }
                     TranscriptEvent::ReasoningDelta { .. } => "responding".into(),
+                    TranscriptEvent::ToolStart { name, .. } if name == "read_skill" => {
+                        "loading skill".into()
+                    }
                     TranscriptEvent::ToolStart { .. } => "running tool".into(),
                     TranscriptEvent::AssistantDone => String::new(),
                     TranscriptEvent::ToolEnd { .. } => "sending".into(),
@@ -160,6 +166,7 @@ impl ViewState {
                 self.activity = match name.as_str() {
                     "write_file" => "preparing write".into(),
                     "edit_file" => "preparing edit".into(),
+                    "read_skill" => "loading skill".into(),
                     _ => "preparing tool".into(),
                 };
             }
@@ -281,6 +288,7 @@ pub(super) fn advance_ticks(state: &mut ViewState) -> bool {
         .iter()
         .any(|snapshot| snapshot.status.is_active());
     let animate = super::render::loading_label(&state.activity).is_some()
+        || state.turn_started.is_some()
         || (state.transcript.is_empty()
             && state.spinner_tick < super::render::WELCOME_ANIMATION_TICKS)
         || state.subagent_view.is_some()

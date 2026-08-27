@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use crate::provider::{Message, ReasoningKind, Role};
 
@@ -18,6 +19,9 @@ pub(super) enum Entry {
         output: String,
         is_error: bool,
         running: bool,
+        /// Live start time of a running call. Always `None` once the call
+        /// settles so live and replayed transcripts stay identical.
+        started: Option<Instant>,
     },
     Notice(String),
     SubagentResult {
@@ -100,6 +104,7 @@ impl Transcript {
                             output: String::new(),
                             is_error: false,
                             running: false,
+                            started: None,
                         });
                         pending_tools.push_back((call.id.as_str(), entries.len() - 1));
                     }
@@ -132,6 +137,7 @@ impl Transcript {
                             output: message.content.clone(),
                             is_error: message.is_error,
                             running: false,
+                            started: None,
                         });
                     }
                 }
@@ -400,6 +406,7 @@ impl Transcript {
                     output: String::new(),
                     is_error: false,
                     running: true,
+                    started: Some(Instant::now()),
                 });
                 self.running_tool = Some(self.entries.len() - 1);
             }
@@ -414,6 +421,7 @@ impl Transcript {
                     output: entry_output,
                     is_error: entry_error,
                     running,
+                    started,
                     ..
                 }) = index.and_then(|index| self.entries.get_mut(index))
                 {
@@ -421,6 +429,7 @@ impl Transcript {
                     *entry_output = output;
                     *entry_error = is_error;
                     *running = false;
+                    *started = None;
                 }
             }
         }
@@ -556,6 +565,7 @@ mod tests {
                 output: String::new(),
                 is_error: false,
                 running: false,
+                started: None,
             }]
         );
     }

@@ -41,6 +41,10 @@ pub(crate) enum ConfigChange {
         base_url: String,
         api_key: Option<String>,
     },
+    ProviderModel {
+        name: String,
+        model: String,
+    },
     AnthropicBaseUrl(String),
     OpenAiBaseUrl(String),
     AnthropicApiKey(String),
@@ -101,6 +105,10 @@ enum ValidatedChange {
         name: String,
         base_url: String,
         api_key: Option<String>,
+    },
+    ProviderModel {
+        name: String,
+        model: String,
     },
     AnthropicBaseUrl(String),
     OpenAiBaseUrl(String),
@@ -287,6 +295,13 @@ impl ValidatedChange {
                     api_key,
                 })
             }
+            ConfigChange::ProviderModel { name, model } => {
+                validate_provider_name(&name)?;
+                if model.trim().is_empty() {
+                    return Err(Error::Config("provider model must not be empty".into()));
+                }
+                Ok(Self::ProviderModel { name, model })
+            }
             ConfigChange::AnthropicBaseUrl(url) => {
                 validate_http_url(&url)?;
                 Ok(Self::AnthropicBaseUrl(url))
@@ -395,6 +410,32 @@ impl ValidatedChange {
                 }
                 Ok(())
             }
+            Self::ProviderModel { name, model } => {
+                let providers = object_field(root, "providers")?;
+                let provider = providers
+                    .entry(name.clone())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                let Value::Object(provider) = provider else {
+                    return Err(Error::Config(format!(
+                        "providers.{name} must be a JSON object"
+                    )));
+                };
+                let models = provider
+                    .entry("models".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                let Value::Array(models) = models else {
+                    return Err(Error::Config(format!(
+                        "providers.{name}.models must be an array"
+                    )));
+                };
+                if !models
+                    .iter()
+                    .any(|entry| entry.get("id").and_then(Value::as_str) == Some(model))
+                {
+                    models.push(json!({"id": model}));
+                }
+                Ok(())
+            }
             Self::AnthropicBaseUrl(url) => insert_root(root, "anthropic_base_url", json!(url)),
             Self::OpenAiBaseUrl(url) => insert_root(root, "openai_base_url", json!(url)),
             Self::AnthropicApiKey(key) => match key {
@@ -445,6 +486,10 @@ impl ValidatedChange {
             } => config.providers.get(name).is_some_and(|provider| {
                 provider.base_url == *base_url && api_key_is_effective(provider, api_key.as_deref())
             }),
+            Self::ProviderModel { name, model } => config
+                .providers
+                .get(name)
+                .is_some_and(|provider| provider.models.iter().any(|entry| entry.id == *model)),
             Self::AnthropicBaseUrl(url) => config.anthropic_base_url == *url,
             Self::OpenAiBaseUrl(url) => config.openai_base_url == *url,
             Self::AnthropicApiKey(key) => config.anthropic_api_key == *key,

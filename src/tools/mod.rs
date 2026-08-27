@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::provider::ToolSpec;
+use crate::skills::Skill;
 use crate::subagent::presets::discover as discover_presets;
 use crate::subagent::{AgentPreset, RunOrigin, SubagentManager};
 
@@ -29,6 +30,7 @@ const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 120;
 enum ToolImpl {
     Shell,
     ReadFile,
+    ReadSkill,
     WriteFile,
     EditFile,
     Exec(exec::ExecTool),
@@ -80,6 +82,7 @@ impl ToolOutcome {
 pub struct Registry {
     entries: Vec<ToolEntry>,
     pub warnings: Vec<String>,
+    skills: Vec<Skill>,
     subagents: Option<SubagentContext>,
 }
 
@@ -90,8 +93,19 @@ impl Registry {
         let mut registry = Registry {
             entries: builtins(),
             warnings: Vec::new(),
+            skills: Vec::new(),
             subagents: None,
         };
+        let catalog = crate::skills::discover(config);
+        registry.warnings.extend(catalog.warnings);
+        registry.skills = catalog
+            .skills
+            .into_iter()
+            .filter(|skill| !skill.disable_model_invocation)
+            .collect();
+        if !registry.skills.is_empty() {
+            registry.entries.push(read_skill_entry());
+        }
         for dir in config.tool_dirs() {
             let (tools, warnings) = exec::scan_dir(&dir, cache);
             registry.warnings.extend(warnings);
@@ -137,6 +151,9 @@ impl Registry {
     pub(crate) fn retain_names(&mut self, names: &[String]) {
         self.entries
             .retain(|entry| names.contains(&entry.spec.name));
+        if !names.iter().any(|name| name == "read_skill") {
+            self.skills.clear();
+        }
     }
 
     fn insert(&mut self, entry: ToolEntry) {
@@ -155,6 +172,10 @@ impl Registry {
         self.entries.iter().map(|e| e.spec.clone()).collect()
     }
 
+    pub(crate) fn skills(&self) -> &[Skill] {
+        &self.skills
+    }
+
     /// Name, description, and origin for `/tools` and `--list-tools`.
     pub fn describe_all(&self) -> Vec<(String, String, String)> {
         self.entries
@@ -163,6 +184,7 @@ impl Registry {
                 let origin = match &e.imp {
                     ToolImpl::Exec(t) => t.path.display().to_string(),
                     ToolImpl::Subagent(_) => "orchestration".to_string(),
+                    ToolImpl::ReadSkill => "skills".to_string(),
                     _ => "builtin".to_string(),
                 };
                 (e.spec.name.clone(), e.spec.description.clone(), origin)
@@ -188,6 +210,7 @@ impl Registry {
         let mut outcome = match &entry.imp {
             ToolImpl::Shell => shell(&args),
             ToolImpl::ReadFile => read_file(&args),
+            ToolImpl::ReadSkill => read_skill(&self.skills, &args),
             ToolImpl::WriteFile => write_file(&args),
             ToolImpl::EditFile => edit_file(&args),
             ToolImpl::Exec(tool) => {
@@ -310,12 +333,31 @@ impl Registry {
 }
 
 const RESERVED_TOOL_NAMES: &[&str] = &[
+    "read_skill",
     "subagent_spawn",
     "subagent_send",
     "subagent_wait",
     "subagent_cancel",
     "subagent_list",
 ];
+
+fn read_skill_entry() -> ToolEntry {
+    ToolEntry {
+        spec: ToolSpec {
+            name: "read_skill".into(),
+            description:
+                "Load the complete instructions for an advertised skill before applying it.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Exact advertised skill name"}
+                },
+                "required": ["name"]
+            }),
+        },
+        imp: ToolImpl::ReadSkill,
+    }
+}
 
 fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
     let tool = |name: &str, description: &str, input_schema: Value, imp| ToolEntry {
@@ -393,7 +435,8 @@ fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         tool(
             "subagent_wait",
             "Wait until all requested subagents settle or the timeout expires without canceling them. \
-             Every settled run reports its complete final response.",
+             Every settled run reports its complete final response. A timeout only ends this status \
+             check; the subagents keep running, and long tasks routinely take 10+ minutes.",
             json!({
                 "type": "object",
                 "properties": {
@@ -406,7 +449,9 @@ fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         ),
         tool(
             "subagent_cancel",
-            "Cancel active subagent runs, clear their queues, and retain partial transcripts.",
+            "Cancel active subagent runs, clear their queues, and retain partial transcripts. \
+             Cancel only work that is no longer needed; a slow run or an expired wait is not a \
+             reason to cancel.",
             json!({
                 "type": "object",
                 "properties": {
@@ -581,6 +626,19 @@ fn read_file(args: &Value) -> ToolOutcome {
         Ok(file) => read_bounded_utf8(path, file),
         Err(e) => ToolOutcome::error(format!("cannot read {path}: {e}")),
     }
+}
+
+fn read_skill(skills: &[Skill], args: &Value) -> ToolOutcome {
+    let name = match str_arg(args, "name") {
+        Ok(name) => name,
+        Err(error) => return error,
+    };
+    let Some(skill) = skills.iter().find(|skill| skill.name == name) else {
+        return ToolOutcome::error(format!(
+            "skill '{name}' is not available for model invocation"
+        ));
+    };
+    ToolOutcome::ok(crate::skills::tool_result(skill))
 }
 
 fn read_bounded_utf8(path: &str, reader: impl Read) -> ToolOutcome {
@@ -801,6 +859,7 @@ fi
         assert!(
             RESERVED_TOOL_NAMES
                 .iter()
+                .filter(|name| name.starts_with("subagent_"))
                 .all(|name| names.iter().any(|candidate| candidate == name))
         );
         let _ = std::fs::remove_dir_all(root);
@@ -821,7 +880,7 @@ fi
             .find(|spec| spec.name == "subagent_spawn")
             .expect("spawn tool present");
         assert!(
-            spawn.description.contains("scout (read_file)"),
+            spawn.description.contains("scout (read_file+read_skill)"),
             "the description should advertise bundled presets; got:\n{}",
             spawn.description
         );
@@ -951,6 +1010,58 @@ fi
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, ["read_file", "shell"]);
+    }
+
+    #[test]
+    fn registry_exposes_only_model_invokable_skills() -> std::io::Result<()> {
+        let root = temp_path("skill-registry");
+        let skills = root.join("skills");
+        std::fs::create_dir_all(skills.join("automatic"))?;
+        std::fs::create_dir_all(skills.join("manual"))?;
+        std::fs::write(
+            skills.join("automatic/SKILL.md"),
+            "---\nname: automatic\ndescription: Use automatically\n---\nRead all relevant code.\n",
+        )?;
+        std::fs::write(
+            skills.join("manual/SKILL.md"),
+            "---\nname: manual\ndescription: Use manually\ndisable-model-invocation: true\n---\nOnly when requested.\n",
+        )?;
+        let mut config = registry_config(root.join("home"), root.join("project"));
+        config.skill_dirs = vec![skills.clone()];
+        config.global_skill_dirs = vec![skills];
+
+        let mut registry = Registry::scan(&config, &mut DescribeCache::default());
+        assert_eq!(
+            registry
+                .skills()
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["automatic"]
+        );
+        assert!(
+            registry
+                .specs()
+                .iter()
+                .any(|spec| spec.name == "read_skill")
+        );
+        let loaded = registry.execute("read_skill", r#"{"name":"automatic"}"#, "session");
+        assert!(!loaded.is_error, "{}", loaded.content);
+        assert!(loaded.content.contains("Read all relevant code."));
+        assert!(loaded.content.contains(&root.display().to_string()));
+        let denied = registry.execute("read_skill", r#"{"name":"manual"}"#, "session");
+        assert!(denied.is_error);
+
+        registry.retain_names(&["read_file".into()]);
+        assert!(registry.skills().is_empty());
+        assert!(
+            registry
+                .specs()
+                .iter()
+                .all(|spec| spec.name != "read_skill")
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]

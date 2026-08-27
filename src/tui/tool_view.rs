@@ -1,5 +1,7 @@
 //! Compact, tool-aware transcript rendering.
 
+use std::time::Duration;
+
 use serde_json::Value;
 
 use super::markdown;
@@ -8,6 +10,7 @@ const OUTPUT_PREVIEW_LINES: usize = 10;
 const CALL_PREVIEW_LINES: usize = 6;
 const SUCCESS_BACKGROUND: &str = "\x1b[48;2;42;50;41m";
 const ERROR_BACKGROUND: &str = "\x1b[48;2;50;42;42m";
+const SKILL_BACKGROUND: &str = "\x1b[48;2;54;44;82m";
 
 #[derive(Clone, Copy)]
 enum Tone {
@@ -33,12 +36,39 @@ impl ToolLine {
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 pub(super) fn render(
     name: &str,
     args: &str,
     output: &str,
     is_error: bool,
     running: bool,
+    elapsed: Option<Duration>,
+    width: usize,
+    expanded: bool,
+) -> Vec<String> {
+    render_labeled(
+        name,
+        args,
+        output,
+        is_error,
+        running,
+        elapsed,
+        &[],
+        width,
+        expanded,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(super) fn render_labeled(
+    name: &str,
+    args: &str,
+    output: &str,
+    is_error: bool,
+    running: bool,
+    elapsed: Option<Duration>,
+    labels: &[(&str, &str)],
     width: usize,
     expanded: bool,
 ) -> Vec<String> {
@@ -46,7 +76,16 @@ pub(super) fn render(
     let horizontal_padding = usize::from(width >= 3);
     let content_width = width.saturating_sub(horizontal_padding * 2).max(1);
     let parsed = serde_json::from_str::<Value>(args).ok();
-    let mut lines = render_call(name, parsed.as_ref(), args, running, is_error, expanded);
+    let mut lines = render_call(
+        name,
+        parsed.as_ref(),
+        args,
+        running,
+        elapsed,
+        is_error,
+        labels,
+        expanded,
+    );
 
     if should_show_output(name, output, is_error) {
         lines.push(ToolLine::new("", Tone::Output));
@@ -60,10 +99,12 @@ pub(super) fn render(
         ));
     }
 
-    let background = if running {
-        "\x1b[48;5;58m"
-    } else if is_error {
+    let background = if is_error {
         ERROR_BACKGROUND
+    } else if name == "read_skill" {
+        SKILL_BACKGROUND
+    } else if running {
+        "\x1b[48;5;58m"
     } else {
         SUCCESS_BACKGROUND
     };
@@ -85,21 +126,28 @@ pub(super) fn render(
     rendered
 }
 
+#[expect(clippy::too_many_arguments)]
 fn render_call(
     name: &str,
     args: Option<&Value>,
     raw_args: &str,
     running: bool,
+    elapsed: Option<Duration>,
     is_error: bool,
+    labels: &[(&str, &str)],
     expanded: bool,
 ) -> Vec<ToolLine> {
     let status = if running {
-        "  [running]"
+        match elapsed {
+            Some(elapsed) => format!("  [running {}]", format_elapsed(elapsed)),
+            None => "  [running]".to_string(),
+        }
     } else if is_error {
-        "  [error]"
+        "  [error]".to_string()
     } else {
-        ""
+        String::new()
     };
+    let status = status.as_str();
     match name {
         "shell" => {
             let command = string_arg(args, "command").unwrap_or(raw_args);
@@ -114,6 +162,10 @@ fn render_call(
                 "read {}{status}",
                 display_path(string_arg(args, "path").unwrap_or("?"))
             ),
+            Tone::Header,
+        )],
+        "read_skill" => vec![ToolLine::new(
+            format!("Skill {}{status}", string_arg(args, "name").unwrap_or("?")),
             Tone::Header,
         )],
         "write_file" => {
@@ -142,6 +194,68 @@ fn render_call(
             }
             call
         }
+        "subagent_spawn" => {
+            let agent = string_arg(args, "agent").unwrap_or("default");
+            let title = match string_arg(args, "name") {
+                Some(name) => format!("Spawn {name} ({agent}){status}"),
+                None => format!("Spawn subagent ({agent}){status}"),
+            };
+            let mut call = vec![ToolLine::new(title, Tone::Header)];
+            if let Some(prompt) = string_arg(args, "prompt") {
+                call.push(ToolLine::new("", Tone::Output));
+                call.extend(preview_lines(
+                    text_lines(prompt, Tone::Output),
+                    CALL_PREVIEW_LINES,
+                    expanded,
+                    false,
+                ));
+            }
+            call
+        }
+        "subagent_send" => {
+            let target = labeled_id(string_arg(args, "id").unwrap_or("?"), labels);
+            let mut call = vec![ToolLine::new(
+                format!("Message {target}{status}"),
+                Tone::Header,
+            )];
+            if let Some(message) = string_arg(args, "message") {
+                call.push(ToolLine::new("", Tone::Output));
+                call.extend(preview_lines(
+                    text_lines(message, Tone::Output),
+                    CALL_PREVIEW_LINES,
+                    expanded,
+                    false,
+                ));
+            }
+            call
+        }
+        "subagent_wait" => {
+            let targets = labeled_ids(args, labels);
+            let title = if running {
+                match elapsed {
+                    Some(elapsed) => {
+                        format!("Waiting for {targets} · {}", format_elapsed(elapsed))
+                    }
+                    None => format!("Waiting for {targets}"),
+                }
+            } else if is_error {
+                format!("Waiting for {targets}  [error]")
+            } else {
+                format!("Waiting for {targets}")
+            };
+            vec![ToolLine::new(title, Tone::Header)]
+        }
+        "subagent_cancel" => vec![ToolLine::new(
+            format!("Cancel {}{status}", labeled_ids(args, labels)),
+            Tone::Header,
+        )],
+        "subagent_list" => {
+            let title = match string_arg(args, "id") {
+                Some(id) => format!("Subagent {}{status}", labeled_id(id, labels)),
+                None => format!("Subagents{status}"),
+            };
+            vec![ToolLine::new(title, Tone::Header)]
+        }
         _ => {
             let summary = generic_summary(args, raw_args);
             let title = if summary.is_empty() {
@@ -163,6 +277,43 @@ fn should_show_output(name: &str, output: &str, is_error: bool) -> bool {
 
 fn string_arg<'a>(args: Option<&'a Value>, key: &str) -> Option<&'a str> {
     args?.get(key)?.as_str()
+}
+
+fn labeled_id(id: &str, labels: &[(&str, &str)]) -> String {
+    labels
+        .iter()
+        .find(|(key, _)| *key == id)
+        .map(|(_, name)| *name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(id)
+        .to_string()
+}
+
+fn labeled_ids(args: Option<&Value>, labels: &[(&str, &str)]) -> String {
+    args.and_then(|args| args.get("ids"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|id| labeled_id(id, labels))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|joined| !joined.is_empty())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Compact human elapsed time: `42s`, `3m 07s`, `1h 04m`.
+pub(super) fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs >= 3600 {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 fn generic_summary(args: Option<&Value>, raw_args: &str) -> String {
@@ -456,6 +607,7 @@ mod tests {
             &output,
             false,
             false,
+            None,
             80,
             false,
         );
@@ -473,6 +625,7 @@ mod tests {
             "",
             false,
             false,
+            None,
             40,
             false,
         );
@@ -482,12 +635,119 @@ mod tests {
             "failed",
             true,
             false,
+            None,
             40,
             false,
         );
 
         assert!(success.iter().all(|line| line.contains(SUCCESS_BACKGROUND)));
         assert!(error.iter().all(|line| line.contains(ERROR_BACKGROUND)));
+    }
+
+    #[test]
+    fn skill_blocks_use_a_distinct_background_and_label() {
+        let running = render(
+            "read_skill",
+            r#"{"name":"rust"}"#,
+            "",
+            false,
+            true,
+            None,
+            40,
+            false,
+        );
+        let plain = markdown::strip_ansi(&running.join("\n"));
+        assert!(plain.contains("Skill rust  [running]"));
+        assert!(running.iter().all(|line| line.contains(SKILL_BACKGROUND)));
+
+        let error = render(
+            "read_skill",
+            r#"{"name":"missing"}"#,
+            "not available",
+            true,
+            false,
+            None,
+            40,
+            false,
+        );
+        assert!(error.iter().all(|line| line.contains(ERROR_BACKGROUND)));
+    }
+
+    #[test]
+    fn subagent_calls_render_readable_summaries_instead_of_json() {
+        let wait = render(
+            "subagent_wait",
+            r#"{"ids":["sa-1","sa-2","sa-3"],"timeout_secs":300}"#,
+            "",
+            false,
+            true,
+            Some(Duration::from_secs(83)),
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&wait.join("\n"));
+        assert!(plain.contains("Waiting for sa-1, sa-2, sa-3 · 1m 23s"));
+        assert!(!plain.contains("{\"ids\""));
+        assert!(!plain.contains("timeout_secs"));
+
+        let named = render_labeled(
+            "subagent_wait",
+            r#"{"ids":["sa-1","sa-2"],"timeout_secs":300}"#,
+            "",
+            false,
+            true,
+            Some(Duration::from_secs(27)),
+            &[("sa-1", "LucidOtter"), ("sa-2", "SwiftFalcon")],
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&named.join("\n"));
+        assert!(plain.contains("Waiting for LucidOtter, SwiftFalcon · 27s"));
+        assert!(!plain.contains("sa-1"));
+
+        let spawn = render(
+            "subagent_spawn",
+            r##"{"prompt":"# Target\naudit the frontend","required_tools":["read_file"],"name":"auditor","agent":"scout"}"##,
+            "",
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&spawn.join("\n"));
+        assert!(plain.contains("Spawn auditor (scout)"));
+        assert!(plain.contains("audit the frontend"));
+        assert!(!plain.contains("required_tools"));
+
+        let send = render(
+            "subagent_send",
+            r#"{"id":"sa-2","message":"also check the tests"}"#,
+            "",
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&send.join("\n"));
+        assert!(plain.contains("Message sa-2"));
+        assert!(plain.contains("also check the tests"));
+
+        let cancel = render(
+            "subagent_cancel",
+            r#"{"ids":["sa-1"]}"#,
+            "",
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        assert!(markdown::strip_ansi(&cancel.join("\n")).contains("Cancel sa-1"));
+
+        let list = render("subagent_list", r#"{}"#, "", false, false, None, 80, false);
+        assert!(markdown::strip_ansi(&list.join("\n")).contains("Subagents"));
     }
 
     #[test]
@@ -498,6 +758,7 @@ mod tests {
             "",
             false,
             false,
+            None,
             40,
             false,
         );
@@ -520,6 +781,7 @@ mod tests {
             &output,
             false,
             false,
+            None,
             80,
             true,
         );
@@ -537,6 +799,7 @@ mod tests {
             "result",
             false,
             false,
+            None,
             40,
             false,
         );
@@ -562,11 +825,20 @@ mod tests {
             "",
             false,
             false,
+            None,
             40,
             false,
         );
         let plain = markdown::strip_ansi(&rendered[1]);
         assert!(plain.starts_with(" $ true"));
+    }
+
+    #[test]
+    fn elapsed_times_use_compact_human_units() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(format_elapsed(Duration::from_secs(187)), "3m 07s");
+        assert_eq!(format_elapsed(Duration::from_secs(3_845)), "1h 04m");
     }
 
     #[test]

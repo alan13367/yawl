@@ -751,6 +751,12 @@ fn build_plan(
             flow.endpoint.clone(),
             &flow.credential,
         )?);
+        if let ProviderId::Compatible(name) = provider {
+            changes.push(crate::config::ConfigChange::ProviderModel {
+                name: name.clone(),
+                model: flow.model.clone(),
+            });
+        }
         if let Some(change) = provider::credential_change(provider, &flow.credential) {
             changes.push(change);
         }
@@ -794,4 +800,52 @@ fn go_back(flow: &mut ConnectFlow, step: ConnectStep, state: &mut ViewState) {
         | ConnectStep::Login
         | ConnectStep::Review => provider_picker(&flow.config, flow.root_parent.clone()),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_only_persists_the_selected_compatible_model() -> Result<(), Error> {
+        let root =
+            std::env::temp_dir().join(format!("yawl-connection-only-model-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let config = Config::load_from(root.join("home/.yawl"), root.join("project/.yawl"))?;
+        let flow = ConnectFlow {
+            config: config.clone(),
+            step: ConnectStep::Review,
+            provider: Some(ProviderId::Compatible("local-api".into())),
+            provider_label: "Local API".into(),
+            endpoint: "http://127.0.0.1:9000/v1".into(),
+            credential: CredentialChoice::None,
+            model: "chosen-model".into(),
+            models: vec!["chosen-model".into()],
+            job: None,
+            root_parent: None,
+        };
+
+        let plan = build_plan(&flow, ConnectionActivation::ConnectionOnly)?;
+        let saved = config.change_global_batch(plan.changes_for_save())?.config;
+
+        assert_eq!(
+            saved.providers["local-api"]
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["chosen-model"]
+        );
+        assert!(
+            crate::model::available_models(&saved)
+                .iter()
+                .any(|(model, _)| model == "local-api:chosen-model")
+        );
+        assert_eq!(saved.model, config.model);
+
+        let saved_again = saved.change_global_batch(plan.changes_for_save())?.config;
+        assert_eq!(saved_again.providers["local-api"].models.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
 }

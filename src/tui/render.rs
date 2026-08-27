@@ -60,6 +60,7 @@ impl CacheSlot {
         transcript: &super::transcript::Transcript,
         tools_expanded: bool,
         hide_reasoning: bool,
+        labels: &[(&str, &str)],
     ) {
         let entries = transcript.entries();
         if entries.len() < self.frozen_count {
@@ -94,6 +95,7 @@ impl CacheSlot {
                 expanded,
                 hide_reasoning,
                 self.accent_color,
+                labels,
             );
             changed_from = Some(changed_from.map_or(i, |changed| changed.min(i)));
         }
@@ -110,6 +112,7 @@ impl CacheSlot {
                 expanded,
                 hide_reasoning,
                 self.accent_color,
+                labels,
             );
             changed_from = Some(changed_from.map_or(idx, |changed| changed.min(idx)));
         }
@@ -185,6 +188,7 @@ impl RenderCache {
         hide_reasoning: bool,
         accent_color: UiColor,
         width: usize,
+        labels: &[(&str, &str)],
     ) -> &'a CacheSlot {
         let slot_idx = self.slots.iter().position(|slot| {
             slot.as_ref()
@@ -206,7 +210,7 @@ impl RenderCache {
         };
 
         let slot = self.slots[idx].as_mut().expect("slot was set above");
-        slot.update(transcript, tools_expanded, hide_reasoning);
+        slot.update(transcript, tools_expanded, hide_reasoning, labels);
         slot
     }
 
@@ -225,6 +229,7 @@ impl RenderCache {
             hide_reasoning,
             accent_color,
             width,
+            &[],
         )
         .flattened()
     }
@@ -236,6 +241,7 @@ fn render_entry(
     expanded: bool,
     hide_reasoning: bool,
     accent_color: UiColor,
+    labels: &[(&str, &str)],
 ) -> Option<Vec<String>> {
     match entry {
         Entry::User(content) if !expanded => Some(render_collapsed("Prompt", content, width)),
@@ -264,8 +270,17 @@ fn render_entry(
             output,
             is_error,
             running,
-        } => Some(tool_view::render(
-            name, args, output, *is_error, *running, width, expanded,
+            started,
+        } => Some(tool_view::render_labeled(
+            name,
+            args,
+            output,
+            *is_error,
+            *running,
+            started.map(|started| started.elapsed()),
+            labels,
+            width,
+            expanded,
         )),
         Entry::Notice(content) if !expanded => Some(render_collapsed("Notice", content, width)),
         Entry::Notice(content) => {
@@ -322,6 +337,7 @@ pub(super) fn render_entries(
             entry_default_expanded(entry, tools_expanded),
             hide_reasoning,
             UiColor::WHITE,
+            &[],
         ) {
             lines.extend(rendered);
             lines.push(String::new());
@@ -698,6 +714,21 @@ struct TranscriptWindow {
     max_scroll: usize,
 }
 
+fn subagent_labels(state: &ViewState) -> Vec<(String, String)> {
+    state
+        .subagent_snapshots
+        .iter()
+        .map(|snapshot| (snapshot.id.to_string(), snapshot.name.clone()))
+        .collect()
+}
+
+fn label_refs(labels: &[(String, String)]) -> Vec<(&str, &str)> {
+    labels
+        .iter()
+        .map(|(id, name)| (id.as_str(), name.as_str()))
+        .collect()
+}
+
 fn render_transcript_window(
     state: &mut ViewState,
     width: usize,
@@ -714,6 +745,8 @@ fn render_transcript_window(
 
     let selected = state.transcript.selected_index();
     let reveal = state.transcript.take_reveal_selected();
+    let labels = subagent_labels(state);
+    let label_refs = label_refs(&labels);
     let (cached_lines, selected_range) = {
         let slot = state.render_cache.get_or_render_slot(
             &state.transcript,
@@ -721,6 +754,7 @@ fn render_transcript_window(
             state.hide_reasoning,
             state.accent_color,
             width,
+            &label_refs,
         );
         (
             slot.total_lines(),
@@ -743,6 +777,7 @@ fn render_transcript_window(
         state.hide_reasoning,
         state.accent_color,
         width,
+        &label_refs,
     );
     let mut lines = Vec::with_capacity(end - start);
     for row in start..end {
@@ -779,6 +814,7 @@ pub(super) fn loading_label(activity: &str) -> Option<&str> {
         "preparing write" => Some("Preparing write…"),
         "preparing edit" => Some("Preparing edit…"),
         "preparing tool" => Some("Preparing tool…"),
+        "loading skill" => Some("Loading skill…"),
         "compacting conversation" => Some("Compacting conversation…"),
         "canceling turn" => Some("Canceling turn…"),
         other if other.starts_with("attempt") => Some(other),
@@ -788,7 +824,10 @@ pub(super) fn loading_label(activity: &str) -> Option<&str> {
 
 pub(super) fn render_loading_state(state: &ViewState, width: usize) -> Option<String> {
     let label = loading_label(&state.activity)?;
-    if has_visible_in_flight_content(state) && !state.activity.starts_with("preparing ") {
+    if has_visible_in_flight_content(state)
+        && !state.activity.starts_with("preparing ")
+        && state.activity != "loading skill"
+    {
         return None;
     }
     const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -973,50 +1012,34 @@ pub(super) fn build_frame(
         .saturating_mul(100)
         .checked_div(state.context_window)
         .unwrap_or(0);
-    let reasoning = state
+    let mut parts = Vec::new();
+    if let Some(effort) = state
         .reasoning_effort
         .as_deref()
-        .map_or(String::new(), |effort| format!(" · {effort}"));
-    let mut status = format!(
-        "{}  {}/{} tokens ({}%)",
-        reasoning, state.context_tokens, state.context_window, percentage
-    );
-    if !state.activity.is_empty() {
-        status.push_str("  ");
-        status.push_str(&state.activity);
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(effort.to_string());
+    }
+    parts.push(format!(
+        "{}% / {}",
+        percentage,
+        format_token_count(state.context_window)
+    ));
+    if let Some(started) = state.turn_started {
+        parts.push(tool_view::format_elapsed(started.elapsed()));
     }
     if !state.queued_inputs.is_empty() {
-        status.push_str(&format!("  {} queued", state.queued_inputs.len()));
+        parts.push(format!("{} queued", state.queued_inputs.len()));
     }
     if !state.pending_actions.is_empty() {
-        status.push_str(&format!("  {} change pending", state.pending_actions.len()));
+        parts.push(format!("{} pending", state.pending_actions.len()));
     }
-    if !state.subagent_snapshots.is_empty() {
-        let running = state
-            .subagent_snapshots
-            .iter()
-            .filter(|snapshot| snapshot.status.is_active())
-            .count();
-        let done = state
-            .subagent_snapshots
-            .iter()
-            .filter(|snapshot| snapshot.status == crate::subagent::SubagentStatus::Done)
-            .count();
-        let failed = state
-            .subagent_snapshots
-            .iter()
-            .filter(|snapshot| snapshot.status == crate::subagent::SubagentStatus::Failed)
-            .count();
-        status.push_str(&format!(
-            "  agents {running} running · {done} done · {failed} failed"
-        ));
-        if state.subagent_tokens > 0 {
-            status.push_str(&format!(
-                " · {} child tokens",
-                format_token_count(state.subagent_tokens)
-            ));
-        }
-    }
+    parts.extend(agent_status_parts(state));
+    let status = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  ·  {}", parts.join("  ·  "))
+    };
     frame.push(markdown::fit_width(
         &format!(
             " {}\x1b[1m{}\x1b[22m{}{status}\x1b[0m",
@@ -1054,6 +1077,8 @@ fn render_block_viewer(
         state.transcript.close_viewer();
         return build_frame(state, &Editor::default(), columns, rows);
     };
+    let labels = subagent_labels(state);
+    let label_refs = label_refs(&labels);
     let Some(entry) = state.transcript.entry(index) else {
         state.transcript.close_viewer();
         return build_frame(state, &Editor::default(), columns, rows);
@@ -1071,6 +1096,7 @@ fn render_block_viewer(
         true,
         state.hide_reasoning,
         state.accent_color,
+        &label_refs,
     )
     .unwrap_or_default();
     let body_height = rows.saturating_sub(2);
@@ -1098,18 +1124,57 @@ fn render_block_viewer(
     (frame, (rows, 1))
 }
 
+fn agent_status_parts(state: &ViewState) -> Vec<String> {
+    if state.subagent_snapshots.is_empty() && state.subagent_tokens == 0 {
+        return Vec::new();
+    }
+    let running = state
+        .subagent_snapshots
+        .iter()
+        .filter(|snapshot| snapshot.status.is_active())
+        .collect::<Vec<_>>();
+    let failed = state
+        .subagent_snapshots
+        .iter()
+        .filter(|snapshot| snapshot.status == crate::subagent::SubagentStatus::Failed)
+        .count();
+    let mut parts = Vec::new();
+    match running.as_slice() {
+        [] => {}
+        [snapshot] => parts.push(snapshot.name.clone()),
+        many => parts.push(format!("{} agents", many.len())),
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    if state.subagent_tokens > 0 {
+        parts.push(format!(
+            "{} child",
+            format_token_count(state.subagent_tokens)
+        ));
+    }
+    parts
+}
+
 /// Compact token counts for the status bar: raw below 10,000, then 12.3k
-/// and 1.2M steps so the line stays short.
+/// and 1.2M steps so the line stays short. Whole thousands drop the
+/// trailing `.0` (`400k`, `1M`).
 pub(super) fn format_token_count(tokens: u64) -> String {
     if tokens < 10_000 {
         return tokens.to_string();
     }
     if tokens < 1_000_000 {
-        return format!("{}.{:01}k", tokens / 1_000, tokens % 1_000 / 100);
+        let whole = tokens / 1_000;
+        let tenths = tokens % 1_000 / 100;
+        if tenths == 0 {
+            return format!("{whole}k");
+        }
+        return format!("{whole}.{tenths}k");
     }
-    format!(
-        "{}.{:01}M",
-        tokens / 1_000_000,
-        tokens % 1_000_000 / 100_000
-    )
+    let whole = tokens / 1_000_000;
+    let tenths = tokens % 1_000_000 / 100_000;
+    if tenths == 0 {
+        return format!("{whole}M");
+    }
+    format!("{whole}.{tenths}M")
 }

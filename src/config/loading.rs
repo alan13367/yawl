@@ -22,16 +22,17 @@ impl Config {
         let mut cfg = Self::defaults(home_dir, project_dir);
         let global = cfg.global_config_path();
         let project = cfg.project_dir.join("config.json");
-        for path in [global, project] {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    let file: ConfigFile = serde_json::from_str(&text)
-                        .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
-                    cfg.apply(file)
-                        .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(Error::Config(format!("{}: {e}", path.display()))),
+        if let Some(file) = read_config_file(&global)? {
+            cfg.apply(file)
+                .map_err(|e| Error::Config(format!("{}: {e}", global.display())))?;
+        }
+        cfg.global_skill_dirs.clone_from(&cfg.skill_dirs);
+        if let Some(file) = read_config_file(&project)? {
+            let has_skill_override = file.skill_dirs.is_some();
+            cfg.apply(file)
+                .map_err(|e| Error::Config(format!("{}: {e}", project.display())))?;
+            if has_skill_override {
+                cfg.project_skill_dirs = Some(cfg.skill_dirs.clone());
             }
         }
         Ok(cfg)
@@ -59,6 +60,9 @@ impl Config {
             subagent_request_budget: DEFAULT_SUBAGENT_REQUEST_BUDGET,
             subagent_timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
             skill_dirs: vec![home.join(".yawl/skills"), home.join(".agents/skills")],
+            global_skill_dirs: vec![home.join(".yawl/skills"), home.join(".agents/skills")],
+            project_skill_dirs: None,
+            project_skills_trusted: false,
             providers: default_local_providers(),
             setup_skipped: false,
             anthropic_api_key: None,
@@ -69,7 +73,9 @@ impl Config {
     }
 
     pub(crate) fn reload(&self) -> Result<Config, Error> {
-        Self::load_from(self.home_dir.clone(), self.project_dir.clone())
+        let mut reloaded = Self::load_from(self.home_dir.clone(), self.project_dir.clone())?;
+        reloaded.project_skills_trusted = self.project_skills_trusted;
+        Ok(reloaded)
     }
 
     /// Merges one on-disk file into the effective config. Values are held to
@@ -202,6 +208,16 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+fn read_config_file(path: &Path) -> Result<Option<ConfigFile>, Error> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| Error::Config(format!("{}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Config(format!("{}: {e}", path.display()))),
     }
 }
 
@@ -483,6 +499,36 @@ mod tests {
                 .contains(&home.join("config.json").display().to_string())
         );
         assert!(error.to_string().contains("positive integer"));
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn load_retains_global_and_project_skill_directory_provenance() -> Result<(), Error> {
+        let root = std::env::temp_dir().join(format!(
+            "yawl-config-skill-provenance-{}",
+            std::process::id()
+        ));
+        let home = root.join("home/.yawl");
+        let project = root.join("project/.yawl");
+        std::fs::create_dir_all(&home)?;
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(
+            home.join("config.json"),
+            r#"{"skill_dirs":["/global/skills"]}"#,
+        )?;
+        std::fs::write(
+            project.join("config.json"),
+            r#"{"skill_dirs":["/project/skills"]}"#,
+        )?;
+
+        let config = Config::load_from(home, project)?;
+        assert_eq!(config.global_skill_dirs, [PathBuf::from("/global/skills")]);
+        assert_eq!(
+            config.project_skill_dirs.as_deref(),
+            Some([PathBuf::from("/project/skills")].as_slice())
+        );
+        assert!(!config.project_skills_trusted);
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }

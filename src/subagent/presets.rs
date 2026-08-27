@@ -42,7 +42,7 @@ pub(crate) fn bundled() -> Vec<AgentPreset> {
         // `shell` is intentionally excluded. Even commands that look like
         // searches can contain redirection or invoke mutating subprocesses,
         // so a prompt instruction cannot make the shell read-only.
-        tools: Some(vec!["read_file".into()]),
+        tools: Some(vec!["read_file".into(), "read_skill".into()]),
         prompt: Some(
             "You are a read-only research specialist. Inspect the files named in the delegated \
              task and report findings with exact paths and line references. Never modify files \
@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(presets[0].name, "scout");
         assert_eq!(
             presets[0].tools.as_deref(),
-            Some(["read_file".to_string()].as_slice())
+            Some(["read_file".to_string(), "read_skill".to_string()].as_slice())
         );
     }
 

@@ -239,11 +239,16 @@ impl SubagentSnapshot {
                 self.current_activity = match name {
                     "write_file" => "preparing write".into(),
                     "edit_file" => "preparing edit".into(),
+                    "read_skill" => "loading skill".into(),
                     _ => "preparing tool".into(),
                 };
             }
             TurnEvent::ToolStart { name, args } => {
-                self.current_activity = format!("running {name}");
+                self.current_activity = if name == "read_skill" {
+                    "loading skill".into()
+                } else {
+                    format!("running {name}")
+                };
                 self.current_tool = Some(LiveTool {
                     name: sanitize_preview(name, MAX_TRANSCRIPT_TEXT_BYTES),
                     arguments: sanitize_preview(args, MAX_TRANSCRIPT_TEXT_BYTES),

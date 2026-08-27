@@ -347,6 +347,19 @@ impl SubagentManager {
             .deferred
             .retain(|delivery| !ids.iter().any(|id| id == delivery.id.as_str()));
         let mut output = format_snapshots(&snapshots);
+        let active = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.status.is_active())
+            .count();
+        if active > 0 {
+            output = format!(
+                "Wait ended after {timeout_secs}s with {active} of {} subagent(s) still \
+                 running. This is normal: subagent tasks often take 10+ minutes. Their results \
+                 arrive automatically when they settle, so wait again or continue other work. \
+                 Do not cancel a subagent because a wait timed out.\n\n{output}",
+                snapshots.len()
+            );
+        }
         consumed.sort_by_key(|delivery| delivery.run_number);
         for delivery in consumed {
             // The snapshot section already carries the latest run's full text,
@@ -1532,6 +1545,61 @@ mod tests {
         manager
             .wait(&[id.to_string()], Some(5))
             .expect("canceled worker should settle");
+        server.join().expect("provider server should exit");
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn timed_out_wait_reports_progress_and_discourages_cancellation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
+        let base_url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("test provider address")
+        );
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("subagent provider connection");
+            read_request(&mut stream).expect("subagent provider request");
+            ready_tx.send(()).expect("provider ready signal");
+            release_rx.recv().expect("provider release signal");
+            write_response(&mut stream, "slow result").expect("subagent provider response");
+        });
+        let manager = SubagentManager::new("session".into(), 1);
+        let id = manager
+            .spawn(
+                provider_config(base_url),
+                "local:model",
+                Some("slow"),
+                "long work",
+                None,
+            )
+            .expect("slow subagent spawn");
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker should reach the provider");
+
+        let timed_out = manager
+            .wait(&[id.to_string()], Some(1))
+            .expect("a timed-out wait must still report status");
+        assert!(
+            timed_out.contains("1 of 1 subagent(s) still running"),
+            "the timed-out wait must explain that the run continues; got:\n{timed_out}"
+        );
+        assert!(
+            timed_out.contains("Do not cancel a subagent because a wait timed out"),
+            "the timed-out wait must discourage premature cancellation; got:\n{timed_out}"
+        );
+
+        release_tx.send(()).expect("release provider response");
+        let settled = manager
+            .wait(&[id.to_string()], Some(5))
+            .expect("released subagent should settle");
+        assert!(settled.contains("slow result"));
+        assert!(
+            !settled.contains("still running"),
+            "settled waits must not carry the timeout notice; got:\n{settled}"
+        );
         server.join().expect("provider server should exit");
         manager.shutdown_and_discard();
     }

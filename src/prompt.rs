@@ -3,7 +3,14 @@
 
 use std::path::Path;
 
-pub(crate) fn build_system_prompt(global_dir: &Path, subagents: bool, print_mode: bool) -> String {
+use crate::skills::Skill;
+
+pub(crate) fn build_system_prompt(
+    global_dir: &Path,
+    subagents: bool,
+    print_mode: bool,
+    skills: &[Skill],
+) -> String {
     let cwd = std::env::current_dir().ok();
     build_system_prompt_from(
         cwd.as_deref(),
@@ -12,12 +19,14 @@ pub(crate) fn build_system_prompt(global_dir: &Path, subagents: bool, print_mode
         false,
         print_mode,
         None,
+        skills,
     )
 }
 
 pub(crate) fn build_subagent_system_prompt(
     global_dir: &Path,
     role_fragment: Option<&str>,
+    skills: &[Skill],
 ) -> String {
     let cwd = std::env::current_dir().ok();
     build_system_prompt_from(
@@ -27,6 +36,7 @@ pub(crate) fn build_subagent_system_prompt(
         true,
         false,
         role_fragment,
+        skills,
     )
 }
 
@@ -37,6 +47,7 @@ fn build_system_prompt_from(
     is_subagent: bool,
     print_mode: bool,
     role_fragment: Option<&str>,
+    skills: &[Skill],
 ) -> String {
     let cwd_display = cwd.map_or_else(
         || "(unknown)".to_string(),
@@ -59,6 +70,7 @@ Tools:
 - To add a tool, create an executable whose `--describe` output is JSON with `name`, `description`, `input_schema`, and optional `timeout_secs`. Normal calls receive JSON on stdin and return their result on stdout. A nonzero exit is an error. The tool inherits the working directory and receives `YAWL_SESSION_ID`.
 "#
     );
+    append_skill_catalog(&mut prompt, skills);
     append_instructions(
         &mut prompt,
         "global_instructions",
@@ -84,6 +96,7 @@ Tools:
 - Before the first subagent_spawn for a user request, inspect the working directory yourself with a quick local check: identify the repository root, list the top-level files, detect an empty or uninitialized directory, and read applicable instructions. Decide whether delegation is useful only after this check. Do not spawn Scout just to discover the layout or that the directory is empty.
 - Delegate only self-contained work. Include paths, constraints, file ownership, and expected output.
 - Give concurrent agents disjoint editing scopes. Spawn them in the background and keep working.
+- Subagent tasks often take 10+ minutes. A subagent_wait timeout is a status check, not a failure: the run keeps going, so wait again or keep working. Cancel only work you no longer need, never for slowness.
 "#);
         prompt.push_str(delivery);
         prompt.push_str(
@@ -92,7 +105,7 @@ Tools:
              - Set required_tools to every tool the task needs before choosing an agent. Use [] only when the child can answer without tools.\n\
              - Never select a model in subagent_spawn. A preset or user configuration may pin the child model; otherwise it inherits the active parent model.\n\
              - Omit agent to use the default child for any task that creates, edits, or deletes files, runs commands, tests, or builds, or otherwise needs a tool the preset does not advertise. File creation requires write_file; file modification requires edit_file or write_file.\n\
-             - Use agent=\"scout\" only to inspect exact existing files with read_file and return findings in its response. Never ask Scout to create or modify a file.\n\
+             - Use agent=\"scout\" only to inspect exact existing files with read_file or load relevant read-only guidance with read_skill. Never ask Scout to create or modify a file.\n\
              - Decide interfaces between concurrent agents up front and restate them in every prompt.\n\
              - Tell every agent to skip formatters, linters, and project-wide test suites; validate once yourself after all agents finish.\n\
              - When a result will be large and must be written to disk, use the default child, include write_file in required_tools, and have it return the path with a summary.\n</subagent_guidance>\n",
@@ -111,6 +124,36 @@ Tools:
         prompt.push_str("</subagent_role>\n");
     }
     prompt
+}
+
+fn append_skill_catalog(prompt: &mut String, skills: &[Skill]) {
+    if skills.is_empty() {
+        return;
+    }
+    prompt.push_str(
+        "\n<skills>\nReusable skills, listed as name and description. Check this catalog for every request. When a description matches the task, call read_skill with the skill name and follow the returned instructions before acting. The description only says when a skill applies; never apply a skill from its description alone.\n",
+    );
+    for skill in skills {
+        prompt.push_str("<skill name=\"");
+        push_xml_escaped(prompt, &skill.name);
+        prompt.push_str("\">");
+        push_xml_escaped(prompt, &skill.description);
+        prompt.push_str("</skill>\n");
+    }
+    prompt.push_str("</skills>\n");
+}
+
+fn push_xml_escaped(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&apos;"),
+            _ => output.push(character),
+        }
+    }
 }
 
 fn append_instructions(prompt: &mut String, tag: &str, display_path: &str, path: &Path) {
@@ -167,6 +210,7 @@ mod tests {
             false,
             false,
             None,
+            &[],
         );
         assert!(prompt.contains("expert coding agent"));
         assert!(prompt.contains("--describe"));
@@ -188,8 +232,15 @@ mod tests {
         std::fs::write(project_dir.join("YAWL.md"), "legacy rule")
             .expect("legacy instructions should be written");
 
-        let prompt =
-            build_system_prompt_from(Some(&project_dir), &global_dir, false, false, false, None);
+        let prompt = build_system_prompt_from(
+            Some(&project_dir),
+            &global_dir,
+            false,
+            false,
+            false,
+            None,
+            &[],
+        );
         let global_position = prompt
             .find("global rule")
             .expect("global instructions should be present");
@@ -206,10 +257,11 @@ mod tests {
     #[test]
     fn orchestration_and_subagent_guidance_are_conditional() {
         let dirs = TestDirs::new();
-        let main = build_system_prompt_from(Some(&dirs.0), &dirs.0, true, false, false, None);
-        let child = build_system_prompt_from(Some(&dirs.0), &dirs.0, false, true, false, None);
-        let disabled = build_system_prompt_from(Some(&dirs.0), &dirs.0, false, false, false, None);
-        let print = build_system_prompt_from(Some(&dirs.0), &dirs.0, true, false, true, None);
+        let main = build_system_prompt_from(Some(&dirs.0), &dirs.0, true, false, false, None, &[]);
+        let child = build_system_prompt_from(Some(&dirs.0), &dirs.0, false, true, false, None, &[]);
+        let disabled =
+            build_system_prompt_from(Some(&dirs.0), &dirs.0, false, false, false, None, &[]);
+        let print = build_system_prompt_from(Some(&dirs.0), &dirs.0, true, false, true, None, &[]);
 
         assert!(main.contains("<subagent_guidance>"));
         assert!(child.contains("<subagent_role>"));
@@ -223,6 +275,10 @@ mod tests {
         assert!(
             main.contains("skip formatters, linters, and project-wide test suites"),
             "the mid-flight validation ban must reach the main agent"
+        );
+        assert!(
+            main.contains("A subagent_wait timeout is a status check, not a failure"),
+            "the guidance must forbid canceling subagents for slowness"
         );
         assert!(
             main.contains("Set required_tools to every tool the task needs")
@@ -240,7 +296,8 @@ mod tests {
     #[test]
     fn subagent_guidance_requires_a_local_repository_check_before_delegation() {
         let dirs = TestDirs::new();
-        let prompt = build_system_prompt_from(Some(&dirs.0), &dirs.0, true, false, false, None);
+        let prompt =
+            build_system_prompt_from(Some(&dirs.0), &dirs.0, true, false, false, None, &[]);
         let local_check = prompt
             .find("Before the first subagent_spawn")
             .expect("the parent must check the working directory before spawning");
@@ -263,6 +320,7 @@ mod tests {
             true,
             false,
             Some("You are a scout: investigate and report paths."),
+            &[],
         );
 
         let block_start = child.find("<subagent_role>").expect("role block opens");
@@ -274,7 +332,36 @@ mod tests {
             block_start < fragment_at && fragment_at < block_end,
             "the preset fragment must land inside the role block"
         );
-        let plain = build_subagent_system_prompt(&dirs.0, None);
+        let plain = build_subagent_system_prompt(&dirs.0, None, &[]);
         assert!(!plain.contains("You are a scout"));
+    }
+
+    #[test]
+    fn skill_catalog_keeps_complete_descriptions_and_omits_paths() {
+        let dirs = TestDirs::new();
+        let long = format!("Choose this for <reviews> & fixes. {}", "x".repeat(4_000));
+        let skill = Skill {
+            name: "review".into(),
+            description: long.clone(),
+            path: dirs.0.join("secret/SKILL.md"),
+            directory: dirs.0.join("secret"),
+            instructions: "instructions are loaded later".into(),
+            disable_model_invocation: false,
+        };
+
+        let prompt =
+            build_system_prompt_from(Some(&dirs.0), &dirs.0, false, false, false, None, &[skill]);
+        assert!(
+            prompt.contains(
+                &long
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+            )
+        );
+        assert!(prompt.contains("call read_skill with the skill name"));
+        assert!(prompt.contains("never apply a skill from its description alone"));
+        assert!(!prompt.contains("secret/SKILL.md"));
+        assert!(!prompt.contains("instructions are loaded later"));
     }
 }

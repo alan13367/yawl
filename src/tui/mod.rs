@@ -113,6 +113,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
     loop {
         if agent.has_deferred_subagent_results() {
             state.activity = "delivering subagent results".into();
+            state.turn_started = Some(std::time::Instant::now());
             terminal.draw(&mut state, &editor)?;
             match deferred_subagents_interactive(
                 agent,
@@ -129,6 +130,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
             }
             rebuild_transcript_after_deferred_follow_up(&mut state, agent.messages());
             state.activity.clear();
+            state.turn_started = None;
             terminal.draw(&mut state, &editor)?;
             continue;
         }
@@ -402,6 +404,7 @@ fn run_agent_submission<R: Read>(
 ) -> Result<(), Error> {
     state.transcript.push_user(displayed_input);
     state.activity = "sending".into();
+    state.turn_started = Some(std::time::Instant::now());
     state.scroll_offset = 0;
     terminal.draw(state, editor)?;
     match turn_interactive(agent, agent_input, state, editor, terminal, events) {
@@ -411,5 +414,6 @@ fn run_agent_submission<R: Read>(
     }
     crate::set_interrupted(false);
     state.activity.clear();
+    state.turn_started = None;
     Ok(())
 }

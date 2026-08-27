@@ -598,7 +598,7 @@ fn render_snapshot(hide_reasoning: bool, snapshot: &SubagentSnapshot, width: usi
                 output,
                 is_error,
             } => lines.extend(tool_view::render(
-                name, arguments, output, *is_error, false, width, false,
+                name, arguments, output, *is_error, false, None, width, false,
             )),
         }
         lines.push(String::new());
@@ -622,6 +622,7 @@ fn render_snapshot(hide_reasoning: bool, snapshot: &SubagentSnapshot, width: usi
             &tool.output,
             tool.is_error,
             true,
+            None,
             width,
             false,
         ));
@@ -693,6 +694,7 @@ mod tests {
             scroll_bar_drag: None,
             copy_toast_ticks: 0,
             spinner_tick: 0,
+            turn_started: None,
             context_tokens: 0,
             context_window: 100,
             activity: String::new(),

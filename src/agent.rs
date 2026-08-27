@@ -583,19 +583,6 @@ impl Conversation {
             }
             self.append_input_message(Message::user(input))?;
         }
-        let system = if self.subagents.is_some() {
-            crate::prompt::build_system_prompt(
-                &self.config.home_dir,
-                self.config.subagents,
-                self.print_mode,
-            )
-        } else {
-            crate::prompt::build_subagent_system_prompt(
-                &self.config.home_dir,
-                self.role_fragment.as_deref(),
-            )
-        };
-
         // Per-run guard rails: only subagent conversations carry limits.
         let limits = self.run_limits;
         let max_requests = limits.map_or(0, |limits| limits.max_requests);
@@ -630,6 +617,20 @@ impl Conversation {
             // available on its very next step.
             let registry = self.scan_tools();
             let specs = registry.specs();
+            let system = if self.subagents.is_some() {
+                crate::prompt::build_system_prompt(
+                    &self.config.home_dir,
+                    self.config.subagents,
+                    self.print_mode,
+                    registry.skills(),
+                )
+            } else {
+                crate::prompt::build_subagent_system_prompt(
+                    &self.config.home_dir,
+                    self.role_fragment.as_deref(),
+                    registry.skills(),
+                )
+            };
 
             self.maybe_compact(sink, resolve_provider)?;
 

@@ -49,6 +49,13 @@ List the tools currently available:
 yawl --list-tools
 ```
 
+Project skills are enabled after you trust the repository. For a noninteractive
+run, trust them for that invocation without changing the saved decision:
+
+```sh
+git diff | yawl --trust-project "Review this patch"
+```
+
 Run `yawl --help` for the complete command-line reference.
 
 ## Terminal controls
@@ -74,7 +81,9 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 
 `/model`, `/settings`, and `/connect` open keyboard pickers, including while a model response is still running. Settings are grouped under Model, Interface, Context, Providers, Subagents, Skills, and Advanced. Use the arrow keys and Enter to choose; Escape returns to the parent category before closing settings. Editable settings stay in the picker: Enter starts editing the current value, Enter again saves it, and the refreshed value is shown in the menu. Reasoning visibility, accent color, and selection color changes apply immediately during an active response. Settings that can affect generation apply as soon as the response releases the agent and before the next queued message starts.
 
-`/connect` and Settings > Providers use the same guided setup. Fixed providers appear first, followed by configured custom providers in name order. Existing endpoints are prefilled and credentials are preserved unless you choose an environment variable, enter a replacement key, or explicitly use no key. The no-key option appears only for providers that support keyless requests and do not have an active fallback environment credential. Secret input is masked. Discovery and Codex device login remain interactive while a model response continues; Escape cancels only the setup job. The review can save and use the model globally, save and use it for this session, or save only the connection.
+`/connect` and Settings > Providers use the same guided setup. Fixed providers appear first, followed by configured custom providers in name order. Existing endpoints are prefilled and credentials are preserved unless you choose an environment variable, enter a replacement key, or explicitly use no key. The no-key option appears only for providers that support keyless requests and do not have an active fallback environment credential. Secret input is masked. Discovery and Codex device login remain interactive while a model response continues; Escape cancels only the setup job. The review can save and use the model globally, save and use it for this session, or save only the connection. Saving an OpenAI-compatible connection also keeps the selected model in `/model`, even when the session does not switch to it.
+
+While a turn is active, the status bar shows a compact elapsed timer (for example `1m 23s`). A running tool card counts its own time in the header, such as `$ cargo test  [running 42s]` or `Waiting for LucidOtter · 4m 10s`. Both timers disappear once the turn settles. The rest of the status bar stays short: model, optional reasoning effort, context as `20% / 400k`, the running subagent name (or a count when several are active), and queued messages.
 
 Messages submitted during an active response are queued automatically. Each pending message is shown below the live transcript with a `Queued` label, and the status bar shows the queue length. Run `/unqueue` to open the queue editor: `K`/`J` reorder the selected message, `e` edits it, `d` or Delete removes it, and Enter stops the active turn and sends that message next. `/unqueue NUMBER` still removes one directly, and `/unqueue all` clears the queue.
 
@@ -256,13 +265,13 @@ When enabled, the main model receives five tools:
 
 - `subagent_spawn` starts a background task and returns its `sa-N` ID. `prompt` and `required_tools` are required; the latter declares every tool the task needs before an optional preset is selected. The name is generated when omitted. The child model comes from its preset, `subagent_model`, or the active parent model, in that order.
 - `subagent_send` queues another turn or restarts a settled child with its retained conversation.
-- `subagent_wait` waits for selected IDs without canceling unfinished work on timeout. Every settled run reports its complete final response.
+- `subagent_wait` waits for selected IDs without canceling unfinished work on timeout. Every settled run reports its complete final response. A timed-out wait tells the model how many runs are still going and that long tasks are normal, so the orchestrator polls again instead of canceling them.
 - `subagent_cancel` cancels selected runs and clears their queued messages. A cancelled run delivers any last activity it produced, labeled with its request count.
 - `subagent_list` returns compact rows or detailed status and the complete latest result for one ID.
 
 Yawl permits up to 16 active subagents and retains up to 64 tracked entries. Settled entries do not use active capacity. Each child has memory-only history, shares the working directory, receives the global and project `AGENTS.md` files, and cannot create more subagents. Executable tools cannot claim the reserved orchestration names.
 
-Model-originated results arrive as one automatic follow-up after the main turn becomes idle, and every delivery carries the run's complete final response. An explicit wait consumes matching results and reports each settled run in full, so Yawl does not deliver anything twice. Print mode pumps settled results and waits for still-running children after the main turn, so nothing is lost at exit. A failed child reports its error prefixed with the model that produced it. The status bar adds up child usage tokens across the session next to the running counts. Interrupting the main turn also cancels every subagent with delivery suppressed; use the dashboard for targeted cancels instead.
+Model-originated results arrive as one automatic follow-up after the main turn becomes idle, and every delivery carries the run's complete final response. An explicit wait consumes matching results and reports each settled run in full, so Yawl does not deliver anything twice. Print mode pumps settled results and waits for still-running children after the main turn, so nothing is lost at exit. A failed child reports its error prefixed with the model that produced it. The status bar names a single running child, or shows a count when several are active, plus compact child-token usage. Interrupting the main turn also cancels every subagent with delivery suppressed; use the dashboard for targeted cancels instead.
 
 ### Agent presets
 
@@ -350,7 +359,19 @@ The model can also create, mark executable, test, and call such a tool within on
 
 ## Skills
 
-Yawl discovers Markdown skills from `~/.yawl/skills/` and `~/.agents/skills/` by default. A skill may be either `NAME/SKILL.md` or `NAME.md`; optional YAML frontmatter can provide `name` and `description`. Skills appear in the `/` completion menu as `/skill:NAME` and can receive trailing instructions, for example `/skill:review focus on security`.
+Yawl discovers Markdown skills recursively from `~/.yawl/skills/` and `~/.agents/skills/` by default. After project trust is granted, it also scans `./.yawl/skills/`, every `.agents/skills/` directory from the Git root through the current directory, and `skill_dirs` supplied by `./.yawl/config.json`. Project skills override global skills with the same name, nearer ancestor directories override farther ones, and later configured directories override earlier ones.
+
+Every skill needs YAML frontmatter with a valid `name` and a complete, nonempty `description`. The instructions follow the frontmatter:
+
+```markdown
+---
+name: review
+description: Review a code change for correctness, regressions, and missing tests.
+---
+Read the relevant implementation and tests before reporting findings.
+```
+
+Yawl puts the full descriptions in a compact system-prompt catalog. When one matches the task, the model calls the dedicated `read_skill` tool to load its instructions. The TUI renders that call as a purple `Skill NAME` card. Set `disable-model-invocation: true` in the frontmatter to keep a skill out of the model catalog while retaining explicit `/skill:NAME` use. Explicit skills can receive trailing instructions, for example `/skill:review focus on security`.
 
 Manage search directories from the TUI:
 
@@ -359,7 +380,9 @@ Manage search directories from the TUI:
 /settings skills remove ~/.agents/skills
 ```
 
-The resulting `skill_dirs` array is stored in `~/.yawl/config.json`. Later directories override earlier directories when skill names collide.
+The resulting `skill_dirs` array is stored in `~/.yawl/config.json`. `/skills` lists active search directories, labels manual-only skills, and reports rejected skill files.
+
+When project skill sources first appear, interactive runs offer permanent trust, session-only trust, or denial. Permanent decisions are stored in `~/.yawl/trust.json` with mode `0600`, keyed by the canonical Git root or by the current directory outside Git. Piped runs never prompt: undecided project sources stay disabled and Yawl prints a warning on stderr. `--trust-project` enables them for one invocation without changing `trust.json`.
 
 ## Project instructions
 

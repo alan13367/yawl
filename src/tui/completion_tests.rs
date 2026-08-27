@@ -19,6 +19,7 @@ fn completion_state(commands: &[&str]) -> ViewState {
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
+        turn_started: None,
         context_tokens: 0,
         context_window: 100,
         activity: String::new(),

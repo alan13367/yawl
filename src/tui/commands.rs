@@ -52,20 +52,36 @@ pub(super) fn is_new_session_command(name: &str) -> bool {
 }
 
 pub(super) fn show_skills(agent: &Agent, state: &mut ViewState) {
-    let skills = crate::skills::scan(agent.config());
+    let catalog = crate::skills::discover(agent.config());
     let mut text = String::from("Skill directories\n\n");
-    for dir in &agent.config().skill_dirs {
+    for dir in &catalog.directories {
         text.push_str(&format!("- `{}`\n", dir.display()));
     }
-    if skills.is_empty() {
+    if !agent.config().project_skills_trusted()
+        && crate::skills::has_project_sources(agent.config())
+    {
+        text.push_str("\nProject skill sources are not trusted for this invocation.\n");
+    }
+    if catalog.skills.is_empty() {
         text.push_str("\nNo skills found. Add one with `/settings skills add DIRECTORY`.");
     } else {
         text.push_str("\nAvailable skills\n\n");
-        for skill in skills {
+        for skill in catalog.skills {
+            let mode = if skill.disable_model_invocation {
+                " (manual only)"
+            } else {
+                ""
+            };
             text.push_str(&format!(
-                "- `/skill:{}`: {}\n",
-                skill.name, skill.description
+                "- `/skill:{}`{mode}: {}\n",
+                skill.name, skill.description,
             ));
+        }
+    }
+    if !catalog.warnings.is_empty() {
+        text.push_str("\nRejected skills\n\n");
+        for warning in catalog.warnings {
+            text.push_str(&format!("- {warning}\n"));
         }
     }
     state.notice(text);

@@ -1,5 +1,6 @@
 mod cli;
 mod print_mode;
+mod project_trust;
 
 use std::io::{self, IsTerminal};
 use std::path::Path;
@@ -71,12 +72,13 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     if let Some(model) = &cli.model {
         config.model = Some(model.clone());
     }
+    let stdin_is_terminal = io::stdin().is_terminal();
     if cli.list_tools {
+        project_trust::resolve(&mut config, cli.trust_project, stdin_is_terminal)?;
         list_tools(&config);
         return Ok(0);
     }
 
-    let stdin_is_terminal = io::stdin().is_terminal();
     if config.model.is_none() && !config.setup_skipped && cli.prompt.is_empty() && stdin_is_terminal
     {
         yawl::install_interrupt_handler()?;
@@ -88,6 +90,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let model = config.model.clone().ok_or_else(|| {
         Error::Config("no model configured; run 'yawl --setup' or pass --model".into())
     })?;
+    project_trust::resolve(&mut config, cli.trust_project, stdin_is_terminal)?;
     let (session, messages) = open_session(&config, &cli, &model)?;
     let mut agent = Agent::new(config, model, session, messages);
 

@@ -11,6 +11,7 @@ Options:
   -c, --continue              Resume the most recent session
       --session ID            Resume a session by id
       --list-tools            List builtin and discovered exec tools
+      --trust-project         Allow project skill sources for this invocation
       --login PROVIDER        Log into a subscription provider
       --setup                 Run provider and model onboarding again
       --doctor                Diagnose and repair the configuration
@@ -24,6 +25,7 @@ pub(super) struct Cli {
     pub(super) continue_latest: bool,
     pub(super) session_id: Option<String>,
     pub(super) list_tools: bool,
+    pub(super) trust_project: bool,
     pub(super) login: Option<String>,
     pub(super) setup: bool,
     pub(super) doctor: bool,
@@ -60,6 +62,7 @@ pub(super) fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, 
                 );
             }
             "--list-tools" => cli.list_tools = true,
+            "--trust-project" => cli.trust_project = true,
             "--login" => {
                 cli.login = Some(
                     args.next()
@@ -82,6 +85,7 @@ pub(super) fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, 
             || cli.continue_latest
             || cli.session_id.is_some()
             || cli.list_tools
+            || cli.trust_project
             || !cli.prompt.is_empty()
             || cli.login.is_some() && (cli.setup || cli.doctor)
             || cli.setup && cli.doctor)
@@ -118,6 +122,14 @@ mod tests {
     #[test]
     fn rejects_conflicting_session_flags() {
         assert!(parse(&["-c", "--session", "abc"]).is_err());
+    }
+
+    #[test]
+    fn parses_project_trust_override_with_a_prompt() {
+        let cli = parse(&["--trust-project", "inspect this"])
+            .expect("the trust override should compose with a turn");
+        assert!(cli.trust_project);
+        assert_eq!(cli.prompt, ["inspect this"]);
     }
 
     #[test]

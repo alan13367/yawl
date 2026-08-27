@@ -19,6 +19,7 @@ pub mod session;
 pub mod skills;
 pub(crate) mod subagent;
 pub mod tools;
+pub mod trust;
 pub mod tui;
 
 use std::sync::atomic::{AtomicBool, Ordering};

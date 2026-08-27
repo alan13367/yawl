@@ -66,8 +66,17 @@ pub struct Config {
     pub subagent_request_budget: usize,
     /// Wall-clock limit per subagent run in seconds. `0` disables it.
     pub subagent_timeout_secs: u64,
-    /// Directories containing `NAME/SKILL.md` or `NAME.md` skills.
+    /// Directories containing `NAME/SKILL.md` or `NAME.md` skills. Replacing
+    /// this list programmatically replaces the configured skill roots.
     pub skill_dirs: Vec<PathBuf>,
+    /// Skill directories from defaults plus the global config, before any
+    /// project override. Project-controlled roots stay separate so trust can
+    /// gate them without suppressing global skills.
+    pub(crate) global_skill_dirs: Vec<PathBuf>,
+    /// A `skill_dirs` override supplied by `./.yawl/config.json`.
+    pub(crate) project_skill_dirs: Option<Vec<PathBuf>>,
+    /// Whether project-controlled skill sources may be read this invocation.
+    pub(crate) project_skills_trusted: bool,
     pub providers: HashMap<String, ProviderConfig>,
     /// Whether the user explicitly skipped onboarding, suppressing the
     /// first-run setup prompt.
@@ -83,6 +92,30 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn set_project_skills_trusted(&mut self, trusted: bool) {
+        self.project_skills_trusted = trusted;
+    }
+
+    pub fn project_skills_trusted(&self) -> bool {
+        self.project_skills_trusted
+    }
+
+    pub(crate) fn has_project_skill_override(&self) -> bool {
+        self.skill_dir_sources().1.is_some()
+    }
+
+    pub(crate) fn skill_dir_sources(&self) -> (&[PathBuf], Option<&[PathBuf]>) {
+        let loaded_effective = self
+            .project_skill_dirs
+            .as_deref()
+            .unwrap_or(&self.global_skill_dirs);
+        if self.skill_dirs.as_slice() != loaded_effective {
+            (&self.skill_dirs, None)
+        } else {
+            (&self.global_skill_dirs, self.project_skill_dirs.as_deref())
+        }
+    }
+
     /// The menu selection highlight color: the explicit `selection_color`
     /// when set, otherwise the accent color.
     pub(crate) fn effective_selection_color(&self) -> UiColor {
@@ -224,6 +257,9 @@ impl Config {
             subagent_request_budget: DEFAULT_SUBAGENT_REQUEST_BUDGET,
             subagent_timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
             skill_dirs: Vec::new(),
+            global_skill_dirs: Vec::new(),
+            project_skill_dirs: None,
+            project_skills_trusted: false,
             providers: HashMap::new(),
             setup_skipped: false,
             anthropic_api_key: None,

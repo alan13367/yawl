@@ -62,6 +62,7 @@ fn frame_keeps_input_and_status_pinned() {
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
+        turn_started: None,
         context_tokens: 12,
         context_window: 100,
         activity: String::new(),
@@ -137,6 +138,7 @@ fn tool_entries_are_compact_and_visually_separated() {
         output,
         is_error: false,
         running: false,
+        started: None,
     }];
 
     let rendered = render_entries(&entries, 80, false, false);
@@ -210,6 +212,7 @@ fn reasoning_has_one_blank_line_on_each_side() {
             output: String::new(),
             is_error: false,
             running: false,
+            started: None,
         },
     ];
 
@@ -240,6 +243,7 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
+        turn_started: None,
         context_tokens: 0,
         context_window: 100,
         activity: "sending".into(),
@@ -292,6 +296,7 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
+        turn_started: None,
         context_tokens: 0,
         context_window: 100,
         activity: "sending".into(),
@@ -357,6 +362,22 @@ fn preparing_file_tool_stays_visible_after_assistant_text() {
 }
 
 #[test]
+fn skill_loading_uses_a_specific_activity_label() {
+    let mut state = overflow_state();
+    state.apply(Update::from_event(crate::agent::TurnEvent::ToolPreparing {
+        name: "read_skill",
+    }));
+    let preparing = render_loading_state(&state, 80).expect("skill preparation should be visible");
+    assert!(markdown::strip_ansi(&preparing).contains("Loading skill…"));
+
+    state.apply(Update::Transcript(TranscriptEvent::ToolStart {
+        name: "read_skill".into(),
+        args: r#"{"name":"rust"}"#.into(),
+    }));
+    assert_eq!(state.activity, "loading skill");
+}
+
+#[test]
 fn loading_state_ignores_status_activity() {
     let mut state = ViewState {
         transcript: Transcript::from_messages(&[]),
@@ -374,6 +395,7 @@ fn loading_state_ignores_status_activity() {
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
+        turn_started: None,
         context_tokens: 0,
         context_window: 100,
         activity: String::new(),
@@ -431,6 +453,7 @@ fn overflow_state() -> ViewState {
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
+        turn_started: None,
         context_tokens: 0,
         context_window: 100,
         activity: String::new(),
@@ -722,6 +745,7 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
+        turn_started: None,
         context_tokens: 0,
         context_window: 100,
         activity: String::new(),
@@ -777,6 +801,8 @@ fn token_counts_compact_for_the_status_bar() {
     assert_eq!(crate::tui::render::format_token_count(0), "0");
     assert_eq!(crate::tui::render::format_token_count(9_999), "9999");
     assert_eq!(crate::tui::render::format_token_count(12_340), "12.3k");
+    assert_eq!(crate::tui::render::format_token_count(400_000), "400k");
+    assert_eq!(crate::tui::render::format_token_count(1_000_000), "1M");
     assert_eq!(crate::tui::render::format_token_count(1_234_567), "1.2M");
 }
 
@@ -893,6 +919,7 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
+        turn_started: None,
         context_tokens: 0,
         context_window: 100,
         activity: String::new(),
@@ -1037,6 +1064,7 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
+        turn_started: None,
         context_tokens: 0,
         context_window: 100,
         activity: String::new(),
@@ -1084,6 +1112,86 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
     );
 }
 
+#[test]
+fn status_bar_shows_a_live_turn_timer_next_to_the_activity() {
+    let mut state = empty_session_state();
+    state.activity = "running tool".into();
+    state.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(95));
+    let editor = Editor::default();
+    let (frame, _) = build_frame(&mut state, &editor, 80, 24);
+    let plain = markdown::strip_ansi(&frame.join("\n"));
+    assert!(
+        plain.contains(" ·  1m 35s"),
+        "the status bar must show the turn elapsed time; got:\n{plain}"
+    );
+    assert!(
+        !plain.contains("running tool"),
+        "activity text should not clutter the status bar; got:\n{plain}"
+    );
+    assert!(
+        !plain.contains("tokens"),
+        "token usage should stay compact; got:\n{plain}"
+    );
+
+    state.turn_started = None;
+    let (frame, _) = build_frame(&mut state, &editor, 80, 24);
+    let plain = markdown::strip_ansi(&frame.join("\n"));
+    assert!(!plain.contains("1m 35s"));
+}
+
+#[test]
+fn status_bar_names_a_running_subagent_instead_of_zero_counts() {
+    let mut state = empty_session_state();
+    state.reasoning_effort = Some("medium".into());
+    state.context_tokens = 42_679;
+    state.context_window = 272_000;
+    let mut snapshot = crate::subagent::SubagentSnapshot::new(
+        crate::subagent::SubagentId::new(1),
+        "LucidOtter".into(),
+        "default".into(),
+        "audit".into(),
+        "test:model".into(),
+        100,
+    );
+    snapshot.status = crate::subagent::SubagentStatus::Running;
+    state.subagent_snapshots = vec![snapshot];
+    state.subagent_tokens = 182_600;
+    let editor = Editor::default();
+    let (frame, _) = build_frame(&mut state, &editor, 120, 24);
+    let status = markdown::strip_ansi(frame.last().expect("status bar"));
+    assert!(
+        status.contains("medium  ·  15% / 272k  ·  LucidOtter  ·  182.6k child"),
+        "the status bar should stay compact and name the running agent; got:\n{status}"
+    );
+    assert!(!status.contains("running"));
+    assert!(!status.contains("failed"));
+    assert!(!status.contains("tokens"));
+}
+
+#[test]
+fn running_tool_entries_show_their_elapsed_time() {
+    let mut transcript = Transcript::from_messages(&[]);
+    transcript.apply(TranscriptEvent::ToolStart {
+        name: "shell".into(),
+        args: r#"{"command":"cargo build"}"#.into(),
+    });
+    let rendered = render_entries(transcript.entries(), 80, false, false);
+    let plain = markdown::strip_ansi(&rendered.join("\n"));
+    assert!(
+        plain.contains("$ cargo build  [running 0s]"),
+        "a just-started tool shows a zero elapsed timer; got:\n{plain}"
+    );
+
+    transcript.apply(TranscriptEvent::ToolEnd {
+        name: "shell".into(),
+        output: "ok".into(),
+        is_error: false,
+    });
+    let rendered = render_entries(transcript.entries(), 80, false, false);
+    let plain = markdown::strip_ansi(&rendered.join("\n"));
+    assert!(!plain.contains("[running"));
+}
+
 fn empty_session_state() -> ViewState {
     ViewState {
         transcript: Transcript::from_messages(&[]),
@@ -1101,6 +1209,7 @@ fn empty_session_state() -> ViewState {
         scroll_bar_drag: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
+        turn_started: None,
         context_tokens: 0,
         context_window: 100,
         activity: String::new(),
