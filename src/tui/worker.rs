@@ -36,6 +36,7 @@ pub(super) fn turn_interactive<R: Read>(
     let mut active_pickers = ActivePickers::from_agent(agent);
     let mut active_config = agent.config().clone();
     let active_cancellation = agent.cancellation_token();
+    let background = agent.background_processes();
     agent.clear_cancellation();
     let active_agent = &mut *agent;
     let result = std::thread::scope(|scope| {
@@ -58,6 +59,7 @@ pub(super) fn turn_interactive<R: Read>(
                 done: done_rx,
                 thread: worker_thread,
                 cancellation: active_cancellation,
+                background,
             },
             state,
             editor,
@@ -81,6 +83,7 @@ pub(super) fn compact_interactive<R: Read>(
     let mut active_pickers = ActivePickers::from_agent(agent);
     let mut active_config = agent.config().clone();
     let active_cancellation = agent.cancellation_token();
+    let background = agent.background_processes();
     agent.clear_cancellation();
     let active_agent = &mut *agent;
     let result = std::thread::scope(|scope| {
@@ -103,6 +106,7 @@ pub(super) fn compact_interactive<R: Read>(
                 done: done_rx,
                 thread: worker_thread,
                 cancellation: active_cancellation,
+                background,
             },
             state,
             editor,
@@ -126,6 +130,7 @@ pub(super) fn deferred_subagents_interactive<R: Read>(
     let mut active_pickers = ActivePickers::from_agent(agent);
     let mut active_config = agent.config().clone();
     let active_cancellation = agent.cancellation_token();
+    let background = agent.background_processes();
     agent.clear_cancellation();
     let active_agent = &mut *agent;
     let result = std::thread::scope(|scope| {
@@ -148,6 +153,7 @@ pub(super) fn deferred_subagents_interactive<R: Read>(
                 done: done_rx,
                 thread: worker_thread,
                 cancellation: active_cancellation,
+                background,
             },
             state,
             editor,
@@ -166,6 +172,7 @@ pub(super) struct WorkerChannels<T> {
     done: Receiver<Result<T, Error>>,
     thread: usize,
     cancellation: CancellationToken,
+    background: crate::background::BackgroundProcessManager,
 }
 
 pub(super) fn pump_events<R: Read, T>(
@@ -204,14 +211,21 @@ pub(super) fn pump_events<R: Read, T>(
         loop {
             needs_draw |= !matches!(&event, Event::Tick);
             if matches!(&event, Event::Tick) && crate::interrupted() {
-                state.subagent_manager.interrupt_all();
-                cancel_worker(worker.thread, &worker.cancellation, state);
                 crate::set_interrupted(false);
+                if !super::processes::handle_interrupt(state) {
+                    state.subagent_manager.interrupt_all();
+                    cancel_worker(worker.thread, &worker.cancellation, state);
+                }
                 needs_draw = true;
             }
             if state.subagent_view.is_some() {
                 needs_draw = true;
                 super::subagents::handle_event(state, editor, event);
+                break;
+            }
+            if state.process_view.is_some() {
+                needs_draw = true;
+                super::processes::handle_event(state, event);
                 break;
             }
             if state.picker.is_some() {
@@ -286,6 +300,7 @@ pub(super) fn pump_events<R: Read, T>(
                                         state,
                                         active_pickers,
                                         active_config,
+                                        &worker.background,
                                         terminal,
                                     )?;
                                 }
@@ -335,6 +350,7 @@ pub(super) fn handle_submission_while_busy(
     state: &mut ViewState,
     active_pickers: &ActivePickers,
     active_config: &Config,
+    background: &crate::background::BackgroundProcessManager,
     terminal: &mut Terminal,
 ) -> Result<(), Error> {
     match busy_command(&input) {
@@ -343,6 +359,7 @@ pub(super) fn handle_submission_while_busy(
         Some(BusyCommand::Connect) => super::connection::open(state, active_config, false),
         Some(BusyCommand::Unqueue(argument)) => unqueue(&argument, state),
         Some(BusyCommand::Subagents) => super::subagents::open_dashboard(state),
+        Some(BusyCommand::Processes) => super::processes::open_dashboard(state, background.clone()),
         Some(BusyCommand::Copy) => copy_last_reply(terminal, state, &[])?,
         Some(BusyCommand::CopyAll) => copy_all_from_transcript(terminal, state)?,
         None => {
@@ -360,6 +377,7 @@ pub(super) enum BusyCommand {
     Connect,
     Unqueue(String),
     Subagents,
+    Processes,
     Copy,
     CopyAll,
 }
@@ -375,6 +393,7 @@ pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
         "connect" if argument.is_empty() => Some(BusyCommand::Connect),
         "unqueue" => Some(BusyCommand::Unqueue(argument.to_string())),
         "subagents" if argument.is_empty() => Some(BusyCommand::Subagents),
+        "ps" if argument.is_empty() => Some(BusyCommand::Processes),
         "copy" if argument.is_empty() => Some(BusyCommand::Copy),
         "copy-all" if argument.is_empty() => Some(BusyCommand::CopyAll),
         _ => None,

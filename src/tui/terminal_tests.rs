@@ -24,3 +24,10 @@ fn clipboard_payload_uses_standard_base64() {
     assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
     assert_eq!(base64_encode("copy me".as_bytes()), "Y29weSBtZQ==");
 }
+
+#[test]
+fn views_without_an_editor_keep_the_terminal_cursor_hidden() {
+    assert_eq!(cursor_control(HIDDEN_CURSOR, false), "\x1b[?25l");
+    assert_eq!(cursor_control((4, 7), true), "\x1b[?25l");
+    assert_eq!(cursor_control((4, 7), false), "\x1b[4;7H\x1b[?25h");
+}

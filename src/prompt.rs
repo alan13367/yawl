@@ -70,6 +70,11 @@ Tools:
 - To add a tool, create an executable whose `--describe` output is JSON with `name`, `description`, `input_schema`, and optional `timeout_secs`. Normal calls receive JSON on stdin and return their result on stdout. A nonzero exit is an error. The tool inherits the working directory and receives `YAWL_SESSION_ID`.
 "#
     );
+    if !is_subagent {
+        prompt.push_str(
+            "- For long-running commands such as development servers, call shell with background=true. Use shell_output to wait for logs, shell_list to recover IDs, and shell_stop when the process is no longer needed.\n",
+        );
+    }
     append_skill_catalog(&mut prompt, skills);
     append_instructions(
         &mut prompt,

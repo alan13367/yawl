@@ -2,9 +2,12 @@ use std::time::Instant;
 
 use crate::subagent::{RunOrigin, SubagentSnapshot, SubagentStatus, SubagentTranscriptItem};
 
+use super::dashboard::{Alignment, Column, Panel, PanelContent, PanelRow};
 use super::events::{Event, Key};
 use super::input::{EditAction, Editor};
-use super::render::{foreground_color, render_reasoning, render_user_panel, status_style};
+use super::render::{
+    HIDDEN_CURSOR, foreground_color, render_reasoning, render_user_panel, status_style,
+};
 use super::{ViewState, markdown, tool_view};
 
 pub(super) enum SubagentView {
@@ -385,15 +388,8 @@ fn render_dashboard(
     columns: usize,
     rows: usize,
 ) -> (Vec<String>, (usize, usize)) {
-    let columns = columns.max(20);
-    let rows = rows.max(8);
-    let mut frame = vec![markdown::fit_width("\x1b[1mSubagents\x1b[0m", columns)];
-    frame.push(markdown::fit_width(
-        "  status  name · id  model  context  elapsed  queue",
-        columns,
-    ));
-    frame.push(" ".repeat(columns));
-    let capacity = rows.saturating_sub(5);
+    let panel = Panel::new(columns, rows, snapshots.len());
+    let capacity = panel.capacity();
     let selected_index = selected_id
         .and_then(|id| {
             snapshots
@@ -402,6 +398,13 @@ fn render_dashboard(
         })
         .unwrap_or(0);
     let start = selected_index.saturating_sub(capacity.saturating_sub(1));
+    let columns = subagent_columns(panel.inner_width());
+    let table_columns = columns
+        .iter()
+        .map(|column| column.column())
+        .collect::<Vec<_>>();
+    let header = super::dashboard::render_header(&table_columns, panel.inner_width());
+    let mut rendered_rows = Vec::with_capacity(capacity);
     for snapshot in snapshots.iter().skip(start).take(capacity) {
         let selected = selected_id == Some(snapshot.id.as_str());
         let marker = if selected { "›" } else { " " };
@@ -422,45 +425,187 @@ fn render_dashboard(
         } else {
             format!("{} · {}", snapshot.name, snapshot.agent)
         };
-        let line = format!(
-            "{marker} {square} {:<10} {} · {}  {}  {}% {}/{}  {}  q{}",
-            snapshot.status.label(),
-            name,
-            snapshot.id,
-            model,
-            percentage,
-            snapshot.context_tokens,
-            snapshot.context_window,
-            format_duration(snapshot.elapsed(Instant::now())),
-            snapshot.queued_messages.len()
-        );
-        frame.push(if selected {
-            super::render::selected_row(
-                &markdown::fit_width(&line, columns),
-                &super::render::selection_style(selection_color),
-            )
-        } else {
-            markdown::fit_width(&line, columns)
+        let cells = columns
+            .iter()
+            .map(|column| match column.field {
+                SubagentField::Status => {
+                    format!("{marker} {square} {}", snapshot.status.label())
+                }
+                SubagentField::Name => name.clone(),
+                SubagentField::Id => snapshot.id.to_string(),
+                SubagentField::Model => model.clone(),
+                SubagentField::Context => format!(
+                    "{percentage}% · {}/{}",
+                    snapshot.context_tokens, snapshot.context_window
+                ),
+                SubagentField::Elapsed => format_duration(snapshot.elapsed(Instant::now())),
+                SubagentField::Queue => snapshot.queued_messages.len().to_string(),
+            })
+            .collect::<Vec<_>>();
+        rendered_rows.push(PanelRow {
+            content: super::dashboard::render_row(&table_columns, &cells, panel.inner_width()),
+            selected,
         });
     }
     if snapshots.is_empty() {
-        frame.push(markdown::fit_width("No tracked subagents.", columns));
+        rendered_rows.push(PanelRow {
+            content: markdown::fit_width("No tracked subagents.", panel.inner_width()),
+            selected: false,
+        });
     }
-    frame.extend(std::iter::repeat_n(
-        " ".repeat(columns),
-        rows.saturating_sub(frame.len() + 1),
-    ));
     let hint = if confirm_cancel {
         "Cancel selected subagent? Enter confirms, Esc keeps it running"
     } else {
-        "↑/↓ or j/k move  Enter take over  x cancel  Esc close"
+        "↑↓ move · Enter take over · x cancel · Esc close"
     };
-    frame.push(format!(
-        "{}{}\x1b[0m",
-        status_style(accent_color),
-        markdown::fit_width(&format!(" {hint}"), columns)
-    ));
-    (frame, (1, 1))
+    let active = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.status.is_active())
+        .count();
+    let summary = super::dashboard::summary(active, snapshots.len(), "active");
+    (
+        panel.render(PanelContent {
+            title: "Subagents",
+            summary: &summary,
+            header: &header,
+            rows: &rendered_rows,
+            hint,
+            accent: accent_color,
+            selection: selection_color,
+        }),
+        HIDDEN_CURSOR,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum SubagentField {
+    Status,
+    Name,
+    Id,
+    Model,
+    Context,
+    Elapsed,
+    Queue,
+}
+
+struct SubagentColumn {
+    field: SubagentField,
+    header: &'static str,
+    width: usize,
+    alignment: Alignment,
+}
+
+impl SubagentColumn {
+    const fn new(
+        field: SubagentField,
+        header: &'static str,
+        width: usize,
+        alignment: Alignment,
+    ) -> Self {
+        Self {
+            field,
+            header,
+            width,
+            alignment,
+        }
+    }
+
+    const fn column(&self) -> Column {
+        Column::new(self.header, self.width, self.alignment)
+    }
+}
+
+fn subagent_columns(width: usize) -> Vec<SubagentColumn> {
+    if width >= 75 {
+        let mut extra = width - 75;
+        let name_extra = extra.min(12);
+        extra -= name_extra;
+        let model_extra = extra.min(12);
+        extra -= model_extra;
+        let context_extra = extra.min(6);
+        extra -= context_extra;
+        let elapsed_extra = extra.min(1);
+        extra -= elapsed_extra;
+        let queue_extra = extra.min(1);
+        extra -= queue_extra;
+        vec![
+            SubagentColumn::new(SubagentField::Status, "    STATUS", 13, Alignment::Left),
+            SubagentColumn::new(
+                SubagentField::Name,
+                "NAME",
+                14 + name_extra + extra,
+                Alignment::Left,
+            ),
+            SubagentColumn::new(SubagentField::Id, "ID", 6, Alignment::Left),
+            SubagentColumn::new(
+                SubagentField::Model,
+                "MODEL",
+                12 + model_extra,
+                Alignment::Left,
+            ),
+            SubagentColumn::new(
+                SubagentField::Context,
+                "CONTEXT",
+                12 + context_extra,
+                Alignment::Right,
+            ),
+            SubagentColumn::new(
+                SubagentField::Elapsed,
+                "TIME",
+                7 + elapsed_extra,
+                Alignment::Right,
+            ),
+            SubagentColumn::new(
+                SubagentField::Queue,
+                "QUEUE",
+                5 + queue_extra,
+                Alignment::Right,
+            ),
+        ]
+    } else if width >= 56 {
+        let extra = width - 56;
+        let name_extra = extra.min(10);
+        let model_extra = extra - name_extra;
+        vec![
+            SubagentColumn::new(SubagentField::Status, "    STATUS", 13, Alignment::Left),
+            SubagentColumn::new(
+                SubagentField::Name,
+                "NAME",
+                14 + name_extra,
+                Alignment::Left,
+            ),
+            SubagentColumn::new(SubagentField::Id, "ID", 6, Alignment::Left),
+            SubagentColumn::new(
+                SubagentField::Model,
+                "MODEL",
+                12 + model_extra,
+                Alignment::Left,
+            ),
+            SubagentColumn::new(SubagentField::Elapsed, "TIME", 7, Alignment::Right),
+        ]
+    } else if width >= 31 {
+        vec![
+            SubagentColumn::new(SubagentField::Status, "    STATUS", 13, Alignment::Left),
+            SubagentColumn::new(SubagentField::Name, "NAME", width - 21, Alignment::Left),
+            SubagentColumn::new(SubagentField::Id, "ID", 6, Alignment::Left),
+        ]
+    } else {
+        let status_width = 12.min(width.saturating_sub(2));
+        vec![
+            SubagentColumn::new(
+                SubagentField::Status,
+                "    STATUS",
+                status_width,
+                Alignment::Left,
+            ),
+            SubagentColumn::new(
+                SubagentField::Name,
+                "NAME",
+                width.saturating_sub(status_width + 1),
+                Alignment::Left,
+            ),
+        ]
+    }
 }
 
 /// Immutable render context shared by the takeover renderer.
@@ -491,7 +636,7 @@ fn render_takeover(
                 &format!("Subagent {id} is no longer tracked. Press Esc."),
                 columns,
             )],
-            (1, 1),
+            HIDDEN_CURSOR,
         );
     };
     let percentage = snapshot
@@ -712,6 +857,9 @@ mod tests {
             subagent_snapshots: vec![snapshot()],
             subagents_enabled: false,
             subagent_view: Some(view),
+            background_processes: crate::background::BackgroundProcessManager::default(),
+            background_active_count: 0,
+            process_view: None,
             render_cache: crate::tui::render::RenderCache::default(),
         }
     }
@@ -755,7 +903,7 @@ mod tests {
         });
         let (dashboard_frame, dashboard_cursor) = render(&mut dashboard, &Editor::default(), 20, 8);
         assert_eq!(dashboard_frame.len(), 8);
-        assert_eq!(dashboard_cursor, (1, 1));
+        assert_eq!(dashboard_cursor, HIDDEN_CURSOR);
         assert!(
             dashboard_frame
                 .iter()
@@ -900,5 +1048,53 @@ mod tests {
 
         assert!(frame.iter().any(|line| line.contains("sa-6")));
         assert!(!frame.iter().any(|line| line.contains("sa-1")));
+    }
+
+    #[test]
+    fn dashboard_is_compact_and_uses_the_same_column_grid_for_headers_and_data() {
+        let mut dashboard = state(SubagentView::Dashboard {
+            selected_id: Some("sa-1".into()),
+            selected_index: 0,
+            confirm_cancel: false,
+        });
+        let (frame, _) = render(&mut dashboard, &Editor::default(), 110, 24);
+        let plain = frame
+            .iter()
+            .map(|line| markdown::strip_ansi(line))
+            .collect::<Vec<_>>();
+        let header = plain
+            .iter()
+            .find(|line| line.contains("STATUS") && line.contains("QUEUE"))
+            .expect("wide dashboard should show the full table header");
+        let data = plain
+            .iter()
+            .find(|line| line.contains("sa-1"))
+            .expect("the tracked subagent should be visible");
+        let column = |line: &str, value: &str| {
+            let index = line.find(value).expect("fixture value should be visible");
+            markdown::visible_width(&line[..index])
+        };
+        let right_edge =
+            |line: &str, value: &str| column(line, value) + markdown::visible_width(value);
+        let last_right_edge = |line: &str, value: &str| {
+            let index = line.rfind(value).expect("fixture value should be visible");
+            markdown::visible_width(&line[..index]) + markdown::visible_width(value)
+        };
+
+        assert_eq!(column(header, "STATUS"), column(data, "running"));
+        assert_eq!(column(header, "NAME"), column(data, "narrow dashboard row"));
+        assert_eq!(column(header, "ID"), column(data, "sa-1"));
+        assert_eq!(column(header, "MODEL"), column(data, "test:model"));
+        assert_eq!(right_edge(header, "QUEUE"), last_right_edge(data, "1"));
+
+        let occupied = plain
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(occupied.len(), 9);
+        assert!(occupied[0] > 0);
+        assert!(occupied[8] < frame.len() - 1);
     }
 }

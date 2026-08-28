@@ -141,7 +141,7 @@ fn resume_command(session_id: &str) -> String {
 
 fn list_tools(config: &Config) {
     let mut cache = DescribeCache::default();
-    let registry = Registry::scan(config, &mut cache);
+    let registry = Registry::scan_for_main_listing(config, &mut cache);
     for (name, description, origin) in registry.describe_all() {
         println!("{name}\t{origin}\n  {description}");
     }

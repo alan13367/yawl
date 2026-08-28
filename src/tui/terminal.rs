@@ -6,7 +6,7 @@ use crate::error::Error;
 
 use super::events::{MouseEvent, MouseKind};
 use super::input::Editor;
-use super::render::build_frame;
+use super::render::{HIDDEN_CURSOR, build_frame};
 use super::{ViewState, markdown};
 
 pub(super) struct Terminal {
@@ -145,11 +145,8 @@ impl Terminal {
                 write!(self.stdout, "\x1b[{};1H\x1b[2K{line}", index + 1)?;
             }
         }
-        if self.selection.is_some() {
-            self.stdout.write_all(b"\x1b[?25l")?;
-        } else {
-            write!(self.stdout, "\x1b[{};{}H\x1b[?25h", cursor.0, cursor.1)?;
-        }
+        self.stdout
+            .write_all(cursor_control(cursor, self.selection.is_some()).as_bytes())?;
         self.stdout.flush()?;
         self.last_frame = frame;
         self.last_size = (columns, rows);
@@ -171,6 +168,14 @@ impl Terminal {
             self.stdout.flush()?;
         }
         Ok(true)
+    }
+}
+
+pub(super) fn cursor_control(cursor: (usize, usize), selecting: bool) -> String {
+    if selecting || cursor == HIDDEN_CURSOR {
+        "\x1b[?25l".into()
+    } else {
+        format!("\x1b[{};{}H\x1b[?25h", cursor.0, cursor.1)
     }
 }
 

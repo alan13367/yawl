@@ -9,6 +9,7 @@ fn settings_and_model_pickers_are_recognized_during_an_active_turn() {
     assert_eq!(busy_command("/model"), Some(BusyCommand::Model));
     assert_eq!(busy_command("/connect"), Some(BusyCommand::Connect));
     assert_eq!(busy_command("/subagents"), Some(BusyCommand::Subagents));
+    assert_eq!(busy_command("/ps"), Some(BusyCommand::Processes));
     assert_eq!(busy_command("/copy"), Some(BusyCommand::Copy));
     assert_eq!(busy_command("/copy-all"), Some(BusyCommand::CopyAll));
     assert_eq!(
@@ -84,6 +85,9 @@ fn display_settings_apply_during_an_active_turn() {
         subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        background_processes: crate::background::BackgroundProcessManager::default(),
+        background_active_count: 0,
+        process_view: None,
         render_cache: crate::tui::render::RenderCache::default(),
     };
     let root = std::env::temp_dir().join(format!(

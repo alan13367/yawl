@@ -45,6 +45,9 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        background_processes: crate::background::BackgroundProcessManager::default(),
+        background_active_count: 0,
+        process_view: None,
         render_cache: crate::tui::render::RenderCache::default(),
     };
     open_queue_picker(&mut state);
@@ -229,6 +232,7 @@ fn help_lists_undo_and_copy_commands() {
     assert!(HELP.contains("/undo"));
     assert!(HELP.contains("/copy"));
     assert!(HELP.contains("/copy-all"));
+    assert!(HELP.contains("/ps"));
 }
 
 #[test]

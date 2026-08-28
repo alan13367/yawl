@@ -9,6 +9,7 @@ mod completion;
 #[cfg(test)]
 mod completion_tests;
 mod connection;
+mod dashboard;
 pub mod events;
 mod files;
 pub mod highlight;
@@ -18,6 +19,7 @@ mod navigation;
 mod picker;
 #[cfg(test)]
 mod picker_tests;
+mod processes;
 mod render;
 #[cfg(test)]
 mod render_tests;
@@ -52,7 +54,7 @@ use self::picker::{
     take_picker_action,
 };
 use self::state::{ViewState, advance_ticks, scroll, toggle_tool_expansion};
-use self::subagents::open_dashboard;
+use self::subagents::open_dashboard as open_subagent_dashboard;
 use self::terminal::Terminal;
 use self::transcript::Transcript;
 use self::worker::{
@@ -75,14 +77,14 @@ use self::picker::{
 };
 #[cfg(test)]
 use self::render::{
-    RenderCache, WELCOME_ANIMATION_TICKS, build_frame, render_entries, render_loading_state,
-    render_queued_panel, selected_row, selection_style,
+    HIDDEN_CURSOR, RenderCache, WELCOME_ANIMATION_TICKS, build_frame, render_entries,
+    render_loading_state, render_queued_panel, selected_row, selection_style,
 };
 #[cfg(test)]
 use self::state::Update;
 #[cfg(test)]
 use self::terminal::{
-    ScreenPoint, TextSelection, base64_encode, highlighted_selection, selected_text,
+    ScreenPoint, TextSelection, base64_encode, cursor_control, highlighted_selection, selected_text,
 };
 #[cfg(test)]
 use self::transcript::{Entry, TranscriptEvent};
@@ -160,17 +162,24 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
         loop {
             needs_draw |= !matches!(&event, Event::Tick);
             if matches!(&event, Event::Tick) && crate::interrupted() {
-                state.subagent_manager.interrupt_all();
                 crate::set_interrupted(false);
-                if !editor.is_empty() {
-                    editor.clear();
+                if !processes::handle_interrupt(&mut state) {
+                    state.subagent_manager.interrupt_all();
+                    if !editor.is_empty() {
+                        editor.clear();
+                    }
+                    state.activity = "input cleared".into();
                 }
-                state.activity = "input cleared".into();
                 needs_draw = true;
             }
             if state.subagent_view.is_some() {
                 needs_draw = true;
                 subagents::handle_event(&mut state, &mut editor, event);
+                break;
+            }
+            if state.process_view.is_some() {
+                needs_draw = true;
+                processes::handle_event(&mut state, event);
                 break;
             }
             if state.picker.is_some() {
@@ -357,8 +366,12 @@ fn handle_submission<R: Read>(
                 state.notice(text);
             }
             "skills" => show_skills(agent, state),
-            "subagents" if argument.is_empty() => open_dashboard(state),
+            "subagents" if argument.is_empty() => open_subagent_dashboard(state),
             "subagents" => state.notice("Usage: /subagents"),
+            "ps" if argument.is_empty() => {
+                processes::open_dashboard(state, agent.background_processes())
+            }
+            "ps" => state.notice("Usage: /ps"),
             "resume" if argument.is_empty() => open_resume_picker(agent, state),
             "resume" => resume(agent, argument, state),
             "unqueue" => unqueue(argument, state),

@@ -12,6 +12,13 @@ use super::state::{ScrollGeometry, scroll_bar_position, scroll_bar_span};
 use super::transcript::Entry;
 use super::{USER_BACKGROUND, USER_TEXT, ViewState, markdown, tool_view};
 
+const BACKGROUND_NOTICE_CYAN: UiColor = UiColor::new(116, 199, 213);
+const BACKGROUND_NOTICE_AMBER: UiColor = UiColor::new(232, 202, 118);
+
+/// Invalid one-based terminal coordinates signal views that have no editor
+/// and must leave the hardware cursor hidden.
+pub(super) const HIDDEN_CURSOR: (usize, usize) = (0, 0);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheSlot {
     width: usize,
@@ -843,6 +850,9 @@ pub(super) fn build_frame(
     columns: usize,
     rows: usize,
 ) -> (Vec<String>, (usize, usize)) {
+    if state.process_view.is_some() {
+        return super::processes::render(state, columns, rows);
+    }
     if state.subagent_view.is_some() {
         return super::subagents::render(state, editor, columns, rows);
     }
@@ -867,7 +877,11 @@ pub(super) fn build_frame(
     let input_lines = &layout.lines[input_start..input_end];
     let cursor_input_row = layout.cursor_row.saturating_sub(input_start);
     let input_height = input_lines.len() + 2;
-    let menu_capacity = COMPLETION_MENU_ROWS.min(rows.saturating_sub(input_height + 1));
+    let background_count = state.background_processes.active_count();
+    state.background_active_count = background_count;
+    let background_notice_height = usize::from(background_count > 0);
+    let menu_capacity =
+        COMPLETION_MENU_ROWS.min(rows.saturating_sub(input_height + background_notice_height + 1));
     let menu_entries = if state.picker.is_none() {
         sync_completion_filter(state, editor);
         menu_rows(state, editor)
@@ -926,7 +940,8 @@ pub(super) fn build_frame(
     }
     let menu_height = menu.len();
     let search_height = usize::from(state.transcript.search_active());
-    let transcript_height = rows.saturating_sub(input_height + menu_height + search_height + 1);
+    let transcript_height = rows
+        .saturating_sub(input_height + menu_height + search_height + background_notice_height + 1);
     let transcript = render_transcript_window(state, columns, transcript_height);
     let transcript_width = columns;
     let visible = &transcript.lines;
@@ -1007,6 +1022,14 @@ pub(super) fn build_frame(
     ));
     frame.extend(menu);
 
+    if background_count > 0 {
+        frame.push(render_background_process_notice(
+            background_count,
+            columns,
+            state.accent_color,
+        ));
+    }
+
     let percentage = state
         .context_tokens
         .saturating_mul(100)
@@ -1066,6 +1089,59 @@ pub(super) fn build_frame(
         )
     };
     (frame, (cursor_row, cursor_col))
+}
+
+pub(super) fn render_background_process_notice(
+    count: usize,
+    width: usize,
+    accent: UiColor,
+) -> String {
+    let color = background_notice_color(accent);
+    if width < 48 {
+        return markdown::fit_width(
+            &format!(
+                " {}\x1b[1m{count} bg\x1b[22m {}running \u{b7} /ps\x1b[0m",
+                foreground_color(color),
+                status_style(color),
+            ),
+            width,
+        );
+    }
+    let noun = if count == 1 {
+        "background terminal"
+    } else {
+        "background terminals"
+    };
+    markdown::fit_width(
+        &format!(
+            " {}\u{25cf}  \x1b[1m{count} {noun}\x1b[22m {}running  \u{b7}  /ps to view\x1b[0m",
+            foreground_color(color),
+            status_style(color),
+        ),
+        width,
+    )
+}
+
+fn background_notice_color(accent: UiColor) -> UiColor {
+    if perceptual_color_distance(accent, BACKGROUND_NOTICE_CYAN)
+        >= perceptual_color_distance(accent, BACKGROUND_NOTICE_AMBER)
+    {
+        BACKGROUND_NOTICE_CYAN
+    } else {
+        BACKGROUND_NOTICE_AMBER
+    }
+}
+
+/// Weighted RGB distance keeps the notice visually separate from both named
+/// and custom accent colors without adding another configurable setting.
+fn perceptual_color_distance(left: UiColor, right: UiColor) -> u32 {
+    let red_mean = (u32::from(left.red) + u32::from(right.red)) / 2;
+    let squared_delta =
+        |left: u8, right: u8| (i32::from(left) - i32::from(right)).unsigned_abs().pow(2);
+    let red = squared_delta(left.red, right.red);
+    let green = squared_delta(left.green, right.green);
+    let blue = squared_delta(left.blue, right.blue);
+    (((512 + red_mean) * red) >> 8) + 4 * green + (((767 - red_mean) * blue) >> 8)
 }
 
 fn render_block_viewer(

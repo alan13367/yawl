@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use crate::background::BackgroundProcessManager;
 use crate::cancellation::CancellationToken;
 use crate::checkpoint::{Checkpoints, RestoreReport};
 use crate::compaction;
@@ -153,6 +154,7 @@ pub(crate) struct Conversation {
     /// Extra instruction appended to the subagent role block by a preset.
     role_fragment: Option<String>,
     checkpoints: Option<Checkpoints>,
+    background: Option<BackgroundProcessManager>,
 }
 
 impl Conversation {
@@ -180,6 +182,7 @@ impl Conversation {
             tool_allowlist: None,
             role_fragment: None,
             checkpoints,
+            background: Some(BackgroundProcessManager::default()),
         }
     }
 
@@ -199,6 +202,7 @@ impl Conversation {
             tool_allowlist: None,
             role_fragment: None,
             checkpoints: None,
+            background: None,
         }
     }
 
@@ -246,6 +250,10 @@ impl Conversation {
         self.subagents.clone()
     }
 
+    pub(crate) fn background_manager(&self) -> Option<BackgroundProcessManager> {
+        self.background.clone()
+    }
+
     pub(crate) fn latest_turn_result(&self) -> String {
         self.latest_turn_result.clone()
     }
@@ -281,10 +289,14 @@ impl Conversation {
         if let Some(manager) = &self.subagents {
             manager.shutdown_and_discard();
         }
+        if let Some(manager) = &self.background {
+            manager.shutdown_and_discard();
+        }
         self.subagents = Some(SubagentManager::new(
             session.id.clone(),
             self.config.max_subagents,
         ));
+        self.background = Some(BackgroundProcessManager::default());
         self.session = Journal::persistent(session);
         self.messages.clear();
         self.context_tokens = 0;
@@ -341,10 +353,14 @@ impl Conversation {
         if let Some(manager) = &self.subagents {
             manager.shutdown_and_discard();
         }
+        if let Some(manager) = &self.background {
+            manager.shutdown_and_discard();
+        }
         self.subagents = Some(SubagentManager::new(
             session.id.clone(),
             self.config.max_subagents,
         ));
+        self.background = Some(BackgroundProcessManager::default());
         self.session = Journal::persistent(session);
         self.messages = messages;
         self.context_tokens = 0;
@@ -358,12 +374,20 @@ impl Conversation {
     }
 
     pub fn scan_tools(&mut self) -> Registry {
-        let mut registry = match (&self.subagents, self.config.subagents) {
-            (Some(manager), true) => Registry::scan_with_subagents(
+        let mut registry = match (&self.subagents, self.config.subagents, &self.background) {
+            (Some(manager), true, Some(background)) => {
+                Registry::scan_with_subagents_and_background(
+                    &self.config,
+                    &mut self.describe_cache,
+                    manager.clone(),
+                    &self.model,
+                    background.clone(),
+                )
+            }
+            (_, _, Some(background)) => Registry::scan_with_background(
                 &self.config,
                 &mut self.describe_cache,
-                manager.clone(),
-                &self.model,
+                background.clone(),
             ),
             _ => Registry::scan(&self.config, &mut self.describe_cache),
         };
@@ -894,6 +918,12 @@ impl Agent {
             .expect("persistent agents always own a subagent manager")
     }
 
+    pub(crate) fn background_processes(&self) -> BackgroundProcessManager {
+        self.conversation
+            .background_manager()
+            .expect("persistent agents always own a background process manager")
+    }
+
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.conversation.cancellation_token()
     }
@@ -1018,6 +1048,7 @@ impl Agent {
 impl Drop for Agent {
     fn drop(&mut self) {
         self.subagents().shutdown_and_discard();
+        self.background_processes().shutdown_and_discard();
     }
 }
 

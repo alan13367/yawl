@@ -684,6 +684,20 @@ fn sanitize(text: &str) -> String {
         .collect()
 }
 
+/// Renders untrusted plain text as hard-wrapped terminal lines. Markdown and
+/// terminal control sequences are treated as data.
+pub(crate) fn plain_lines(text: &str, width: usize) -> Vec<String> {
+    let sanitized = sanitize(&strip_ansi(text));
+    let mut lines = Vec::new();
+    for line in sanitized.split('\n') {
+        lines.extend(wrap_ansi_hard(line, width.max(1)));
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

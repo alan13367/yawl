@@ -26,6 +26,7 @@ Commands
   /tools               list builtin and discovered tools
   /skills              list discovered skills and search directories
   /subagents           open the subagent dashboard
+  /ps                  open the background process dashboard
   /skill:NAME [ARGS]   run a discovered skill
   /resume [ID|NUMBER]  open the session picker or resume directly
   /unqueue [N|all]     cancel queued messages

@@ -27,6 +27,18 @@ struct ToolLine {
     tone: Tone,
 }
 
+struct BackgroundStartDetails {
+    id: String,
+    pid: String,
+    name: Option<String>,
+}
+
+struct BackgroundOutputDetails {
+    status: String,
+    pid: String,
+    lines: Vec<ToolLine>,
+}
+
 impl ToolLine {
     fn new(text: impl Into<String>, tone: Tone) -> Self {
         Self {
@@ -76,10 +88,28 @@ pub(super) fn render_labeled(
     let horizontal_padding = usize::from(width >= 3);
     let content_width = width.saturating_sub(horizontal_padding * 2).max(1);
     let parsed = serde_json::from_str::<Value>(args).ok();
+    let background_start = name == "shell" && bool_arg(parsed.as_ref(), "background") == Some(true);
+    let background_details = if background_start && !is_error && !running {
+        parse_background_start(output)
+    } else {
+        None
+    };
+    let background_output = if name == "shell_output" && !is_error && !running {
+        parse_background_output(output)
+    } else {
+        None
+    };
+    let background_stop = if name == "shell_stop" && !is_error && !running {
+        parse_background_stop(output)
+    } else {
+        None
+    };
     let mut lines = render_call(
         name,
         parsed.as_ref(),
         args,
+        background_start,
+        background_details.as_ref(),
         running,
         elapsed,
         is_error,
@@ -87,7 +117,42 @@ pub(super) fn render_labeled(
         expanded,
     );
 
-    if should_show_output(name, output, is_error) {
+    if let Some(details) = background_details {
+        lines.push(ToolLine::new("", Tone::Output));
+        let name = details
+            .name
+            .as_deref()
+            .map_or_else(String::new, |name| format!("  \u{b7}  {name}"));
+        lines.push(ToolLine::new(
+            format!(
+                "\u{25cf} Started in background  \u{b7}  pid {}{name}  \u{b7}  /ps to view",
+                details.pid
+            ),
+            Tone::Output,
+        ));
+    } else if let Some(mut details) = background_output {
+        lines.push(ToolLine::new("", Tone::Output));
+        lines.push(ToolLine::new(
+            format!(
+                "● {}  \u{b7}  pid {}",
+                capitalize_label(&details.status),
+                details.pid
+            ),
+            Tone::Output,
+        ));
+        if !details.lines.is_empty() {
+            lines.push(ToolLine::new("", Tone::Output));
+            lines.extend(preview_lines(
+                std::mem::take(&mut details.lines),
+                OUTPUT_PREVIEW_LINES,
+                expanded,
+                true,
+            ));
+        }
+    } else if let Some(status) = background_stop {
+        lines.push(ToolLine::new("", Tone::Output));
+        lines.push(ToolLine::new(format!("● {status}"), Tone::Output));
+    } else if should_show_output(name, output, is_error) {
         lines.push(ToolLine::new("", Tone::Output));
         let output_lines = text_lines(output, if is_error { Tone::Error } else { Tone::Output });
         let keep_tail = name == "shell";
@@ -131,13 +196,25 @@ fn render_call(
     name: &str,
     args: Option<&Value>,
     raw_args: &str,
+    background_start: bool,
+    background_details: Option<&BackgroundStartDetails>,
     running: bool,
     elapsed: Option<Duration>,
     is_error: bool,
     labels: &[(&str, &str)],
     expanded: bool,
 ) -> Vec<ToolLine> {
-    let status = if running {
+    let status = if background_start && running {
+        match elapsed {
+            Some(elapsed) => format!("  [starting in background {}]", format_elapsed(elapsed)),
+            None => "  [starting in background]".to_string(),
+        }
+    } else if background_start && !is_error {
+        background_details.map_or_else(
+            || "  [background]".to_string(),
+            |details| format!("  [started in background \u{b7} {}]", details.id),
+        )
+    } else if running {
         match elapsed {
             Some(elapsed) => format!("  [running {}]", format_elapsed(elapsed)),
             None => "  [running]".to_string(),
@@ -157,6 +234,24 @@ fn render_call(
             }
             preview_lines(call, CALL_PREVIEW_LINES, expanded, false)
         }
+        "shell_output" => vec![ToolLine::new(
+            format!(
+                "Background output  \u{b7}  {}{status}",
+                string_arg(args, "id").unwrap_or("?")
+            ),
+            Tone::Header,
+        )],
+        "shell_list" => vec![ToolLine::new(
+            format!("Background terminals{status}"),
+            Tone::Header,
+        )],
+        "shell_stop" => vec![ToolLine::new(
+            format!(
+                "Stop background terminal  \u{b7}  {}{status}",
+                string_arg(args, "id").unwrap_or("?")
+            ),
+            Tone::Header,
+        )],
         "read_file" => vec![ToolLine::new(
             format!(
                 "read {}{status}",
@@ -277,6 +372,75 @@ fn should_show_output(name: &str, output: &str, is_error: bool) -> bool {
 
 fn string_arg<'a>(args: Option<&'a Value>, key: &str) -> Option<&'a str> {
     args?.get(key)?.as_str()
+}
+
+fn bool_arg(args: Option<&Value>, key: &str) -> Option<bool> {
+    args?.get(key)?.as_bool()
+}
+
+fn parse_background_start(output: &str) -> Option<BackgroundStartDetails> {
+    let line = output.lines().next()?;
+    let rest = line.strip_prefix("started ")?;
+    let (id, rest) = rest.split_once(" (pid ")?;
+    let (pid, suffix) = rest.split_once(')')?;
+    let suffix = suffix.strip_suffix(" in the background")?;
+    let name = suffix
+        .strip_prefix(" as ")
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    if !suffix.is_empty() && name.is_none() {
+        return None;
+    }
+    Some(BackgroundStartDetails {
+        id: id.to_string(),
+        pid: pid.to_string(),
+        name,
+    })
+}
+
+fn parse_background_output(output: &str) -> Option<BackgroundOutputDetails> {
+    let mut lines = output.lines();
+    let status_line = lines.next()?;
+    let cursor_line = lines.next_back()?;
+    cursor_line
+        .strip_prefix("next_cursor: ")?
+        .parse::<u64>()
+        .ok()?;
+
+    let (_, status_and_pid) = status_line.split_once(": ")?;
+    let (status, pid) = status_and_pid.rsplit_once(" (pid ")?;
+    let pid = pid.strip_suffix(')')?;
+    let lines = lines
+        .filter_map(|line| match line {
+            "[stdout]" | "[stderr]" => None,
+            "[earlier output was discarded]" => {
+                Some(ToolLine::new("Earlier output was discarded.", Tone::Muted))
+            }
+            line => Some(ToolLine::new(line, Tone::Output)),
+        })
+        .collect();
+
+    Some(BackgroundOutputDetails {
+        status: status.to_string(),
+        pid: pid.to_string(),
+        lines,
+    })
+}
+
+fn capitalize_label(label: &str) -> String {
+    let mut characters = label.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect()
+    })
+}
+
+fn parse_background_stop(output: &str) -> Option<String> {
+    if output.starts_with("stop requested for ") {
+        return Some("Stop requested".to_string());
+    }
+    output
+        .split_once(": ")
+        .map(|(_, status)| capitalize_label(status))
 }
 
 fn labeled_id(id: &str, labels: &[(&str, &str)]) -> String {
@@ -815,6 +979,104 @@ mod tests {
         assert!(command.contains("\x1b[1;97m"));
         assert!(output.contains("\x1b[38;5;245m"));
         assert!(!output.contains("\x1b[1;97m"));
+    }
+
+    #[test]
+    fn background_shell_start_has_a_compact_running_state() {
+        let rendered = render(
+            "shell",
+            r#"{"command":"npm run dev","background":true,"name":"web"}"#,
+            "started bg-1 (pid 4242) as web in the background\nnext_cursor: 0",
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&rendered.join("\n"));
+
+        assert!(plain.contains("$ npm run dev  [started in background · bg-1]"));
+        assert!(plain.contains("● Started in background  ·  pid 4242  ·  web  ·  /ps to view"));
+        assert!(!plain.contains("next_cursor"));
+        assert!(!plain.contains("started bg-1 (pid"));
+    }
+
+    #[test]
+    fn in_flight_background_shell_says_what_it_is_starting() {
+        let rendered = render(
+            "shell",
+            r#"{"command":"npm run dev","background":true}"#,
+            "",
+            false,
+            true,
+            Some(Duration::from_secs(2)),
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&rendered.join("\n"));
+
+        assert!(plain.contains("$ npm run dev  [starting in background 2s]"));
+    }
+
+    #[test]
+    fn background_output_hides_tool_protocol_and_keeps_terminal_text() {
+        let rendered = render(
+            "shell_output",
+            r#"{"id":"bg-1","cursor":0,"wait_secs":8}"#,
+            "bg-1: running (pid 4242)\n[stderr]\nnpm notice run dev\n[stdout]\n\nVITE ready\nLocal: http://localhost:5173/\nnext_cursor: 97",
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&rendered.join("\n"));
+
+        assert!(plain.contains("Background output  ·  bg-1"));
+        assert!(plain.contains("● Running  ·  pid 4242"));
+        assert!(plain.contains("npm notice run dev"));
+        assert!(plain.contains("Local: http://localhost:5173/"));
+        assert!(!plain.contains("shell_output"));
+        assert!(!plain.contains("wait_secs"));
+        assert!(!plain.contains("next_cursor"));
+        assert!(!plain.contains("[stdout]"));
+        assert!(!plain.contains("[stderr]"));
+        assert!(!plain.contains("bg-1: running"));
+    }
+
+    #[test]
+    fn background_management_calls_have_human_readable_titles() {
+        let running = render(
+            "shell_output",
+            r#"{"id":"bg-2","wait_secs":8}"#,
+            "",
+            false,
+            true,
+            Some(Duration::from_secs(3)),
+            80,
+            false,
+        );
+        let listed = render("shell_list", "{}", "none", false, false, None, 80, false);
+        let stopped = render(
+            "shell_stop",
+            r#"{"id":"bg-2"}"#,
+            "stop requested for bg-2",
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+
+        assert!(
+            markdown::strip_ansi(&running.join("\n"))
+                .contains("Background output  ·  bg-2  [running 3s]")
+        );
+        assert!(markdown::strip_ansi(&listed.join("\n")).contains("Background terminals"));
+        let stopped = markdown::strip_ansi(&stopped.join("\n"));
+        assert!(stopped.contains("Stop background terminal  ·  bg-2"));
+        assert!(stopped.contains("● Stop requested"));
+        assert!(!stopped.contains("{\"id\""));
     }
 
     #[test]

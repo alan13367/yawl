@@ -1,12 +1,14 @@
 //! Mutable UI state and owned agent-event updates.
 
 use crate::agent::{Agent, TurnEvent};
+use crate::background::BackgroundProcessManager;
 use crate::config::{Config, UiColor};
 use crate::subagent::{SubagentManager, SubagentSnapshot};
 
 use super::completion::{Completion, command_completions};
 use super::events::{MouseEvent, MouseKind};
 use super::picker::{Picker, PickerAction};
+use super::processes::ProcessView;
 use super::subagents::SubagentView;
 use super::transcript::{Transcript, TranscriptEvent};
 
@@ -72,6 +74,9 @@ pub(super) struct ViewState {
     /// Session-wide usage tokens across finished subagent runs.
     pub(super) subagent_tokens: u64,
     pub(super) subagent_view: Option<SubagentView>,
+    pub(super) background_processes: BackgroundProcessManager,
+    pub(super) background_active_count: usize,
+    pub(super) process_view: Option<ProcessView>,
     pub(super) render_cache: super::render::RenderCache,
 }
 
@@ -111,6 +116,9 @@ impl ViewState {
             subagent_snapshots: agent.subagents().snapshots(),
             subagent_tokens: agent.subagents().total_child_tokens(),
             subagent_view: None,
+            background_processes: agent.background_processes(),
+            background_active_count: agent.background_processes().active_count(),
+            process_view: None,
             render_cache: super::render::RenderCache::default(),
         }
     }
@@ -287,12 +295,19 @@ pub(super) fn advance_ticks(state: &mut ViewState) -> bool {
         .subagent_snapshots
         .iter()
         .any(|snapshot| snapshot.status.is_active());
+    let background_active_count = state.background_processes.active_count();
+    if background_active_count != state.background_active_count {
+        state.background_active_count = background_active_count;
+        changed = true;
+    }
     let animate = super::render::loading_label(&state.activity).is_some()
         || state.turn_started.is_some()
         || (state.transcript.is_empty()
             && state.spinner_tick < super::render::WELCOME_ANIMATION_TICKS)
         || state.subagent_view.is_some()
-        || has_active_subagent;
+        || state.process_view.is_some()
+        || has_active_subagent
+        || background_active_count > 0;
     if animate {
         state.spinner_tick = state.spinner_tick.wrapping_add(1);
         changed = true;
@@ -305,6 +320,7 @@ pub(super) fn advance_ticks(state: &mut ViewState) -> bool {
         }
     }
     super::subagents::refresh(state);
+    super::processes::refresh(state);
     if state.transcript.poll_search() {
         changed = true;
         if state.transcript.search_position().is_some()

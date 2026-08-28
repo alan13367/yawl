@@ -80,6 +80,9 @@ fn frame_keeps_input_and_status_pinned() {
         subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        background_processes: crate::background::BackgroundProcessManager::default(),
+        background_active_count: 0,
+        process_view: None,
         render_cache: RenderCache::default(),
     };
     let editor = Editor::default();
@@ -115,6 +118,70 @@ fn frame_keeps_input_and_status_pinned() {
     advance_ticks(&mut state);
     let (frame, _) = build_frame(&mut state, &editor, 40, 12);
     assert!(!markdown::strip_ansi(&frame.join("\n")).contains("Copied!"));
+}
+
+#[test]
+fn active_background_terminal_gets_its_own_row_above_status() {
+    let mut state = empty_session_state();
+    state.transcript = Transcript::from_messages(&[crate::provider::Message::assistant(
+        "server setup complete".into(),
+        Vec::new(),
+    )]);
+    state
+        .background_processes
+        .start(crate::background::StartSpec {
+            command: "sleep 30".into(),
+            name: Some("dev server".into()),
+            cwd: std::env::current_dir().expect("current directory"),
+            timeout: None,
+        })
+        .expect("start background terminal");
+
+    let (frame, cursor) = build_frame(&mut state, &Editor::default(), 54, 12);
+    let notice = markdown::strip_ansi(&frame[frame.len() - 2]);
+    let styled_notice = &frame[frame.len() - 2];
+    let status = markdown::strip_ansi(frame.last().expect("status row"));
+
+    assert_eq!(frame.len(), 12);
+    assert!(notice.contains("1 background terminal running  ·  /ps to view"));
+    assert!(
+        styled_notice.contains("38;2;116;199;213"),
+        "the default notice uses cyan instead of the white accent"
+    );
+    assert!(status.contains("test"));
+    assert!(!status.contains("background terminal"));
+    assert_eq!(cursor.0, 9, "the notice row must be reserved in the layout");
+    let narrow = markdown::strip_ansi(&render::render_background_process_notice(
+        8,
+        20,
+        UiColor::WHITE,
+    ));
+    assert!(narrow.contains("8 bg running · /ps"));
+
+    state.background_processes.shutdown_and_discard();
+    assert!(
+        advance_ticks(&mut state),
+        "settlement must schedule a redraw"
+    );
+    let (frame, cursor) = build_frame(&mut state, &Editor::default(), 54, 12);
+    assert!(!markdown::strip_ansi(&frame.join("\n")).contains("background terminal running"));
+    assert_eq!(cursor.0, 10, "the transcript reclaims the notice row");
+}
+
+#[test]
+fn background_terminal_color_stays_distinct_from_the_accent() {
+    let cyan = UiColor::parse("cyan").expect("cyan palette color");
+    let amber = UiColor::parse("yellow").expect("yellow palette color");
+
+    let with_cyan_accent = render::render_background_process_notice(1, 60, cyan);
+    let with_amber_accent = render::render_background_process_notice(1, 60, amber);
+    let with_custom_cyan =
+        render::render_background_process_notice(1, 60, UiColor::new(110, 195, 210));
+
+    assert!(with_cyan_accent.contains("38;2;232;202;118"));
+    assert!(!with_cyan_accent.contains("38;2;116;199;213"));
+    assert!(with_amber_accent.contains("38;2;116;199;213"));
+    assert!(with_custom_cyan.contains("38;2;232;202;118"));
 }
 
 #[test]
@@ -261,6 +328,9 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        background_processes: crate::background::BackgroundProcessManager::default(),
+        background_active_count: 0,
+        process_view: None,
         render_cache: RenderCache::default(),
     };
 
@@ -314,6 +384,9 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        background_processes: crate::background::BackgroundProcessManager::default(),
+        background_active_count: 0,
+        process_view: None,
         render_cache: RenderCache::default(),
     };
 
@@ -413,6 +486,9 @@ fn loading_state_ignores_status_activity() {
         subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        background_processes: crate::background::BackgroundProcessManager::default(),
+        background_active_count: 0,
+        process_view: None,
         render_cache: RenderCache::default(),
     };
     state.notice("Yawl is ready. Type /help for commands.");
@@ -471,6 +547,9 @@ fn overflow_state() -> ViewState {
         subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        background_processes: crate::background::BackgroundProcessManager::default(),
+        background_active_count: 0,
+        process_view: None,
         render_cache: RenderCache::default(),
     }
 }
@@ -763,6 +842,9 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        background_processes: crate::background::BackgroundProcessManager::default(),
+        background_active_count: 0,
+        process_view: None,
         render_cache: RenderCache::default(),
     };
     let editor = Editor::default();
@@ -942,6 +1024,9 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        background_processes: crate::background::BackgroundProcessManager::default(),
+        background_active_count: 0,
+        process_view: None,
         render_cache: RenderCache::default(),
     };
     let mut editor = Editor::default();
@@ -1086,6 +1171,9 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        background_processes: crate::background::BackgroundProcessManager::default(),
+        background_active_count: 0,
+        process_view: None,
         render_cache: RenderCache::default(),
     };
     let mut editor = Editor::default();
@@ -1227,6 +1315,9 @@ fn empty_session_state() -> ViewState {
         subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        background_processes: crate::background::BackgroundProcessManager::default(),
+        background_active_count: 0,
+        process_view: None,
         render_cache: RenderCache::default(),
     }
 }

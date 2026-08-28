@@ -22,6 +22,7 @@ pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
         ("/connect", "Configure a model provider"),
         ("/settings", "Show or change settings"),
         ("/subagents", "Open the subagent dashboard"),
+        ("/ps", "Open the background process dashboard"),
         ("/new", "Start a session without changing directories"),
         ("/clear", "Alias for /new"),
         ("/compact", "Summarize older messages"),

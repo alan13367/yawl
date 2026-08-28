@@ -132,8 +132,9 @@ Run `yawl --help` for the complete command-line reference.
 - The mouse wheel and `PageUp` or `PageDown` move through Yawl's internal scrollback.
 - Drag with the left mouse button to select visible text. Releasing the button copies the selection to the clipboard and briefly shows a `Copied!` box in the top-right corner, including while a response is streaming.
 - `Escape` or `Ctrl+C` aborts the active model response or tool. Neither exits Yawl.
+- `/ps` opens the background-process dashboard, including while the model is busy. While any background terminals are active, a dedicated row above the status bar shows their count and the `/ps` shortcut. Use `Up`/`Down` or `j`/`k` to select a row, Enter to view live logs, `x` or `Ctrl+C` to stop immediately, `r` to restart a settled command as a new run, and `d` or Delete to remove settled history. The log view follows new output until you scroll upward.
 
-The terminal interface renders headings, emphasis, inline code, lists, blockquotes, tables, and fenced code. Fenced blocks have lightweight highlighting for Rust, Python, JavaScript, TypeScript, Go, C, C++, Bash, JSON, TOML, HTML, and CSS. Tool calls use separate full-width blocks with compact views for shell commands, file reads, writes, and edits. Edit calls show a line-level diff with unchanged context instead of printing the entire old value followed by the entire replacement.
+The terminal interface renders headings, emphasis, inline code, lists, blockquotes, tables, and fenced code. Fenced blocks have lightweight highlighting for Rust, Python, JavaScript, TypeScript, Go, C, C++, Bash, JSON, TOML, HTML, and CSS. Tool calls use separate full-width blocks with compact views for shell commands, background-terminal output, file reads, writes, and edits. Background cards hide tool arguments, output cursors, and stream bookkeeping while keeping the terminal text visible. Edit calls show a line-level diff with unchanged context instead of printing the entire old value followed by the entire replacement.
 
 ## Slash commands
 
@@ -141,7 +142,7 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 
 `/connect` and Settings > Providers use the same guided setup. Fixed providers appear first, followed by configured custom providers in name order. Existing endpoints are prefilled and credentials are preserved unless you choose an environment variable, enter a replacement key, or explicitly use no key. The no-key option appears only for providers that support keyless requests and do not have an active fallback environment credential. Secret input is masked. Discovery and Codex device login remain interactive while a model response continues; Escape cancels only the setup job. The review can save and use the model globally, save and use it for this session, or save only the connection. Saving an OpenAI-compatible connection also keeps the selected model in `/model`, even when the session does not switch to it.
 
-While a turn is active, the status bar shows a compact elapsed timer (for example `1m 23s`). A running tool card counts its own time in the header, such as `$ cargo test  [running 42s]` or `Waiting for LucidOtter · 4m 10s`. Both timers disappear once the turn settles. The rest of the status bar stays short: model, optional reasoning effort, context as `20% / 400k`, the running subagent name (or a count when several are active), and queued messages.
+While a turn is active, the status bar shows a compact elapsed timer (for example `1m 23s`). A running tool card counts its own time in the header, such as `$ cargo test  [running 42s]` or `Waiting for LucidOtter · 4m 10s`. A background shell card changes from `starting in background` to `started in background · bg-N` and links the run to `/ps`. Timers disappear once the turn settles. The rest of the status bar stays short: model, optional reasoning effort, context as `20% / 400k`, the running subagent name (or a count when several are active), and queued messages.
 
 Messages submitted during an active response are queued automatically. Each pending message is shown below the live transcript with a `Queued` label, and the status bar shows the queue length. Run `/unqueue` to open the queue editor: `K`/`J` reorder the selected message, `e` edits it, `d` or Delete removes it, and Enter stops the active turn and sends that message next. `/unqueue NUMBER` still removes one directly, and `/unqueue all` clears the queue.
 
@@ -160,6 +161,7 @@ Messages submitted during an active response are queued automatically. Each pend
 | `/skills` | List discovered skills and their search directories |
 | `/skill:NAME [ARGS]` | Run a discovered Markdown skill |
 | `/subagents` | Open the full-screen subagent dashboard and takeover view, or print a note in the chat when nothing is running |
+| `/ps` | Open the full-screen background-process dashboard, or print a note when nothing has been started |
 | `/resume [ID\|NUMBER]` | Open the session picker scoped to the current directory, or resume directly by ID or number. In the picker, `d` or Delete opens a confirmation dialog before removing the selected session |
 | `/unqueue [NUMBER\|all]` | Open the queue editor, remove one pending message directly, or clear the queue |
 | `/help` | Show terminal controls and commands |
@@ -247,7 +249,7 @@ Add providers under `providers`. This uses the same field names as pi's `models.
 
 Set `hide_reasoning` to `true`, choose "Reasoning display" in `/settings`, or run `/settings hide_reasoning on` to remove both summary and full reasoning from the TUI and print-mode output. Yawl still records the reasoning in the session so it reappears if the setting is turned off. In print mode, visible reasoning goes to standard error and the answer remains on standard output.
 
-Choose "Accent color" in `/settings` to color the status bar, text-box border, the Yawl label on system messages, and the large welcome name on a fresh session. The wordmark types in, then a `/help` hint follows. The same value can be set directly with `/settings accent_color blue` or `/settings accent_color '#7aa2f7'`. Palette names and `#RRGGBB` values are accepted; the default is white. `/new` and `/clear` return to that welcome screen.
+Choose "Accent color" in `/settings` to color the status bar, text-box border, the Yawl label on system messages, and the large welcome name on a fresh session. The background-terminal notice uses cyan or amber, whichever is more distinct from the current accent. The wordmark types in, then a `/help` hint follows. The same value can be set directly with `/settings accent_color blue` or `/settings accent_color '#7aa2f7'`. Palette names and `#RRGGBB` values are accepted; the default is white. `/new` and `/clear` return to that welcome screen.
 
 The highlighted row in the completion menu, pickers, and the subagent dashboard follows the accent color by default. Choose "Selection color" in `/settings`, or run `/settings selection_color accent|NAME|#RRGGBB`, to keep it on the accent (`accent`, the default) or pick an independent color. Whatever color is chosen, Yawl draws the selected row's text in near-black or near-white based on the color's luminance so the row always stays readable.
 
@@ -298,6 +300,8 @@ The doctor also reports problems it will not touch automatically: a `model` nami
 ## Sessions and compaction
 
 Yawl stores append-only JSONL session files in `~/.yawl/sessions/projects/<project-key>/<id>.jsonl`, scoped to the canonical working directory. The first line records the session ID, creation timestamp, working directory, and model. Both `-c` (`--continue`) and the `/resume` picker list sessions only for the active working directory, and only sessions that contain at least one turn. Opening Yawl and quitting without sending a message does not leave a resumable session. Passing `--session ID` or `/resume ID` searches the current and other project directories, so an ID can be resumed from any directory. Session IDs must be unique across project directories; Yawl reports duplicate matches as ambiguous instead of choosing one. Each user message, assistant response, reasoning block, tool result, and compaction event is written as it happens. The original history remains in the log after compaction. `/new` starts a blank session without changing the current working directory. In the `/resume` picker, `d` or Delete opens a confirmation dialog before removing the selected session. Leaving the terminal interface after a real turn prints `yawl --session ID` so you can resume that conversation.
+
+Background process metadata and logs stay in memory. They are not replayed from session files. Yawl keeps them across prompts in the active session, then terminates their process groups on `/new`, `/resume`, active-session replacement, or exit. `/undo` does not change background process state. Abrupt termination such as `SIGKILL` cannot run this cleanup.
 
 `/undo` opens an empty restore point at the start of a prompt, then saves a file's pre-image the first time `write_file` or `edit_file` touches it. It never scans or copies the working directory, so starting Yawl in `~/` does not make prompt startup depend on the contents of the home directory; checkpoint size grows only with files the agent edits. Individual pre-images are capped at 32 MiB. Files changed by `shell` or custom exec tools are not restored because those tools do not report their mutations. When the agent moves git `HEAD`, `/undo` uses a soft reset and restores the paths that were staged before the turn; it does not update remotes. Checkpoints from the old whole-tree implementation are deleted when their session is opened, and that session starts with an empty undo stack.
 
@@ -350,14 +354,19 @@ Run `/subagents` to open the dashboard, including while the main model is busy. 
 
 ## Builtin tools
 
-The model always has these tools:
+The main model always has these tools:
 
-- `shell` runs `sh -c` in the current directory, with a 120-second default timeout.
+- `shell` runs `sh -c` in the current directory. Foreground commands have a 120-second default timeout. Passing `background: true` starts a session-bound command with no timeout unless `timeout_secs` is supplied, then returns a `bg-N` ID immediately. An optional `name` labels the row in `/ps`.
+- `shell_output` reads up to 48 KiB of new stdout and stderr from a `bg-N` command. Pass its `next_cursor` back on the next call, and optionally wait up to 30 seconds for output or settlement.
+- `shell_list` lists tracked background commands without copying their logs.
+- `shell_stop` requests graceful process-group termination for a background command.
 - `read_file` reads a UTF-8 file up to 1 MiB; larger files are rejected so the model can request portions via `shell`.
 - `write_file` writes a file and creates missing parent directories.
 - `edit_file` performs one exact string replacement and rejects missing or repeated matches.
 
-Tool output sent back to the model is capped at 60,000 characters. Streaming responses are capped at 64 MiB of SSE data per response and 4 MiB per event, so a runaway server fails with an error instead of growing without bound. A command timeout or `Ctrl+C` kills the command's process group so child processes do not remain behind.
+Yawl permits 8 active background commands and retains up to 64 rows per session. Each row keeps the newest 256 KiB of combined stdout and stderr. Settled rows remain available until removed or the session ends; when history fills, Yawl prunes the oldest settled rows. Stopping a command sends `SIGTERM` to its process group, waits two seconds, then sends `SIGKILL` if needed.
+
+Tool output sent back to the model is capped at 60,000 characters. Streaming responses are capped at 64 MiB of SSE data per response and 4 MiB per event, so a runaway server fails with an error instead of growing without bound. A foreground command timeout or `Ctrl+C` kills that command's process group. Canceling a model turn does not stop a command that was explicitly started in the background; use `/ps` or `shell_stop`.
 
 Yawl has no approval prompt or permission layer. Review the current model and working directory before giving it a task. Use `Ctrl+C` to stop the active turn.
 
@@ -452,11 +461,12 @@ Yawl stays in one Cargo package. Stable facade modules keep callers independent 
 
 - `src/main.rs` coordinates startup. `src/cli.rs` and `src/print_mode.rs` contain the two binary frontends.
 - `src/agent.rs` owns the reusable provider and tool conversation loop. The persistent main agent and memory-only subagents both use it.
+- `src/background.rs` owns session-bound shell processes, bounded output, process-group shutdown, and restart history.
 - `src/subagent/` contains typed snapshots, capacity accounting, worker lifecycles, deferred delivery, cancellation, retained conversations, generated handles, request budgets, and JSON agent presets.
 - `src/cancellation.rs` binds cancellation tokens to worker threads while preserving process-wide SIGINT handling.
 - `src/provider/mod.rs` re-exports the provider-neutral protocol. Private modules contain streaming retries, provider resolution, and SSE/HTTP support. Codex OAuth and Responses handling live separately under `src/provider/codex/`.
 - `src/config.rs` exposes the effective configuration. Its child modules separate runtime types, persisted schema, loading and merging, storage, and validated changes.
-- `src/tui/mod.rs` exposes `tui::run` and coordinates the event loop. Commands, completion, pickers, subagent views, state, workers, rendering, and terminal handling live in focused sibling modules.
+- `src/tui/mod.rs` exposes `tui::run` and coordinates the event loop. Commands, completion, pickers, process and subagent dashboards, state, workers, rendering, and terminal handling live in focused sibling modules.
 - `src/onboarding.rs` coordinates setup while its child modules own the arrow-key selector, terminal prompts, model discovery, and the wizard flow.
 - `src/doctor.rs` coordinates configuration diagnosis and repair; checks, interactive repairs, and report rendering live in its child modules.
 

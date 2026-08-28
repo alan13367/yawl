@@ -63,6 +63,9 @@ fn state_with(geometry: Option<ScrollGeometry>) -> ViewState {
         subagent_tokens: 0,
         subagents_enabled: false,
         subagent_view: None,
+        background_processes: crate::background::BackgroundProcessManager::default(),
+        background_active_count: 0,
+        process_view: None,
         render_cache: super::render::RenderCache::default(),
     }
 }

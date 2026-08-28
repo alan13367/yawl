@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::background::{BackgroundProcessManager, OutputRead, StartSpec};
 use crate::config::Config;
 use crate::provider::ToolSpec;
 use crate::skills::Skill;
@@ -29,6 +30,9 @@ const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 enum ToolImpl {
     Shell,
+    ShellList,
+    ShellOutput,
+    ShellStop,
     ReadFile,
     ReadSkill,
     WriteFile,
@@ -84,18 +88,46 @@ pub struct Registry {
     pub warnings: Vec<String>,
     skills: Vec<Skill>,
     subagents: Option<SubagentContext>,
+    background: Option<BackgroundProcessManager>,
 }
 
 impl Registry {
     /// Scans builtins + exec tool directories. Called every loop iteration;
     /// `cache` avoids respawning `--describe` for unchanged tools.
     pub fn scan(config: &Config, cache: &mut DescribeCache) -> Registry {
+        Self::scan_inner(config, cache, None)
+    }
+
+    /// Scans the tools advertised by the persistent main agent without
+    /// creating a live process manager. Used by `yawl --list-tools`.
+    pub fn scan_for_main_listing(config: &Config, cache: &mut DescribeCache) -> Registry {
+        let mut registry = Self::scan(config, cache);
+        if let Some(shell) = registry
+            .entries
+            .iter_mut()
+            .find(|entry| entry.spec.name == "shell" && matches!(entry.imp, ToolImpl::Shell))
+        {
+            *shell = shell_entry(true);
+        }
+        registry.entries.extend(background_entries());
+        registry
+    }
+
+    fn scan_inner(
+        config: &Config,
+        cache: &mut DescribeCache,
+        background: Option<BackgroundProcessManager>,
+    ) -> Registry {
         let mut registry = Registry {
-            entries: builtins(),
+            entries: builtins(background.is_some()),
             warnings: Vec::new(),
             skills: Vec::new(),
             subagents: None,
+            background,
         };
+        if registry.background.is_some() {
+            registry.entries.extend(background_entries());
+        }
         let catalog = crate::skills::discover(config);
         registry.warnings.extend(catalog.warnings);
         registry.skills = catalog
@@ -127,6 +159,7 @@ impl Registry {
         registry
     }
 
+    #[cfg(test)]
     pub(crate) fn scan_with_subagents(
         config: &Config,
         cache: &mut DescribeCache,
@@ -134,15 +167,39 @@ impl Registry {
         parent_model: &str,
     ) -> Registry {
         let mut registry = Self::scan(config, cache);
+        registry.enable_subagents(config, manager, parent_model);
+        registry
+    }
+
+    fn enable_subagents(&mut self, config: &Config, manager: SubagentManager, parent_model: &str) {
         let (presets, warnings) = discover_presets(config);
-        registry.warnings.extend(warnings);
-        registry.entries.extend(subagent_tools(&presets));
-        registry.subagents = Some(SubagentContext {
+        self.warnings.extend(warnings);
+        self.entries.extend(subagent_tools(&presets));
+        self.subagents = Some(SubagentContext {
             manager,
             config: config.clone(),
             parent_model: parent_model.to_string(),
             presets,
         });
+    }
+
+    pub(crate) fn scan_with_background(
+        config: &Config,
+        cache: &mut DescribeCache,
+        background: BackgroundProcessManager,
+    ) -> Registry {
+        Self::scan_inner(config, cache, Some(background))
+    }
+
+    pub(crate) fn scan_with_subagents_and_background(
+        config: &Config,
+        cache: &mut DescribeCache,
+        manager: SubagentManager,
+        parent_model: &str,
+        background: BackgroundProcessManager,
+    ) -> Registry {
+        let mut registry = Self::scan_inner(config, cache, Some(background));
+        registry.enable_subagents(config, manager, parent_model);
         registry
     }
 
@@ -185,6 +242,9 @@ impl Registry {
                     ToolImpl::Exec(t) => t.path.display().to_string(),
                     ToolImpl::Subagent(_) => "orchestration".to_string(),
                     ToolImpl::ReadSkill => "skills".to_string(),
+                    ToolImpl::ShellList | ToolImpl::ShellOutput | ToolImpl::ShellStop => {
+                        "builtin".to_string()
+                    }
                     _ => "builtin".to_string(),
                 };
                 (e.spec.name.clone(), e.spec.description.clone(), origin)
@@ -208,7 +268,10 @@ impl Registry {
             Err(e) => return ToolOutcome::error(format!("invalid tool arguments json: {e}")),
         };
         let mut outcome = match &entry.imp {
-            ToolImpl::Shell => shell(&args),
+            ToolImpl::Shell => shell(&args, self.background.as_ref()),
+            ToolImpl::ShellList => shell_list(self.background.as_ref()),
+            ToolImpl::ShellOutput => shell_output(self.background.as_ref(), &args),
+            ToolImpl::ShellStop => shell_stop(self.background.as_ref(), &args),
             ToolImpl::ReadFile => read_file(&args),
             ToolImpl::ReadSkill => read_skill(&self.skills, &args),
             ToolImpl::WriteFile => write_file(&args),
@@ -334,6 +397,9 @@ impl Registry {
 
 const RESERVED_TOOL_NAMES: &[&str] = &[
     "read_skill",
+    "shell_list",
+    "shell_output",
+    "shell_stop",
     "subagent_spawn",
     "subagent_send",
     "subagent_wait",
@@ -519,25 +585,9 @@ fn truncate_result(content: &mut String) {
     }
 }
 
-fn builtins() -> Vec<ToolEntry> {
+fn builtins(background: bool) -> Vec<ToolEntry> {
     vec![
-        ToolEntry {
-            spec: ToolSpec {
-                name: "shell".into(),
-                description: "Run a shell command with `sh -c` in the current working directory. \
-                              Returns stdout (and stderr / exit code on failure)."
-                    .into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string", "description": "The command to run"},
-                        "timeout_secs": {"type": "integer", "description": "Optional timeout in seconds (default 120)"}
-                    },
-                    "required": ["command"]
-                }),
-            },
-            imp: ToolImpl::Shell,
-        },
+        shell_entry(background),
         ToolEntry {
             spec: ToolSpec {
                 name: "read_file".into(),
@@ -590,22 +640,142 @@ fn builtins() -> Vec<ToolEntry> {
     ]
 }
 
+fn shell_entry(background: bool) -> ToolEntry {
+    let mut properties = json!({
+        "command": {"type": "string", "description": "The command to run"},
+        "timeout_secs": {"type": "integer", "minimum": 1, "description": "Optional timeout in seconds. Foreground commands default to 120 seconds; background commands have no timeout when omitted."}
+    });
+    let description = if background {
+        properties["background"] = json!({
+            "type": "boolean",
+            "description": "Start the command in the background and return its bg-N ID immediately"
+        });
+        properties["name"] = json!({
+            "type": "string",
+            "maxLength": 80,
+            "description": "Optional short label shown in /ps"
+        });
+        "Run a shell command with `sh -c` in the current working directory. Foreground commands return their output. Set background=true for a long-running command, then use shell_output, shell_list, or shell_stop with the returned bg-N ID."
+    } else {
+        "Run a foreground shell command with `sh -c` in the current working directory. Returns stdout and reports stderr or the exit code on failure."
+    };
+    ToolEntry {
+        spec: ToolSpec {
+            name: "shell".into(),
+            description: description.into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": properties,
+                "required": ["command"]
+            }),
+        },
+        imp: ToolImpl::Shell,
+    }
+}
+
+fn background_entries() -> Vec<ToolEntry> {
+    vec![
+        ToolEntry {
+            spec: ToolSpec {
+                name: "shell_list".into(),
+                description: "List background shell commands started in the active session. Returns IDs, status, PID, elapsed time, name, and command without log output.".into(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            },
+            imp: ToolImpl::ShellList,
+        },
+        ToolEntry {
+            spec: ToolSpec {
+                name: "shell_output".into(),
+                description: "Read new output from a background shell command. Pass the returned next_cursor to the next call. A short wait can block until output arrives or the command settles.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "The bg-N process ID"},
+                        "cursor": {"type": "integer", "minimum": 0, "description": "Cursor returned by a previous call; defaults to 0"},
+                        "wait_secs": {"type": "integer", "minimum": 0, "maximum": 30, "description": "Wait up to this many seconds for output or a status change; defaults to 0"}
+                    },
+                    "required": ["id"]
+                }),
+            },
+            imp: ToolImpl::ShellOutput,
+        },
+        ToolEntry {
+            spec: ToolSpec {
+                name: "shell_stop".into(),
+                description: "Request graceful termination of one background shell process group. Already-settled commands return their current status without error.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"id": {"type": "string", "description": "The bg-N process ID"}},
+                    "required": ["id"]
+                }),
+            },
+            imp: ToolImpl::ShellStop,
+        },
+    ]
+}
+
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolOutcome> {
     args[key]
         .as_str()
         .ok_or_else(|| ToolOutcome::error(format!("missing required string argument '{key}'")))
 }
 
-fn shell(args: &Value) -> ToolOutcome {
+fn shell(args: &Value, background: Option<&BackgroundProcessManager>) -> ToolOutcome {
     let command = match str_arg(args, "command") {
         Ok(c) => c,
         Err(e) => return e,
     };
-    let timeout = Duration::from_secs(
-        args["timeout_secs"]
-            .as_u64()
-            .unwrap_or(SHELL_DEFAULT_TIMEOUT_SECS),
-    );
+    let run_in_background = match args.get("background") {
+        Some(Value::Bool(value)) => *value,
+        None => false,
+        Some(_) => return ToolOutcome::error("'background' must be a boolean when provided"),
+    };
+    if run_in_background {
+        let Some(background) = background else {
+            return ToolOutcome::error("background shell execution is not available");
+        };
+        let name = match args.get("name") {
+            Some(Value::String(name)) if name.trim().chars().count() > 80 => {
+                return ToolOutcome::error("'name' must be at most 80 characters");
+            }
+            Some(Value::String(name)) if !name.trim().is_empty() => Some(name.trim().to_string()),
+            Some(Value::String(_)) | None => None,
+            Some(_) => return ToolOutcome::error("'name' must be a string when provided"),
+        };
+        let timeout = match args.get("timeout_secs") {
+            Some(value) => match value.as_u64() {
+                Some(0) | None => {
+                    return ToolOutcome::error("'timeout_secs' must be a positive integer");
+                }
+                Some(seconds) => Some(Duration::from_secs(seconds)),
+            },
+            None => None,
+        };
+        return match background.start(StartSpec {
+            command: command.to_string(),
+            name: name.clone(),
+            cwd: crate::config::working_dir(),
+            timeout,
+        }) {
+            Ok(started) => ToolOutcome::ok(format!(
+                "started {} (pid {}){} in the background\nnext_cursor: 0",
+                started.id,
+                started.pid,
+                name.map_or_else(String::new, |name| format!(" as {name}"))
+            )),
+            Err(error) => ToolOutcome::error(error),
+        };
+    }
+    let timeout_secs = match args.get("timeout_secs") {
+        Some(value) => match value.as_u64() {
+            Some(0) | None => {
+                return ToolOutcome::error("'timeout_secs' must be a positive integer");
+            }
+            Some(seconds) => seconds,
+        },
+        None => SHELL_DEFAULT_TIMEOUT_SECS,
+    };
+    let timeout = Duration::from_secs(timeout_secs);
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c").arg(command);
     match exec::run_with_timeout(cmd, None, timeout) {
@@ -614,6 +784,111 @@ fn shell(args: &Value) -> ToolOutcome {
             ToolOutcome { content, is_error }
         }
         Err(e) => ToolOutcome::error(format!("failed to spawn shell: {e}")),
+    }
+}
+
+fn shell_list(background: Option<&BackgroundProcessManager>) -> ToolOutcome {
+    let Some(background) = background else {
+        return ToolOutcome::error("background shell execution is not available");
+    };
+    let snapshots = background.snapshots();
+    if snapshots.is_empty() {
+        return ToolOutcome::ok("no background shell commands are tracked".into());
+    }
+    let now = std::time::Instant::now();
+    let mut output = String::new();
+    for snapshot in snapshots {
+        let pid = snapshot
+            .pid
+            .map_or_else(|| "?".into(), |pid| pid.to_string());
+        output.push_str(&format!(
+            "{}  {}  pid={}  elapsed={}s  {}  command={}\n",
+            snapshot.id,
+            snapshot.status.detail(),
+            pid,
+            snapshot.elapsed(now).as_secs(),
+            snapshot.name.as_deref().unwrap_or("unnamed"),
+            snapshot.command
+        ));
+    }
+    ToolOutcome::ok(output.trim_end().to_string())
+}
+
+fn shell_output(background: Option<&BackgroundProcessManager>, args: &Value) -> ToolOutcome {
+    let Some(background) = background else {
+        return ToolOutcome::error("background shell execution is not available");
+    };
+    let id = match str_arg(args, "id") {
+        Ok(id) => id,
+        Err(error) => return error,
+    };
+    let cursor = match args.get("cursor") {
+        Some(value) => match value.as_u64() {
+            Some(cursor) => cursor,
+            None => return ToolOutcome::error("'cursor' must be a non-negative integer"),
+        },
+        None => 0,
+    };
+    let wait_secs = match args.get("wait_secs") {
+        Some(value) => match value.as_u64() {
+            Some(wait) => wait,
+            None => return ToolOutcome::error("'wait_secs' must be a non-negative integer"),
+        },
+        None => 0,
+    };
+    if wait_secs > 30 {
+        return ToolOutcome::error("'wait_secs' must be between 0 and 30");
+    }
+    match background.read_output(id, cursor, Duration::from_secs(wait_secs)) {
+        Ok(read) => ToolOutcome::ok(format_background_output(read)),
+        Err(error) => ToolOutcome::error(error),
+    }
+}
+
+fn format_background_output(read: OutputRead) -> String {
+    let mut output = format!(
+        "{}: {} (pid {})\n",
+        read.snapshot.id,
+        read.snapshot.status.detail(),
+        read.snapshot
+            .pid
+            .map_or_else(|| "?".into(), |pid| pid.to_string())
+    );
+    if read.stale_cursor {
+        output.push_str("[earlier output was discarded]\n");
+    }
+    let mut previous = None;
+    for chunk in read.chunks {
+        if previous != Some(chunk.stream) {
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&format!("[{}]\n", chunk.stream.label()));
+            previous = Some(chunk.stream);
+        }
+        output.push_str(&chunk.text);
+    }
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(&format!("next_cursor: {}", read.next_cursor));
+    output
+}
+
+fn shell_stop(background: Option<&BackgroundProcessManager>, args: &Value) -> ToolOutcome {
+    let Some(background) = background else {
+        return ToolOutcome::error("background shell execution is not available");
+    };
+    let id = match str_arg(args, "id") {
+        Ok(id) => id,
+        Err(error) => return error,
+    };
+    match background.stop(id) {
+        Ok(snapshot) if snapshot.status.is_active() => {
+            ToolOutcome::ok(format!("stop requested for {id}"))
+        }
+        Ok(snapshot) => ToolOutcome::ok(format!("{id}: {}", snapshot.status.detail())),
+        Err(error) => ToolOutcome::error(error),
     }
 }
 
@@ -723,6 +998,10 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    use crate::background::{
+        BackgroundId, BackgroundSnapshot, BackgroundStatus, LogChunk, OutputStream,
+    };
+
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("yawl-tools-{}-{name}", std::process::id()))
     }
@@ -767,10 +1046,122 @@ mod tests {
 
     #[test]
     fn shell_builtin_reports_exit_code() {
-        let out = shell(&json!({"command": "echo hello; exit 2"}));
+        let out = shell(&json!({"command": "echo hello; exit 2"}), None);
         assert!(out.is_error);
         assert!(out.content.contains("hello"));
         assert!(out.content.contains("exit code: 2"));
+    }
+
+    #[test]
+    fn background_output_keeps_adjacent_read_chunks_contiguous() {
+        let now = std::time::Instant::now();
+        let output = format_background_output(OutputRead {
+            snapshot: BackgroundSnapshot {
+                id: BackgroundId::new(1),
+                pid: Some(42),
+                command: "printf hello".into(),
+                name: None,
+                cwd: std::path::PathBuf::from("."),
+                timeout: None,
+                status: BackgroundStatus::Running,
+                started_at: now,
+                settled_at: None,
+            },
+            chunks: vec![
+                LogChunk {
+                    cursor: 0,
+                    stream: OutputStream::Stdout,
+                    text: "hello ".into(),
+                },
+                LogChunk {
+                    cursor: 1,
+                    stream: OutputStream::Stdout,
+                    text: "world".into(),
+                },
+            ],
+            stale_cursor: false,
+            next_cursor: 2,
+        });
+
+        assert!(output.contains("[stdout]\nhello world\nnext_cursor: 2"));
+        assert!(!output.contains("hello \nworld"));
+    }
+
+    #[test]
+    fn background_tools_are_main_agent_only() {
+        let root = temp_path("background-registry");
+        let config = registry_config(root.join("home"), root.join("project"));
+        let mut cache = DescribeCache::default();
+        let child = Registry::scan(&config, &mut cache);
+        let child_names = child
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert!(!child_names.iter().any(|name| name == "shell_output"));
+        let child_shell = child
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "shell")
+            .expect("child shell tool");
+        assert!(
+            child_shell.input_schema["properties"]
+                .get("background")
+                .is_none()
+        );
+
+        let manager = BackgroundProcessManager::default();
+        let main = Registry::scan_with_background(&config, &mut cache, manager.clone());
+        let main_names = main
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert!(
+            ["shell_list", "shell_output", "shell_stop"]
+                .iter()
+                .all(|name| main_names.iter().any(|candidate| candidate == name))
+        );
+        let main_shell = main
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "shell")
+            .expect("main shell tool");
+        assert!(
+            main_shell.input_schema["properties"]
+                .get("background")
+                .is_some()
+        );
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn background_shell_can_be_read_listed_and_stopped() {
+        let root = temp_path("background-tools");
+        let config = registry_config(root.join("home"), root.join("project"));
+        let manager = BackgroundProcessManager::default();
+        let registry =
+            Registry::scan_with_background(&config, &mut DescribeCache::default(), manager.clone());
+        let started = registry.execute(
+            "shell",
+            r#"{"command":"printf ready; trap 'exit 0' TERM; while :; do sleep 1; done","background":true,"name":"dev"}"#,
+            "session",
+        );
+        assert!(!started.is_error, "{}", started.content);
+        assert!(started.content.contains("bg-1"));
+        let output = registry.execute(
+            "shell_output",
+            r#"{"id":"bg-1","cursor":0,"wait_secs":2}"#,
+            "session",
+        );
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("ready"));
+        assert!(output.content.contains("next_cursor:"));
+        let listed = registry.execute("shell_list", "{}", "session");
+        assert!(listed.content.contains("dev"));
+        let stopped = registry.execute("shell_stop", r#"{"id":"bg-1"}"#, "session");
+        assert!(!stopped.is_error, "{}", stopped.content);
+        manager.shutdown_and_discard();
     }
 
     #[test]

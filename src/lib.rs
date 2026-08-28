@@ -5,6 +5,7 @@
 //! recompiling to gain capabilities.
 
 pub mod agent;
+pub(crate) mod background;
 pub(crate) mod cancellation;
 pub(crate) mod checkpoint;
 pub mod compaction;
