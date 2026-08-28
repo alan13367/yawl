@@ -327,7 +327,7 @@ When enabled, the main model receives five tools:
 
 - `subagent_spawn` starts a background task and returns its `sa-N` ID. `prompt` and `required_tools` are required; the latter declares every tool the task needs before an optional preset is selected. The name is generated when omitted. The child model comes from its preset, `subagent_model`, or the active parent model, in that order.
 - `subagent_send` queues another turn or restarts a settled child with its retained conversation.
-- `subagent_wait` waits for selected IDs without canceling unfinished work on timeout. Every settled run reports its complete final response. A timed-out wait tells the model how many runs are still going and that long tasks are normal, so the orchestrator polls again instead of canceling them.
+- `subagent_wait` blocks by default until every selected ID has finished or failed, then reports every complete final response together. Passing `timeout_secs` makes it a bounded status check without canceling unfinished work.
 - `subagent_cancel` cancels selected runs and clears their queued messages. A cancelled run delivers any last activity it produced, labeled with its request count.
 - `subagent_list` returns compact rows or detailed status and the complete latest result for one ID.
 
@@ -460,7 +460,7 @@ Yawl reads global instructions from `~/.yawl/AGENTS.md` and project instructions
 Yawl stays in one Cargo package. Stable facade modules keep callers independent of the internal file layout:
 
 - `src/main.rs` coordinates startup. `src/cli.rs` and `src/print_mode.rs` contain the two binary frontends.
-- `src/agent.rs` owns the reusable provider and tool conversation loop. The persistent main agent and memory-only subagents both use it.
+- `src/agent.rs` preserves the public `Agent` API. Private child modules own conversation lifecycle, model/tool turns, streamed event translation, and session journaling for persistent main agents and memory-only subagents.
 - `src/background.rs` owns session-bound shell processes, bounded output, process-group shutdown, and restart history.
 - `src/subagent/` contains typed snapshots, capacity accounting, worker lifecycles, deferred delivery, cancellation, retained conversations, generated handles, request budgets, and JSON agent presets.
 - `src/cancellation.rs` binds cancellation tokens to worker threads while preserving process-wide SIGINT handling.
@@ -470,7 +470,7 @@ Yawl stays in one Cargo package. Stable facade modules keep callers independent 
 - `src/onboarding.rs` coordinates setup while its child modules own the arrow-key selector, terminal prompts, model discovery, and the wizard flow.
 - `src/doctor.rs` coordinates configuration diagnosis and repair; checks, interactive repairs, and report rendering live in its child modules.
 
-Internal module moves must preserve existing public paths through facade re-exports. Files are split when they own unrelated responsibilities, not when they cross an arbitrary line count.
+Internal module moves must preserve existing public paths through facade re-exports. Facades coordinate and re-export; private child modules own state and implementation, using `pub(super)` when only their parent needs access. Files are split when they own unrelated responsibilities, not when they cross an arbitrary line count.
 
 ```sh
 cargo fmt --all --check

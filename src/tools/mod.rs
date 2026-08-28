@@ -411,8 +411,7 @@ fn read_skill_entry() -> ToolEntry {
     ToolEntry {
         spec: ToolSpec {
             name: "read_skill".into(),
-            description:
-                "Load the complete instructions for an advertised skill before applying it.".into(),
+            description: "Load full instructions for an advertised skill.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -450,15 +449,10 @@ fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         .map(|preset| preset.name.clone())
         .collect::<Vec<_>>();
     let spawn_description = format!(
-        "Start a self-contained background coding subagent and return its ID immediately. \
-         Declare every tool the task needs in required_tools before choosing an agent. Omit agent \
-         unless the selected preset includes every required tool. In particular, scout is only for \
-         read-only inspection of existing files; any task that creates or modifies files must \
-         require write_file or edit_file and use the default agent. Do not select a child model: \
-         presets and user configuration may pin one, otherwise the active parent model is inherited. \
-         Write the prompt as a contract: # Target (exact files and symbols, plus non-goals), # Change (steps), # Acceptance \
-         (observable result). The agent must skip formatters, linters, and project-wide test suites. \
-         Available agents: {available_agents}."
+        "Start a background subagent and return its ID. Prompt contract: # Target (paths, \
+         ownership, non-goals), # Change, # Acceptance. Declare all required tools; omit agent for \
+         writes, commands, or unsupported tools. scout is read-only. Never set a model. Agents: \
+         {available_agents}."
     );
     vec![
         tool(
@@ -472,13 +466,13 @@ fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
                         "type": "array",
                         "items": {"type": "string"},
                         "maxItems": 64,
-                        "description": "Every tool the delegated task must use. Use [] only when the child can answer directly without tools. File creation requires write_file; file modification requires edit_file or write_file."
+                        "description": "All tools the child needs; [] only for a tool-free answer."
                     },
                     "name": {"type": "string"},
                     "agent": {
                         "type": "string",
                         "enum": agent_names,
-                        "description": "Optional specialist preset. Omit this field for the default agent whenever the task needs a tool absent from the preset. Scout is read-only and cannot create or modify files."
+                        "description": "Optional preset. Omit for the default agent. Scout is read-only."
                     }
                 },
                 "required": ["prompt", "required_tools"]
@@ -487,7 +481,7 @@ fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         ),
         tool(
             "subagent_send",
-            "Queue another model-directed turn on a subagent, restarting it if settled.",
+            "Send another turn to a subagent; restart it if settled.",
             json!({
                 "type": "object",
                 "properties": {
@@ -500,14 +494,13 @@ fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         ),
         tool(
             "subagent_wait",
-            "Wait until all requested subagents settle or the timeout expires without canceling them. \
-             Every settled run reports its complete final response. A timeout only ends this status \
-             check; the subagents keep running, and long tasks routinely take 10+ minutes.",
+            "Wait for every ID to finish or fail. Omit timeout_secs to block; set it only for a \
+             bounded status check. Settled runs include their full result.",
             json!({
                 "type": "object",
                 "properties": {
                     "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64},
-                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 300}
+                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 300, "description": "Optional bounded wait; omit to block until every ID settles."}
                 },
                 "required": ["ids"]
             }),
@@ -515,9 +508,8 @@ fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         ),
         tool(
             "subagent_cancel",
-            "Cancel active subagent runs, clear their queues, and retain partial transcripts. \
-             Cancel only work that is no longer needed; a slow run or an expired wait is not a \
-             reason to cancel.",
+            "Cancel runs and queued work for the IDs, retaining partial transcripts. Use only when \
+             the work is no longer needed.",
             json!({
                 "type": "object",
                 "properties": {
@@ -529,7 +521,7 @@ fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         ),
         tool(
             "subagent_list",
-            "List tracked subagents or return detailed status and the complete latest result for one ID.",
+            "List all subagents, or full status and result for one ID.",
             json!({
                 "type": "object",
                 "properties": {"id": {"type": "string"}}
@@ -591,7 +583,7 @@ fn builtins(background: bool) -> Vec<ToolEntry> {
         ToolEntry {
             spec: ToolSpec {
                 name: "read_file".into(),
-                description: "Read a UTF-8 text file and return its contents.".into(),
+                description: "Read a UTF-8 text file.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -605,9 +597,8 @@ fn builtins(background: bool) -> Vec<ToolEntry> {
         ToolEntry {
             spec: ToolSpec {
                 name: "write_file".into(),
-                description: "Write content to a file, creating parent directories as needed. \
-                              Overwrites existing files."
-                    .into(),
+                description:
+                    "Write a file, creating parent directories; replaces existing content.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -622,8 +613,7 @@ fn builtins(background: bool) -> Vec<ToolEntry> {
         ToolEntry {
             spec: ToolSpec {
                 name: "edit_file".into(),
-                description: "Replace an exact string in a file. `old_string` must appear exactly \
-                              once; include enough surrounding context to make it unique."
+                description: "Replace one exact `old_string` occurrence; include enough context for uniqueness."
                     .into(),
                 input_schema: json!({
                     "type": "object",
@@ -642,22 +632,22 @@ fn builtins(background: bool) -> Vec<ToolEntry> {
 
 fn shell_entry(background: bool) -> ToolEntry {
     let mut properties = json!({
-        "command": {"type": "string", "description": "The command to run"},
-        "timeout_secs": {"type": "integer", "minimum": 1, "description": "Optional timeout in seconds. Foreground commands default to 120 seconds; background commands have no timeout when omitted."}
+        "command": {"type": "string"},
+        "timeout_secs": {"type": "integer", "minimum": 1, "description": "Seconds; foreground defaults to 120, background to unlimited."}
     });
     let description = if background {
         properties["background"] = json!({
             "type": "boolean",
-            "description": "Start the command in the background and return its bg-N ID immediately"
+            "description": "Run in background and return a bg-N ID"
         });
         properties["name"] = json!({
             "type": "string",
             "maxLength": 80,
-            "description": "Optional short label shown in /ps"
+            "description": "Optional /ps label"
         });
-        "Run a shell command with `sh -c` in the current working directory. Foreground commands return their output. Set background=true for a long-running command, then use shell_output, shell_list, or shell_stop with the returned bg-N ID."
+        "Run `sh -c` in the working directory. Use background=true for long commands, then shell_output, shell_list, or shell_stop."
     } else {
-        "Run a foreground shell command with `sh -c` in the current working directory. Returns stdout and reports stderr or the exit code on failure."
+        "Run foreground `sh -c` in the working directory; return stdout or the failure."
     };
     ToolEntry {
         spec: ToolSpec {
@@ -678,7 +668,7 @@ fn background_entries() -> Vec<ToolEntry> {
         ToolEntry {
             spec: ToolSpec {
                 name: "shell_list".into(),
-                description: "List background shell commands started in the active session. Returns IDs, status, PID, elapsed time, name, and command without log output.".into(),
+                description: "List background commands with ID, status, PID, elapsed time, label, and command.".into(),
                 input_schema: json!({"type": "object", "properties": {}}),
             },
             imp: ToolImpl::ShellList,
@@ -686,13 +676,13 @@ fn background_entries() -> Vec<ToolEntry> {
         ToolEntry {
             spec: ToolSpec {
                 name: "shell_output".into(),
-                description: "Read new output from a background shell command. Pass the returned next_cursor to the next call. A short wait can block until output arrives or the command settles.".into(),
+                description: "Read new background-command output. Reuse next_cursor; wait_secs may wait for output or completion.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string", "description": "The bg-N process ID"},
-                        "cursor": {"type": "integer", "minimum": 0, "description": "Cursor returned by a previous call; defaults to 0"},
-                        "wait_secs": {"type": "integer", "minimum": 0, "maximum": 30, "description": "Wait up to this many seconds for output or a status change; defaults to 0"}
+                        "id": {"type": "string", "description": "bg-N ID"},
+                        "cursor": {"type": "integer", "minimum": 0, "description": "Previous cursor; default 0"},
+                        "wait_secs": {"type": "integer", "minimum": 0, "maximum": 30, "description": "Wait seconds; default 0"}
                     },
                     "required": ["id"]
                 }),
@@ -702,10 +692,10 @@ fn background_entries() -> Vec<ToolEntry> {
         ToolEntry {
             spec: ToolSpec {
                 name: "shell_stop".into(),
-                description: "Request graceful termination of one background shell process group. Already-settled commands return their current status without error.".into(),
+                description: "Gracefully stop a background process group; settled commands return status.".into(),
                 input_schema: json!({
                     "type": "object",
-                    "properties": {"id": {"type": "string", "description": "The bg-N process ID"}},
+                    "properties": {"id": {"type": "string", "description": "bg-N ID"}},
                     "required": ["id"]
                 }),
             },
@@ -1265,8 +1255,17 @@ fi
         let registry =
             Registry::scan_with_subagents(&config, &mut DescribeCache::default(), manager, "test");
 
-        let spawn = registry
-            .specs()
+        let specs = registry.specs();
+        let orchestration_chars = specs
+            .iter()
+            .filter(|spec| spec.name.starts_with("subagent_"))
+            .map(|spec| spec.description.len() + spec.input_schema.to_string().len())
+            .sum::<usize>();
+        assert!(
+            orchestration_chars < 2_000,
+            "orchestration schemas should stay compact; got {orchestration_chars} bytes"
+        );
+        let spawn = specs
             .into_iter()
             .find(|spec| spec.name == "subagent_spawn")
             .expect("spawn tool present");
@@ -1285,7 +1284,7 @@ fi
         assert!(
             spawn
                 .description
-                .contains("any task that creates or modifies files")
+                .contains("omit agent for writes, commands")
         );
         let properties = spawn
             .input_schema

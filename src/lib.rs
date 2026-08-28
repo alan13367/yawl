@@ -1,8 +1,8 @@
 //! Yawl — a minimal, self-extending AI agent harness.
 //!
-//! Single crate, blocking I/O, four direct dependencies. The model extends
-//! Yawl at runtime by writing executable tools; the harness never needs
-//! recompiling to gain capabilities.
+//! One Cargo package, blocking I/O, and a small direct dependency set. The
+//! model extends Yawl at runtime by writing executable tools; the harness
+//! never needs recompiling to gain capabilities.
 
 pub mod agent;
 pub(crate) mod background;

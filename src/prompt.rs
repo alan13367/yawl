@@ -66,13 +66,12 @@ Guidelines:
 
 Tools:
 - Builtins: shell, read_file, write_file, edit_file.
-- Yawl also loads executable tools from `~/.yawl/tools/` and `./.yawl/tools/` before every model step.
-- To add a tool, create an executable whose `--describe` output is JSON with `name`, `description`, `input_schema`, and optional `timeout_secs`. Normal calls receive JSON on stdin and return their result on stdout. A nonzero exit is an error. The tool inherits the working directory and receives `YAWL_SESSION_ID`.
+- Yawl rescans executable tools in `~/.yawl/tools/` and `./.yawl/tools/` before each model step. Add one with an executable whose `--describe` returns JSON fields `name`, `description`, `input_schema`, and optional `timeout_secs`. Calls read JSON stdin, write stdout, run in the working directory with `YAWL_SESSION_ID`, and report errors with a nonzero exit.
 "#
     );
     if !is_subagent {
         prompt.push_str(
-            "- For long-running commands such as development servers, call shell with background=true. Use shell_output to wait for logs, shell_list to recover IDs, and shell_stop when the process is no longer needed.\n",
+            "- Run long commands with shell background=true; use shell_output, shell_list, and shell_stop with the returned bg-N ID.\n",
         );
     }
     append_skill_catalog(&mut prompt, skills);
@@ -92,29 +91,20 @@ Tools:
     }
     if subagents {
         let delivery = if print_mode {
-            "- Print mode delivers settled results automatically after the turn; you may still wait when your next step needs one.\n"
+            "- Print mode delivers settled results after the turn; wait only when blocked.\n"
         } else {
-            "- TUI results arrive automatically. Wait only when your next step depends on a result.\n"
+            "- TUI results arrive automatically; wait only when blocked.\n"
         };
         prompt.push_str(r#"
 <subagent_guidance>
-- Before the first subagent_spawn for a user request, inspect the working directory yourself with a quick local check: identify the repository root, list the top-level files, detect an empty or uninitialized directory, and read applicable instructions. Decide whether delegation is useful only after this check. Do not spawn Scout just to discover the layout or that the directory is empty.
-- Delegate only self-contained work. Include paths, constraints, file ownership, and expected output.
-- Give concurrent agents disjoint editing scopes. Spawn them in the background and keep working.
-- Subagent tasks often take 10+ minutes. A subagent_wait timeout is a status check, not a failure: the run keeps going, so wait again or keep working. Cancel only work you no longer need, never for slowness.
+- Before spawning, inspect the repository root, top-level files, instructions, and empty or uninitialized state yourself; never use scout for discovery.
+- Delegate only useful, self-contained work. Prompts need # Target (paths, ownership, non-goals), # Change, and # Acceptance. Give parallel agents disjoint scopes, define interfaces first, and keep working.
+- Declare every required tool; use [] only for tool-free answers. Omit agent for commands, file changes, or missing preset capabilities. File changes require write_file or edit_file. scout may only read named files or skills. Never set a model.
+- Children lack this conversation and cannot delegate. Use subagent_send for follow-ups. They skip project-wide formatting, linting, builds, and tests; validate once after all finish. Large disk output requires the default agent and write_file.
+- subagent_wait without a timeout blocks until every ID settles. Set timeout_secs only for a bounded status check. Cancel only unwanted work.
 "#);
         prompt.push_str(delivery);
-        prompt.push_str(
-            "- Use subagent_send for more model-directed work. Children do not see this conversation and cannot create subagents.\n\
-             - Write each spawn prompt as a contract: # Target (exact files and symbols, plus non-goals), # Change (steps), # Acceptance (observable result).\n\
-             - Set required_tools to every tool the task needs before choosing an agent. Use [] only when the child can answer without tools.\n\
-             - Never select a model in subagent_spawn. A preset or user configuration may pin the child model; otherwise it inherits the active parent model.\n\
-             - Omit agent to use the default child for any task that creates, edits, or deletes files, runs commands, tests, or builds, or otherwise needs a tool the preset does not advertise. File creation requires write_file; file modification requires edit_file or write_file.\n\
-             - Use agent=\"scout\" only to inspect exact existing files with read_file or load relevant read-only guidance with read_skill. Never ask Scout to create or modify a file.\n\
-             - Decide interfaces between concurrent agents up front and restate them in every prompt.\n\
-             - Tell every agent to skip formatters, linters, and project-wide test suites; validate once yourself after all agents finish.\n\
-             - When a result will be large and must be written to disk, use the default child, include write_file in required_tools, and have it return the path with a summary.\n</subagent_guidance>\n",
-        );
+        prompt.push_str("</subagent_guidance>\n");
     }
     if is_subagent {
         prompt.push_str(
@@ -272,24 +262,30 @@ mod tests {
         assert!(child.contains("<subagent_role>"));
         assert!(!child.contains("<subagent_guidance>"));
         assert!(!disabled.contains("subagent_guidance"));
-        assert!(print.contains("Print mode delivers settled results automatically"));
+        assert!(
+            main.len() < 2_500,
+            "orchestration guidance should stay compact; got {} bytes",
+            main.len()
+        );
+        assert!(print.contains("Print mode delivers settled results after the turn"));
         assert!(
             main.contains("# Target") && main.contains("# Change") && main.contains("# Acceptance"),
             "the spawn prompt contract must be part of the guidance"
         );
         assert!(
-            main.contains("skip formatters, linters, and project-wide test suites"),
+            main.contains("skip project-wide formatting, linting, builds, and tests"),
             "the mid-flight validation ban must reach the main agent"
         );
         assert!(
-            main.contains("A subagent_wait timeout is a status check, not a failure"),
-            "the guidance must forbid canceling subagents for slowness"
+            main.contains("subagent_wait without a timeout blocks until every ID settles")
+                && main.contains("Cancel only unwanted work"),
+            "the guidance must describe blocking waits and forbid canceling useful work"
         );
         assert!(
-            main.contains("Set required_tools to every tool the task needs")
-                && main.contains("Never select a model in subagent_spawn")
-                && main.contains("Never ask Scout to create or modify a file")
-                && main.contains("Omit agent to use the default child"),
+            main.contains("Declare every required tool")
+                && main.contains("Never set a model")
+                && main.contains("scout may only read named files or skills")
+                && main.contains("Omit agent for commands, file changes"),
             "the parent must route write tasks away from read-only presets"
         );
         assert!(
@@ -304,15 +300,15 @@ mod tests {
         let prompt =
             build_system_prompt_from(Some(&dirs.0), &dirs.0, true, false, false, None, &[]);
         let local_check = prompt
-            .find("Before the first subagent_spawn")
+            .find("Before spawning")
             .expect("the parent must check the working directory before spawning");
         let delegation = prompt
-            .find("Delegate only self-contained work")
+            .find("Delegate only useful, self-contained work")
             .expect("the delegation guidance should be present");
 
         assert!(local_check < delegation);
-        assert!(prompt.contains("detect an empty or uninitialized directory"));
-        assert!(prompt.contains("Do not spawn Scout just to discover the layout"));
+        assert!(prompt.contains("empty or uninitialized state yourself"));
+        assert!(prompt.contains("never use scout for discovery"));
     }
 
     #[test]

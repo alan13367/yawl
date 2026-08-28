@@ -8,7 +8,8 @@ Yawl is one Cargo package with a Rust 2024 library target and binary target for 
 
 - `src/main.rs`: binary bootstrap, session selection, and TUI/print-mode dispatch
 - `src/cli.rs`, `src/print_mode.rs`: binary-local argument parsing and streamed text presentation
-- `src/agent.rs`: model/tool turn loop and application orchestration
+- `src/agent.rs`: stable `Agent` facade and public turn events
+- `src/agent/conversation.rs`, `conversation/turn.rs`, `events.rs`, `journal.rs`: conversation lifecycle, model/tool turns, streamed event translation, and optional session persistence
 - `src/provider/mod.rs`: stable provider facade and re-exports
 - `src/provider/types.rs`, `streaming.rs`, `resolution.rs`, `http.rs`: provider-neutral protocol, retries, provider selection, and SSE/HTTP support
 - `src/provider/anthropic.rs`, `openai.rs`: provider-specific wire translation
@@ -42,7 +43,7 @@ Run `cargo fmt --all` after editing Rust. After making code changes, run `cargo 
 ## Code rules
 
 - Follow existing module boundaries and Rust naming conventions. Organize by responsibility, not by file size alone.
-- Keep `main.rs`, `provider/mod.rs`, `config.rs`, `tui/mod.rs`, `onboarding.rs`, and `doctor.rs` as facades. Put implementation in their private child modules.
+- Keep `main.rs`, `agent.rs`, `provider/mod.rs`, `config.rs`, `tui/mod.rs`, `onboarding.rs`, and `doctor.rs` as facades. Put implementation in their private child modules.
 - Preserve established public paths when moving code. Re-export from the facade instead of forcing callers to follow the internal layout.
 - Prefer sibling visibility through `pub(super)` over widening internal APIs to `pub(crate)` or `pub`.
 - Prefer the standard library over a new dependency. Commit `Cargo.lock` when dependencies change.

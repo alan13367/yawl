@@ -15,10 +15,21 @@ use super::types::{
     SubagentSnapshot, SubagentStatus, SubagentTranscriptItem, bounded,
 };
 
-const DEFAULT_WAIT_SECS: u64 = 30;
 const MAX_WAIT_SECS: u64 = 300;
 const CANCEL_WAIT: Duration = Duration::from_secs(5);
 const SALVAGE_SNIPPET_BYTES: usize = 500;
+
+fn wait_timeout(timeout_secs: Option<u64>) -> Result<Option<Duration>, String> {
+    let Some(timeout_secs) = timeout_secs else {
+        return Ok(None);
+    };
+    if !(1..=MAX_WAIT_SECS).contains(&timeout_secs) {
+        return Err(format!(
+            "timeout_secs must be between 1 and {MAX_WAIT_SECS}"
+        ));
+    }
+    Ok(Some(Duration::from_secs(timeout_secs)))
+}
 
 #[derive(Clone)]
 pub(crate) struct SubagentManager {
@@ -279,14 +290,8 @@ impl SubagentManager {
 
     pub(crate) fn wait(&self, ids: &[String], timeout_secs: Option<u64>) -> Result<String, String> {
         validate_id_list(ids)?;
-        let timeout_secs = timeout_secs.unwrap_or(DEFAULT_WAIT_SECS);
-        if !(1..=MAX_WAIT_SECS).contains(&timeout_secs) {
-            return Err(format!(
-                "timeout_secs must be between 1 and {MAX_WAIT_SECS}"
-            ));
-        }
-        let timeout = Duration::from_secs(timeout_secs);
-        let deadline = Instant::now().checked_add(timeout);
+        let timeout = wait_timeout(timeout_secs)?;
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
         let mut state = self.lock();
         let indexes = resolve_indexes(&state, ids)?;
         let selected = indexes
@@ -352,13 +357,23 @@ impl SubagentManager {
             .filter(|snapshot| snapshot.status.is_active())
             .count();
         if active > 0 {
-            output = format!(
-                "Wait ended after {timeout_secs}s with {active} of {} subagent(s) still \
-                 running. This is normal: subagent tasks often take 10+ minutes. Their results \
-                 arrive automatically when they settle, so wait again or continue other work. \
-                 Do not cancel a subagent because a wait timed out.\n\n{output}",
-                snapshots.len()
-            );
+            if crate::cancellation::interrupted() {
+                output = format!(
+                    "Wait interrupted with {active} of {} subagent(s) still \
+                     running. This turn was canceled; the wait ended, not the work. \
+                     Their results arrive automatically when they settle. Do not wait again \
+                     or cancel a subagent because a wait was interrupted.\n\n{output}",
+                    snapshots.len()
+                );
+            } else if let Some(timeout_secs) = timeout_secs {
+                output = format!(
+                    "Wait ended after {timeout_secs}s with {active} of {} subagent(s) still \
+                     running. This is normal: subagent tasks often take 10+ minutes. Their results \
+                     arrive automatically when they settle, so wait again or continue other work. \
+                     Do not cancel a subagent because a wait timed out.\n\n{output}",
+                    snapshots.len()
+                );
+            }
         }
         consumed.sort_by_key(|delivery| delivery.run_number);
         for delivery in consumed {
@@ -1433,6 +1448,84 @@ mod tests {
     }
 
     #[test]
+    fn omitted_wait_timeout_has_no_deadline() {
+        assert_eq!(wait_timeout(None), Ok(None));
+        assert_eq!(wait_timeout(Some(7)), Ok(Some(Duration::from_secs(7))));
+    }
+
+    #[test]
+    fn wait_without_timeout_blocks_until_every_selected_subagent_settles() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
+        let base_url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("test provider address")
+        );
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (first_release_tx, first_release_rx) = mpsc::channel();
+        let (second_release_tx, second_release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().expect("first provider connection");
+            read_request(&mut first).expect("first provider request");
+            ready_tx.send(()).expect("first provider ready");
+
+            let (mut second, _) = listener.accept().expect("second provider connection");
+            read_request(&mut second).expect("second provider request");
+            ready_tx.send(()).expect("second provider ready");
+
+            first_release_rx.recv().expect("first provider release");
+            write_response(&mut first, "first result").expect("first provider response");
+            second_release_rx.recv().expect("second provider release");
+            write_response(&mut second, "second result").expect("second provider response");
+        });
+        let manager = SubagentManager::new("session".into(), 2);
+        let config = provider_config(base_url);
+        let first = manager
+            .spawn(
+                config.clone(),
+                "local:model",
+                Some("first"),
+                "first task",
+                None,
+            )
+            .expect("first subagent spawn");
+        let second = manager
+            .spawn(config, "local:model", Some("second"), "second task", None)
+            .expect("second subagent spawn");
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first worker should reach the provider");
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second worker should reach the provider");
+
+        let (wait_tx, wait_rx) = mpsc::channel();
+        let wait_manager = manager.clone();
+        let wait = std::thread::spawn(move || {
+            let result = wait_manager.wait(&[first.to_string(), second.to_string()], None);
+            wait_tx.send(result).expect("wait result receiver");
+        });
+
+        first_release_tx.send(()).expect("release first provider");
+        assert!(
+            wait_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the wait must remain blocked while any selected subagent is active"
+        );
+
+        second_release_tx.send(()).expect("release second provider");
+        let output = wait_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wait should finish after both providers")
+            .expect("wait result");
+        assert!(output.contains("first result"));
+        assert!(output.contains("second result"));
+        assert!(!output.contains("Wait ended after"));
+
+        wait.join().expect("wait thread should exit");
+        server.join().expect("provider server should exit");
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
     fn omitted_spawn_names_are_generated_and_supplied_names_are_kept() {
         let config = provider_config("http://127.0.0.1:9/v1".into());
         let manager = SubagentManager::new("session".into(), 3);
@@ -1600,6 +1693,129 @@ mod tests {
             !settled.contains("still running"),
             "settled waits must not carry the timeout notice; got:\n{settled}"
         );
+        server.join().expect("provider server should exit");
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn interrupted_wait_explains_that_the_work_continues() {
+        crate::set_interrupted(false);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
+        let base_url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("test provider address")
+        );
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("subagent provider connection");
+            read_request(&mut stream).expect("subagent provider request");
+            ready_tx.send(()).expect("provider ready signal");
+            release_rx.recv().expect("provider release signal");
+            write_response(&mut stream, "slow result").expect("subagent provider response");
+        });
+        let manager = SubagentManager::new("session".into(), 1);
+        let id = manager
+            .spawn(
+                provider_config(base_url),
+                "local:model",
+                Some("slow"),
+                "long work",
+                None,
+            )
+            .expect("slow subagent spawn");
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker should reach the provider");
+
+        let token = CancellationToken::default();
+        token.cancel();
+        crate::cancellation::scope(&token, || {
+            let unbounded = manager
+                .wait(&[id.to_string()], None)
+                .expect("an interrupted wait must still report status");
+            assert!(
+                unbounded.contains("Wait interrupted"),
+                "the interrupted wait must explain that the wait ended; got:\n{unbounded}"
+            );
+            assert!(
+                unbounded.contains("1 of 1 subagent(s) still running"),
+                "the interrupted wait must report that the run continues; got:\n{unbounded}"
+            );
+            assert!(
+                unbounded.contains("Do not wait again"),
+                "the interrupted wait must discourage immediately waiting again; got:\n{unbounded}"
+            );
+            assert!(
+                !unbounded.contains("Wait ended after"),
+                "an interrupted wait must not look like a timeout; got:\n{unbounded}"
+            );
+
+            let timed = manager
+                .wait(&[id.to_string()], Some(300))
+                .expect("interrupt should win over a pending timeout");
+            assert!(
+                timed.contains("Wait interrupted"),
+                "Esc during a timed wait is a cancel, not a timeout; got:\n{timed}"
+            );
+            assert!(
+                !timed.contains("Wait ended after"),
+                "interrupt must take precedence over timeout; got:\n{timed}"
+            );
+        });
+
+        release_tx.send(()).expect("release provider response");
+        manager
+            .wait(&[id.to_string()], Some(5))
+            .expect("released subagent should settle");
+        server.join().expect("provider server should exit");
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn interrupted_wait_stays_quiet_when_every_id_already_settled() {
+        crate::set_interrupted(false);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
+        let base_url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("test provider address")
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("subagent provider connection");
+            read_request(&mut stream).expect("subagent provider request");
+            write_response(&mut stream, "done").expect("subagent provider response");
+        });
+        let manager = SubagentManager::new("session".into(), 1);
+        let id = manager
+            .spawn(
+                provider_config(base_url),
+                "local:model",
+                Some("quick"),
+                "short work",
+                None,
+            )
+            .expect("subagent spawn");
+        manager
+            .wait(&[id.to_string()], Some(5))
+            .expect("subagent should settle");
+
+        let token = CancellationToken::default();
+        token.cancel();
+        crate::cancellation::scope(&token, || {
+            let output = manager
+                .wait(&[id.to_string()], None)
+                .expect("waiting on a settled ID should succeed");
+            assert!(
+                !output.contains("Wait interrupted"),
+                "a finished wait must not claim it was interrupted; got:\n{output}"
+            );
+            assert!(
+                !output.contains("Wait ended after"),
+                "a finished wait must not carry a timeout notice; got:\n{output}"
+            );
+            assert!(output.contains("done"));
+        });
+
         server.join().expect("provider server should exit");
         manager.shutdown_and_discard();
     }
