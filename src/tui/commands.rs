@@ -41,6 +41,7 @@ Input
   Messages submitted during a response appear below it as queued. /unqueue opens
     an editor: K/J reorder, e edits, d deletes, and Enter stops the turn to send.
   Outside the menu, Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
+  Ctrl+V pastes a clipboard image as [Image #N] when the model accepts images.
   Tab focuses transcript blocks. Up/Down move, Left/Right fold, Enter opens,
     y copies, and Esc returns to the editor. Ctrl+F searches the transcript.
   Ctrl+O expands or collapses tool output. Esc or Ctrl+C aborts the active turn.
@@ -98,7 +99,7 @@ pub(super) fn queue_picker(state: &ViewState, selected: usize) -> Option<Picker>
         .enumerate()
         .map(|(index, input)| PickerItem {
             label: format!("Queued {}", index + 1),
-            description: input.replace('\n', " "),
+            description: input.text.replace('\n', " "),
             action: PickerAction::SendQueued(index),
         })
         .collect::<Vec<_>>();
@@ -199,7 +200,7 @@ pub(super) fn handle_queue_picker_action(
     match action {
         PickerAction::ApplyQueued { index, value } => {
             if let Some(input) = state.queued_inputs.get_mut(index) {
-                *input = value;
+                input.set_text(value);
                 state.activity = format!("updated queued message {}", index + 1);
             }
             state.picker = queue_picker(state, index);

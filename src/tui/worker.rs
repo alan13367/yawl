@@ -14,7 +14,7 @@ use super::commands::{
 };
 use super::completion::handle_completion_key;
 use super::events::{Event, EventReader, Key, MouseEvent};
-use super::input::{EditAction, Editor};
+use super::input::{EditAction, Editor, Submission};
 use super::picker::{
     ActivePickers, PickerAction, SettingsCategory, SettingsItem, SettingsLocation,
     picker_is_editing, select_picker_item, settings_item_index, take_picker_action,
@@ -27,7 +27,7 @@ use super::terminal::Terminal;
 
 pub(super) fn turn_interactive<R: Read>(
     agent: &mut Agent,
-    input: String,
+    input: crate::provider::TurnInput,
     state: &mut ViewState,
     editor: &mut Editor,
     terminal: &mut Terminal,
@@ -45,9 +45,10 @@ pub(super) fn turn_interactive<R: Read>(
         let (thread_tx, thread_rx) = mpsc::channel();
         scope.spawn(move || {
             let _ = thread_tx.send(native_thread_id());
-            let result = active_agent.run_turn_preserving_cancellation(Some(input), &mut |event| {
-                let _ = updates_tx.send(Update::from_event(event));
-            });
+            let result =
+                active_agent.run_turn_input_preserving_cancellation(Some(input), &mut |event| {
+                    let _ = updates_tx.send(Update::from_event(event));
+                });
             let _ = done_tx.send(result);
         });
         let worker_thread = thread_rx
@@ -269,7 +270,18 @@ pub(super) fn pump_events<R: Read, T>(
                         state.transcript.search_paste(&text);
                     } else {
                         state.transcript.blur();
-                        editor.paste(&text);
+                        if text.is_empty() {
+                            let supported =
+                                crate::model::supports_images(active_config, &state.model);
+                            match editor.paste_clipboard_image(supported) {
+                                Ok(()) => state.scroll_offset = 0,
+                                Err(error) => {
+                                    state.notice(format!("Could not paste image: {error}."))
+                                }
+                            }
+                        } else {
+                            editor.paste(&text);
+                        }
                     }
                 }
                 Event::Key(key)
@@ -288,13 +300,30 @@ pub(super) fn pump_events<R: Read, T>(
                             Key::Ctrl('o') => toggle_tool_expansion(state),
                             Key::PageUp => scroll(state, 10),
                             Key::PageDown => scroll(state, -10),
+                            Key::Ctrl('v') | Key::Super('v') => {
+                                let supported =
+                                    crate::model::supports_images(active_config, &state.model);
+                                match editor.paste_clipboard_image(supported) {
+                                    Ok(()) => state.scroll_offset = 0,
+                                    Err(error) => {
+                                        state.notice(format!("Could not paste image: {error}."))
+                                    }
+                                }
+                            }
                             _ if handle_completion_key(state, editor, key) => {
                                 // Keep accepting and completing input while the agent runs.
                             }
                             Key::Tab => super::navigation::focus_transcript(state),
                             _ => {
                                 if let EditAction::Submit(input) = editor.handle_key(key) {
-                                    let input = super::displayed_submission(editor, &input);
+                                    if input.has_images() && busy_command(&input.text).is_some() {
+                                        state.notice("Images cannot accompany commands while a turn is running.");
+                                        editor.restore_submission(input);
+                                        continue;
+                                    }
+                                    let displayed = super::displayed_submission(editor, &input);
+                                    let mut input = input;
+                                    input.set_text(displayed);
                                     handle_submission_while_busy(
                                         input,
                                         state,
@@ -346,14 +375,14 @@ pub(super) fn cancel_worker(
 }
 
 pub(super) fn handle_submission_while_busy(
-    input: String,
+    input: Submission,
     state: &mut ViewState,
     active_pickers: &ActivePickers,
     active_config: &Config,
     background: &crate::background::BackgroundProcessManager,
     terminal: &mut Terminal,
 ) -> Result<(), Error> {
-    match busy_command(&input) {
+    match busy_command(&input.text) {
         Some(BusyCommand::Settings) => state.picker = Some(active_pickers.settings.clone()),
         Some(BusyCommand::Model) => state.picker = Some(active_pickers.model.clone()),
         Some(BusyCommand::Connect) => super::connection::open(state, active_config, false),

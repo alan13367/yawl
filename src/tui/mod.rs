@@ -2,6 +2,7 @@
 //! sequences. The terminal remains responsive while the blocking agent loop
 //! runs on a scoped worker thread.
 
+mod clipboard;
 mod commands;
 #[cfg(test)]
 mod commands_tests;
@@ -48,7 +49,7 @@ use self::commands::{
 };
 use self::completion::handle_completion_key;
 use self::events::{Event, EventReader, Key};
-use self::input::{EditAction, Editor};
+use self::input::{EditAction, Editor, Submission};
 use self::picker::{
     open_model_picker, open_reasoning_picker, open_settings_picker, picker_is_editing,
     take_picker_action,
@@ -214,7 +215,11 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                         state.transcript.search_paste(&text);
                     } else {
                         state.transcript.blur();
-                        editor.paste(&text);
+                        if text.is_empty() {
+                            paste_clipboard_image(agent, &mut state, &mut editor);
+                        } else {
+                            editor.paste(&text);
+                        }
                         state.scroll_offset = 0;
                     }
                 }
@@ -231,6 +236,9 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                             }
                             Key::Ctrl('l') => terminal.invalidate(),
                             Key::Ctrl('o') => toggle_tool_expansion(&mut state),
+                            Key::Ctrl('v') | Key::Super('v') => {
+                                paste_clipboard_image(agent, &mut state, &mut editor)
+                            }
                             _ if handle_completion_key(&mut state, &mut editor, key) => {
                                 // The completion menu consumed navigation or Tab.
                             }
@@ -272,19 +280,37 @@ fn rebuild_transcript_after_deferred_follow_up(
     state.render_cache.invalidate();
 }
 
-fn displayed_submission(editor: &Editor, input: &str) -> String {
-    editor.expand_pastes(input)
+fn paste_clipboard_image(agent: &Agent, state: &mut ViewState, editor: &mut Editor) {
+    let supported = crate::model::supports_images(agent.config(), agent.model());
+    match editor.paste_clipboard_image(supported) {
+        Ok(()) => {
+            state.scroll_offset = 0;
+        }
+        Err(error) => state.notice(format!("Could not paste image: {error}.")),
+    }
+}
+
+fn displayed_submission(editor: &Editor, input: &Submission) -> String {
+    editor.expand_pastes(&input.text)
 }
 
 fn handle_submission<R: Read>(
     agent: &mut Agent,
-    input: String,
+    input: Submission,
     state: &mut ViewState,
     editor: &mut Editor,
     terminal: &mut Terminal,
     events: &mut EventReader<R>,
 ) -> Result<bool, Error> {
-    let command = input.trim();
+    let command = input.text.trim().to_string();
+    if input.has_images() && !crate::model::supports_images(agent.config(), agent.model()) {
+        state.notice(format!(
+            "Model '{}' does not accept image input.",
+            agent.model()
+        ));
+        editor.restore_submission(input);
+        return Ok(false);
+    }
     if let Some(skill_command) = command.strip_prefix("/skill:") {
         let (name, arguments) = skill_command
             .split_once(char::is_whitespace)
@@ -297,7 +323,14 @@ fn handle_submission<R: Read>(
             run_agent_submission(
                 agent,
                 displayed_submission(editor, &input),
-                expanded,
+                match input.turn_input(expanded) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        state.notice(format!("Could not prepare images: {error}."));
+                        editor.restore_submission(input);
+                        return Ok(false);
+                    }
+                },
                 state,
                 editor,
                 terminal,
@@ -307,10 +340,16 @@ fn handle_submission<R: Read>(
             state.notice(format!(
                 "Unknown skill '{name}'. Type /skills to list skills."
             ));
+            editor.restore_submission(input);
         }
         return Ok(false);
     }
     if let Some(command) = command.strip_prefix('/') {
+        if input.has_images() {
+            state.notice("Images can accompany prompts and /skill commands, not local commands.");
+            editor.restore_submission(input);
+            return Ok(false);
+        }
         let (name, argument) = command
             .split_once(char::is_whitespace)
             .map_or((command, ""), |(name, argument)| (name, argument.trim()));
@@ -393,7 +432,15 @@ fn handle_submission<R: Read>(
     }
 
     let displayed_input = displayed_submission(editor, &input);
-    let agent_input = editor.expand_submission(&input);
+    let agent_text = editor.expand_submission(&input.text);
+    let agent_input = match input.turn_input(agent_text) {
+        Ok(input) => input,
+        Err(error) => {
+            state.notice(format!("Could not prepare images: {error}."));
+            editor.restore_submission(input);
+            return Ok(false);
+        }
+    };
     run_agent_submission(
         agent,
         displayed_input,
@@ -409,7 +456,7 @@ fn handle_submission<R: Read>(
 fn run_agent_submission<R: Read>(
     agent: &mut Agent,
     displayed_input: String,
-    agent_input: String,
+    agent_input: crate::provider::TurnInput,
     state: &mut ViewState,
     editor: &mut Editor,
     terminal: &mut Terminal,

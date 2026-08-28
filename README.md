@@ -121,6 +121,8 @@ Run `yawl --help` for the complete command-line reference.
 - `Enter` submits the editor contents.
 - `Shift+Enter` inserts a newline. `Ctrl+J` and `Alt+Enter` also insert a newline if the terminal does not report Shift.
 - Pasted multiline text stays multiline through bracketed paste mode. Pastes longer than 400 characters or 8 lines appear as `[Pasted #N 1234 characters]` while they are in the editor. After submission, the transcript shows the full text and the model receives it unchanged.
+- `Ctrl+V` pastes a clipboard image into the editor as `[Image #N]`. Terminals that forward Super+V or an empty bracketed-paste event work too. Yawl accepts up to five PNG, JPEG, GIF, or WebP images of 5 MB each per prompt. Deleting a marker detaches that image. Queued prompts and input history keep their attachments until Yawl exits. On Linux, image paste requires `wl-paste` or `xclip`.
+- Image results from `read_file` appear below their tool card when the terminal supports inline images. Ghostty, Kitty, and WezTerm use the Kitty graphics protocol for PNG previews; iTerm2 previews PNG, JPEG, GIF, and WebP. Other terminals keep the normal text result, and saved sessions can render the preview when reopened in a supported terminal.
 - Typing `/` opens a filtered command and skill menu below the input box. Up to 6 matches are shown at a time; `Up`/`Down` move the selection and wrap through the full list. When more matches exist than fit, `↑`/`↓` indicator rows frame the menu showing how many matches are hidden in each direction, the selection position, and where the list wraps. The first match is selected. `Tab` completes it. Enter runs the selected command, or the exact name when you have typed it in full, so `/copy` runs `/copy` rather than `/copy-all`.
 - Typing `@` opens the same menu filtered over the project's files so you can tag one for the model. The file list is indexed lazily on first use and cached for the session; it comes from `git ls-files` (which respects `.gitignore`) or, outside a repository, a bounded walk that skips hidden and build directories. Matching is case-insensitive and ranks file-name hits above path and subsequence hits. `Tab` or `Enter` inserts a short tag such as `@render.rs` (two files with the same name get longer tags like `@other/render.rs`); the editor and transcript keep the short tag while the model receives the relative path, such as `@src/tui/render.rs`.
 - `/undo` restores files changed through Yawl's `write_file` and `edit_file` tools to their state before the last prompt, including outside a git repository. If the working directory is in a git repo and the agent moved `HEAD`, `/undo` also resets local `HEAD` softly to the pre-turn commit. It then removes that user prompt and the assistant reply from the conversation. `/copy` puts the last assistant reply on the clipboard; `/copy-all` copies the full user/assistant transcript without reasoning so you can paste it into another harness.
@@ -237,7 +239,8 @@ Add providers under `providers`. This uses the same field names as pi's `models.
           "id": "Qwen3-Coder",
           "name": "Qwen3 Coder (local)",
           "contextWindow": 65536,
-          "maxTokens": 32768
+          "maxTokens": 32768,
+          "input": ["text", "image"]
         }
       ]
     }
@@ -245,7 +248,7 @@ Add providers under `providers`. This uses the same field names as pi's `models.
 }
 ```
 
-`models` is optional. It supplies labels and token limits for `/model`; Yawl still accepts an unlisted model ID. Custom providers use streaming OpenAI Chat Completions at `BASE_URL/chat/completions` and support text, tool calls, and full reasoning from `reasoning_content`, `reasoning`, or `reasoning_text` deltas. Yawl displays full reasoning as a separate multi-line block. The OMLX preset also sends saved full reasoning back as `reasoning_content` during tool loops.
+`models` is optional. It supplies labels, token limits, and accepted input types for `/model`; Yawl still accepts an unlisted model ID. Set `input` to `["text", "image"]` to enable image prompts for an exact custom model entry. Unlisted custom models remain text-only. Yawl enables image prompts for known multimodal Anthropic and OpenAI model families and for models in its Codex catalog. Unknown built-in model IDs and older text-only models remain text-only. Custom providers use streaming OpenAI Chat Completions at `BASE_URL/chat/completions` and support text, tool calls, and full reasoning from `reasoning_content`, `reasoning`, or `reasoning_text` deltas. Yawl displays full reasoning as a separate multi-line block. The OMLX preset also sends saved full reasoning back as `reasoning_content` during tool loops.
 
 Set `hide_reasoning` to `true`, choose "Reasoning display" in `/settings`, or run `/settings hide_reasoning on` to remove both summary and full reasoning from the TUI and print-mode output. Yawl still records the reasoning in the session so it reappears if the setting is turned off. In print mode, visible reasoning goes to standard error and the answer remains on standard output.
 
@@ -255,7 +258,7 @@ The highlighted row in the completion menu, pickers, and the subagent dashboard 
 
 When the transcript overflows the screen, Yawl overlays a solid thumb along its right edge without drawing a track or reserving a column. The thumb changes the background of the existing final cell, so reasoning and tool text remain visible beneath it and keep the full transcript width. Click the last column to jump, or press and drag to scrub through the history. With auto-hide on (the default), the thumb appears while you scroll with the mouse wheel, PageUp/PageDown, or dragging, then disappears after two idle seconds. Set `scroll_bar` to `false`, choose "Scroll bar" in `/settings`, or run `/settings scroll_bar off` to disable it entirely. Set `scroll_bar_auto_hide` to `false`, choose "Auto-hide scroll bar" in `/settings`, or run `/settings scroll_bar_auto_hide off` to keep the thumb permanently visible. Both default to on.
 
-Provider keys and header values accept `$ENV_VAR` and `${ENV_VAR}` references. If `apiKey` is omitted, Yawl also checks an environment variable derived from the provider name, such as `OMLX_API_KEY` or `LMSTUDIO_API_KEY`. Keyless local servers need no placeholder key. Extra pi model fields such as `cost`, `input`, and `reasoning` are ignored.
+Provider keys and header values accept `$ENV_VAR` and `${ENV_VAR}` references. If `apiKey` is omitted, Yawl also checks an environment variable derived from the provider name, such as `OMLX_API_KEY` or `LMSTUDIO_API_KEY`. Keyless local servers need no placeholder key. Extra pi model fields such as `cost` and `reasoning` are ignored.
 
 These compatibility fields are supported at provider or model level:
 
@@ -360,7 +363,7 @@ The main model always has these tools:
 - `shell_output` reads up to 48 KiB of new stdout and stderr from a `bg-N` command. Pass its `next_cursor` back on the next call, and optionally wait up to 30 seconds for output or settlement.
 - `shell_list` lists tracked background commands without copying their logs.
 - `shell_stop` requests graceful process-group termination for a background command.
-- `read_file` reads a UTF-8 file up to 1 MiB; larger files are rejected so the model can request portions via `shell`.
+- `read_file` reads a UTF-8 file up to 1 MiB. It also returns PNG, JPEG, GIF, and WebP files up to 5 MB as image input when the selected model accepts images. Larger files are rejected so the model can request portions via `shell`.
 - `write_file` writes a file and creates missing parent directories.
 - `edit_file` performs one exact string replacement and rejects missing or repeated matches.
 

@@ -1,5 +1,6 @@
 //! Focused tests for the corresponding TUI responsibility.
 
+use super::render::{ImageSupport, build_frame_with_images};
 use super::*;
 
 #[test]
@@ -203,6 +204,7 @@ fn tool_entries_are_compact_and_visually_separated() {
         name: "shell".into(),
         args: r#"{"command":"cargo test --all-targets"}"#.into(),
         output,
+        images: Vec::new(),
         is_error: false,
         running: false,
         started: None,
@@ -214,6 +216,65 @@ fn tool_entries_are_compact_and_visually_separated() {
     assert!(plain.contains("$ cargo test --all-targets"));
     assert!(plain.contains("lines, Ctrl+O to expand"));
     assert!(rendered.iter().any(|line| line.contains("\x1b[48;")));
+}
+
+#[test]
+fn image_tool_results_reserve_rows_below_their_tool_card() {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend_from_slice(&[0; 8]);
+    png.extend_from_slice(&200_u32.to_be_bytes());
+    png.extend_from_slice(&100_u32.to_be_bytes());
+    let image = crate::image::encode("image/png", &png);
+    let messages = [
+        crate::provider::Message::assistant(
+            String::new(),
+            vec![crate::provider::ToolCall {
+                id: "read-1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"sample.png"}"#.into(),
+            }],
+        ),
+        crate::provider::Message::tool_result_with_images(
+            "read-1",
+            "read_file",
+            "read image/png image from sample.png".into(),
+            vec![image.clone()],
+            false,
+        ),
+    ];
+    let mut state = empty_session_state();
+    state.transcript = Transcript::from_messages(&messages);
+
+    let rendered =
+        build_frame_with_images(&mut state, &Editor::default(), 80, 30, ImageSupport::Png);
+
+    assert_eq!(rendered.images.len(), 1);
+    let tool_row = rendered
+        .lines
+        .iter()
+        .position(|line| markdown::strip_ansi(line).contains("read sample.png"))
+        .expect("tool card")
+        + 1;
+    assert!(rendered.images[0].row > tool_row);
+    assert_eq!(rendered.images[0].content.as_ref(), &image);
+    assert!(!rendered.lines.join("\n").contains(&image.data));
+
+    state.picker = Some(Picker {
+        title: "Settings".into(),
+        hint: String::new(),
+        selected: 0,
+        items: Vec::new(),
+        editing: None,
+        parent: None,
+    });
+    let with_picker =
+        build_frame_with_images(&mut state, &Editor::default(), 80, 30, ImageSupport::Png);
+    assert!(with_picker.images.is_empty());
+    state.picker = None;
+
+    let without_preview =
+        build_frame_with_images(&mut state, &Editor::default(), 80, 30, ImageSupport::None);
+    assert!(without_preview.images.is_empty());
 }
 
 #[test]
@@ -277,6 +338,7 @@ fn reasoning_has_one_blank_line_on_each_side() {
             name: "shell".into(),
             args: r#"{"command":"true"}"#.into(),
             output: String::new(),
+            images: Vec::new(),
             is_error: false,
             running: false,
             started: None,
@@ -408,6 +470,7 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
     state.apply(Update::Transcript(TranscriptEvent::ToolEnd {
         name: "shell".into(),
         output: "done".into(),
+        images: Vec::new(),
         is_error: false,
     }));
     assert_eq!(state.activity, "sending");
@@ -619,6 +682,7 @@ fn scroll_bar_thumb_overlays_tool_panels_without_replacing_their_content() {
     state.apply(Update::Transcript(TranscriptEvent::ToolEnd {
         name: "shell".into(),
         output: "tool-output".into(),
+        images: Vec::new(),
         is_error: false,
     }));
     state.activity.clear();
@@ -1273,6 +1337,7 @@ fn running_tool_entries_show_their_elapsed_time() {
     transcript.apply(TranscriptEvent::ToolEnd {
         name: "shell".into(),
         output: "ok".into(),
+        images: Vec::new(),
         is_error: false,
     });
     let rendered = render_entries(transcript.entries(), 80, false, false);

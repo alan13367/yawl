@@ -354,7 +354,11 @@ mod tests {
                         "supportsUsageInStreaming": false,
                         "maxTokensField": "max_tokens"
                     },
-                    "models": [{"id": "qwen", "name": "Qwen local"}]
+                    "models": [{
+                        "id": "qwen",
+                        "name": "Qwen local",
+                        "input": ["text", "image"]
+                    }]
                 }
             }
         }))?;
@@ -364,6 +368,7 @@ mod tests {
         assert_eq!(provider.base_url, "http://localhost:9000/v1");
         assert_eq!(provider.api_key.as_deref(), Some("local-key"));
         assert_eq!(provider.models[0].id, "qwen");
+        assert_eq!(provider.models[0].input, ["text", "image"]);
         assert!(!provider.compat.usage_in_stream());
         assert!(provider.compat.reasoning_content_on_assistant_messages());
         Ok(())

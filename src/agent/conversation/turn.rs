@@ -1,7 +1,7 @@
 use crate::compaction;
 use crate::config::Config;
 use crate::error::Error;
-use crate::provider::{self, Message, SubagentResult, ToolCall, stream_turn};
+use crate::provider::{self, Message, SubagentResult, ToolCall, TurnInput, stream_turn};
 use crate::tools::Registry;
 
 use super::Conversation;
@@ -18,10 +18,18 @@ impl Conversation {
         user_input: Option<String>,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
+        self.run_turn_input(user_input.map(Into::into), sink)
+    }
+
+    pub fn run_turn_input(
+        &mut self,
+        user_input: Option<TurnInput>,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
         let cancellation = self.cancellation.clone();
         crate::cancellation::scope(&cancellation, || {
             self.cancellation.clear();
-            self.run_turn_with(user_input, sink, &mut provider::resolve)
+            self.run_turn_input_with(user_input, sink, &mut provider::resolve)
         })
     }
 
@@ -30,14 +38,22 @@ impl Conversation {
         user_input: Option<String>,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
+        self.run_turn_input_preserving_cancellation(user_input.map(Into::into), sink)
+    }
+
+    pub(crate) fn run_turn_input_preserving_cancellation(
+        &mut self,
+        user_input: Option<TurnInput>,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
         let cancellation = self.cancellation.clone();
         crate::cancellation::scope(&cancellation, || {
             let Some(timeout) = self.run_limits.and_then(|limits| limits.timeout) else {
-                return self.run_turn_with(user_input, sink, &mut provider::resolve);
+                return self.run_turn_input_with(user_input, sink, &mut provider::resolve);
             };
             let (result, timed_out) =
                 crate::cancellation::with_timeout(&cancellation, timeout, || {
-                    self.run_turn_with(user_input, sink, &mut provider::resolve)
+                    self.run_turn_input_with(user_input, sink, &mut provider::resolve)
                 });
             if timed_out {
                 sink(TurnEvent::Warning("subagent timeout exceeded".into()));
@@ -163,8 +179,27 @@ impl Conversation {
     where
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
     {
+        self.run_turn_input_with(user_input.map(Into::into), sink, resolve_provider)
+    }
+
+    pub(super) fn run_turn_input_with<F>(
+        &mut self,
+        user_input: Option<TurnInput>,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
         self.latest_turn_result.clear();
         if let Some(input) = user_input {
+            if !input.images.is_empty() && !crate::model::supports_images(&self.config, &self.model)
+            {
+                return Err(Error::Config(format!(
+                    "model '{}' does not accept image input",
+                    self.model
+                )));
+            }
             if let Some(checkpoints) = &mut self.checkpoints
                 && let Err(error) = checkpoints.snapshot()
             {
@@ -172,7 +207,7 @@ impl Conversation {
                     "Could not checkpoint for /undo: {error}"
                 )));
             }
-            self.append_input_message(Message::user(input))?;
+            self.append_input_message(Message::user_input(input))?;
         }
         // Per-run guard rails: only subagent conversations carry limits.
         let limits = self.run_limits;
@@ -232,6 +267,7 @@ impl Conversation {
                 messages: &self.messages,
                 tools: &specs,
                 max_tokens: crate::model::max_tokens(&self.config, &self.model),
+                supports_images: crate::model::supports_images(&self.config, &self.model),
             };
             let out = match stream_turn(provider.as_ref(), &request, &mut forward(sink)) {
                 Ok(out) => out,
@@ -313,16 +349,28 @@ impl Conversation {
                         path.display()
                     )));
                 }
-                let outcome = registry.execute(&call.name, &call.arguments, self.session.id());
+                let outcome = registry.execute_with_capabilities(
+                    &call.name,
+                    &call.arguments,
+                    self.session.id(),
+                    crate::model::supports_images(&self.config, &self.model),
+                );
                 sink(TurnEvent::ToolEnd {
                     name: &call.name,
                     output: &outcome.content,
+                    images: &outcome.images,
                     is_error: outcome.is_error,
                 });
                 if interrupted() {
                     aborted = true;
                 }
-                Message::tool_result(&call.id, &call.name, outcome.content, outcome.is_error)
+                Message::tool_result_with_images(
+                    &call.id,
+                    &call.name,
+                    outcome.content,
+                    outcome.images,
+                    outcome.is_error,
+                )
             };
             self.session.append_message(&result)?;
             self.messages.push(result);

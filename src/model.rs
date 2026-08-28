@@ -16,6 +16,17 @@ const STANDARD_REASONING: &[&str] = &["minimal", "low", "medium", "high"];
 const XHIGH_REASONING: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
 const MAX_REASONING: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
 
+const OPENAI_IMAGE_MODEL_PREFIXES: &[&str] = &[
+    "chatgpt-4o",
+    "gpt-4-turbo",
+    "gpt-4-vision",
+    "gpt-4.1",
+    "gpt-4.5",
+    "gpt-4o",
+    "gpt-5",
+    "o4-mini",
+];
+
 #[derive(Clone, Copy)]
 pub(crate) enum ProviderSelection<'a> {
     Anthropic,
@@ -146,6 +157,38 @@ impl<'a> ModelTarget<'a> {
             _ => STANDARD_REASONING,
         }
     }
+
+    fn supports_images(&self) -> bool {
+        match self.provider {
+            ProviderSelection::Anthropic => anthropic_supports_images(self.model),
+            ProviderSelection::OpenAi => openai_supports_images(self.model),
+            ProviderSelection::Codex => CODEX_MODELS.iter().any(|(id, _, _)| *id == self.model),
+            ProviderSelection::Custom { .. } => self
+                .configured_model()
+                .is_some_and(|model| model.input.iter().any(|input| input == "image")),
+        }
+    }
+}
+
+fn anthropic_supports_images(model: &str) -> bool {
+    model.starts_with("claude-3")
+        || ["claude-haiku-", "claude-opus-", "claude-sonnet-"]
+            .iter()
+            .any(|prefix| model.starts_with(prefix))
+}
+
+fn openai_supports_images(model: &str) -> bool {
+    if model == "o1"
+        || model.starts_with("o1-20")
+        || model == "o3"
+        || model.starts_with("o3-20")
+        || model.starts_with("o3-pro")
+    {
+        return true;
+    }
+    OPENAI_IMAGE_MODEL_PREFIXES
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
 }
 
 pub(crate) fn context_window(config: &Config, spec: &str) -> u64 {
@@ -162,6 +205,10 @@ pub(crate) fn is_codex(config: &Config, spec: &str) -> bool {
 
 pub(crate) fn reasoning_efforts(config: &Config, spec: &str) -> &'static [&'static str] {
     ModelTarget::parse(spec, config).reasoning_efforts()
+}
+
+pub(crate) fn supports_images(config: &Config, spec: &str) -> bool {
+    ModelTarget::parse(spec, config).supports_images()
 }
 
 pub(crate) fn available_models(config: &Config) -> Vec<(String, String)> {
@@ -208,6 +255,7 @@ mod tests {
                     name: Some("Local model".into()),
                     context_window: Some(65_536),
                     max_tokens: Some(4096),
+                    input: vec!["text".into(), "image".into()],
                     compat: OpenAiCompatibility::default(),
                 }],
                 compat: OpenAiCompatibility::default(),
@@ -232,6 +280,7 @@ mod tests {
         assert_eq!(target.context_window(&config), 65_536);
         assert_eq!(target.max_tokens(&config), 4096);
         assert!(target.reasoning_efforts().is_empty());
+        assert!(target.supports_images());
     }
 
     #[test]
@@ -260,5 +309,15 @@ mod tests {
             ModelTarget::parse("gpt-4o", &config).provider(),
             ProviderSelection::OpenAi
         ));
+        assert!(supports_images(&config, "anthropic:claude-sonnet-4"));
+        assert!(!supports_images(&config, "anthropic:claude-2.1"));
+        assert!(supports_images(&config, "openai:gpt-4o"));
+        assert!(supports_images(&config, "openai:o1"));
+        assert!(!supports_images(&config, "openai:o1-mini"));
+        assert!(!supports_images(&config, "openai:gpt-3.5-turbo"));
+        assert!(!supports_images(&config, "openai:unknown-model"));
+        assert!(supports_images(&config, "openai-codex:gpt-5.4"));
+        assert!(!supports_images(&config, "openai-codex:unknown-model"));
+        assert!(!supports_images(&config, "local:unlisted"));
     }
 }

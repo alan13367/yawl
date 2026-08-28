@@ -123,6 +123,7 @@ pub(crate) fn summarize(
         messages: std::slice::from_ref(&ask),
         tools: &[],
         max_tokens,
+        supports_images: false,
     };
     let out = stream_turn(provider, &request, sink)?;
     if out.text.trim().is_empty() {

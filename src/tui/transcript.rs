@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
 
-use crate::provider::{Message, ReasoningKind, Role};
+use crate::provider::{ImageContent, Message, ReasoningKind, Role};
 
 use super::search::TranscriptSearch;
 
@@ -17,6 +18,7 @@ pub(super) enum Entry {
         name: String,
         args: String,
         output: String,
+        images: Vec<Arc<ImageContent>>,
         is_error: bool,
         running: bool,
         /// Live start time of a running call. Always `None` once the call
@@ -47,6 +49,7 @@ pub(super) enum TranscriptEvent {
     ToolEnd {
         name: String,
         output: String,
+        images: Vec<ImageContent>,
         is_error: bool,
     },
 }
@@ -102,6 +105,7 @@ impl Transcript {
                             name: call.name.clone(),
                             args: call.arguments.clone(),
                             output: String::new(),
+                            images: Vec::new(),
                             is_error: false,
                             running: false,
                             started: None,
@@ -121,6 +125,7 @@ impl Transcript {
                     if let Some(Entry::Tool {
                         name,
                         output,
+                        images,
                         is_error,
                         ..
                     }) = pending_index.and_then(|index| entries.get_mut(index))
@@ -129,12 +134,14 @@ impl Transcript {
                             name.clone_from(tool_name);
                         }
                         output.clone_from(&message.content);
+                        images.extend(message.images.iter().cloned().map(Arc::new));
                         *is_error = message.is_error;
                     } else {
                         entries.push(Entry::Tool {
                             name: message.tool_name.clone().unwrap_or_else(|| "tool".into()),
                             args: String::new(),
                             output: message.content.clone(),
+                            images: message.images.iter().cloned().map(Arc::new).collect(),
                             is_error: message.is_error,
                             running: false,
                             started: None,
@@ -404,6 +411,7 @@ impl Transcript {
                     name,
                     args,
                     output: String::new(),
+                    images: Vec::new(),
                     is_error: false,
                     running: true,
                     started: Some(Instant::now()),
@@ -413,12 +421,14 @@ impl Transcript {
             TranscriptEvent::ToolEnd {
                 name,
                 output,
+                images,
                 is_error,
             } => {
                 let index = self.running_tool.take();
                 if let Some(Entry::Tool {
                     name: entry_name,
                     output: entry_output,
+                    images: entry_images,
                     is_error: entry_error,
                     running,
                     started,
@@ -427,6 +437,7 @@ impl Transcript {
                 {
                     *entry_name = name;
                     *entry_output = output;
+                    entry_images.extend(images.into_iter().map(Arc::new));
                     *entry_error = is_error;
                     *running = false;
                     *started = None;
@@ -486,6 +497,10 @@ mod tests {
 
     #[test]
     fn live_events_and_replayed_messages_produce_the_same_entries() {
+        let image = ImageContent {
+            media_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+        };
         let mut assistant = Message::assistant(
             "hello".into(),
             vec![ToolCall {
@@ -501,7 +516,13 @@ mod tests {
         let replayed = Transcript::from_messages(&[
             Message::user("hi"),
             assistant,
-            Message::tool_result("id", "shell", "ok".into(), false),
+            Message::tool_result_with_images(
+                "id",
+                "shell",
+                "ok".into(),
+                vec![image.clone()],
+                false,
+            ),
         ]);
 
         let mut live = Transcript::from_messages(&[]);
@@ -519,6 +540,7 @@ mod tests {
         live.apply(TranscriptEvent::ToolEnd {
             name: "shell".into(),
             output: "ok".into(),
+            images: vec![image],
             is_error: false,
         });
 
@@ -563,6 +585,7 @@ mod tests {
                 name: "shell".into(),
                 args: "{}".into(),
                 output: String::new(),
+                images: Vec::new(),
                 is_error: false,
                 running: false,
                 started: None,

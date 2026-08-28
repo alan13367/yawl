@@ -54,14 +54,27 @@ fn build_messages(
     system: &str,
     messages: &[super::Message],
     compat: &OpenAiCompatibility,
+    supports_images: bool,
 ) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     if !system.is_empty() {
         out.push(json!({"role": "system", "content": system}));
     }
+    let mut pending_tool_images: Vec<(&str, &str, &super::ImageContent)> = Vec::new();
     for m in messages {
+        if m.role != Role::Tool && !pending_tool_images.is_empty() {
+            push_tool_images(&mut out, &mut pending_tool_images);
+        }
         match m.role {
-            Role::User => out.push(json!({"role": "user", "content": m.content})),
+            Role::User => {
+                if supports_images && !m.images.is_empty() {
+                    let mut content = vec![json!({"type": "text", "text": m.content})];
+                    content.extend(m.images.iter().map(openai_image_block));
+                    out.push(json!({"role": "user", "content": content}));
+                } else {
+                    out.push(json!({"role": "user", "content": m.content}));
+                }
+            }
             Role::Assistant => {
                 let mut msg = json!({"role": "assistant", "content": m.content});
                 let reasoning = m
@@ -100,17 +113,49 @@ fn build_messages(
                     message["name"] = json!(m.tool_name.as_deref().unwrap_or("tool"));
                 }
                 out.push(message);
+                if supports_images {
+                    let call_id = m.tool_call_id.as_deref().unwrap_or("");
+                    let name = m.tool_name.as_deref().unwrap_or("tool");
+                    pending_tool_images.extend(m.images.iter().map(|image| (call_id, name, image)));
+                }
             }
         }
     }
+    if !pending_tool_images.is_empty() {
+        push_tool_images(&mut out, &mut pending_tool_images);
+    }
     out
+}
+
+fn openai_image_block(image: &super::ImageContent) -> Value {
+    json!({
+        "type": "image_url",
+        "image_url": {
+            "url": format!("data:{};base64,{}", image.media_type, image.data),
+            "detail": "auto",
+        }
+    })
+}
+
+fn push_tool_images(out: &mut Vec<Value>, images: &mut Vec<(&str, &str, &super::ImageContent)>) {
+    let mut text = String::from("Images returned by tools:\n");
+    for (index, (call_id, name, _)) in images.iter().enumerate() {
+        text.push_str(&format!(
+            "[Tool image #{}] {name} call {call_id}\n",
+            index + 1
+        ));
+    }
+    let mut content = vec![json!({"type": "text", "text": text})];
+    content.extend(images.iter().map(|(_, _, image)| openai_image_block(image)));
+    out.push(json!({"role": "user", "content": content}));
+    images.clear();
 }
 
 fn build_body(req: &Request<'_>, compat: &OpenAiCompatibility) -> Value {
     let mut body = json!({
         "model": req.model,
         "stream": true,
-        "messages": build_messages(req.system, req.messages, compat),
+        "messages": build_messages(req.system, req.messages, compat, req.supports_images),
     });
     body[compat.max_tokens_field()] = json!(req.max_tokens);
     if compat.usage_in_stream() {
@@ -375,7 +420,7 @@ mod tests {
             requires_reasoning_content_on_assistant_messages: Some(true),
             ..OpenAiCompatibility::default()
         };
-        let wire = build_messages("sys", &messages, &compat);
+        let wire = build_messages("sys", &messages, &compat, false);
         assert_eq!(wire.len(), 4);
         assert_eq!(wire[0]["role"], "system");
         assert_eq!(wire[2]["tool_calls"][0]["function"]["name"], "shell");
@@ -392,11 +437,63 @@ mod tests {
             messages: &messages,
             tools: &[],
             max_tokens: 321,
+            supports_images: false,
         };
         assert_eq!(
             build_body(&request, &OpenAiCompatibility::default())["max_tokens"],
             321
         );
+    }
+
+    #[test]
+    fn tool_images_follow_all_parallel_tool_messages() {
+        let image = super::super::ImageContent {
+            media_type: "image/png".into(),
+            data: "cG5n".into(),
+        };
+        let messages = vec![
+            Message::assistant(
+                String::new(),
+                vec![
+                    ToolCall {
+                        id: "a".into(),
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "b".into(),
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+            ),
+            Message::tool_result_with_images(
+                "a",
+                "read_file",
+                "first".into(),
+                vec![image.clone()],
+                false,
+            ),
+            Message::tool_result_with_images("b", "read_file", "second".into(), vec![image], false),
+        ];
+        let wire = build_messages("", &messages, &OpenAiCompatibility::default(), true);
+
+        assert_eq!(wire[1]["role"], "tool");
+        assert_eq!(wire[2]["role"], "tool");
+        assert_eq!(wire[3]["role"], "user");
+        assert_eq!(wire[3]["content"][1]["type"], "image_url");
+        assert_eq!(wire[3]["content"][2]["type"], "image_url");
+    }
+
+    #[test]
+    fn text_only_requests_omit_persisted_images() {
+        let mut message = Message::user("marker");
+        message.images.push(super::super::ImageContent {
+            media_type: "image/png".into(),
+            data: "cG5n".into(),
+        });
+        let wire = build_messages("", &[message], &OpenAiCompatibility::default(), false);
+        assert_eq!(wire[0]["content"], "marker");
     }
 
     #[test]
@@ -435,6 +532,7 @@ mod tests {
             messages: &messages,
             tools: &[],
             max_tokens: 123,
+            supports_images: false,
         };
         let body = build_body(&request, &compat);
         assert!(body.get("stream_options").is_none());

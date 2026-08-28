@@ -12,14 +12,25 @@ use crate::provider::{
 
 const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
-fn build_input(messages: &[Message]) -> Vec<Value> {
+fn codex_image_block(image: &crate::provider::ImageContent) -> Value {
+    json!({
+        "type": "input_image",
+        "image_url": format!("data:{};base64,{}", image.media_type, image.data),
+        "detail": "auto",
+    })
+}
+
+fn build_input(messages: &[Message], supports_images: bool) -> Vec<Value> {
     let mut input = Vec::new();
     for (message_index, message) in messages.iter().enumerate() {
         match message.role {
-            Role::User => input.push(json!({
-                "role": "user",
-                "content": [{"type": "input_text", "text": message.content}],
-            })),
+            Role::User => {
+                let mut content = vec![json!({"type": "input_text", "text": message.content})];
+                if supports_images {
+                    content.extend(message.images.iter().map(codex_image_block));
+                }
+                input.push(json!({"role": "user", "content": content}));
+            }
             Role::Assistant => {
                 input.extend(message.provider_data.iter().cloned());
                 if !message.content.is_empty() {
@@ -62,10 +73,17 @@ fn build_input(messages: &[Message]) -> Vec<Value> {
                         || message.tool_call_id.as_deref().unwrap_or(""),
                         |(call_id, _)| call_id,
                     );
+                let output = if supports_images && !message.images.is_empty() {
+                    let mut output = vec![json!({"type": "input_text", "text": message.content})];
+                    output.extend(message.images.iter().map(codex_image_block));
+                    Value::Array(output)
+                } else {
+                    Value::String(message.content.clone())
+                };
                 input.push(json!({
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": message.content,
+                    "output": output,
                 }));
             }
         }
@@ -79,7 +97,7 @@ fn build_body(request: &Request<'_>, reasoning_effort: Option<&str>) -> Value {
         "store": false,
         "stream": true,
         "instructions": if request.system.is_empty() { "You are a helpful assistant." } else { request.system },
-        "input": build_input(request.messages),
+        "input": build_input(request.messages, request.supports_images),
         "text": {"verbosity": "low"},
         "include": ["reasoning.encrypted_content"],
         "tool_choice": "auto",
@@ -317,11 +335,32 @@ mod tests {
             assistant,
             Message::tool_result("call_1|fc_1", "shell", "/tmp".into(), false),
         ];
-        let input = build_input(&messages);
+        let input = build_input(&messages, false);
         assert_eq!(input[1]["type"], "reasoning");
         assert_eq!(input[2]["call_id"], "call_1");
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(input[3]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn images_translate_for_user_and_function_output() {
+        let image = crate::provider::ImageContent {
+            media_type: "image/png".into(),
+            data: "cG5n".into(),
+        };
+        let mut user = Message::user("inspect");
+        user.images.push(image.clone());
+        let tool = Message::tool_result_with_images(
+            "call_1",
+            "read_file",
+            "read image".into(),
+            vec![image],
+            false,
+        );
+        let input = build_input(&[user, tool], true);
+
+        assert_eq!(input[0]["content"][1]["type"], "input_image");
+        assert_eq!(input[1]["output"][1]["type"], "input_image");
     }
 
     #[test]
@@ -332,6 +371,7 @@ mod tests {
             messages: &[],
             tools: &[],
             max_tokens: 1024,
+            supports_images: false,
         };
         let body = build_body(&request, Some("max"));
         assert_eq!(body["reasoning"]["effort"], "max");

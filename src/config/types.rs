@@ -172,6 +172,9 @@ pub struct ModelConfig {
     pub context_window: Option<u64>,
     #[serde(default, alias = "maxTokens")]
     pub max_tokens: Option<u32>,
+    /// Input kinds accepted by this model, such as `text` and `image`.
+    #[serde(default)]
+    pub input: Vec<String>,
     #[serde(default)]
     pub compat: OpenAiCompatibility,
 }

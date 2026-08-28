@@ -259,6 +259,7 @@ impl SubagentSnapshot {
             TurnEvent::ToolEnd {
                 name,
                 output,
+                images: _,
                 is_error,
             } => {
                 let arguments = self
@@ -467,6 +468,7 @@ mod tests {
         snapshot.apply_event(TurnEvent::ToolEnd {
             name: "shell",
             output: "ok\nnext",
+            images: &[],
             is_error: false,
         });
         snapshot.apply_event(TurnEvent::Usage {

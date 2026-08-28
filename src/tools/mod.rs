@@ -64,6 +64,7 @@ struct ToolEntry {
 
 pub struct ToolOutcome {
     pub content: String,
+    pub images: Vec<crate::provider::ImageContent>,
     pub is_error: bool,
 }
 
@@ -71,6 +72,7 @@ impl ToolOutcome {
     fn error(msg: impl Into<String>) -> ToolOutcome {
         ToolOutcome {
             content: msg.into(),
+            images: Vec::new(),
             is_error: true,
         }
     }
@@ -78,6 +80,15 @@ impl ToolOutcome {
     fn ok(content: String) -> ToolOutcome {
         ToolOutcome {
             content,
+            images: Vec::new(),
+            is_error: false,
+        }
+    }
+
+    fn image(content: String, image: crate::provider::ImageContent) -> ToolOutcome {
+        ToolOutcome {
+            content,
+            images: vec![image],
             is_error: false,
         }
     }
@@ -253,6 +264,16 @@ impl Registry {
     }
 
     pub fn execute(&self, name: &str, args_json: &str, session_id: &str) -> ToolOutcome {
+        self.execute_with_capabilities(name, args_json, session_id, false)
+    }
+
+    pub(crate) fn execute_with_capabilities(
+        &self,
+        name: &str,
+        args_json: &str,
+        session_id: &str,
+        supports_images: bool,
+    ) -> ToolOutcome {
         let Some(entry) = self.entries.iter().find(|e| e.spec.name == name) else {
             return ToolOutcome::error(format!(
                 "unknown tool '{name}'; available: {}",
@@ -272,13 +293,17 @@ impl Registry {
             ToolImpl::ShellList => shell_list(self.background.as_ref()),
             ToolImpl::ShellOutput => shell_output(self.background.as_ref(), &args),
             ToolImpl::ShellStop => shell_stop(self.background.as_ref(), &args),
-            ToolImpl::ReadFile => read_file(&args),
+            ToolImpl::ReadFile => read_file_for_model(&args, supports_images),
             ToolImpl::ReadSkill => read_skill(&self.skills, &args),
             ToolImpl::WriteFile => write_file(&args),
             ToolImpl::EditFile => edit_file(&args),
             ToolImpl::Exec(tool) => {
                 let (content, is_error) = exec::invoke(tool, args_json, session_id);
-                ToolOutcome { content, is_error }
+                ToolOutcome {
+                    content,
+                    images: Vec::new(),
+                    is_error,
+                }
             }
             ToolImpl::Subagent(tool) => self.execute_subagent(*tool, &args),
         };
@@ -583,7 +608,7 @@ fn builtins(background: bool) -> Vec<ToolEntry> {
         ToolEntry {
             spec: ToolSpec {
                 name: "read_file".into(),
-                description: "Read a UTF-8 text file.".into(),
+                description: "Read a UTF-8 text file or a PNG, JPEG, GIF, or WebP image.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -771,7 +796,11 @@ fn shell(args: &Value, background: Option<&BackgroundProcessManager>) -> ToolOut
     match exec::run_with_timeout(cmd, None, timeout) {
         Ok(result) => {
             let (content, is_error) = exec::render_result(&result, timeout);
-            ToolOutcome { content, is_error }
+            ToolOutcome {
+                content,
+                images: Vec::new(),
+                is_error,
+            }
         }
         Err(e) => ToolOutcome::error(format!("failed to spawn shell: {e}")),
     }
@@ -882,15 +911,55 @@ fn shell_stop(background: Option<&BackgroundProcessManager>, args: &Value) -> To
     }
 }
 
+#[cfg(test)]
 fn read_file(args: &Value) -> ToolOutcome {
+    read_file_for_model(args, false)
+}
+
+fn read_file_for_model(args: &Value, supports_images: bool) -> ToolOutcome {
     let path = match str_arg(args, "path") {
         Ok(p) => p,
         Err(e) => return e,
     };
     match std::fs::File::open(path) {
-        Ok(file) => read_bounded_utf8(path, file),
+        Ok(file) => read_bounded_file(path, file, supports_images),
         Err(e) => ToolOutcome::error(format!("cannot read {path}: {e}")),
     }
+}
+
+fn read_bounded_file(path: &str, mut reader: impl Read, supports_images: bool) -> ToolOutcome {
+    const IMAGE_SIGNATURE_BYTES: usize = 12;
+    let mut prefix = Vec::with_capacity(IMAGE_SIGNATURE_BYTES);
+    if let Err(error) = reader.by_ref().take(12).read_to_end(&mut prefix) {
+        return ToolOutcome::error(format!("cannot read {path}: {error}"));
+    }
+    let media_type = crate::image::media_type(&prefix);
+    let reader = std::io::Cursor::new(prefix).chain(reader);
+    let Some(media_type) = media_type else {
+        return read_bounded_utf8(path, reader);
+    };
+    if !supports_images {
+        return ToolOutcome::error("the selected model does not accept image input");
+    }
+
+    let mut bytes = Vec::new();
+    if let Err(error) = reader
+        .take(crate::image::MAX_IMAGE_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+    {
+        return ToolOutcome::error(format!("cannot read {path}: {error}"));
+    }
+    if bytes.len() > crate::image::MAX_IMAGE_BYTES {
+        return ToolOutcome::error(format!(
+            "{path} exceeds the {}-byte image limit",
+            crate::image::MAX_IMAGE_BYTES
+        ));
+    }
+    let size = bytes.len();
+    ToolOutcome::image(
+        format!("read {media_type} image from {path} ({size} bytes)"),
+        crate::image::encode(media_type, &bytes),
+    )
 }
 
 fn read_skill(skills: &[Skill], args: &Value) -> ToolOutcome {
@@ -1473,6 +1542,48 @@ fi
 
         assert!(out.is_error);
         assert!(out.content.contains("read limit"));
+    }
+
+    #[test]
+    fn read_file_keeps_non_images_at_the_text_read_limit() {
+        struct CountingRepeat(std::rc::Rc<std::cell::Cell<usize>>);
+
+        impl Read for CountingRepeat {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                buffer.fill(b'a');
+                self.0.set(self.0.get().saturating_add(buffer.len()));
+                Ok(buffer.len())
+            }
+        }
+
+        let bytes_read = std::rc::Rc::new(std::cell::Cell::new(0));
+        let out = read_bounded_file("endless", CountingRepeat(bytes_read.clone()), false);
+
+        assert!(out.is_error);
+        assert!(out.content.contains("read limit"));
+        assert_eq!(
+            bytes_read.get(),
+            MAX_READ_FILE_BYTES as usize + 1,
+            "text detection must not read up to the larger image limit"
+        );
+    }
+
+    #[test]
+    fn read_file_returns_images_only_for_capable_models() -> std::io::Result<()> {
+        let path = temp_path("read-image.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\npayload")?;
+        let args = json!({"path": path.to_string_lossy()});
+
+        let supported = read_file_for_model(&args, true);
+        assert!(!supported.is_error, "{}", supported.content);
+        assert_eq!(supported.images.len(), 1);
+        assert_eq!(supported.images[0].media_type, "image/png");
+
+        let unsupported = read_file_for_model(&args, false);
+        assert!(unsupported.is_error);
+        assert!(unsupported.images.is_empty());
+        let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]

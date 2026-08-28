@@ -23,6 +23,7 @@ pub enum Key {
     Tab,
     Escape,
     Ctrl(char),
+    Super(char),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +278,7 @@ fn key_from_encoded(code: u32, modifier: u8) -> Option<Key> {
     let shift = bits & 1 != 0;
     let alt = bits & 2 != 0;
     let ctrl = bits & 4 != 0;
+    let super_key = bits & 8 != 0;
     if code == 13 {
         return Some(if shift || alt {
             Key::Newline
@@ -292,6 +294,12 @@ fn key_from_encoded(code: u32, modifier: u8) -> Option<Key> {
         && character.is_ascii_alphabetic()
     {
         return Some(Key::Ctrl(character.to_ascii_lowercase()));
+    }
+    if super_key
+        && let Some(character) = char::from_u32(code)
+        && character.is_ascii_alphabetic()
+    {
+        return Some(Key::Super(character.to_ascii_lowercase()));
     }
     char::from_u32(code).map(Key::Char)
 }
@@ -341,6 +349,13 @@ mod tests {
     fn decodes_kitty_shift_enter() -> std::io::Result<()> {
         let mut reader = EventReader::new(Cursor::new(b"\x1b[13;2u"));
         assert_eq!(reader.read_event()?, Event::Key(Key::Newline));
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_kitty_super_v() -> std::io::Result<()> {
+        let mut reader = EventReader::new(&b"\x1b[118;9u"[..]);
+        assert_eq!(reader.read_event()?, Event::Key(Key::Super('v')));
         Ok(())
     }
 

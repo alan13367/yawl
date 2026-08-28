@@ -1,7 +1,11 @@
 //! Full-screen frame composition and transcript presentation.
 
+use std::sync::Arc;
+
+use base64::Engine as _;
+
 use crate::config::UiColor;
-use crate::provider::ReasoningKind;
+use crate::provider::{ImageContent, ReasoningKind};
 
 use super::completion::{
     COMPLETION_MENU_ROWS, completion_window, menu_rows, sync_completion_filter,
@@ -19,47 +23,98 @@ const BACKGROUND_NOTICE_AMBER: UiColor = UiColor::new(232, 202, 118);
 /// and must leave the hardware cursor hidden.
 pub(super) const HIDDEN_CURSOR: (usize, usize) = (0, 0);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ImageSupport {
+    None,
+    Png,
+    All,
+}
+
+impl ImageSupport {
+    fn accepts(self, media_type: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::Png => media_type == "image/png",
+            Self::All => matches!(
+                media_type,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct FrameImage {
+    pub(super) key: usize,
+    pub(super) row: usize,
+    pub(super) column: usize,
+    pub(super) columns: usize,
+    pub(super) rows: usize,
+    pub(super) content: Arc<ImageContent>,
+}
+
+pub(super) struct RenderedFrame {
+    pub(super) lines: Vec<String>,
+    pub(super) cursor: (usize, usize),
+    pub(super) images: Vec<FrameImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedImage {
+    start_line: usize,
+    columns: usize,
+    rows: usize,
+    content: Arc<ImageContent>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct RenderedEntry {
+    lines: Vec<String>,
+    images: Vec<CachedImage>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RenderSettings {
+    width: usize,
+    tools_expanded: bool,
+    hide_reasoning: bool,
+    image_support: ImageSupport,
+    accent_color: UiColor,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheSlot {
     width: usize,
     tools_expanded: bool,
     hide_reasoning: bool,
+    image_support: ImageSupport,
     accent_color: UiColor,
-    entry_lines: Vec<Option<Vec<String>>>,
+    entries: Vec<Option<RenderedEntry>>,
     /// Absolute starting line for every entry, plus one total-height sentinel.
     entry_starts: Vec<usize>,
     frozen_count: usize,
 }
 
 impl CacheSlot {
-    fn new(
-        width: usize,
-        tools_expanded: bool,
-        hide_reasoning: bool,
-        accent_color: UiColor,
-    ) -> Self {
+    fn new(settings: RenderSettings) -> Self {
         Self {
-            width,
-            tools_expanded,
-            hide_reasoning,
-            accent_color,
-            entry_lines: Vec::new(),
+            width: settings.width,
+            tools_expanded: settings.tools_expanded,
+            hide_reasoning: settings.hide_reasoning,
+            image_support: settings.image_support,
+            accent_color: settings.accent_color,
+            entries: Vec::new(),
             entry_starts: vec![0],
             frozen_count: 0,
         }
     }
 
-    fn matches(
-        &self,
-        width: usize,
-        tools_expanded: bool,
-        hide_reasoning: bool,
-        accent_color: UiColor,
-    ) -> bool {
-        self.width == width
-            && self.tools_expanded == tools_expanded
-            && self.hide_reasoning == hide_reasoning
-            && self.accent_color == accent_color
+    fn matches(&self, settings: RenderSettings) -> bool {
+        self.width == settings.width
+            && self.tools_expanded == settings.tools_expanded
+            && self.hide_reasoning == settings.hide_reasoning
+            && self.image_support == settings.image_support
+            && self.accent_color == settings.accent_color
     }
 
     fn update(
@@ -80,11 +135,11 @@ impl CacheSlot {
         let frozen_boundary = mutable_index.unwrap_or(entries.len()).min(entries.len());
 
         let mut changed_from = None;
-        if self.entry_lines.len() < entries.len() {
-            changed_from = Some(self.entry_lines.len());
-            self.entry_lines.resize_with(entries.len(), || None);
-        } else if self.entry_lines.len() > entries.len() {
-            self.entry_lines.truncate(entries.len());
+        if self.entries.len() < entries.len() {
+            changed_from = Some(self.entries.len());
+            self.entries.resize_with(entries.len(), || None);
+        } else if self.entries.len() > entries.len() {
+            self.entries.truncate(entries.len());
             changed_from = Some(entries.len());
         }
 
@@ -96,11 +151,12 @@ impl CacheSlot {
         {
             let expanded =
                 transcript.entry_expanded(i, entry_default_expanded(entry, tools_expanded));
-            self.entry_lines[i] = render_entry(
+            self.entries[i] = render_entry(
                 entry,
                 self.width,
                 expanded,
                 hide_reasoning,
+                self.image_support,
                 self.accent_color,
                 labels,
             );
@@ -113,11 +169,12 @@ impl CacheSlot {
         {
             let expanded = transcript
                 .entry_expanded(idx, entry_default_expanded(&entries[idx], tools_expanded));
-            self.entry_lines[idx] = render_entry(
+            self.entries[idx] = render_entry(
                 &entries[idx],
                 self.width,
                 expanded,
                 hide_reasoning,
+                self.image_support,
                 self.accent_color,
                 labels,
             );
@@ -125,14 +182,14 @@ impl CacheSlot {
         }
 
         if let Some(start) = changed_from {
-            self.entry_starts.resize(self.entry_lines.len() + 1, 0);
+            self.entry_starts.resize(self.entries.len() + 1, 0);
             if start == 0 {
                 self.entry_starts[0] = 0;
             }
-            for index in start..self.entry_lines.len() {
-                let height = self.entry_lines[index]
+            for index in start..self.entries.len() {
+                let height = self.entries[index]
                     .as_ref()
-                    .map_or(0, |lines| lines.len() + 1);
+                    .map_or(0, |entry| entry.lines.len() + 1);
                 self.entry_starts[index + 1] = self.entry_starts[index] + height;
             }
         }
@@ -156,14 +213,40 @@ impl CacheSlot {
             .entry_starts
             .partition_point(|start| *start <= row)
             .saturating_sub(1)
-            .min(self.entry_lines.len().saturating_sub(1));
+            .min(self.entries.len().saturating_sub(1));
         let offset = row.saturating_sub(self.entry_starts[index]);
-        let lines = self.entry_lines.get(index)?.as_ref()?;
-        if offset < lines.len() {
-            Some((lines[offset].clone(), Some(index)))
+        let entry = self.entries.get(index)?.as_ref()?;
+        if offset < entry.lines.len() {
+            Some((entry.lines[offset].clone(), Some(index)))
         } else {
             Some((String::new(), None))
         }
+    }
+
+    fn images_in(&self, visible: std::ops::Range<usize>, screen_offset: usize) -> Vec<FrameImage> {
+        let mut images = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            let Some(entry) = entry else {
+                continue;
+            };
+            let entry_start = self.entry_starts[index];
+            for image in &entry.images {
+                let start = entry_start + image.start_line;
+                let end = start + image.rows;
+                if start < visible.start || end > visible.end {
+                    continue;
+                }
+                images.push(FrameImage {
+                    key: Arc::as_ptr(&image.content) as usize,
+                    row: screen_offset + start - visible.start + 1,
+                    column: 2,
+                    columns: image.columns,
+                    rows: image.rows,
+                    content: Arc::clone(&image.content),
+                });
+            }
+        }
+        images
     }
 
     #[cfg(test)]
@@ -191,33 +274,30 @@ impl RenderCache {
     fn get_or_render_slot<'a>(
         &'a mut self,
         transcript: &super::transcript::Transcript,
-        tools_expanded: bool,
-        hide_reasoning: bool,
-        accent_color: UiColor,
-        width: usize,
+        settings: RenderSettings,
         labels: &[(&str, &str)],
     ) -> &'a CacheSlot {
-        let slot_idx = self.slots.iter().position(|slot| {
-            slot.as_ref()
-                .is_some_and(|s| s.matches(width, tools_expanded, hide_reasoning, accent_color))
-        });
+        let slot_idx = self
+            .slots
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|slot| slot.matches(settings)));
 
         let idx = match slot_idx {
             Some(i) => i,
             None => {
                 let empty_idx = self.slots.iter().position(|s| s.is_none()).unwrap_or(1);
-                self.slots[empty_idx] = Some(CacheSlot::new(
-                    width,
-                    tools_expanded,
-                    hide_reasoning,
-                    accent_color,
-                ));
+                self.slots[empty_idx] = Some(CacheSlot::new(settings));
                 empty_idx
             }
         };
 
         let slot = self.slots[idx].as_mut().expect("slot was set above");
-        slot.update(transcript, tools_expanded, hide_reasoning, labels);
+        slot.update(
+            transcript,
+            settings.tools_expanded,
+            settings.hide_reasoning,
+            labels,
+        );
         slot
     }
 
@@ -232,10 +312,13 @@ impl RenderCache {
     ) -> Vec<String> {
         self.get_or_render_slot(
             transcript,
-            tools_expanded,
-            hide_reasoning,
-            accent_color,
-            width,
+            RenderSettings {
+                width,
+                tools_expanded,
+                hide_reasoning,
+                image_support: ImageSupport::None,
+                accent_color,
+            },
             &[],
         )
         .flattened()
@@ -247,69 +330,123 @@ fn render_entry(
     width: usize,
     expanded: bool,
     hide_reasoning: bool,
+    image_support: ImageSupport,
     accent_color: UiColor,
     labels: &[(&str, &str)],
-) -> Option<Vec<String>> {
-    match entry {
-        Entry::User(content) if !expanded => Some(render_collapsed("Prompt", content, width)),
-        Entry::User(content) => Some(render_user_panel(content, width)),
+) -> Option<RenderedEntry> {
+    let lines = match entry {
+        Entry::User(content) if !expanded => render_collapsed("Prompt", content, width),
+        Entry::User(content) => render_user_panel(content, width),
         Entry::Assistant(content) => {
             if content.trim().is_empty() {
-                None
+                return None;
             } else if !expanded {
-                Some(render_collapsed("Reply", content, width))
+                render_collapsed("Reply", content, width)
             } else {
-                Some(markdown::render(content.trim(), width))
+                markdown::render(content.trim(), width)
             }
         }
         Entry::Reasoning { kind, content } => {
             if hide_reasoning || content.trim().is_empty() {
-                None
+                return None;
             } else if !expanded {
-                Some(render_collapsed("Reasoning", content, width))
+                render_collapsed("Reasoning", content, width)
             } else {
-                Some(render_reasoning(*kind, content, width))
+                render_reasoning(*kind, content, width)
             }
         }
         Entry::Tool {
             name,
             args,
             output,
+            images,
             is_error,
             running,
             started,
-        } => Some(tool_view::render_labeled(
-            name,
-            args,
-            output,
-            *is_error,
-            *running,
-            started.map(|started| started.elapsed()),
-            labels,
-            width,
-            expanded,
-        )),
-        Entry::Notice(content) if !expanded => Some(render_collapsed("Notice", content, width)),
+        } => {
+            let mut lines = tool_view::render_labeled(
+                name,
+                args,
+                output,
+                *is_error,
+                *running,
+                started.map(|started| started.elapsed()),
+                labels,
+                width,
+                expanded,
+            );
+            let previews = image_previews(images, image_support, width, lines.len());
+            let reserved_rows = previews.iter().map(|image| image.rows).sum();
+            lines.extend(std::iter::repeat_n(String::new(), reserved_rows));
+            return Some(RenderedEntry {
+                lines,
+                images: previews,
+            });
+        }
+        Entry::Notice(content) if !expanded => render_collapsed("Notice", content, width),
         Entry::Notice(content) => {
             let mut lines = vec![yawl_label(accent_color)];
             lines.extend(markdown::render(content, width));
-            Some(lines)
+            lines
         }
         Entry::SubagentResult {
             id,
             name,
             status,
             content,
-        } if !expanded => Some(render_collapsed(name, content, width)),
+        } if !expanded => render_collapsed(name, content, width),
         Entry::SubagentResult {
             id,
             name,
             status,
             content,
-        } => Some(render_subagent_result(
-            id, name, status, content, width, true,
-        )),
-    }
+        } => render_subagent_result(id, name, status, content, width, true),
+    };
+    Some(RenderedEntry {
+        lines,
+        images: Vec::new(),
+    })
+}
+
+fn image_previews(
+    images: &[Arc<ImageContent>],
+    support: ImageSupport,
+    width: usize,
+    mut start_line: usize,
+) -> Vec<CachedImage> {
+    let columns = width.saturating_sub(4).clamp(1, 100);
+    images
+        .iter()
+        .filter(|image| support.accepts(&image.media_type))
+        .filter_map(|image| {
+            let max_encoded_bytes = crate::image::MAX_IMAGE_BYTES.div_ceil(3) * 4;
+            if image.data.len() > max_encoded_bytes {
+                return None;
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .ok()?;
+            if bytes.len() > crate::image::MAX_IMAGE_BYTES
+                || crate::image::media_type(&bytes) != Some(image.media_type.as_str())
+            {
+                return None;
+            }
+            let (pixel_width, pixel_height) = crate::image::dimensions(&bytes)?;
+            let numerator = u64::from(pixel_height).saturating_mul(columns as u64);
+            let denominator = u64::from(pixel_width).saturating_mul(2).max(1);
+            let rows = usize::try_from(numerator.div_ceil(denominator))
+                .unwrap_or(12)
+                .clamp(3, 12);
+            let preview = CachedImage {
+                start_line,
+                columns,
+                rows,
+                content: Arc::clone(image),
+            };
+            start_line += rows;
+            Some(preview)
+        })
+        .collect()
 }
 
 fn render_collapsed(label: &str, content: &str, width: usize) -> Vec<String> {
@@ -343,10 +480,11 @@ pub(super) fn render_entries(
             width,
             entry_default_expanded(entry, tools_expanded),
             hide_reasoning,
+            ImageSupport::None,
             UiColor::WHITE,
             &[],
         ) {
-            lines.extend(rendered);
+            lines.extend(rendered.lines);
             lines.push(String::new());
         }
     }
@@ -717,6 +855,7 @@ pub(super) fn apply_scroll_bar(
 
 struct TranscriptWindow {
     lines: Vec<(String, Option<usize>)>,
+    images: Vec<FrameImage>,
     total_lines: usize,
     max_scroll: usize,
 }
@@ -740,6 +879,7 @@ fn render_transcript_window(
     state: &mut ViewState,
     width: usize,
     height: usize,
+    image_support: ImageSupport,
 ) -> TranscriptWindow {
     let mut tail = Vec::new();
     if let Some(loading) = render_loading_state(state, width) {
@@ -747,22 +887,24 @@ fn render_transcript_window(
         tail.push(String::new());
     }
     for (index, input) in state.queued_inputs.iter().enumerate() {
-        tail.extend(render_queued_panel(input, index + 1, width));
+        tail.extend(render_queued_panel(&input.text, index + 1, width));
     }
 
     let selected = state.transcript.selected_index();
     let reveal = state.transcript.take_reveal_selected();
     let labels = subagent_labels(state);
     let label_refs = label_refs(&labels);
+    let settings = RenderSettings {
+        width,
+        tools_expanded: state.tools_expanded,
+        hide_reasoning: state.hide_reasoning,
+        image_support,
+        accent_color: state.accent_color,
+    };
     let (cached_lines, selected_range) = {
-        let slot = state.render_cache.get_or_render_slot(
-            &state.transcript,
-            state.tools_expanded,
-            state.hide_reasoning,
-            state.accent_color,
-            width,
-            &label_refs,
-        );
+        let slot = state
+            .render_cache
+            .get_or_render_slot(&state.transcript, settings, &label_refs);
         (
             slot.total_lines(),
             selected.and_then(|index| slot.entry_range(index)),
@@ -778,14 +920,9 @@ fn render_transcript_window(
     let end = total_lines.saturating_sub(state.scroll_offset);
     let start = end.saturating_sub(height);
 
-    let slot = state.render_cache.get_or_render_slot(
-        &state.transcript,
-        state.tools_expanded,
-        state.hide_reasoning,
-        state.accent_color,
-        width,
-        &label_refs,
-    );
+    let slot = state
+        .render_cache
+        .get_or_render_slot(&state.transcript, settings, &label_refs);
     let mut lines = Vec::with_capacity(end - start);
     for row in start..end {
         if row < cached_lines {
@@ -796,8 +933,17 @@ fn render_transcript_window(
             lines.push((line.clone(), None));
         }
     }
+    let cached_start = start.min(cached_lines);
+    let cached_end = end.min(cached_lines);
+    let screen_offset = height.saturating_sub(end - start);
+    let images = if cached_start < cached_end {
+        slot.images_in(cached_start..cached_end, screen_offset)
+    } else {
+        Vec::new()
+    };
     TranscriptWindow {
         lines,
+        images,
         total_lines,
         max_scroll,
     }
@@ -850,16 +996,42 @@ pub(super) fn build_frame(
     columns: usize,
     rows: usize,
 ) -> (Vec<String>, (usize, usize)) {
+    let rendered = build_frame_with_images(state, editor, columns, rows, ImageSupport::None);
+    (rendered.lines, rendered.cursor)
+}
+
+pub(super) fn build_frame_with_images(
+    state: &mut ViewState,
+    editor: &Editor,
+    columns: usize,
+    rows: usize,
+    image_support: ImageSupport,
+) -> RenderedFrame {
     if state.process_view.is_some() {
-        return super::processes::render(state, columns, rows);
+        let (lines, cursor) = super::processes::render(state, columns, rows);
+        return RenderedFrame {
+            lines,
+            cursor,
+            images: Vec::new(),
+        };
     }
     if state.subagent_view.is_some() {
-        return super::subagents::render(state, editor, columns, rows);
+        let (lines, cursor) = super::subagents::render(state, editor, columns, rows);
+        return RenderedFrame {
+            lines,
+            cursor,
+            images: Vec::new(),
+        };
     }
     let columns = columns.max(20);
     let rows = rows.max(8);
     if state.transcript.viewer_open() {
-        return render_block_viewer(state, columns, rows);
+        let (lines, cursor) = render_block_viewer(state, columns, rows);
+        return RenderedFrame {
+            lines,
+            cursor,
+            images: Vec::new(),
+        };
     }
     let inner_width = columns.saturating_sub(2);
     let layout = if super::picker::picker_is_secret(state) {
@@ -942,7 +1114,7 @@ pub(super) fn build_frame(
     let search_height = usize::from(state.transcript.search_active());
     let transcript_height = rows
         .saturating_sub(input_height + menu_height + search_height + background_notice_height + 1);
-    let transcript = render_transcript_window(state, columns, transcript_height);
+    let transcript = render_transcript_window(state, columns, transcript_height, image_support);
     let transcript_width = columns;
     let visible = &transcript.lines;
 
@@ -1088,7 +1260,16 @@ pub(super) fn build_frame(
             (2 + layout.cursor_col).min(columns.saturating_sub(1)),
         )
     };
-    (frame, (cursor_row, cursor_col))
+    let images = if state.picker.is_some() {
+        Vec::new()
+    } else {
+        transcript.images
+    };
+    RenderedFrame {
+        lines: frame,
+        cursor: (cursor_row, cursor_col),
+        images,
+    }
 }
 
 pub(super) fn render_background_process_notice(
@@ -1171,10 +1352,12 @@ fn render_block_viewer(
         columns,
         true,
         state.hide_reasoning,
+        ImageSupport::None,
         state.accent_color,
         &label_refs,
     )
     .unwrap_or_default();
+    let body = body.lines;
     let body_height = rows.saturating_sub(2);
     let total = body.len();
     let max_scroll = total.saturating_sub(body_height);

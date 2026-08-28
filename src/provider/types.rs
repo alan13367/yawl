@@ -48,6 +48,30 @@ pub struct SubagentResult {
     pub content: String,
 }
 
+/// One inline raster image supplied to a model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageContent {
+    pub media_type: String,
+    /// Standard base64 without a data-URL prefix.
+    pub data: String,
+}
+
+/// User-authored input for one agent turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnInput {
+    pub text: String,
+    pub images: Vec<ImageContent>,
+}
+
+impl From<String> for TurnInput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
 /// The provider-agnostic message format used in memory and in session JSONL.
 /// Translated to each provider's wire shape at request time, which is what
 /// makes mid-session `/model` switching possible.
@@ -56,6 +80,8 @@ pub struct Message {
     pub role: Role,
     #[serde(default)]
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageContent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     /// Displayable reasoning returned alongside this assistant message.
@@ -82,6 +108,22 @@ impl Message {
         Message {
             role: Role::User,
             content: content.into(),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            reasoning: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+            is_error: false,
+            provider_data: Vec::new(),
+            subagent_results: Vec::new(),
+        }
+    }
+
+    pub fn user_input(input: TurnInput) -> Message {
+        Message {
+            role: Role::User,
+            content: input.text,
+            images: input.images,
             tool_calls: Vec::new(),
             reasoning: Vec::new(),
             tool_call_id: None,
@@ -96,6 +138,7 @@ impl Message {
         Message {
             role: Role::Assistant,
             content,
+            images: Vec::new(),
             tool_calls,
             reasoning: Vec::new(),
             tool_call_id: None,
@@ -112,9 +155,20 @@ impl Message {
         content: String,
         is_error: bool,
     ) -> Message {
+        Self::tool_result_with_images(call_id, name, content, Vec::new(), is_error)
+    }
+
+    pub fn tool_result_with_images(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        content: String,
+        images: Vec<ImageContent>,
+        is_error: bool,
+    ) -> Message {
         Message {
             role: Role::Tool,
             content,
+            images,
             tool_calls: Vec::new(),
             reasoning: Vec::new(),
             tool_call_id: Some(call_id.into()),
@@ -136,6 +190,7 @@ impl Message {
         Message {
             role: Role::User,
             content,
+            images: Vec::new(),
             tool_calls: Vec::new(),
             reasoning: Vec::new(),
             tool_call_id: None,
@@ -161,6 +216,8 @@ pub struct Request<'a> {
     pub messages: &'a [Message],
     pub tools: &'a [ToolSpec],
     pub max_tokens: u32,
+    /// Whether this request's selected model accepts image inputs.
+    pub supports_images: bool,
 }
 
 /// Events surfaced by a provider while streaming one assistant response.
@@ -205,6 +262,28 @@ mod tests {
         let back: Message = serde_json::from_str(&text)?;
         assert_eq!(back.role, Role::Assistant);
         assert_eq!(back.reasoning, m.reasoning);
+        Ok(())
+    }
+
+    #[test]
+    fn old_messages_default_to_no_images() -> Result<(), serde_json::Error> {
+        let message: Message = serde_json::from_str(r#"{"role":"user","content":"hello"}"#)?;
+        assert!(message.images.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn image_messages_roundtrip_inline_data() -> Result<(), serde_json::Error> {
+        let message = Message::user_input(TurnInput {
+            text: "[Image #1]".into(),
+            images: vec![ImageContent {
+                media_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+            }],
+        });
+        let serialized = serde_json::to_string(&message)?;
+        let replayed: Message = serde_json::from_str(&serialized)?;
+        assert_eq!(replayed.images, message.images);
         Ok(())
     }
 }

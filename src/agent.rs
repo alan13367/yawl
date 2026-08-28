@@ -10,7 +10,7 @@ use crate::background::BackgroundProcessManager;
 use crate::cancellation::CancellationToken;
 use crate::config::{Config, ConfigChange, ConfigChangeEffect};
 use crate::error::Error;
-use crate::provider::Message;
+use crate::provider::{Message, TurnInput};
 use crate::session::Session;
 use crate::subagent::SubagentManager;
 use crate::tools::Registry;
@@ -150,13 +150,22 @@ impl Agent {
         self.conversation.run_turn(user_input, sink)
     }
 
-    pub(crate) fn run_turn_preserving_cancellation(
+    /// Runs a turn with text and optional inline images.
+    pub fn run_turn_input(
         &mut self,
-        user_input: Option<String>,
+        user_input: Option<TurnInput>,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.conversation.run_turn_input(user_input, sink)
+    }
+
+    pub(crate) fn run_turn_input_preserving_cancellation(
+        &mut self,
+        user_input: Option<TurnInput>,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
         self.conversation
-            .run_turn_preserving_cancellation(user_input, sink)
+            .run_turn_input_preserving_cancellation(user_input, sink)
     }
 
     pub(crate) fn has_deferred_subagent_results(&self) -> bool {

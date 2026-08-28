@@ -6,7 +6,7 @@ use crate::error::Error;
 
 use super::events::{MouseEvent, MouseKind};
 use super::input::Editor;
-use super::render::{HIDDEN_CURSOR, build_frame};
+use super::render::{FrameImage, HIDDEN_CURSOR, ImageSupport, build_frame_with_images};
 use super::{ViewState, markdown};
 
 pub(super) struct Terminal {
@@ -15,8 +15,75 @@ pub(super) struct Terminal {
     active: bool,
     last_frame: Vec<String>,
     last_base_frame: Vec<String>,
+    last_images: Vec<DisplayedImage>,
     last_size: (u16, u16),
     selection: Option<TextSelection>,
+    image_protocol: ImageProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ImageProtocol {
+    None,
+    Kitty,
+    Iterm2,
+}
+
+impl ImageProtocol {
+    fn detect() -> Self {
+        Self::from_terminal(
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+            std::env::var_os("KITTY_WINDOW_ID").is_some(),
+            std::env::var("TERM").ok().as_deref(),
+        )
+    }
+
+    pub(super) fn from_terminal(
+        term_program: Option<&str>,
+        kitty_window: bool,
+        term: Option<&str>,
+    ) -> Self {
+        if kitty_window
+            || term.is_some_and(|value| value.contains("kitty"))
+            || term_program.is_some_and(|value| {
+                value.eq_ignore_ascii_case("ghostty") || value.eq_ignore_ascii_case("wezterm")
+            })
+        {
+            Self::Kitty
+        } else if term_program.is_some_and(|value| value.eq_ignore_ascii_case("iterm.app")) {
+            Self::Iterm2
+        } else {
+            Self::None
+        }
+    }
+
+    fn support(self) -> ImageSupport {
+        match self {
+            Self::None => ImageSupport::None,
+            Self::Kitty => ImageSupport::Png,
+            Self::Iterm2 => ImageSupport::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisplayedImage {
+    key: usize,
+    row: usize,
+    column: usize,
+    columns: usize,
+    rows: usize,
+}
+
+impl From<&FrameImage> for DisplayedImage {
+    fn from(image: &FrameImage) -> Self {
+        Self {
+            key: image.key,
+            row: image.row,
+            column: image.column,
+            columns: image.columns,
+            rows: image.rows,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -67,8 +134,10 @@ impl Terminal {
             active: true,
             last_frame: Vec::new(),
             last_base_frame: Vec::new(),
+            last_images: Vec::new(),
             last_size: (0, 0),
             selection: None,
+            image_protocol: ImageProtocol::detect(),
         };
         terminal.stdout.write_all(
             b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>1u\x1b[=1;1u\x1b[>4;1m",
@@ -128,16 +197,37 @@ impl Terminal {
 
     pub(super) fn draw(&mut self, state: &mut ViewState, editor: &Editor) -> Result<(), Error> {
         let (columns, rows) = terminal_size();
-        let (base_frame, cursor) =
-            build_frame(state, editor, usize::from(columns), usize::from(rows));
+        let rendered = build_frame_with_images(
+            state,
+            editor,
+            usize::from(columns),
+            usize::from(rows),
+            self.image_protocol.support(),
+        );
+        let base_frame = rendered.lines;
+        let cursor = rendered.cursor;
+        let images = rendered.images;
         self.last_base_frame.clone_from(&base_frame);
         let frame = self
             .selection
             .as_ref()
             .map_or(base_frame, highlighted_selection);
-        let force = self.last_size != (columns, rows) || self.last_frame.len() != frame.len();
+        let displayed_images = images.iter().map(DisplayedImage::from).collect::<Vec<_>>();
+        let images_changed = self.last_images != displayed_images;
+        let image_rows_changed = images.iter().any(|image| {
+            let start = image.row.saturating_sub(1);
+            let end = start.saturating_add(image.rows).min(frame.len());
+            (start..end).any(|row| self.last_frame.get(row) != frame.get(row))
+        });
+        let force = self.last_size != (columns, rows)
+            || self.last_frame.len() != frame.len()
+            || images_changed
+            || image_rows_changed;
         self.stdout.write_all(b"\x1b[?25l")?;
         if force {
+            if self.image_protocol == ImageProtocol::Kitty && !self.last_images.is_empty() {
+                self.stdout.write_all(b"\x1b_Ga=d,d=A,q=2;\x1b\\")?;
+            }
             self.stdout.write_all(b"\x1b[2J")?;
         }
         for (index, line) in frame.iter().enumerate() {
@@ -145,10 +235,14 @@ impl Terminal {
                 write!(self.stdout, "\x1b[{};1H\x1b[2K{line}", index + 1)?;
             }
         }
+        if force {
+            write_inline_images(&mut self.stdout, self.image_protocol, &images)?;
+        }
         self.stdout
             .write_all(cursor_control(cursor, self.selection.is_some()).as_bytes())?;
         self.stdout.flush()?;
         self.last_frame = frame;
+        self.last_images = displayed_images;
         self.last_size = (columns, rows);
         Ok(())
     }
@@ -171,6 +265,56 @@ impl Terminal {
     }
 }
 
+pub(super) fn write_inline_images(
+    output: &mut impl Write,
+    protocol: ImageProtocol,
+    images: &[FrameImage],
+) -> io::Result<()> {
+    for (index, image) in images.iter().enumerate() {
+        write!(output, "\x1b[{};{}H", image.row, image.column)?;
+        match protocol {
+            ImageProtocol::None => {}
+            ImageProtocol::Kitty => write_kitty_image(output, image, index + 1)?,
+            ImageProtocol::Iterm2 => {
+                write!(
+                    output,
+                    "\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio=1;doNotMoveCursor=1:",
+                    image.columns, image.rows
+                )?;
+                output.write_all(image.content.data.as_bytes())?;
+                output.write_all(b"\x07")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_kitty_image(
+    output: &mut impl Write,
+    image: &FrameImage,
+    image_id: usize,
+) -> io::Result<()> {
+    let mut chunks = image.content.data.as_bytes().chunks(4096).peekable();
+    let Some(first) = chunks.next() else {
+        return Ok(());
+    };
+    let more = usize::from(chunks.peek().is_some());
+    write!(
+        output,
+        "\x1b_Ga=T,f=100,t=d,q=2,C=1,i={image_id},c={},r={},m={more};",
+        image.columns, image.rows
+    )?;
+    output.write_all(first)?;
+    output.write_all(b"\x1b\\")?;
+    while let Some(chunk) = chunks.next() {
+        let more = usize::from(chunks.peek().is_some());
+        write!(output, "\x1b_Gm={more};")?;
+        output.write_all(chunk)?;
+        output.write_all(b"\x1b\\")?;
+    }
+    Ok(())
+}
+
 pub(super) fn cursor_control(cursor: (usize, usize), selecting: bool) -> String {
     if selecting || cursor == HIDDEN_CURSOR {
         "\x1b[?25l".into()
@@ -183,6 +327,9 @@ impl Drop for Terminal {
     fn drop(&mut self) {
         if !self.active {
             return;
+        }
+        if self.image_protocol == ImageProtocol::Kitty && !self.last_images.is_empty() {
+            let _ = self.stdout.write_all(b"\x1b_Ga=d,d=A,q=2;\x1b\\");
         }
         let _ = self.stdout.write_all(
             b"\x1b[>4;0m\x1b[=0;1u\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l",

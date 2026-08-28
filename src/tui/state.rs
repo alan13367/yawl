@@ -55,7 +55,7 @@ pub(super) struct ViewState {
     pub(super) context_window: u64,
     pub(super) activity: String,
     pub(super) scroll_offset: usize,
-    pub(super) queued_inputs: std::collections::VecDeque<String>,
+    pub(super) queued_inputs: std::collections::VecDeque<super::input::Submission>,
     pub(super) pending_actions: std::collections::VecDeque<PickerAction>,
     pub(super) completions: Vec<Completion>,
     pub(super) completion_index: usize,
@@ -265,10 +265,12 @@ impl Update {
             TurnEvent::ToolEnd {
                 name,
                 output,
+                images,
                 is_error,
             } => Self::Transcript(TranscriptEvent::ToolEnd {
                 name: name.to_string(),
                 output: output.to_string(),
+                images: images.to_vec(),
                 is_error,
             }),
             TurnEvent::Compacting => Self::Compacting,

@@ -893,7 +893,7 @@ pub(super) fn take_picker_action(
                 && let Some(initial) = state.queued_inputs.get(index)
             {
                 editor.clear();
-                editor.paste(initial);
+                editor.restore_submission(initial.clone());
                 picker.editing = Some(PickerEdit::Queued(index));
             }
         }

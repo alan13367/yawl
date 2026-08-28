@@ -73,7 +73,7 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
     let action = take_picker_action(&mut state, &mut editor, Key::Enter)
         .expect("saving a queue edit returns an action");
     assert!(handle_queue_picker_action(&mut state, action).is_none());
-    assert_eq!(state.queued_inputs[0], "edited second");
+    assert_eq!(state.queued_inputs[0].text, "edited second");
 
     let action = take_picker_action(&mut state, &mut editor, Key::Char('J'))
         .expect("queue reorder returns an action");
@@ -89,7 +89,7 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         panic!("queue Enter should request immediate delivery");
     };
     assert!(super::commands::promote_queued(&mut state, index));
-    assert_eq!(state.queued_inputs[0], "edited second");
+    assert_eq!(state.queued_inputs[0].text, "edited second");
 }
 
 #[test]

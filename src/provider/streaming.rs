@@ -160,6 +160,7 @@ mod tests {
             messages: &[],
             tools: &[],
             max_tokens: 10,
+            supports_images: false,
         };
         let mut notices = Vec::new();
         let output = stream_turn(&provider, &request, &mut |notice| match notice {

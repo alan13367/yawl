@@ -28,14 +28,29 @@ impl Anthropic {
 /// Translate the provider-agnostic history to Anthropic's shape: tool results
 /// become `tool_result` blocks inside user messages, with consecutive results
 /// merged into one user message so they directly follow their `tool_use`.
-fn build_messages(messages: &[super::Message]) -> Vec<Value> {
+fn image_block(image: &super::ImageContent) -> Value {
+    json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": image.media_type,
+            "data": image.data,
+        }
+    })
+}
+
+fn build_messages(messages: &[super::Message], supports_images: bool) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for m in messages {
         match m.role {
-            Role::User => out.push(json!({
-                "role": "user",
-                "content": [{"type": "text", "text": m.content}],
-            })),
+            Role::User => {
+                let mut content = Vec::new();
+                if supports_images {
+                    content.extend(m.images.iter().map(image_block));
+                }
+                content.push(json!({"type": "text", "text": m.content}));
+                out.push(json!({"role": "user", "content": content}));
+            }
             Role::Assistant => {
                 let mut blocks: Vec<Value> = Vec::new();
                 if !m.content.is_empty() {
@@ -57,10 +72,17 @@ fn build_messages(messages: &[super::Message]) -> Vec<Value> {
                 out.push(json!({"role": "assistant", "content": blocks}));
             }
             Role::Tool => {
+                let content = if supports_images && !m.images.is_empty() {
+                    let mut content = vec![json!({"type": "text", "text": m.content})];
+                    content.extend(m.images.iter().map(image_block));
+                    Value::Array(content)
+                } else {
+                    Value::String(m.content.clone())
+                };
                 let block = json!({
                     "type": "tool_result",
                     "tool_use_id": m.tool_call_id.as_deref().unwrap_or(""),
-                    "content": m.content,
+                    "content": content,
                     "is_error": m.is_error,
                 });
                 // Append to the previous user message if it is a tool-result
@@ -86,7 +108,7 @@ fn build_body(req: &Request<'_>) -> Value {
         "model": req.model,
         "max_tokens": req.max_tokens,
         "stream": true,
-        "messages": build_messages(req.messages),
+        "messages": build_messages(req.messages, req.supports_images),
     });
     if !req.system.is_empty() {
         body["system"] = json!(req.system);
@@ -305,7 +327,7 @@ mod tests {
             Message::tool_result("a", "shell", "out-a".into(), false),
             Message::tool_result("b", "read_file", "out-b".into(), true),
         ];
-        let wire = build_messages(&messages);
+        let wire = build_messages(&messages, false);
         assert_eq!(wire.len(), 3);
         assert_eq!(wire[2]["role"], "user");
         assert!(
@@ -314,6 +336,27 @@ mod tests {
                 .is_some_and(|content| content.len() == 2)
         );
         assert_eq!(wire[2]["content"][1]["is_error"], true);
+    }
+
+    #[test]
+    fn images_stay_inside_user_and_tool_result_blocks() {
+        let image = super::super::ImageContent {
+            media_type: "image/png".into(),
+            data: "cG5n".into(),
+        };
+        let mut user = Message::user("inspect");
+        user.images.push(image.clone());
+        let tool = Message::tool_result_with_images(
+            "call_1",
+            "read_file",
+            "read image".into(),
+            vec![image],
+            false,
+        );
+        let wire = build_messages(&[user, tool], true);
+
+        assert_eq!(wire[0]["content"][0]["type"], "image");
+        assert_eq!(wire[1]["content"][0]["content"][1]["type"], "image");
     }
 
     #[test]

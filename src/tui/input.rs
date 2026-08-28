@@ -1,15 +1,89 @@
 //! Multiline input editor with cursor movement, kill keys, paste, and
 //! command history.
 
+use super::clipboard::{ClipboardStore, StagedImage};
 use super::events::Key;
 
 const LONG_PASTE_CHARS: usize = 400;
 const LONG_PASTE_LINES: usize = 8;
 
+/// One editor submission with any staged clipboard images.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submission {
+    pub(super) text: String,
+    images: Vec<StagedImage>,
+}
+
+impl Submission {
+    pub(super) fn new(text: String, images: Vec<StagedImage>) -> Self {
+        Self { text, images }
+    }
+
+    pub(super) fn has_images(&self) -> bool {
+        !self.referenced_images().is_empty()
+    }
+
+    pub(super) fn set_text(&mut self, text: String) {
+        self.text = text;
+    }
+
+    pub(super) fn turn_input(&self, text: String) -> Result<crate::provider::TurnInput, String> {
+        let mut images = Vec::new();
+        for staged in self.referenced_images() {
+            let bytes = std::fs::read(&staged.path)
+                .map_err(|error| format!("cannot read {}: {error}", staged.path.display()))?;
+            if bytes.len() > crate::image::MAX_IMAGE_BYTES {
+                return Err(format!(
+                    "{} exceeds the {}-byte image limit",
+                    staged.path.display(),
+                    crate::image::MAX_IMAGE_BYTES
+                ));
+            }
+            let media_type = crate::image::media_type(&bytes).ok_or_else(|| {
+                format!("{} is no longer a supported image", staged.path.display())
+            })?;
+            if media_type != staged.media_type {
+                return Err(format!(
+                    "{} changed after it was pasted",
+                    staged.path.display()
+                ));
+            }
+            images.push(crate::image::encode(media_type, &bytes));
+        }
+        Ok(crate::provider::TurnInput { text, images })
+    }
+
+    fn referenced_images(&self) -> Vec<&StagedImage> {
+        let mut images = self
+            .images
+            .iter()
+            .filter_map(|image| {
+                self.text
+                    .find(&image.marker())
+                    .map(|offset| (offset, image))
+            })
+            .collect::<Vec<_>>();
+        images.sort_by_key(|(offset, _)| *offset);
+        images.into_iter().map(|(_, image)| image).collect()
+    }
+}
+
+impl From<String> for Submission {
+    fn from(text: String) -> Self {
+        Self::new(text, Vec::new())
+    }
+}
+
+impl From<&str> for Submission {
+    fn from(text: &str) -> Self {
+        text.to_string().into()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum EditAction {
     None,
-    Submit(String),
+    Submit(Submission),
 }
 
 #[derive(Debug)]
@@ -23,13 +97,16 @@ pub struct InputLayout {
 pub struct Editor {
     buffer: Vec<char>,
     cursor: usize,
-    history: Vec<String>,
+    history: Vec<Submission>,
     history_index: Option<usize>,
-    history_draft: Vec<char>,
+    history_draft: Option<Submission>,
     pastes: Vec<String>,
     /// `@` mention tags inserted by completion: `(display, relative path)`.
     /// The short display stays visible; the path is substituted on submit.
     mentions: Vec<(String, String)>,
+    images: Vec<StagedImage>,
+    next_image_id: usize,
+    clipboard: ClipboardStore,
 }
 
 impl Editor {
@@ -48,6 +125,45 @@ impl Editor {
         }
         self.clear();
         Some(text)
+    }
+
+    pub(super) fn next_image_id(&self) -> usize {
+        self.next_image_id.saturating_add(1)
+    }
+
+    pub(super) fn can_add_image(&self) -> bool {
+        Submission::new(self.text(), self.images.clone())
+            .referenced_images()
+            .len()
+            < 5
+    }
+
+    pub(super) fn insert_image(&mut self, image: StagedImage) {
+        self.leave_history();
+        self.next_image_id = self.next_image_id.max(image.id);
+        let marker = image.marker();
+        self.images.push(image);
+        self.insert_chars(marker.chars());
+    }
+
+    pub(super) fn paste_clipboard_image(&mut self, supports_images: bool) -> Result<(), String> {
+        if !supports_images {
+            return Err("the selected model does not accept image input".into());
+        }
+        if !self.can_add_image() {
+            return Err("a prompt can contain at most 5 images".into());
+        }
+        let image = self.clipboard.paste_image(self.next_image_id())?;
+        self.insert_image(image);
+        Ok(())
+    }
+
+    pub(super) fn restore_submission(&mut self, submission: Submission) {
+        self.buffer = submission.text.chars().collect();
+        self.cursor = self.buffer.len();
+        self.images = submission.images;
+        self.history_index = None;
+        self.history_draft = None;
     }
 
     /// Replaces long-paste placeholders with the original pasted text.
@@ -204,7 +320,8 @@ impl Editor {
         self.buffer.clear();
         self.cursor = 0;
         self.history_index = None;
-        self.history_draft.clear();
+        self.history_draft = None;
+        self.images.clear();
     }
 
     pub fn paste(&mut self, text: &str) {
@@ -236,7 +353,7 @@ impl Editor {
             Key::Ctrl('k') => self.kill_to_line_end(),
             Key::Ctrl('w') => self.kill_previous_word(),
             Key::Tab => self.paste("    "),
-            Key::PageUp | Key::PageDown | Key::Escape | Key::Ctrl(_) => {}
+            Key::PageUp | Key::PageDown | Key::Escape | Key::Ctrl(_) | Key::Super(_) => {}
         }
         EditAction::None
     }
@@ -374,11 +491,12 @@ impl Editor {
         if text.trim().is_empty() {
             return EditAction::None;
         }
-        if self.history.last() != Some(&text) {
-            self.history.push(text.clone());
+        let submission = Submission::new(text, self.images.clone());
+        if self.history.last() != Some(&submission) {
+            self.history.push(submission.clone());
         }
         self.clear();
-        EditAction::Submit(text)
+        EditAction::Submit(submission)
     }
 
     fn history_previous(&mut self) {
@@ -387,13 +505,14 @@ impl Editor {
         }
         let next = match self.history_index {
             None => {
-                self.history_draft.clone_from(&self.buffer);
+                self.history_draft = Some(Submission::new(self.text(), self.images.clone()));
                 self.history.len() - 1
             }
             Some(index) => index.saturating_sub(1),
         };
         self.history_index = Some(next);
-        self.buffer = self.history[next].chars().collect();
+        self.buffer = self.history[next].text.chars().collect();
+        self.images.clone_from(&self.history[next].images);
         self.cursor = self.buffer.len();
     }
 
@@ -404,17 +523,24 @@ impl Editor {
         if index + 1 < self.history.len() {
             let next = index + 1;
             self.history_index = Some(next);
-            self.buffer = self.history[next].chars().collect();
+            self.buffer = self.history[next].text.chars().collect();
+            self.images.clone_from(&self.history[next].images);
         } else {
             self.history_index = None;
-            self.buffer = std::mem::take(&mut self.history_draft);
+            if let Some(draft) = self.history_draft.take() {
+                self.buffer = draft.text.chars().collect();
+                self.images = draft.images;
+            } else {
+                self.buffer.clear();
+                self.images.clear();
+            }
         }
         self.cursor = self.buffer.len();
     }
 
     fn leave_history(&mut self) {
         self.history_index = None;
-        self.history_draft.clear();
+        self.history_draft = None;
     }
 }
 
@@ -490,6 +616,24 @@ fn parse_paste_placeholder(text: &str) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
 
+    fn staged_image(id: usize, suffix: &str) -> (StagedImage, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "yawl-input-image-{}-{id}-{suffix}.png",
+            std::process::id()
+        ));
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(suffix.as_bytes());
+        std::fs::write(&path, bytes).expect("write image");
+        (
+            StagedImage {
+                id,
+                path: path.clone(),
+                media_type: "image/png".into(),
+            },
+            path,
+        )
+    }
+
     #[test]
     fn shift_enter_builds_multiline_submission() {
         let mut editor = Editor::default();
@@ -512,6 +656,59 @@ mod tests {
         assert_eq!(editor.layout(20).lines, ["> first"]);
         editor.handle_key(Key::Down);
         assert_eq!(editor.layout(20).lines, ["> draft"]);
+    }
+
+    #[test]
+    fn image_markers_control_order_and_deduplicate_payloads() {
+        let (first, first_path) = staged_image(1, "first");
+        let (second, second_path) = staged_image(2, "second");
+        let submission = Submission::new(
+            "[Image #2] compare [Image #1] with [Image #2]".into(),
+            vec![first, second],
+        );
+
+        let input = submission
+            .turn_input(submission.text.clone())
+            .expect("images");
+        assert_eq!(input.images.len(), 2);
+        assert_ne!(input.images[0].data, input.images[1].data);
+        let _ = std::fs::remove_file(first_path);
+        let _ = std::fs::remove_file(second_path);
+    }
+
+    #[test]
+    fn deleting_marker_detaches_image_and_history_restores_it() {
+        let (image, path) = staged_image(1, "history");
+        let detached = Submission::new("marker removed".into(), vec![image.clone()]);
+        assert!(!detached.has_images());
+
+        let mut editor = Editor::default();
+        editor.insert_image(image);
+        assert!(matches!(
+            editor.handle_key(Key::Enter),
+            EditAction::Submit(_)
+        ));
+        editor.handle_key(Key::Up);
+        let EditAction::Submit(recalled) = editor.handle_key(Key::Enter) else {
+            panic!("expected recalled submission");
+        };
+        assert!(recalled.has_images());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_enforces_five_referenced_images() {
+        let mut editor = Editor::default();
+        let mut paths = Vec::new();
+        for id in 1..=5 {
+            let (image, path) = staged_image(id, &id.to_string());
+            paths.push(path);
+            editor.insert_image(image);
+        }
+        assert!(!editor.can_add_image());
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]

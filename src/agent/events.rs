@@ -1,4 +1,4 @@
-use crate::provider::{ReasoningKind, StreamNotice};
+use crate::provider::{ImageContent, ReasoningKind, StreamNotice};
 
 /// Progress events surfaced to the UI (print mode or TUI) during a turn.
 pub enum TurnEvent<'a> {
@@ -27,6 +27,7 @@ pub enum TurnEvent<'a> {
     ToolEnd {
         name: &'a str,
         output: &'a str,
+        images: &'a [ImageContent],
         is_error: bool,
     },
     Compacting,

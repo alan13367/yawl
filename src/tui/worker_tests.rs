@@ -245,7 +245,7 @@ fn display_settings_apply_during_an_active_turn() {
 
     assert_eq!(state.pending_actions.len(), 1);
     assert_eq!(
-        state.queued_inputs.front().map(String::as_str),
+        state.queued_inputs.front().map(|input| input.text.as_str()),
         Some("queued prompt")
     );
     assert!(!config.providers.contains_key("new-provider"));
