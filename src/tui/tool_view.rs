@@ -263,6 +263,20 @@ fn render_call(
             format!("Skill {}{status}", string_arg(args, "name").unwrap_or("?")),
             Tone::Header,
         )],
+        "web_search" => vec![ToolLine::new(
+            format!(
+                "Search web  \u{b7}  {}{status}",
+                string_arg(args, "query").unwrap_or("?")
+            ),
+            Tone::Header,
+        )],
+        "web_fetch" => vec![ToolLine::new(
+            format!(
+                "Fetch web  \u{b7}  {}{status}",
+                string_arg(args, "url").unwrap_or("?")
+            ),
+            Tone::Header,
+        )],
         "write_file" => {
             let path = display_path(string_arg(args, "path").unwrap_or("?"));
             let mut call = vec![ToolLine::new(format!("write {path}{status}"), Tone::Header)];
@@ -835,6 +849,37 @@ mod tests {
             false,
         );
         assert!(error.iter().all(|line| line.contains(ERROR_BACKGROUND)));
+    }
+
+    #[test]
+    fn web_calls_have_compact_query_and_url_titles() {
+        let search = render(
+            "web_search",
+            r#"{"query":"Rust 2024 edition"}"#,
+            "",
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        let fetch = render(
+            "web_fetch",
+            r#"{"url":"https://example.com/guide"}"#,
+            "",
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        assert!(
+            markdown::strip_ansi(&search.join("\n")).contains("Search web  ·  Rust 2024 edition")
+        );
+        assert!(
+            markdown::strip_ansi(&fetch.join("\n"))
+                .contains("Fetch web  ·  https://example.com/guide")
+        );
     }
 
     #[test]

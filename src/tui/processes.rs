@@ -567,19 +567,10 @@ fn render_logs(
     for (stream, text) in runs {
         let label = match stream {
             OutputStream::Stdout => "\x1b[2mstdout\x1b[0m",
-            OutputStream::Stderr => "\x1b[31mstderr\x1b[0m",
+            OutputStream::Stderr => "\x1b[2mstderr\x1b[0m",
         };
         content.push(label.into());
-        let style = if stream == OutputStream::Stderr {
-            "\x1b[31m"
-        } else {
-            ""
-        };
-        content.extend(
-            markdown::plain_lines(&text, columns)
-                .into_iter()
-                .map(|line| format!("{style}{line}\x1b[0m")),
-        );
+        content.extend(markdown::plain_lines(&text, columns));
     }
     if detail.next_cursor == 0 {
         content.push("\x1b[2mWaiting for output…\x1b[0m".into());
@@ -828,6 +819,56 @@ mod tests {
             markdown::strip_ansi(&remove.join("\n"))
                 .contains("Remove selected process and its logs?")
         );
+    }
+
+    #[test]
+    fn successful_stderr_progress_is_neutral_and_replays_terminal_updates() {
+        let manager = BackgroundProcessManager::default();
+        let started = manager
+            .start(StartSpec {
+                command: "printf 'Compiling alpha\\nBuilding [>   ] 1/2\\rBuilding [==> ] 2/2\\nFinished\\n' >&2".into(),
+                name: Some("release build".into()),
+                cwd: std::env::current_dir().expect("test working directory"),
+                timeout: None,
+            })
+            .expect("start background process");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let settled = manager
+                .snapshots()
+                .into_iter()
+                .find(|snapshot| snapshot.id == started.id)
+                .is_some_and(|snapshot| !snapshot.status.is_active());
+            if settled {
+                break;
+            }
+            assert!(Instant::now() < deadline, "process did not settle");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let (frame, _) = render_logs(
+            &manager,
+            UiColor::WHITE,
+            started.id.as_str(),
+            &mut LogScroll::default(),
+            100,
+            20,
+        );
+        manager.shutdown_and_discard();
+        let plain = frame
+            .iter()
+            .map(|line| markdown::strip_ansi(line).trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let stderr = plain
+            .split_once("\nstderr\n")
+            .map(|(_, stderr)| stderr)
+            .expect("rendered stderr section");
+
+        assert!(stderr.contains("Compiling alpha\nBuilding [==> ] 2/2\nFinished"));
+        assert!(!stderr.contains("Building [>   ] 1/2"));
+        assert!(!stderr.contains('�'));
+        assert!(!frame.iter().any(|line| line.contains("\x1b[31m")));
     }
 
     #[test]

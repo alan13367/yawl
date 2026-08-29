@@ -16,7 +16,7 @@ pub(crate) use loading::{
 pub(crate) use schema::validate_file_shape;
 pub(crate) use storage::{read_json_object, resolve_config_value, write_json_object};
 pub(crate) use types::UiColor;
-pub use types::{ModelConfig, OpenAiCompatibility, ProviderConfig};
+pub use types::{ModelConfig, OpenAiCompatibility, ProviderConfig, WebSearchProvider};
 
 use storage::{object_field, validate_provider_name};
 
@@ -28,6 +28,8 @@ pub const DEFAULT_MAX_SUBAGENTS: usize = 3;
 pub const DEFAULT_SUBAGENT_MODEL: &str = "inherit";
 pub const DEFAULT_SUBAGENT_REQUEST_BUDGET: usize = 200;
 pub const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 0;
+pub const DEFAULT_WEB_FETCH_MAX_CHARS: usize = 20_000;
+pub const MAX_WEB_FETCH_MAX_CHARS: usize = 50_000;
 pub const MAX_SUBAGENT_REQUEST_BUDGET: usize = 1000;
 pub const MAX_SUBAGENT_TIMEOUT_SECS: u64 = 86_400;
 const OPENAI_COMPLETIONS_API: &str = "openai-completions";
@@ -55,6 +57,16 @@ pub struct Config {
     pub context_windows: HashMap<String, u64>,
     pub auto_compact: bool,
     pub compact_threshold: f64,
+    /// Whether the model-facing web search and fetch tools are enabled.
+    pub web_browsing: bool,
+    /// Search service used by `web_search`.
+    pub web_search_provider: WebSearchProvider,
+    /// Maximum cleaned page characters returned by `web_fetch`.
+    pub web_fetch_max_chars: usize,
+    /// Brave key stored in config, used when `BRAVE_API_KEY` is unset.
+    pub brave_api_key: Option<String>,
+    /// Firecrawl key stored in config, used when `FIRECRAWL_API_KEY` is unset.
+    pub firecrawl_api_key: Option<String>,
     /// Whether model-facing subagent orchestration tools are enabled.
     pub subagents: bool,
     /// Maximum number of subagents that may own active worker slots.
@@ -251,6 +263,11 @@ impl Config {
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
+            web_browsing: false,
+            web_search_provider: WebSearchProvider::DuckDuckGo,
+            web_fetch_max_chars: DEFAULT_WEB_FETCH_MAX_CHARS,
+            brave_api_key: None,
+            firecrawl_api_key: None,
             subagents: false,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
             subagent_model: DEFAULT_SUBAGENT_MODEL.to_string(),

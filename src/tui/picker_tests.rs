@@ -1,6 +1,9 @@
 //! Focused tests for the corresponding TUI responsibility.
 
-use super::picker::{SettingsCategory, SettingsItem, settings_category_picker, settings_picker};
+use super::picker::{
+    SettingsCategory, SettingsItem, settings_category_picker, settings_picker,
+    web_search_provider_picker,
+};
 use super::*;
 
 #[test]
@@ -371,7 +374,7 @@ fn settings_picker_categories_and_items_keep_their_action_contracts() {
     let agent = Agent::new(config, "test".into(), session, Vec::new());
 
     let picker = settings_picker(&agent);
-    assert_eq!(picker.items.len(), 7);
+    assert_eq!(picker.items.len(), 8);
     assert_eq!(
         picker.items[SettingsCategory::Providers.index()].label,
         "Providers"
@@ -405,9 +408,54 @@ fn settings_picker_categories_and_items_keep_their_action_contracts() {
 
     let context = settings_category_picker(&agent, SettingsCategory::Context, 0);
     assert_eq!(context.items[0].label, "Automatic compaction");
+    let web = settings_category_picker(&agent, SettingsCategory::Web, 0);
+    assert_eq!(web.items.len(), 5);
+    assert_eq!(web.items[0].label, "Web browsing");
+    assert_eq!(web.items[1].label, "Search provider");
+    assert_eq!(web.items[1].description, "DuckDuckGo · Enter to choose");
+    assert!(web.items[3].description.contains("Enter"));
+    assert!(matches!(
+        web.items[0].action,
+        PickerAction::SetWebBrowsing(true)
+    ));
+    assert!(matches!(
+        web.items[1].action,
+        PickerAction::OpenWebSearchProviders
+    ));
+    assert!(matches!(
+        web.items[3].action,
+        PickerAction::EditSecretSetting { .. }
+    ));
     let advanced = settings_category_picker(&agent, SettingsCategory::Advanced, 0);
     assert_eq!(advanced.items[0].label, "Reload configuration");
 
     drop(agent);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn web_search_provider_picker_lists_supported_providers_and_selects_current() {
+    let picker = web_search_provider_picker(crate::config::WebSearchProvider::Firecrawl);
+
+    assert_eq!(picker.title, "Search provider");
+    assert_eq!(
+        picker
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        ["DuckDuckGo", "Firecrawl", "Brave"]
+    );
+    assert_eq!(picker.selected, 1);
+    assert!(matches!(
+        picker.items[1].action,
+        PickerAction::SetWebSearchProvider(crate::config::WebSearchProvider::Firecrawl)
+    ));
+    assert!(matches!(
+        picker.parent,
+        Some(PickerAction::OpenSettingsCategory {
+            category: SettingsCategory::Web,
+            selected: 1,
+        })
+    ));
 }

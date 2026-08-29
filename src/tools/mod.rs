@@ -5,6 +5,7 @@
 //! wins (builtins < `~/.yawl/tools` < `./.yawl/tools`).
 
 pub mod exec;
+mod web;
 
 use std::io::Read;
 use std::path::Path;
@@ -37,6 +38,8 @@ enum ToolImpl {
     ReadSkill,
     WriteFile,
     EditFile,
+    WebSearch,
+    WebFetch,
     Exec(exec::ExecTool),
     Subagent(SubagentTool),
 }
@@ -100,6 +103,7 @@ pub struct Registry {
     skills: Vec<Skill>,
     subagents: Option<SubagentContext>,
     background: Option<BackgroundProcessManager>,
+    web: Option<web::WebTools>,
 }
 
 impl Registry {
@@ -135,7 +139,13 @@ impl Registry {
             skills: Vec::new(),
             subagents: None,
             background,
+            web: config.web_browsing.then(|| web::WebTools::new(config)),
         };
+        if config.web_browsing {
+            registry
+                .entries
+                .extend(web_entries(config.web_search_provider));
+        }
         if registry.background.is_some() {
             registry.entries.extend(background_entries());
         }
@@ -153,7 +163,7 @@ impl Registry {
             let (tools, warnings) = exec::scan_dir(&dir, cache);
             registry.warnings.extend(warnings);
             for tool in tools {
-                if RESERVED_TOOL_NAMES.contains(&tool.spec.name.as_str()) {
+                if reserved_tool_name(config, &tool.spec.name) {
                     registry.warnings.push(format!(
                         "{}: tool name '{}' is reserved by Yawl",
                         tool.path.display(),
@@ -244,6 +254,12 @@ impl Registry {
         &self.skills
     }
 
+    pub(crate) fn has_web_tools(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry.imp, ToolImpl::WebSearch | ToolImpl::WebFetch))
+    }
+
     /// Name, description, and origin for `/tools` and `--list-tools`.
     pub fn describe_all(&self) -> Vec<(String, String, String)> {
         self.entries
@@ -297,6 +313,8 @@ impl Registry {
             ToolImpl::ReadSkill => read_skill(&self.skills, &args),
             ToolImpl::WriteFile => write_file(&args),
             ToolImpl::EditFile => edit_file(&args),
+            ToolImpl::WebSearch => self.execute_web(&args, true),
+            ToolImpl::WebFetch => self.execute_web(&args, false),
             ToolImpl::Exec(tool) => {
                 let (content, is_error) = exec::invoke(tool, args_json, session_id);
                 ToolOutcome {
@@ -316,6 +334,21 @@ impl Registry {
             };
         }
         outcome
+    }
+
+    fn execute_web(&self, args: &Value, search: bool) -> ToolOutcome {
+        let Some(web) = &self.web else {
+            return ToolOutcome::error("web browsing is disabled");
+        };
+        let result = if search {
+            str_arg(args, "query").and_then(|query| web.search(query).map_err(ToolOutcome::error))
+        } else {
+            str_arg(args, "url").and_then(|url| web.fetch(url).map_err(ToolOutcome::error))
+        };
+        match result {
+            Ok(content) => ToolOutcome::ok(content),
+            Err(error) => error,
+        }
     }
 
     fn execute_subagent(&self, tool: SubagentTool, args: &Value) -> ToolOutcome {
@@ -431,6 +464,11 @@ const RESERVED_TOOL_NAMES: &[&str] = &[
     "subagent_cancel",
     "subagent_list",
 ];
+const WEB_TOOL_NAMES: &[&str] = &["web_search", "web_fetch"];
+
+fn reserved_tool_name(config: &Config, name: &str) -> bool {
+    RESERVED_TOOL_NAMES.contains(&name) || (config.web_browsing && WEB_TOOL_NAMES.contains(&name))
+}
 
 fn read_skill_entry() -> ToolEntry {
     ToolEntry {
@@ -653,6 +691,20 @@ fn builtins(background: bool) -> Vec<ToolEntry> {
             imp: ToolImpl::EditFile,
         },
     ]
+}
+
+fn web_entries(provider: crate::config::WebSearchProvider) -> Vec<ToolEntry> {
+    web::WebTools::specs(provider)
+        .into_iter()
+        .map(|spec| {
+            let imp = match spec.name.as_str() {
+                "web_search" => ToolImpl::WebSearch,
+                "web_fetch" => ToolImpl::WebFetch,
+                _ => unreachable!("web module returned an unknown builtin"),
+            };
+            ToolEntry { spec, imp }
+        })
+        .collect()
 }
 
 fn shell_entry(background: bool) -> ToolEntry {
@@ -1109,6 +1161,86 @@ mod tests {
         assert!(out.is_error);
         assert!(out.content.contains("hello"));
         assert!(out.content.contains("exit code: 2"));
+    }
+
+    #[test]
+    fn web_tools_are_advertised_only_when_enabled() {
+        let mut config = registry_config(temp_path("web-home"), temp_path("web-project"));
+        let mut cache = DescribeCache::default();
+        let disabled = Registry::scan(&config, &mut cache);
+        assert!(
+            disabled
+                .specs()
+                .iter()
+                .all(|spec| !spec.name.starts_with("web_"))
+        );
+        assert!(!disabled.has_web_tools());
+
+        config.web_browsing = true;
+        let mut enabled = Registry::scan(&config, &mut cache);
+        assert!(enabled.has_web_tools());
+        let names = enabled
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"web_search".to_string()));
+        assert!(names.contains(&"web_fetch".to_string()));
+
+        enabled.retain_names(&["web_fetch".into()]);
+        assert_eq!(enabled.specs()[0].name, "web_fetch");
+        assert!(enabled.has_web_tools());
+
+        enabled.retain_names(&["read_file".into()]);
+        assert!(!enabled.has_web_tools());
+    }
+
+    #[test]
+    fn executable_web_names_are_reserved_only_when_builtins_are_enabled() -> std::io::Result<()> {
+        let root = temp_path("conditional-web-reservation");
+        let home_dir = root.join("home");
+        let project_dir = root.join("project");
+        let tools_dir = project_dir.join("tools");
+        std::fs::create_dir_all(&tools_dir)?;
+        let tool_path = tools_dir.join("custom-web-search");
+        std::fs::write(
+            &tool_path,
+            r#"#!/bin/sh
+if [ "$1" = "--describe" ]; then
+  echo '{"name":"web_search","description":"custom search","input_schema":{"type":"object"}}'
+else
+  echo custom
+fi
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&tool_path)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool_path, permissions)?;
+
+        let mut config = registry_config(home_dir, project_dir);
+        let mut cache = DescribeCache::default();
+        let disabled = Registry::scan(&config, &mut cache);
+        assert!(
+            disabled.describe_all().iter().any(
+                |(name, description, _)| name == "web_search" && description == "custom search"
+            )
+        );
+
+        config.web_browsing = true;
+        let enabled = Registry::scan(&config, &mut cache);
+        assert!(
+            enabled.describe_all().iter().any(
+                |(name, description, _)| name == "web_search" && description != "custom search"
+            )
+        );
+        assert!(
+            enabled
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("reserved"))
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]

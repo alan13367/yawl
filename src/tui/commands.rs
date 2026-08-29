@@ -9,6 +9,7 @@ use super::picker::{
     Picker, PickerAction, PickerItem, SettingsCategory, SettingsItem, SettingsLocation,
     color_picker, open_model_picker, open_reasoning_picker, select_picker_item,
     selection_color_picker, settings_category_picker, settings_item_index, settings_picker,
+    web_search_provider_picker,
 };
 use super::state::ViewState;
 
@@ -312,6 +313,11 @@ pub(super) fn activate_picker_action(
         PickerAction::OpenSelectionColor => {
             state.picker = Some(selection_color_picker(agent.config().selection_color));
         }
+        PickerAction::OpenWebSearchProviders => {
+            state.picker = Some(web_search_provider_picker(
+                agent.config().web_search_provider,
+            ));
+        }
         PickerAction::SetSelectionColor(selection) => {
             if settings(
                 agent,
@@ -416,6 +422,38 @@ pub(super) fn activate_picker_action(
                 );
             }
         }
+        PickerAction::SetWebBrowsing(enabled) => {
+            if settings(
+                agent,
+                &format!("web_browsing {}", if enabled { "on" } else { "off" }),
+                state,
+            ) {
+                open_settings_location(
+                    agent,
+                    state,
+                    SettingsLocation {
+                        category: SettingsCategory::Web,
+                        item: SettingsItem::WebBrowsingEnabled,
+                    },
+                );
+            }
+        }
+        PickerAction::SetWebSearchProvider(provider) => {
+            if settings(
+                agent,
+                &format!("web_search_provider {}", provider.as_str()),
+                state,
+            ) {
+                open_settings_location(
+                    agent,
+                    state,
+                    SettingsLocation {
+                        category: SettingsCategory::Web,
+                        item: SettingsItem::WebSearchProvider,
+                    },
+                );
+            }
+        }
         PickerAction::SetSubagents(enabled) => {
             if settings(
                 agent,
@@ -446,6 +484,7 @@ pub(super) fn activate_picker_action(
         }
         PickerAction::ShowSettings => show_settings(agent, state),
         PickerAction::EditSetting { .. }
+        | PickerAction::EditSecretSetting { .. }
         | PickerAction::EditModel { .. }
         | PickerAction::EditConnect { .. }
         | PickerAction::ApplyConnect { .. }
@@ -533,6 +572,21 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
             "usage: /settings compact_threshold FRACTION|PERCENT%",
         )
         .map(|value| ConfigChange::CompactThreshold(value.to_string())),
+        "web_browsing" => one_value(&mut parts, "usage: /settings web_browsing on|off")
+            .map(|value| ConfigChange::WebBrowsing(value.to_string())),
+        "web_search_provider" => one_value(
+            &mut parts,
+            "usage: /settings web_search_provider duckduckgo|brave|firecrawl",
+        )
+        .map(|value| ConfigChange::WebSearchProvider(value.to_string())),
+        "web_fetch_max_chars" => {
+            one_value(&mut parts, "usage: /settings web_fetch_max_chars NUMBER")
+                .map(|value| ConfigChange::WebFetchMaxChars(value.to_string()))
+        }
+        "brave_api_key" => one_value(&mut parts, "usage: /settings brave_api_key KEY|-")
+            .map(|value| ConfigChange::BraveApiKey(value.to_string())),
+        "firecrawl_api_key" => one_value(&mut parts, "usage: /settings firecrawl_api_key KEY|-")
+            .map(|value| ConfigChange::FirecrawlApiKey(value.to_string())),
         "subagents" => one_value(&mut parts, "usage: /settings subagents on|off")
             .map(|value| ConfigChange::Subagents(value.to_string())),
         "max_subagents" => one_value(&mut parts, "usage: /settings max_subagents NUMBER")
@@ -663,7 +717,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- web_browsing: `{}`\n- web_search_provider: `{}`\n- web_fetch_max_chars: `{}`\n- brave_api_key: `{}`\n- firecrawl_api_key: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -691,6 +745,18 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         },
         agent.config().compact_threshold * 100.0,
         agent.context_window(),
+        if agent.config().web_browsing {
+            "on"
+        } else {
+            "off"
+        },
+        agent.config().web_search_provider,
+        agent.config().web_fetch_max_chars,
+        configured_key_status("BRAVE_API_KEY", agent.config().brave_api_key.as_deref()),
+        configured_key_status(
+            "FIRECRAWL_API_KEY",
+            agent.config().firecrawl_api_key.as_deref(),
+        ),
         if agent.config().subagents {
             "on"
         } else {
@@ -738,10 +804,20 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);
+}
+
+fn configured_key_status(environment: &str, stored: Option<&str>) -> &'static str {
+    if std::env::var(environment).is_ok_and(|value| !value.trim().is_empty()) {
+        "environment"
+    } else if stored.is_some() {
+        "config"
+    } else {
+        "not set"
+    }
 }
 
 pub(super) fn one_value<'a>(

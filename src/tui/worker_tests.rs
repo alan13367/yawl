@@ -215,6 +215,20 @@ fn display_settings_apply_during_an_active_turn() {
 
     activate_picker_action_while_busy(
         &mut state,
+        PickerAction::OpenWebSearchProviders,
+        &mut active_pickers,
+        &mut config,
+    );
+    let provider_picker = state
+        .picker
+        .as_ref()
+        .expect("search provider picker should open");
+    assert_eq!(provider_picker.items.len(), 3);
+    assert_eq!(provider_picker.selected, 0);
+    assert!(state.pending_actions.is_empty());
+
+    activate_picker_action_while_busy(
+        &mut state,
         PickerAction::SetReasoning {
             effort: Some("high".into()),
             save: true,

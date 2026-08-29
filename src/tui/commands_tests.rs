@@ -10,6 +10,77 @@ fn new_and_clear_are_new_session_commands() {
 }
 
 #[test]
+fn direct_web_settings_apply_and_validate() {
+    let root = std::env::temp_dir().join(format!(
+        "yawl-tui-web-settings-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let config = Config {
+        model: Some("test".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
+    };
+    let cwd = root.join("project");
+    let dirs = config.session_dirs(&cwd);
+    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
+        .expect("session should be created");
+    let mut agent = Agent::new(config, "test".into(), session, Vec::new());
+    let mut state = ViewState::from_agent(&agent);
+
+    assert!(settings(&mut agent, "web_browsing on", &mut state));
+    assert!(settings(
+        &mut agent,
+        "web_search_provider brave",
+        &mut state
+    ));
+    assert!(settings(
+        &mut agent,
+        "web_fetch_max_chars 12345",
+        &mut state
+    ));
+    assert!(settings(
+        &mut agent,
+        "brave_api_key test-secret",
+        &mut state
+    ));
+    assert!(agent.config().web_browsing);
+    assert_eq!(
+        agent.config().web_search_provider,
+        crate::config::WebSearchProvider::Brave
+    );
+    assert_eq!(agent.config().web_fetch_max_chars, 12_345);
+    assert_eq!(agent.config().brave_api_key.as_deref(), Some("test-secret"));
+    assert!(!settings(
+        &mut agent,
+        "web_fetch_max_chars 50001",
+        &mut state
+    ));
+
+    activate_picker_action(&mut agent, &mut state, PickerAction::OpenWebSearchProviders);
+    assert_eq!(
+        state.picker.as_ref().map(|picker| picker.items.len()),
+        Some(3)
+    );
+    activate_picker_action(
+        &mut agent,
+        &mut state,
+        PickerAction::SetWebSearchProvider(crate::config::WebSearchProvider::Firecrawl),
+    );
+    assert_eq!(
+        agent.config().web_search_provider,
+        crate::config::WebSearchProvider::Firecrawl
+    );
+    assert_eq!(state.picker.as_ref().map(|picker| picker.selected), Some(1));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
     let mut state = ViewState {
         transcript: Transcript::from_messages(&[]),

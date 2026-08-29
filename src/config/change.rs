@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use serde_json::{Map, Value, json};
 
 use super::{
-    Config, MAX_SUBAGENT_REQUEST_BUDGET, MAX_SUBAGENT_TIMEOUT_SECS, OPENAI_COMPLETIONS_API,
-    ProviderConfig, UiColor, expand_home_path, object_field, parse_bounded, validate_bounded,
-    validate_provider_name,
+    Config, MAX_SUBAGENT_REQUEST_BUDGET, MAX_SUBAGENT_TIMEOUT_SECS, MAX_WEB_FETCH_MAX_CHARS,
+    OPENAI_COMPLETIONS_API, ProviderConfig, UiColor, WebSearchProvider, expand_home_path,
+    object_field, parse_bounded, validate_bounded, validate_provider_name,
 };
 use crate::error::Error;
 
@@ -23,6 +23,11 @@ pub(crate) enum ConfigChange {
     ScrollBarAutoHide(String),
     AutoCompact(String),
     CompactThreshold(String),
+    WebBrowsing(String),
+    WebSearchProvider(String),
+    WebFetchMaxChars(String),
+    BraveApiKey(String),
+    FirecrawlApiKey(String),
     Subagents(String),
     MaxSubagents(String),
     SubagentModel(String),
@@ -90,6 +95,11 @@ enum ValidatedChange {
     ScrollBarAutoHide(bool),
     AutoCompact(bool),
     CompactThreshold(f64),
+    WebBrowsing(bool),
+    WebSearchProvider(WebSearchProvider),
+    WebFetchMaxChars(usize),
+    BraveApiKey(Option<String>),
+    FirecrawlApiKey(Option<String>),
     Subagents(bool),
     MaxSubagents(usize),
     SubagentModel(String),
@@ -214,6 +224,23 @@ impl ValidatedChange {
             ConfigChange::AutoCompact(value) => Ok(Self::AutoCompact(parse_on_off(&value)?)),
             ConfigChange::CompactThreshold(value) => {
                 Ok(Self::CompactThreshold(parse_threshold(&value)?))
+            }
+            ConfigChange::WebBrowsing(value) => Ok(Self::WebBrowsing(parse_on_off(&value)?)),
+            ConfigChange::WebSearchProvider(value) => value
+                .parse()
+                .map(Self::WebSearchProvider)
+                .map_err(Error::Config),
+            ConfigChange::WebFetchMaxChars(value) => Ok(Self::WebFetchMaxChars(parse_bounded(
+                &value,
+                1,
+                MAX_WEB_FETCH_MAX_CHARS,
+                "web_fetch_max_chars",
+            )?)),
+            ConfigChange::BraveApiKey(value) => {
+                Ok(Self::BraveApiKey(parse_builtin_api_key(&value)?))
+            }
+            ConfigChange::FirecrawlApiKey(value) => {
+                Ok(Self::FirecrawlApiKey(parse_builtin_api_key(&value)?))
             }
             ConfigChange::Subagents(value) => Ok(Self::Subagents(parse_on_off(&value)?)),
             ConfigChange::MaxSubagents(value) => Ok(Self::MaxSubagents(parse_bounded(
@@ -352,6 +379,19 @@ impl ValidatedChange {
             Self::CompactThreshold(threshold) => {
                 insert_root(root, "compact_threshold", json!(threshold))
             }
+            Self::WebBrowsing(enabled) => insert_root(root, "web_browsing", json!(enabled)),
+            Self::WebSearchProvider(provider) => {
+                insert_root(root, "web_search_provider", json!(provider.as_str()))
+            }
+            Self::WebFetchMaxChars(limit) => insert_root(root, "web_fetch_max_chars", json!(limit)),
+            Self::BraveApiKey(key) => match key {
+                Some(key) => insert_root(root, "brave_api_key", json!(key)),
+                None => remove_root(root, "brave_api_key"),
+            },
+            Self::FirecrawlApiKey(key) => match key {
+                Some(key) => insert_root(root, "firecrawl_api_key", json!(key)),
+                None => remove_root(root, "firecrawl_api_key"),
+            },
             Self::Subagents(enabled) => insert_root(root, "subagents", json!(enabled)),
             Self::MaxSubagents(limit) => insert_root(root, "max_subagents", json!(limit)),
             Self::SubagentModel(model) => insert_root(root, "subagent_model", json!(model)),
@@ -469,6 +509,11 @@ impl ValidatedChange {
             Self::ScrollBarAutoHide(enabled) => config.scroll_bar_auto_hide == *enabled,
             Self::AutoCompact(enabled) => config.auto_compact == *enabled,
             Self::CompactThreshold(threshold) => config.compact_threshold == *threshold,
+            Self::WebBrowsing(enabled) => config.web_browsing == *enabled,
+            Self::WebSearchProvider(provider) => config.web_search_provider == *provider,
+            Self::WebFetchMaxChars(limit) => config.web_fetch_max_chars == *limit,
+            Self::BraveApiKey(key) => config.brave_api_key == *key,
+            Self::FirecrawlApiKey(key) => config.firecrawl_api_key == *key,
             Self::Subagents(enabled) => config.subagents == *enabled,
             Self::MaxSubagents(limit) => config.max_subagents == *limit,
             Self::SubagentModel(model) => config.subagent_model == *model,
@@ -969,6 +1014,55 @@ mod tests {
         .expect("saved config should be JSON");
         assert_eq!(saved["anthropic_api_key"], "sk-ant-test");
         assert!(saved.get("openai_api_key").is_none());
+    }
+
+    #[test]
+    fn web_changes_store_validate_and_remove_keys() {
+        let dirs = TestDirs::new("web");
+        let config = dirs.config();
+        let enabled = config
+            .change_global(ConfigChange::WebBrowsing("on".into()))
+            .expect("web browsing should enable");
+        let provider = enabled
+            .config
+            .change_global(ConfigChange::WebSearchProvider("firecrawl".into()))
+            .expect("provider should apply");
+        let limited = provider
+            .config
+            .change_global(ConfigChange::WebFetchMaxChars("12345".into()))
+            .expect("limit should apply");
+        let keyed = limited
+            .config
+            .change_global(ConfigChange::FirecrawlApiKey("$FIRECRAWL_TEST_KEY".into()))
+            .expect("key reference should apply");
+        assert!(keyed.config.web_browsing);
+        assert_eq!(
+            keyed.config.web_search_provider,
+            WebSearchProvider::Firecrawl
+        );
+        assert_eq!(keyed.config.web_fetch_max_chars, 12_345);
+        assert_eq!(
+            keyed.config.firecrawl_api_key.as_deref(),
+            Some("$FIRECRAWL_TEST_KEY")
+        );
+
+        let removed = keyed
+            .config
+            .change_global(ConfigChange::FirecrawlApiKey("-".into()))
+            .expect("key removal should apply");
+        assert_eq!(removed.config.firecrawl_api_key, None);
+        assert!(
+            removed
+                .config
+                .change_global(ConfigChange::WebFetchMaxChars("0".into()))
+                .is_err()
+        );
+        assert!(
+            removed
+                .config
+                .change_global(ConfigChange::WebSearchProvider("other".into()))
+                .is_err()
+        );
     }
 
     #[test]

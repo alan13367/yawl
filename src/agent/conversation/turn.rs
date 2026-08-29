@@ -248,12 +248,14 @@ impl Conversation {
                     &self.config.home_dir,
                     self.config.subagents,
                     self.print_mode,
+                    registry.has_web_tools(),
                     registry.skills(),
                 )
             } else {
                 crate::prompt::build_subagent_system_prompt(
                     &self.config.home_dir,
                     self.role_fragment.as_deref(),
+                    registry.has_web_tools(),
                     registry.skills(),
                 )
             };

@@ -2,14 +2,15 @@
 
 ## Project
 
-Yawl is one Cargo package with a Rust 2024 library target and binary target for macOS and Linux. It uses blocking I/O and targets Rust 1.97.1 or newer. Keep the binary small and the direct dependency count low.
+Yawl is one Cargo package with a Rust 2024 library target and binary target for macOS and Linux. It uses blocking I/O and targets Rust 1.98.0 or newer. Keep the binary small and the direct dependency count low.
 
 ## Layout
 
 - `src/main.rs`: binary bootstrap, session selection, and TUI/print-mode dispatch
-- `src/cli.rs`, `src/print_mode.rs`: binary-local argument parsing and streamed text presentation
+- `src/cli.rs`, `src/print_mode.rs`, `src/project_trust.rs`: binary-local argument parsing, streamed text presentation, and project skill trust prompts
 - `src/agent.rs`: stable `Agent` facade and public turn events
 - `src/agent/conversation.rs`, `conversation/turn.rs`, `events.rs`, `journal.rs`: conversation lifecycle, model/tool turns, streamed event translation, and optional session persistence
+- `src/prompt.rs`: compact system prompt, skill catalog, and `AGENTS.md` instruction injection
 - `src/provider/mod.rs`: stable provider facade and re-exports
 - `src/provider/types.rs`, `streaming.rs`, `resolution.rs`, `http.rs`: provider-neutral protocol, retries, provider selection, and SSE/HTTP support
 - `src/provider/anthropic.rs`, `openai.rs`: provider-specific wire translation
@@ -20,9 +21,13 @@ Yawl is one Cargo package with a Rust 2024 library target and binary target for 
 - `src/tui/commands.rs`, `completion.rs`, `files.rs`, `picker.rs`, `state.rs`, `worker.rs`: TUI behavior and state
 - `src/tui/render.rs`, `terminal.rs`, `events.rs`, `input.rs`, `transcript.rs`: frame composition, terminal lifecycle, input decoding/editing, and transcript reduction
 - `src/tui/markdown.rs`, `highlight.rs`, `tool_view.rs`: sanitized Markdown, syntax highlighting, and tool presentation
+- `src/tui/processes.rs`, `subagents.rs`, `connection.rs`, `dashboard.rs`: background-process and subagent dashboards, provider setup, and shared dashboard layout
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
-- `src/tools/`: built-in tools and executable tool discovery
+- `src/tools/`: builtin registry and executable-tool discovery
+- `src/tools/exec.rs`, `src/tools/web.rs`: exec-tool contract, plus isolated web search/fetch adapters and HTML cleanup
+- `src/background.rs`, `src/subagent/`, `src/cancellation.rs`: session-bound shell processes, parallel subagents, and interrupt tokens
+- `src/skills.rs`, `src/trust.rs`, `src/image.rs`: skill discovery, project skill trust, and image input
 - `src/session.rs`, `src/compaction.rs`, `src/checkpoint.rs`: append-only sessions, context compaction, and `/undo` working-tree snapshots
 - `README.md`: user-facing behavior, contracts, and a concise architecture map
 
@@ -51,6 +56,7 @@ Run `cargo fmt --all` after editing Rust. After making code changes, run `cargo 
 - Keep blocking I/O interruptible where the surrounding code supports `Ctrl+C`.
 - Add a `// SAFETY:` comment to every `unsafe` block and keep its scope minimal.
 - Add focused tests for behavior changes. Preserve provider streaming, session replay, config merging, and terminal escape sanitization invariants.
-- Update `README.md` when changing CLI behavior, configuration, slash commands, or the exec-tool contract.
+- Advertise `web_search` and `web_fetch` in the system prompt only when the current registry actually contains those builtins, not merely when `web_browsing` is enabled in config.
+- Update `README.md` when changing CLI behavior, configuration, slash commands, or the exec-tool contract. Update this file when the module layout above changes.
 
 Before editing, check `git status` and preserve unrelated work. Before finishing, run the three validation commands above and review `git diff`.

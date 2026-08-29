@@ -1,9 +1,52 @@
 use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, de};
 
 use super::OPENAI_COMPLETIONS_API;
 use super::schema::ProviderFile;
+
+/// Search service used by the built-in `web_search` tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WebSearchProvider {
+    /// Keyless search through DuckDuckGo's HTML results page.
+    #[default]
+    DuckDuckGo,
+    /// Brave Web Search API.
+    Brave,
+    /// Firecrawl Search API.
+    Firecrawl,
+}
+
+impl WebSearchProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DuckDuckGo => "duckduckgo",
+            Self::Brave => "brave",
+            Self::Firecrawl => "firecrawl",
+        }
+    }
+}
+
+impl fmt::Display for WebSearchProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for WebSearchProvider {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "duckduckgo" => Ok(Self::DuckDuckGo),
+            "brave" => Ok(Self::Brave),
+            "firecrawl" => Ok(Self::Firecrawl),
+            _ => Err("web_search_provider must be duckduckgo, brave, or firecrawl".to_string()),
+        }
+    }
+}
 
 /// RGB color used by the terminal UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

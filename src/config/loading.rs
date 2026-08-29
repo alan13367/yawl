@@ -5,8 +5,9 @@ use super::schema::ConfigFile;
 use super::{
     Config, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_COMPACT_THRESHOLD, DEFAULT_MAX_SUBAGENTS,
     DEFAULT_MAX_TOKENS, DEFAULT_OPENAI_BASE_URL, DEFAULT_SUBAGENT_MODEL,
-    DEFAULT_SUBAGENT_REQUEST_BUDGET, DEFAULT_SUBAGENT_TIMEOUT_SECS, MAX_SUBAGENT_REQUEST_BUDGET,
-    MAX_SUBAGENT_TIMEOUT_SECS, ProviderConfig, UiColor,
+    DEFAULT_SUBAGENT_REQUEST_BUDGET, DEFAULT_SUBAGENT_TIMEOUT_SECS, DEFAULT_WEB_FETCH_MAX_CHARS,
+    MAX_SUBAGENT_REQUEST_BUDGET, MAX_SUBAGENT_TIMEOUT_SECS, MAX_WEB_FETCH_MAX_CHARS,
+    ProviderConfig, UiColor, WebSearchProvider,
 };
 use crate::error::Error;
 
@@ -54,6 +55,11 @@ impl Config {
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
+            web_browsing: false,
+            web_search_provider: WebSearchProvider::DuckDuckGo,
+            web_fetch_max_chars: DEFAULT_WEB_FETCH_MAX_CHARS,
+            brave_api_key: None,
+            firecrawl_api_key: None,
             subagents: false,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
             subagent_model: DEFAULT_SUBAGENT_MODEL.to_string(),
@@ -142,6 +148,22 @@ impl Config {
         }
         if let Some(value) = file.compact_threshold {
             self.compact_threshold = validate_bounded(value, 0.1, 0.99, "compact_threshold")?;
+        }
+        if let Some(value) = file.web_browsing {
+            self.web_browsing = value;
+        }
+        if let Some(value) = file.web_search_provider {
+            self.web_search_provider = value.parse().map_err(Error::Config)?;
+        }
+        if let Some(value) = file.web_fetch_max_chars {
+            self.web_fetch_max_chars =
+                validate_bounded(value, 1, MAX_WEB_FETCH_MAX_CHARS, "web_fetch_max_chars")?;
+        }
+        if let Some(value) = file.brave_api_key {
+            self.brave_api_key = (!value.trim().is_empty()).then_some(value);
+        }
+        if let Some(value) = file.firecrawl_api_key {
+            self.firecrawl_api_key = (!value.trim().is_empty()).then_some(value);
         }
         if let Some(value) = file.subagents {
             self.subagents = value;
@@ -398,6 +420,33 @@ mod tests {
     }
 
     #[test]
+    fn web_defaults_and_overrides_are_validated() -> Result<(), Error> {
+        let mut cfg = test_config();
+        assert!(!cfg.web_browsing);
+        assert_eq!(cfg.web_search_provider, WebSearchProvider::DuckDuckGo);
+        assert_eq!(cfg.web_fetch_max_chars, DEFAULT_WEB_FETCH_MAX_CHARS);
+
+        cfg.apply(serde_json::from_value(json!({
+            "web_browsing": true,
+            "web_search_provider": "brave",
+            "web_fetch_max_chars": 12345,
+            "brave_api_key": "$BRAVE_TEST_KEY"
+        }))?)?;
+        assert!(cfg.web_browsing);
+        assert_eq!(cfg.web_search_provider, WebSearchProvider::Brave);
+        assert_eq!(cfg.web_fetch_max_chars, 12_345);
+        assert_eq!(cfg.brave_api_key.as_deref(), Some("$BRAVE_TEST_KEY"));
+
+        let invalid_provider: ConfigFile =
+            serde_json::from_value(json!({"web_search_provider": "other"}))?;
+        assert!(cfg.apply(invalid_provider).is_err());
+        let invalid_limit: ConfigFile =
+            serde_json::from_value(json!({"web_fetch_max_chars": 50001}))?;
+        assert!(cfg.apply(invalid_limit).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn scroll_bar_is_visible_unless_disabled() -> Result<(), Error> {
         let mut cfg = test_config();
         assert!(cfg.scroll_bar);
@@ -576,6 +625,39 @@ mod tests {
         assert_eq!(merged.subagent_model, "inherit");
         assert_eq!(merged.subagent_request_budget, 0);
         assert_eq!(merged.subagent_timeout_secs, 120);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn web_global_and_project_values_are_merged() -> Result<(), Error> {
+        let root = std::env::temp_dir().join(format!(
+            "yawl-web-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let home = root.join("home/.yawl");
+        let project = root.join("project/.yawl");
+        std::fs::create_dir_all(&home)?;
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(
+            home.join("config.json"),
+            r#"{"web_browsing":true,"web_search_provider":"brave","web_fetch_max_chars":10000,"brave_api_key":"global-key"}"#,
+        )?;
+        std::fs::write(
+            project.join("config.json"),
+            r#"{"web_search_provider":"firecrawl","web_fetch_max_chars":25000,"firecrawl_api_key":"$FIRECRAWL_KEY"}"#,
+        )?;
+
+        let config = Config::load_from(home, project)?;
+        assert!(config.web_browsing);
+        assert_eq!(config.web_search_provider, WebSearchProvider::Firecrawl);
+        assert_eq!(config.web_fetch_max_chars, 25_000);
+        assert_eq!(config.brave_api_key.as_deref(), Some("global-key"));
+        assert_eq!(config.firecrawl_api_key.as_deref(), Some("$FIRECRAWL_KEY"));
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }

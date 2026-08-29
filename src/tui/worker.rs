@@ -18,6 +18,7 @@ use super::input::{EditAction, Editor, Submission};
 use super::picker::{
     ActivePickers, PickerAction, SettingsCategory, SettingsItem, SettingsLocation,
     picker_is_editing, select_picker_item, settings_item_index, take_picker_action,
+    web_search_provider_picker,
 };
 use super::state::{
     COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, scroll,
@@ -467,6 +468,11 @@ pub(super) fn activate_picker_action_while_busy(
         }
         PickerAction::OpenSelectionColor => {
             state.picker = Some(active_pickers.selection_color.clone());
+        }
+        PickerAction::OpenWebSearchProviders => {
+            state.picker = Some(web_search_provider_picker(
+                active_config.web_search_provider,
+            ));
         }
         PickerAction::OpenSettingsRoot { selected } => {
             state.picker = Some(active_pickers.settings.clone());

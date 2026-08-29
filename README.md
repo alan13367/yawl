@@ -16,7 +16,7 @@
 
 Yawl is a small AI agent runner for macOS and Linux. It gives you a full-screen terminal interface, a scriptable print mode, provider selection, persistent sessions, tool calling, and automatic context compaction.
 
-The model can add tools without recompiling Yawl. Put an executable in `~/.yawl/tools/` or `./.yawl/tools/`, implement the exec-tool contract, and Yawl discovers it before the next model step.
+The model can add tools without recompiling Yawl. Put an executable in `~/.yawl/tools/` or `./.yawl/tools/`, implement the exec-tool contract, and Yawl discovers it before the next model step. Optional built-in web search and page fetching can be enabled in settings.
 
 ## What you get
 
@@ -66,7 +66,7 @@ The interface is intentionally dense without being noisy. These are real views f
 
 ## Install
 
-Yawl requires Rust 1.97.1 or newer.
+Yawl requires Rust 1.98.0 or newer.
 
 ```sh
 git clone https://github.com/alan13367/yawl.git
@@ -140,7 +140,7 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 
 ## Slash commands
 
-`/model`, `/settings`, and `/connect` open keyboard pickers, including while a model response is still running. Settings are grouped under Model, Interface, Context, Providers, Subagents, Skills, and Advanced. Use the arrow keys and Enter to choose; Escape returns to the parent category before closing settings. Editable settings stay in the picker: Enter starts editing the current value, Enter again saves it, and the refreshed value is shown in the menu. Reasoning visibility, accent color, and selection color changes apply immediately during an active response. Settings that can affect generation apply as soon as the response releases the agent and before the next queued message starts.
+`/model`, `/settings`, and `/connect` open keyboard pickers, including while a model response is still running. Settings are grouped under Model, Interface, Context, Providers, Web, Subagents, Skills, and Advanced. Use the arrow keys and Enter to choose; Escape returns to the parent category before closing settings. Editable settings stay in the picker: Enter starts editing the current value, Enter again saves it, and the refreshed value is shown in the menu. Reasoning visibility, accent color, and selection color changes apply immediately during an active response. Settings that can affect generation apply as soon as the response releases the agent and before the next queued message starts.
 
 `/connect` and Settings > Providers use the same guided setup. Fixed providers appear first, followed by configured custom providers in name order. Existing endpoints are prefilled and credentials are preserved unless you choose an environment variable, enter a replacement key, or explicitly use no key. The no-key option appears only for providers that support keyless requests and do not have an active fallback environment credential. Secret input is masked. Discovery and Codex device login remain interactive while a model response continues; Escape cancels only the setup job. The review can save and use the model globally, save and use it for this session, or save only the connection. Saving an OpenAI-compatible connection also keeps the selected model in `/model`, even when the session does not switch to it.
 
@@ -171,7 +171,7 @@ Messages submitted during an active response are queued automatically. Each pend
 
 ## Models and configuration
 
-Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`. Project values override global values. Every field is optional. If the merged config has no `model`, interactive startup runs onboarding unless setup was skipped; print mode requires `--model`. Values are validated at load with the same rules `/settings` enforces: `max_tokens` and context windows must be positive integers, `compact_threshold` must be between 0.1 and 0.99, `max_subagents` must be between 1 and 16, `subagent_request_budget` must be between 0 and 1000, `subagent_timeout_secs` must be between 0 and 86400, and `reasoning_effort` must be a supported level. An out-of-range value fails startup with the file and field named instead of being silently clamped, and the error points at `yawl --doctor`.
+Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`. Project values override global values. Every field is optional. If the merged config has no `model`, interactive startup runs onboarding unless setup was skipped; print mode requires `--model`. Values are validated at load with the same rules `/settings` enforces: `max_tokens` and context windows must be positive integers, `compact_threshold` must be between 0.1 and 0.99, `web_fetch_max_chars` must be between 1 and 50,000, `max_subagents` must be between 1 and 16, `subagent_request_budget` must be between 0 and 1000, `subagent_timeout_secs` must be between 0 and 86400, and `reasoning_effort` must be a supported level. An out-of-range value fails startup with the file and field named instead of being silently clamped, and the error points at `yawl --doctor`.
 
 ```json
 {
@@ -187,6 +187,9 @@ Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`
   "scroll_bar_auto_hide": true,
   "auto_compact": true,
   "compact_threshold": 0.85,
+  "web_browsing": false,
+  "web_search_provider": "duckduckgo",
+  "web_fetch_max_chars": 20000,
   "subagents": false,
   "max_subagents": 3,
   "subagent_model": "inherit",
@@ -310,6 +313,20 @@ Background process metadata and logs stay in memory. They are not replayed from 
 
 Yawl checks the last provider-reported token usage before each request. At the configured threshold, 85 percent by default, it asks the current model to summarize the older conversation and keeps roughly the last ten messages unchanged. Use `/compact` to do this manually. If automatic compaction fails, Yawl shows a warning and continues without compacting; the next request may still fit.
 
+## Web browsing
+
+Web browsing is off by default. Enable it from Settings > Web. The Search provider row opens a picker for DuckDuckGo, Firecrawl, or Brave. You can also use direct settings commands:
+
+```sh
+/settings web_browsing on
+/settings web_search_provider duckduckgo
+/settings web_fetch_max_chars 20000
+```
+
+When enabled, `web_search({"query":"..."})` returns up to five titles, URLs, and short snippets. Search never opens those results automatically; the model chooses whether to call `web_fetch({"url":"https://..."})`. Search results and fetched pages are marked as untrusted content. DuckDuckGo is free and keyless. To select Brave or Firecrawl, set `BRAVE_API_KEY` or `FIRECRAWL_API_KEY`, or save a key with `/settings brave_api_key KEY|-` or `/settings firecrawl_api_key KEY|-`. Environment variables take precedence over saved values, and saved `$ENV_VAR` references are supported. Provider failures do not fall back to another service.
+
+`web_fetch` makes a direct HTTP(S) request, follows at most five redirects, and accepts HTML, text, JSON, and XML, including localhost and private network addresses. It does not run JavaScript, use cookies, send authentication headers, or extract PDFs. Wire input and decoded response bodies are capped at 2 MiB before cleanup; readable output defaults to 20,000 characters and can be configured from 1 to 50,000. HTML extraction has a ten-second processing limit and only one extract runs at a time. Returned page content is marked as untrusted so instructions embedded in a page are not treated as agent instructions. Wrapper markers that appear inside search snippets or page text are rewritten so they cannot close that region.
+
 ## Parallel subagents
 
 Subagents are off by default. Enable them from the settings picker or with these commands:
@@ -367,6 +384,8 @@ The main model always has these tools:
 - `write_file` writes a file and creates missing parent directories.
 - `edit_file` performs one exact string replacement and rejects missing or repeated matches.
 
+When web browsing is enabled, `web_search` and `web_fetch` join the registry and appear in `/tools` and `--list-tools`. They are otherwise absent, including from model tool definitions.
+
 Yawl permits 8 active background commands and retains up to 64 rows per session. Each row keeps the newest 256 KiB of combined stdout and stderr. Settled rows remain available until removed or the session ends; when history fills, Yawl prunes the oldest settled rows. Stopping a command sends `SIGTERM` to its process group, waits two seconds, then sends `SIGKILL` if needed.
 
 Tool output sent back to the model is capped at 60,000 characters. Streaming responses are capped at 64 MiB of SSE data per response and 4 MiB per event, so a runaway server fails with an error instead of growing without bound. A foreground command timeout or `Ctrl+C` kills that command's process group. Canceling a model turn does not stop a command that was explicitly started in the background; use `/ps` or `shell_stop`.
@@ -382,7 +401,7 @@ Yawl scans these directories before every model step:
 
 Project tools override global tools with the same name. Describe results are cached until the executable's modification time changes.
 
-The names `subagent_spawn`, `subagent_send`, `subagent_wait`, `subagent_cancel`, and `subagent_list` are reserved even when subagents are disabled.
+The names `subagent_spawn`, `subagent_send`, `subagent_wait`, `subagent_cancel`, and `subagent_list` are reserved even when subagents are disabled. `web_search` and `web_fetch` are reserved only while built-in web browsing is enabled.
 
 An executable must support two operations:
 
@@ -469,6 +488,7 @@ Yawl stays in one Cargo package. Stable facade modules keep callers independent 
 - `src/cancellation.rs` binds cancellation tokens to worker threads while preserving process-wide SIGINT handling.
 - `src/provider/mod.rs` re-exports the provider-neutral protocol. Private modules contain streaming retries, provider resolution, and SSE/HTTP support. Codex OAuth and Responses handling live separately under `src/provider/codex/`.
 - `src/config.rs` exposes the effective configuration. Its child modules separate runtime types, persisted schema, loading and merging, storage, and validated changes.
+- `src/tools/` contains the builtin registry, executable-tool discovery, and the isolated web search/fetch adapters and HTML cleanup.
 - `src/tui/mod.rs` exposes `tui::run` and coordinates the event loop. Commands, completion, pickers, process and subagent dashboards, state, workers, rendering, and terminal handling live in focused sibling modules.
 - `src/onboarding.rs` coordinates setup while its child modules own the arrow-key selector, terminal prompts, model discovery, and the wizard flow.
 - `src/doctor.rs` coordinates configuration diagnosis and repair; checks, interactive repairs, and report rendering live in its child modules.

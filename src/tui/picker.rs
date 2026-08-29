@@ -1,7 +1,7 @@
 //! Picker model, catalogs, and keyboard reducer.
 
 use crate::agent::Agent;
-use crate::config::{Config, UiColor};
+use crate::config::{Config, UiColor, WebSearchProvider};
 
 use super::ViewState;
 use super::connection::{ConnectEditField, ConnectStep};
@@ -18,17 +18,19 @@ pub(super) enum SettingsCategory {
     Interface,
     Context,
     Providers,
+    Web,
     Subagents,
     Skills,
     Advanced,
 }
 
 impl SettingsCategory {
-    pub(super) const ALL: [Self; 7] = [
+    pub(super) const ALL: [Self; 8] = [
         Self::Model,
         Self::Interface,
         Self::Context,
         Self::Providers,
+        Self::Web,
         Self::Subagents,
         Self::Skills,
         Self::Advanced,
@@ -40,6 +42,7 @@ impl SettingsCategory {
             Self::Interface => "Interface",
             Self::Context => "Context",
             Self::Providers => "Providers",
+            Self::Web => "Web",
             Self::Subagents => "Subagents",
             Self::Skills => "Skills",
             Self::Advanced => "Advanced",
@@ -52,6 +55,7 @@ impl SettingsCategory {
             Self::Interface => "Colors, reasoning display, and scroll bar",
             Self::Context => "Compaction and context windows",
             Self::Providers => "Add or update model providers",
+            Self::Web => "Browsing, search source, fetch limit, and keys",
             Self::Subagents => "Concurrency, models, budgets, and timeouts",
             Self::Skills => "Search directories for reusable skills",
             Self::Advanced => "Reload and inspect configuration",
@@ -80,6 +84,11 @@ pub(super) enum SettingsItem {
     CompactThreshold,
     ContextWindow,
     ProviderSetup,
+    WebBrowsingEnabled,
+    WebSearchProvider,
+    WebFetchMaxChars,
+    BraveApiKey,
+    FirecrawlApiKey,
     SubagentsEnabled,
     MaxSubagents,
     SubagentModel,
@@ -141,6 +150,8 @@ pub(super) enum PickerAction {
     OpenSelectionColor,
     /// `None` follows the accent color.
     SetSelectionColor(Option<UiColor>),
+    OpenWebSearchProviders,
+    SetWebSearchProvider(WebSearchProvider),
     SetScrollBar(bool),
     SetScrollBarAutoHide(bool),
     ResumeSession(String),
@@ -182,6 +193,10 @@ pub(super) enum PickerAction {
         initial: String,
         location: Option<SettingsLocation>,
     },
+    EditSecretSetting {
+        key: String,
+        location: Option<SettingsLocation>,
+    },
     EditModel {
         save: bool,
         initial: String,
@@ -191,6 +206,7 @@ pub(super) enum PickerAction {
         location: Option<SettingsLocation>,
     },
     SetAutoCompact(bool),
+    SetWebBrowsing(bool),
     SetSubagents(bool),
     SendQueued(usize),
     ApplyQueued {
@@ -228,6 +244,7 @@ pub(super) struct Picker {
 #[derive(Clone)]
 pub(super) enum PickerEdit {
     Setting(String),
+    SecretSetting(String),
     Model {
         save: bool,
     },
@@ -526,6 +543,45 @@ pub(super) fn settings_category_picker_from(
             );
             entries
         }
+        SettingsCategory::Web => vec![
+            PickerItem {
+                label: "Web browsing".into(),
+                description: format!("{} · Enter to toggle", on_off(config.web_browsing)),
+                action: PickerAction::SetWebBrowsing(!config.web_browsing),
+            },
+            PickerItem {
+                label: "Search provider".into(),
+                description: format!(
+                    "{} · Enter to choose",
+                    web_search_provider_label(config.web_search_provider)
+                ),
+                action: PickerAction::OpenWebSearchProviders,
+            },
+            edit(
+                SettingsItem::WebFetchMaxChars,
+                "Maximum fetched characters",
+                config.web_fetch_max_chars.to_string(),
+            ),
+            PickerItem {
+                label: "Brave API key".into(),
+                description: web_key_status("BRAVE_API_KEY", config.brave_api_key.as_deref()),
+                action: PickerAction::EditSecretSetting {
+                    key: "brave_api_key".into(),
+                    location: location(SettingsItem::BraveApiKey),
+                },
+            },
+            PickerItem {
+                label: "Firecrawl API key".into(),
+                description: web_key_status(
+                    "FIRECRAWL_API_KEY",
+                    config.firecrawl_api_key.as_deref(),
+                ),
+                action: PickerAction::EditSecretSetting {
+                    key: "firecrawl_api_key".into(),
+                    location: location(SettingsItem::FirecrawlApiKey),
+                },
+            },
+        ],
         SettingsCategory::Subagents => vec![
             PickerItem {
                 label: "Parallel subagents".into(),
@@ -604,11 +660,71 @@ fn setting_key(item: SettingsItem) -> &'static str {
         SettingsItem::MaxOutputTokens => "max_tokens",
         SettingsItem::CompactThreshold => "compact_threshold",
         SettingsItem::ContextWindow => "context_window",
+        SettingsItem::WebSearchProvider => "web_search_provider",
+        SettingsItem::WebFetchMaxChars => "web_fetch_max_chars",
         SettingsItem::MaxSubagents => "max_subagents",
         SettingsItem::SubagentModel => "subagent_model",
         SettingsItem::SubagentRequestBudget => "subagent_request_budget",
         SettingsItem::SubagentTimeout => "subagent_timeout_secs",
         _ => "",
+    }
+}
+
+fn web_key_status(environment: &str, stored: Option<&str>) -> String {
+    if std::env::var(environment).is_ok_and(|value| !value.trim().is_empty()) {
+        format!("Set by {environment} · Enter to edit config fallback")
+    } else if stored.is_some() {
+        "Stored in config · Enter to replace or type - to remove".into()
+    } else {
+        "Not set · Enter to add".into()
+    }
+}
+
+fn web_search_provider_label(provider: WebSearchProvider) -> &'static str {
+    match provider {
+        WebSearchProvider::DuckDuckGo => "DuckDuckGo",
+        WebSearchProvider::Firecrawl => "Firecrawl",
+        WebSearchProvider::Brave => "Brave",
+    }
+}
+
+pub(super) fn web_search_provider_picker(current: WebSearchProvider) -> Picker {
+    let providers = [
+        (
+            WebSearchProvider::DuckDuckGo,
+            "Free search without an API key",
+        ),
+        (
+            WebSearchProvider::Firecrawl,
+            "Uses the configured Firecrawl API key",
+        ),
+        (
+            WebSearchProvider::Brave,
+            "Uses the configured Brave API key",
+        ),
+    ];
+    let items = providers
+        .into_iter()
+        .map(|(provider, description)| PickerItem {
+            label: web_search_provider_label(provider).into(),
+            description: description.into(),
+            action: PickerAction::SetWebSearchProvider(provider),
+        })
+        .collect::<Vec<_>>();
+    let selected = providers
+        .iter()
+        .position(|(provider, _)| *provider == current)
+        .unwrap_or(0);
+    Picker {
+        title: "Search provider".into(),
+        hint: "↑/↓ move  Enter select  Esc cancel".into(),
+        items,
+        selected,
+        editing: None,
+        parent: Some(PickerAction::OpenSettingsCategory {
+            category: SettingsCategory::Web,
+            selected: settings_item_index(SettingsCategory::Web, SettingsItem::WebSearchProvider),
+        }),
     }
 }
 
@@ -782,7 +898,7 @@ pub(super) fn picker_is_secret(state: &ViewState) -> bool {
     state.picker.as_ref().is_some_and(|picker| {
         matches!(
             picker.editing,
-            Some(PickerEdit::Connect { secret: true, .. })
+            Some(PickerEdit::Connect { secret: true, .. } | PickerEdit::SecretSetting(_))
         )
     })
 }
@@ -808,11 +924,16 @@ pub(super) fn take_picker_action(
                             .get(picker.selected)
                             .and_then(|item| match &item.action {
                                 PickerAction::EditSetting { location, .. } => *location,
+                                PickerAction::EditSecretSetting { location, .. } => *location,
                                 _ => None,
                             });
                     state.picker = None;
                     return Some(match editing {
                         PickerEdit::Setting(key) => PickerAction::ApplySetting {
+                            argument: format!("{key} {}", value.trim()),
+                            location,
+                        },
+                        PickerEdit::SecretSetting(key) => PickerAction::ApplySetting {
                             argument: format!("{key} {}", value.trim()),
                             location,
                         },
@@ -863,6 +984,10 @@ pub(super) fn take_picker_action(
                     editor.clear();
                     editor.paste(&initial);
                     picker.editing = Some(PickerEdit::Setting(key));
+                }
+                Some(PickerAction::EditSecretSetting { key, .. }) => {
+                    editor.clear();
+                    picker.editing = Some(PickerEdit::SecretSetting(key));
                 }
                 Some(PickerAction::EditModel { save, initial }) => {
                     editor.clear();
@@ -992,6 +1117,13 @@ fn settings_items(category: SettingsCategory) -> &'static [SettingsItem] {
             SettingsItem::ContextWindow,
         ],
         SettingsCategory::Providers => &[SettingsItem::ProviderSetup],
+        SettingsCategory::Web => &[
+            SettingsItem::WebBrowsingEnabled,
+            SettingsItem::WebSearchProvider,
+            SettingsItem::WebFetchMaxChars,
+            SettingsItem::BraveApiKey,
+            SettingsItem::FirecrawlApiKey,
+        ],
         SettingsCategory::Subagents => &[
             SettingsItem::SubagentsEnabled,
             SettingsItem::MaxSubagents,
@@ -1053,7 +1185,7 @@ pub(super) fn render_picker(
                 "type a value below…".into()
             } else if matches!(
                 picker.editing,
-                Some(PickerEdit::Connect { secret: true, .. })
+                Some(PickerEdit::Connect { secret: true, .. } | PickerEdit::SecretSetting(_))
             ) {
                 "•".repeat(value.chars().count())
             } else {

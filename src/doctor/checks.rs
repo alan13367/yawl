@@ -31,6 +31,11 @@ const KNOWN_KEYS: &[&str] = &[
     "context_windows",
     "auto_compact",
     "compact_threshold",
+    "web_browsing",
+    "web_search_provider",
+    "web_fetch_max_chars",
+    "brave_api_key",
+    "firecrawl_api_key",
     "subagents",
     "max_subagents",
     "subagent_model",
@@ -225,6 +230,38 @@ fn semantic_checks(
                 path,
                 ["compact_threshold"],
                 json!(config::DEFAULT_COMPACT_THRESHOLD),
+            )),
+        ));
+    }
+    if let Some(provider) = map.get("web_search_provider").and_then(Value::as_str)
+        && provider.parse::<config::WebSearchProvider>().is_err()
+    {
+        findings.push(error(
+            area,
+            "web_search_provider must be duckduckgo, brave, or firecrawl".into(),
+            Some(set(
+                path,
+                ["web_search_provider"],
+                json!(config::WebSearchProvider::DuckDuckGo.as_str()),
+            )),
+        ));
+    }
+    if let Some(limit) = map.get("web_fetch_max_chars").and_then(Value::as_u64)
+        && config::validate_bounded(
+            limit,
+            1,
+            config::MAX_WEB_FETCH_MAX_CHARS as u64,
+            "web_fetch_max_chars",
+        )
+        .is_err()
+    {
+        findings.push(error(
+            area,
+            config::bounded_message("web_fetch_max_chars", 1, config::MAX_WEB_FETCH_MAX_CHARS),
+            Some(set(
+                path,
+                ["web_fetch_max_chars"],
+                json!(config::DEFAULT_WEB_FETCH_MAX_CHARS),
             )),
         ));
     }
@@ -427,7 +464,12 @@ fn check_env_references(
             }
         }
     };
-    for key in ["anthropic_api_key", "openai_api_key"] {
+    for key in [
+        "anthropic_api_key",
+        "openai_api_key",
+        "brave_api_key",
+        "firecrawl_api_key",
+    ] {
         if let Some(value) = map.get(key).and_then(Value::as_str) {
             check(vec![key], value);
         }
@@ -687,6 +729,24 @@ fn cross_checks(
             fix: Some(remove(&path, ["setup"])),
         });
     }
+    if config.web_browsing {
+        let missing = match config.web_search_provider {
+            config::WebSearchProvider::DuckDuckGo => None,
+            config::WebSearchProvider::Brave => missing_web_key(
+                "BRAVE_API_KEY",
+                config.brave_api_key.as_deref(),
+                "brave_api_key",
+            ),
+            config::WebSearchProvider::Firecrawl => missing_web_key(
+                "FIRECRAWL_API_KEY",
+                config.firecrawl_api_key.as_deref(),
+                "firecrawl_api_key",
+            ),
+        };
+        if let Some(message) = missing {
+            findings.push(warning("web search", message, None));
+        }
+    }
     let Some(model) = config.model.clone() else {
         findings.push(info(
             "model",
@@ -695,6 +755,13 @@ fn cross_checks(
         return;
     };
     check_model_routing(&model, &config, findings);
+}
+
+fn missing_web_key(environment: &str, stored: Option<&str>, config_key: &str) -> Option<String> {
+    let environment_is_set = std::env::var(environment).is_ok_and(|value| !value.trim().is_empty());
+    (!environment_is_set && stored.is_none()).then(|| {
+        format!("{environment} is not set and no {config_key} is configured; web_search will fail")
+    })
 }
 
 fn check_model_routing(model: &str, config: &Config, findings: &mut Vec<Finding>) {
@@ -964,7 +1031,7 @@ mod tests {
     fn semantic_rules_reset_defaults() {
         let dirs = TestDirs::new("semantic");
         dirs.write_global(
-            r#"{"max_tokens":0,"compact_threshold":1.5,"reasoning_effort":"extreme","setup":"later"}"#,
+            r#"{"max_tokens":0,"compact_threshold":1.5,"reasoning_effort":"extreme","web_search_provider":"other","web_fetch_max_chars":50001,"setup":"later"}"#,
         );
 
         let findings = run(&dirs.paths());
@@ -976,6 +1043,8 @@ mod tests {
             "max_tokens must be a positive integer",
             "compact_threshold must be between 0.1 and 0.99",
             "unsupported reasoning effort 'extreme'",
+            "web_search_provider must be duckduckgo, brave, or firecrawl",
+            "web_fetch_max_chars must be between 1 and 50000",
             "setup must be",
         ] {
             assert!(
@@ -988,6 +1057,18 @@ mod tests {
                 .iter()
                 .all(|finding| finding.fix.is_some())
         );
+    }
+
+    #[test]
+    fn selected_keyed_web_provider_warns_when_unconfigured() {
+        let message = missing_web_key(
+            "YAWL_DOCTOR_TEST_WEB_KEY_THAT_IS_NOT_SET",
+            None,
+            "brave_api_key",
+        )
+        .expect("missing key warning");
+        assert!(message.contains("web_search will fail"));
+        assert!(missing_web_key("IGNORED", Some("$SAVED_KEY"), "brave_api_key").is_none());
     }
 
     #[test]

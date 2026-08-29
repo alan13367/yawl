@@ -684,13 +684,75 @@ fn sanitize(text: &str) -> String {
         .collect()
 }
 
-/// Renders untrusted plain text as hard-wrapped terminal lines. Markdown and
-/// terminal control sequences are treated as data.
-pub(crate) fn plain_lines(text: &str, width: usize) -> Vec<String> {
-    let sanitized = sanitize(&strip_ansi(text));
+fn terminal_lines(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
     let mut lines = Vec::new();
-    for line in sanitized.split('\n') {
-        lines.extend(wrap_ansi_hard(line, width.max(1)));
+    let mut line = Vec::new();
+    let mut cursor = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if let Some(end) = ansi_sequence_end(bytes, index) {
+            if bytes.get(end.saturating_sub(1)) == Some(&b'K') {
+                erase_terminal_line(&mut line, cursor, &text[index..end]);
+            }
+            index = end;
+            continue;
+        }
+        let character = text[index..]
+            .chars()
+            .next()
+            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        index += character.len_utf8();
+        match character {
+            '\n' => {
+                lines.push(line.iter().collect());
+                line.clear();
+                cursor = 0;
+            }
+            '\r' => cursor = 0,
+            '\u{8}' => cursor = cursor.saturating_sub(1),
+            character => {
+                let character = if character == '\t' || !character.is_control() {
+                    character
+                } else {
+                    char::REPLACEMENT_CHARACTER
+                };
+                if cursor < line.len() {
+                    line[cursor] = character;
+                } else {
+                    line.resize(cursor, ' ');
+                    line.push(character);
+                }
+                cursor = cursor.saturating_add(1);
+            }
+        }
+    }
+    lines.push(line.iter().collect());
+    lines
+}
+
+fn erase_terminal_line(line: &mut Vec<char>, cursor: usize, sequence: &str) {
+    let mode = sequence
+        .strip_prefix("\x1b[")
+        .and_then(|parameters| parameters.strip_suffix('K'));
+    match mode {
+        Some("") | Some("0") => line.truncate(cursor),
+        Some("1") => {
+            for character in line.iter_mut().take(cursor.saturating_add(1)) {
+                *character = ' ';
+            }
+        }
+        Some("2") => line.clear(),
+        _ => {}
+    }
+}
+
+/// Renders untrusted plain text as hard-wrapped terminal lines. Markdown and
+/// terminal cursor updates are reduced to the text visible on each line.
+pub(crate) fn plain_lines(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in terminal_lines(text) {
+        lines.extend(wrap_ansi_hard(&line, width.max(1)));
     }
     if lines.is_empty() {
         lines.push(String::new());
@@ -730,6 +792,20 @@ mod tests {
         assert_eq!(wide, ["hello wonderful", "world"]);
         assert_eq!(narrow.join(" "), text);
         assert_eq!(wide.join(" "), text);
+    }
+
+    #[test]
+    fn plain_terminal_text_preserves_lines_and_replays_carriage_returns() {
+        let lines = plain_lines(
+            "Compiling alpha\r\nBuilding a long stale line\r\x1b[2KBuilding [==> ] 2/2\nFinished",
+            80,
+        );
+
+        assert_eq!(
+            lines,
+            ["Compiling alpha", "Building [==> ] 2/2", "Finished"]
+        );
+        assert!(!lines.join("\n").contains('�'));
     }
 
     #[test]

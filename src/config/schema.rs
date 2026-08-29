@@ -35,6 +35,11 @@ pub(super) struct ConfigFile {
     pub(super) auto_compact: Option<bool>,
     /// Fraction of the context window at which auto-compaction triggers.
     pub(super) compact_threshold: Option<f64>,
+    pub(super) web_browsing: Option<bool>,
+    pub(super) web_search_provider: Option<String>,
+    pub(super) web_fetch_max_chars: Option<usize>,
+    pub(super) brave_api_key: Option<String>,
+    pub(super) firecrawl_api_key: Option<String>,
     pub(super) subagents: Option<bool>,
     pub(super) max_subagents: Option<usize>,
     pub(super) subagent_model: Option<String>,
