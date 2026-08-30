@@ -9,7 +9,7 @@ Yawl is one Cargo package with a Rust 2024 library target and binary target for 
 - `src/main.rs`: binary bootstrap, session selection, and TUI/print-mode dispatch
 - `src/cli.rs`, `src/print_mode.rs`, `src/project_trust.rs`: binary-local argument parsing, streamed text presentation, and project skill trust prompts
 - `src/agent.rs`: stable `Agent` facade and public turn events
-- `src/agent/conversation.rs`, `conversation/turn.rs`, `events.rs`, `journal.rs`: conversation lifecycle, model/tool turns, streamed event translation, and optional session persistence
+- `src/agent/conversation.rs`, `conversation/turn.rs`, `conversation/goal.rs`, `conversation/steer.rs`, `events.rs`, `journal.rs`: conversation lifecycle, model/tool turns, goal mode, live steering, streamed event translation, and optional session persistence
 - `src/prompt.rs`: compact system prompt, skill catalog, and `AGENTS.md` instruction injection
 - `src/provider/mod.rs`: stable provider facade and re-exports
 - `src/provider/types.rs`, `streaming.rs`, `resolution.rs`, `http.rs`: provider-neutral protocol, retries, provider selection, and SSE/HTTP support

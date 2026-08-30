@@ -54,6 +54,8 @@ pub struct Config {
     pub scroll_bar: bool,
     /// Whether an idle transcript scroll bar hides itself after a pause.
     pub scroll_bar_auto_hide: bool,
+    /// Whether Enter steers instead of queues while a TUI turn is active.
+    pub enter_steers: bool,
     pub context_windows: HashMap<String, u64>,
     pub auto_compact: bool,
     pub compact_threshold: f64,
@@ -260,6 +262,7 @@ impl Config {
             selection_color: None,
             scroll_bar: true,
             scroll_bar_auto_hide: true,
+            enter_steers: false,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,

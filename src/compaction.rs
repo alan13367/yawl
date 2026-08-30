@@ -1,9 +1,11 @@
 //! Auto-compaction: when the context is ~85% full (estimated from
-//! provider-reported usage), the same model summarizes everything except the
-//! system prompt and the last ~10 messages. The session JSONL keeps the full
-//! original history; compaction is recorded as an event.
+//! provider-reported usage), the same model summarizes older messages while
+//! retaining the last ~10 verbatim. The latest undoable user prompt is also
+//! retained so `/undo` keeps its checkpoint anchor. The session JSONL keeps
+//! the full original history; compaction is recorded as an event.
 
 use std::fmt::Write as _;
+use std::ops::Range;
 
 use crate::error::Error;
 use crate::provider::{Message, Provider, Request, Role, StreamNotice, stream_turn};
@@ -39,12 +41,32 @@ pub fn split_point(messages: &[Message]) -> usize {
     split
 }
 
+/// Selects a contiguous range to summarize without removing `protected`.
+/// Prefer the larger side of the protected prompt so compaction still frees
+/// useful space during a long-running turn.
+pub(crate) fn compaction_range(messages: &[Message], protected: Option<usize>) -> Range<usize> {
+    let split = split_point(messages);
+    let Some(protected) = protected.filter(|index| *index < split) else {
+        return 0..split;
+    };
+    let before = 0..protected;
+    let after = protected.saturating_add(1)..split;
+    if !after.is_empty() && after.len() >= before.len() {
+        after
+    } else {
+        before
+    }
+}
+
 /// Renders messages as a plain transcript for the summarizer.
 fn transcript(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
         match m.role {
             Role::User => {
+                if m.is_hidden_control() {
+                    continue;
+                }
                 out.push_str("## user\n");
                 out.push_str(&m.content);
             }
@@ -93,7 +115,9 @@ pub fn compact(
     messages: &mut Vec<Message>,
     sink: &mut dyn FnMut(StreamNotice<'_>),
 ) -> Result<(String, usize), Error> {
-    let (summary, split) = summarize(provider, model, max_tokens, messages, sink)?;
+    let (summary, range) = summarize(provider, model, max_tokens, messages, None, sink)?;
+    debug_assert_eq!(range.start, 0);
+    let split = range.end;
     apply_summary(messages, &summary, split);
     Ok((summary, split))
 }
@@ -105,17 +129,18 @@ pub(crate) fn summarize(
     model: &str,
     max_tokens: u32,
     messages: &[Message],
+    protected: Option<usize>,
     sink: &mut dyn FnMut(StreamNotice<'_>),
-) -> Result<(String, usize), Error> {
-    let split = split_point(messages);
-    if split == 0 {
+) -> Result<(String, Range<usize>), Error> {
+    let range = compaction_range(messages, protected);
+    if range.is_empty() {
         return Err(Error::Config(
             "nothing to compact: conversation is too short".into(),
         ));
     }
     let ask = Message::user(format!(
         "Summarize this transcript per your instructions:\n\n{}",
-        transcript(&messages[..split])
+        transcript(&messages[range.clone()])
     ));
     let request = Request {
         model,
@@ -130,11 +155,15 @@ pub(crate) fn summarize(
         return Err(Error::Protocol("summarizer returned empty text".into()));
     }
     let summary = out.text.trim().to_string();
-    Ok((summary, split))
+    Ok((summary, range))
 }
 
 pub(crate) fn apply_summary(messages: &mut Vec<Message>, summary: &str, split: usize) {
-    drop(messages.splice(..split, std::iter::once(summary_message(summary))));
+    apply_summary_range(messages, summary, 0..split);
+}
+
+pub(crate) fn apply_summary_range(messages: &mut Vec<Message>, summary: &str, range: Range<usize>) {
+    drop(messages.splice(range, std::iter::once(summary_message(summary))));
 }
 
 #[cfg(test)]
@@ -200,6 +229,35 @@ mod tests {
         assert!(messages[0].content.contains("earlier work"));
         assert_eq!(messages[1].content, "message 2");
         assert_eq!(messages[10].content, "message 11");
+    }
+
+    #[test]
+    fn compaction_preserves_a_protected_user_prompt() {
+        let messages = (0..24)
+            .map(|index| Message::user(format!("message {index}")))
+            .collect::<Vec<_>>();
+
+        let range = compaction_range(&messages, Some(3));
+
+        assert_eq!(range, 4..14);
+        assert!(!range.contains(&3));
+    }
+
+    #[test]
+    fn applying_a_middle_summary_keeps_the_undo_anchor() {
+        let mut messages = (0..24)
+            .map(|index| Message::user(format!("message {index}")))
+            .collect::<Vec<_>>();
+
+        apply_summary_range(&mut messages, "goal progress", 4..14);
+
+        assert_eq!(messages[3].content, "message 3");
+        assert!(messages[4].content.contains("goal progress"));
+        assert_eq!(messages[5].content, "message 14");
+        assert_eq!(
+            messages.last().map(|message| message.content.as_str()),
+            Some("message 23")
+        );
     }
 
     #[test]

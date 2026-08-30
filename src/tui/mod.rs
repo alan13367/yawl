@@ -44,8 +44,9 @@ use crate::agent::Agent;
 use crate::error::Error;
 
 use self::commands::{
-    HELP, activate_picker_action, copy_all_messages, copy_last_reply, is_new_session_command,
-    notice_undo, open_resume_picker, resume, settings, show_skills, unqueue,
+    GoalAction, HELP, activate_picker_action, copy_all_messages, copy_last_reply, goal,
+    is_new_session_command, notice_undo, open_resume_picker, resume, settings, show_skills,
+    unqueue,
 };
 use self::completion::handle_completion_key;
 use self::events::{Event, EventReader, Key};
@@ -243,20 +244,21 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                                 // The completion menu consumed navigation or Tab.
                             }
                             Key::Tab => navigation::focus_transcript(&mut state),
-                            _ => {
-                                if let EditAction::Submit(input) = editor.handle_key(key)
-                                    && handle_submission(
+                            _ => match editor.handle_key(key) {
+                                EditAction::Submit(input) | EditAction::Steer(input) => {
+                                    if handle_submission(
                                         agent,
                                         input,
                                         &mut state,
                                         &mut editor,
                                         &mut terminal,
                                         &mut events,
-                                    )?
-                                {
-                                    return Ok(());
+                                    )? {
+                                        return Ok(());
+                                    }
                                 }
-                            }
+                                EditAction::None => {}
+                            },
                         }
                     }
                 }
@@ -320,17 +322,18 @@ fn handle_submission<R: Read>(
         let skills = crate::skills::scan(agent.config());
         if let Some(skill) = skills.iter().find(|skill| skill.name == name) {
             let expanded = crate::skills::expand(skill, &editor.expand_submission(arguments));
-            run_agent_submission(
+            let agent_input = match input.turn_input(expanded) {
+                Ok(input) => input,
+                Err(error) => {
+                    state.notice(format!("Could not prepare images: {error}."));
+                    editor.restore_submission(input);
+                    return Ok(false);
+                }
+            };
+            run_agent_turn(
                 agent,
-                displayed_submission(editor, &input),
-                match input.turn_input(expanded) {
-                    Ok(input) => input,
-                    Err(error) => {
-                        state.notice(format!("Could not prepare images: {error}."));
-                        editor.restore_submission(input);
-                        return Ok(false);
-                    }
-                },
+                Some(displayed_submission(editor, &input)),
+                TurnDispatch::Normal(Some(agent_input)),
                 state,
                 editor,
                 terminal,
@@ -378,9 +381,11 @@ fn handle_submission<R: Read>(
             name if is_new_session_command(name) => match agent.reset() {
                 Ok(()) => {
                     let queued_inputs = std::mem::take(&mut state.queued_inputs);
+                    let pending_steers = std::mem::take(&mut state.pending_steers);
                     let pending_actions = std::mem::take(&mut state.pending_actions);
                     *state = ViewState::from_agent(agent);
                     state.queued_inputs = queued_inputs;
+                    state.pending_steers = pending_steers;
                     state.pending_actions = pending_actions;
                 }
                 Err(error) => state.notice(format!("Could not start a session: {error}")),
@@ -414,11 +419,40 @@ fn handle_submission<R: Read>(
             "resume" if argument.is_empty() => open_resume_picker(agent, state),
             "resume" => resume(agent, argument, state),
             "unqueue" => unqueue(argument, state),
+            "goal" => {
+                let (agent_argument, displayed) = prepare_goal_submission(editor, argument);
+                match goal_command(agent, &agent_argument, displayed, state) {
+                    GoalDispatch::Idle => {}
+                    GoalDispatch::Start(displayed) => {
+                        run_agent_turn(
+                            agent,
+                            Some(displayed),
+                            TurnDispatch::Goal,
+                            state,
+                            editor,
+                            terminal,
+                            events,
+                        )?;
+                    }
+                    GoalDispatch::Resume => {
+                        run_agent_turn(
+                            agent,
+                            None,
+                            TurnDispatch::Goal,
+                            state,
+                            editor,
+                            terminal,
+                            events,
+                        )?;
+                    }
+                }
+            }
             "undo" => match agent.undo_last_turn() {
                 Ok(report) => {
                     state.transcript = Transcript::from_messages(agent.messages());
                     state.render_cache.invalidate();
                     state.context_tokens = agent.context_tokens();
+                    state.active_goal = agent.active_goal().map(str::to_string);
                     notice_undo(state, report);
                 }
                 Err(error) => state.notice(format!("Could not undo: {error}")),
@@ -441,10 +475,10 @@ fn handle_submission<R: Read>(
             return Ok(false);
         }
     };
-    run_agent_submission(
+    run_agent_turn(
         agent,
-        displayed_input,
-        agent_input,
+        Some(displayed_input),
+        TurnDispatch::Normal(Some(agent_input)),
         state,
         editor,
         terminal,
@@ -453,21 +487,69 @@ fn handle_submission<R: Read>(
     Ok(false)
 }
 
-fn run_agent_submission<R: Read>(
+enum GoalDispatch {
+    Idle,
+    Start(String),
+    Resume,
+}
+
+enum TurnDispatch {
+    Normal(Option<crate::provider::TurnInput>),
+    Goal,
+}
+
+fn prepare_goal_submission(editor: &Editor, argument: &str) -> (String, String) {
+    (
+        editor.expand_submission(argument),
+        editor.expand_pastes(argument),
+    )
+}
+
+fn goal_command(
     agent: &mut Agent,
-    displayed_input: String,
-    agent_input: crate::provider::TurnInput,
+    argument: &str,
+    displayed: String,
+    state: &mut ViewState,
+) -> GoalDispatch {
+    match goal(agent, argument, state) {
+        GoalAction::None => GoalDispatch::Idle,
+        GoalAction::Start => GoalDispatch::Start(displayed),
+        GoalAction::Resume => GoalDispatch::Resume,
+    }
+}
+
+fn run_agent_turn<R: Read>(
+    agent: &mut Agent,
+    displayed_input: Option<String>,
+    turn: TurnDispatch,
     state: &mut ViewState,
     editor: &mut Editor,
     terminal: &mut Terminal,
     events: &mut EventReader<R>,
 ) -> Result<(), Error> {
-    state.transcript.push_user(displayed_input);
+    let goal_mode = matches!(&turn, TurnDispatch::Goal);
+    if let Some(displayed_input) = displayed_input {
+        state.transcript.push_user(displayed_input);
+    }
     state.activity = "sending".into();
     state.turn_started = Some(std::time::Instant::now());
+    state.active_goal = agent.active_goal().map(str::to_string);
+    state.goal_running = goal_mode;
     state.scroll_offset = 0;
     terminal.draw(state, editor)?;
-    match turn_interactive(agent, agent_input, state, editor, terminal, events) {
+    let agent_input = match turn {
+        TurnDispatch::Normal(input) => input,
+        TurnDispatch::Goal => None,
+    };
+    match turn_interactive(
+        agent,
+        agent_input,
+        goal_mode,
+        state,
+        editor,
+        terminal,
+        events,
+    ) {
         Ok(true) => {}
         Ok(false) | Err(Error::Interrupted) => state.notice("Turn interrupted."),
         Err(error) => state.notice(format!("Request failed: {error}")),
@@ -475,5 +557,7 @@ fn run_agent_submission<R: Read>(
     crate::set_interrupted(false);
     state.activity.clear();
     state.turn_started = None;
+    state.active_goal = agent.active_goal().map(str::to_string);
+    state.goal_running = false;
     Ok(())
 }

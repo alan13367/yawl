@@ -3,7 +3,7 @@
 use std::io::Read;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, SteerInbox};
 use crate::cancellation::CancellationToken;
 use crate::config::{Config, ConfigChange};
 use crate::error::Error;
@@ -28,7 +28,8 @@ use super::terminal::Terminal;
 
 pub(super) fn turn_interactive<R: Read>(
     agent: &mut Agent,
-    input: crate::provider::TurnInput,
+    input: Option<crate::provider::TurnInput>,
+    goal_mode: bool,
     state: &mut ViewState,
     editor: &mut Editor,
     terminal: &mut Terminal,
@@ -37,6 +38,7 @@ pub(super) fn turn_interactive<R: Read>(
     let mut active_pickers = ActivePickers::from_agent(agent);
     let mut active_config = agent.config().clone();
     let active_cancellation = agent.cancellation_token();
+    let steers = agent.steer_inbox();
     let background = agent.background_processes();
     agent.clear_cancellation();
     let active_agent = &mut *agent;
@@ -46,10 +48,15 @@ pub(super) fn turn_interactive<R: Read>(
         let (thread_tx, thread_rx) = mpsc::channel();
         scope.spawn(move || {
             let _ = thread_tx.send(native_thread_id());
-            let result =
-                active_agent.run_turn_input_preserving_cancellation(Some(input), &mut |event| {
+            let result = if goal_mode {
+                active_agent.run_goal_preserving_cancellation(&mut |event| {
                     let _ = updates_tx.send(Update::from_event(event));
-                });
+                })
+            } else {
+                active_agent.run_turn_input_preserving_cancellation(input, &mut |event| {
+                    let _ = updates_tx.send(Update::from_event(event));
+                })
+            };
             let _ = done_tx.send(result);
         });
         let worker_thread = thread_rx
@@ -61,6 +68,7 @@ pub(super) fn turn_interactive<R: Read>(
                 done: done_rx,
                 thread: worker_thread,
                 cancellation: active_cancellation,
+                steers,
                 background,
             },
             state,
@@ -71,6 +79,8 @@ pub(super) fn turn_interactive<R: Read>(
             &mut active_config,
         )
     });
+    recover_unaccepted_steers(agent, state);
+    state.active_goal = agent.active_goal().map(str::to_string);
     agent.sync_display_config(&active_config);
     result
 }
@@ -85,6 +95,7 @@ pub(super) fn compact_interactive<R: Read>(
     let mut active_pickers = ActivePickers::from_agent(agent);
     let mut active_config = agent.config().clone();
     let active_cancellation = agent.cancellation_token();
+    let steers = agent.steer_inbox();
     let background = agent.background_processes();
     agent.clear_cancellation();
     let active_agent = &mut *agent;
@@ -108,6 +119,7 @@ pub(super) fn compact_interactive<R: Read>(
                 done: done_rx,
                 thread: worker_thread,
                 cancellation: active_cancellation,
+                steers,
                 background,
             },
             state,
@@ -118,6 +130,7 @@ pub(super) fn compact_interactive<R: Read>(
             &mut active_config,
         )
     });
+    recover_unaccepted_steers(agent, state);
     agent.sync_display_config(&active_config);
     result
 }
@@ -132,6 +145,7 @@ pub(super) fn deferred_subagents_interactive<R: Read>(
     let mut active_pickers = ActivePickers::from_agent(agent);
     let mut active_config = agent.config().clone();
     let active_cancellation = agent.cancellation_token();
+    let steers = agent.steer_inbox();
     let background = agent.background_processes();
     agent.clear_cancellation();
     let active_agent = &mut *agent;
@@ -155,6 +169,7 @@ pub(super) fn deferred_subagents_interactive<R: Read>(
                 done: done_rx,
                 thread: worker_thread,
                 cancellation: active_cancellation,
+                steers,
                 background,
             },
             state,
@@ -165,6 +180,7 @@ pub(super) fn deferred_subagents_interactive<R: Read>(
             &mut active_config,
         )
     });
+    recover_unaccepted_steers(agent, state);
     agent.sync_display_config(&active_config);
     result
 }
@@ -174,6 +190,7 @@ pub(super) struct WorkerChannels<T> {
     done: Receiver<Result<T, Error>>,
     thread: usize,
     cancellation: CancellationToken,
+    steers: SteerInbox,
     background: crate::background::BackgroundProcessManager,
 }
 
@@ -315,8 +332,29 @@ pub(super) fn pump_events<R: Read, T>(
                                 // Keep accepting and completing input while the agent runs.
                             }
                             Key::Tab => super::navigation::focus_transcript(state),
-                            _ => {
-                                if let EditAction::Submit(input) = editor.handle_key(key) {
+                            _ => match editor.handle_key(key) {
+                                EditAction::Steer(input) => {
+                                    handle_steering_while_busy(
+                                        input,
+                                        state,
+                                        editor,
+                                        &worker.steers,
+                                        active_config,
+                                    )?;
+                                }
+                                EditAction::Submit(input) => {
+                                    if active_config.enter_steers
+                                        && !input.text.trim().starts_with('/')
+                                    {
+                                        handle_steering_while_busy(
+                                            input,
+                                            state,
+                                            editor,
+                                            &worker.steers,
+                                            active_config,
+                                        )?;
+                                        continue;
+                                    }
                                     if input.has_images() && busy_command(&input.text).is_some() {
                                         state.notice("Images cannot accompany commands while a turn is running.");
                                         editor.restore_submission(input);
@@ -334,7 +372,8 @@ pub(super) fn pump_events<R: Read, T>(
                                         terminal,
                                     )?;
                                 }
-                            }
+                                EditAction::None => {}
+                            },
                         }
                     }
                 }
@@ -375,6 +414,60 @@ pub(super) fn cancel_worker(
     state.activity = "canceling turn".into();
 }
 
+fn recover_unaccepted_steers(agent: &Agent, state: &mut ViewState) {
+    let leftover = agent.take_unaccepted_steers();
+    let mut recovered = std::mem::take(&mut state.pending_steers);
+    if recovered.len() < leftover.len() {
+        for input in leftover.into_iter().skip(recovered.len()) {
+            recovered.push_back(input.text.into());
+        }
+    }
+    state.queued_inputs.extend(recovered);
+}
+
+fn handle_steering_while_busy(
+    input: Submission,
+    state: &mut ViewState,
+    editor: &Editor,
+    steers: &SteerInbox,
+    active_config: &Config,
+) -> Result<(), Error> {
+    if input.text.trim().starts_with('/') {
+        state.notice(
+            "Commands cannot be sent as steering. They stay queued or run as usual with Enter.",
+        );
+        let displayed = super::displayed_submission(editor, &input);
+        let mut input = input;
+        input.set_text(displayed);
+        state.queued_inputs.push_back(input);
+        state.scroll_offset = 0;
+        return Ok(());
+    }
+    let displayed = super::displayed_submission(editor, &input);
+    let agent_text = editor.expand_submission(&input.text);
+    let agent_input = match input.turn_input(agent_text) {
+        Ok(input) => input,
+        Err(error) => {
+            state.notice(format!("Could not prepare images: {error}."));
+            return Ok(());
+        }
+    };
+    if !agent_input.images.is_empty() && !crate::model::supports_images(active_config, &state.model)
+    {
+        state.notice(format!(
+            "Model '{}' does not accept image input.",
+            state.model
+        ));
+        return Ok(());
+    }
+    steers.push(agent_input);
+    let mut pending = input;
+    pending.set_text(displayed);
+    state.pending_steers.push_back(pending);
+    state.scroll_offset = 0;
+    Ok(())
+}
+
 pub(super) fn handle_submission_while_busy(
     input: Submission,
     state: &mut ViewState,
@@ -392,6 +485,7 @@ pub(super) fn handle_submission_while_busy(
         Some(BusyCommand::Processes) => super::processes::open_dashboard(state, background.clone()),
         Some(BusyCommand::Copy) => copy_last_reply(terminal, state, &[])?,
         Some(BusyCommand::CopyAll) => copy_all_from_transcript(terminal, state)?,
+        Some(BusyCommand::Goal(argument)) => super::commands::goal_while_busy(&argument, state),
         None => {
             state.queued_inputs.push_back(input);
             state.scroll_offset = 0;
@@ -410,6 +504,7 @@ pub(super) enum BusyCommand {
     Processes,
     Copy,
     CopyAll,
+    Goal(String),
 }
 
 pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
@@ -426,6 +521,7 @@ pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
         "ps" if argument.is_empty() => Some(BusyCommand::Processes),
         "copy" if argument.is_empty() => Some(BusyCommand::Copy),
         "copy-all" if argument.is_empty() => Some(BusyCommand::CopyAll),
+        "goal" => Some(BusyCommand::Goal(argument.to_string())),
         _ => None,
     }
 }
@@ -509,6 +605,10 @@ pub(super) fn display_config_change(
         category: SettingsCategory::Interface,
         item,
     };
+    let input = |item| SettingsLocation {
+        category: SettingsCategory::Input,
+        item,
+    };
     match action {
         PickerAction::SetHideReasoning(enabled) => Some((
             ConfigChange::HideReasoning(if *enabled { "on" } else { "off" }.into()),
@@ -531,6 +631,10 @@ pub(super) fn display_config_change(
         PickerAction::SetScrollBarAutoHide(enabled) => Some((
             ConfigChange::ScrollBarAutoHide(if *enabled { "on" } else { "off" }.into()),
             interface(SettingsItem::ScrollBarAutoHide),
+        )),
+        PickerAction::SetEnterSteers(enabled) => Some((
+            ConfigChange::EnterSteers(if *enabled { "on" } else { "off" }.into()),
+            input(SettingsItem::EnterSteers),
         )),
         PickerAction::ApplySetting { argument, location } => argument
             .strip_prefix("accent_color ")
@@ -560,6 +664,7 @@ pub(super) fn apply_display_config_while_busy(
             state.hide_reasoning = config.hide_reasoning;
             state.accent_color = config.accent_color;
             state.selection_color = config.effective_selection_color();
+            state.enter_steers = config.enter_steers;
             state.sync_scroll_bar_config(config);
             state.subagents_enabled = config.subagents;
             notice_config_effect(config, outcome.effect, state);

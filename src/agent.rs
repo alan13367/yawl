@@ -16,7 +16,7 @@ use crate::subagent::SubagentManager;
 use crate::tools::Registry;
 
 pub use conversation::UndoReport;
-pub(crate) use conversation::{Conversation, RunLimits};
+pub(crate) use conversation::{Conversation, RunLimits, SteerInbox};
 pub use events::TurnEvent;
 
 /// A persistent user-facing conversation.
@@ -75,6 +75,26 @@ impl Agent {
 
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.conversation.cancellation_token()
+    }
+
+    pub(crate) fn steer_inbox(&self) -> SteerInbox {
+        self.conversation.steer_inbox()
+    }
+
+    pub(crate) fn active_goal(&self) -> Option<&str> {
+        self.conversation.active_goal()
+    }
+
+    pub(crate) fn take_unaccepted_steers(&self) -> Vec<TurnInput> {
+        self.conversation.take_unaccepted_steers()
+    }
+
+    pub(crate) fn start_goal(&mut self, input: TurnInput) -> Result<Option<String>, Error> {
+        self.conversation.start_goal(input)
+    }
+
+    pub(crate) fn cancel_goal(&mut self) -> Result<bool, Error> {
+        self.conversation.cancel_goal()
     }
 
     pub(crate) fn clear_cancellation(&self) {
@@ -166,6 +186,13 @@ impl Agent {
     ) -> Result<bool, Error> {
         self.conversation
             .run_turn_input_preserving_cancellation(user_input, sink)
+    }
+
+    pub(crate) fn run_goal_preserving_cancellation(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.conversation.run_goal_preserving_cancellation(sink)
     }
 
     pub(crate) fn has_deferred_subagent_results(&self) -> bool {

@@ -10,6 +10,8 @@ pub enum Key {
     Enter,
     /// Shift+Enter, Alt+Enter, or Ctrl+J.
     Newline,
+    /// Ctrl+Enter when the terminal reports modifiers.
+    Steer,
     Backspace,
     Delete,
     Left,
@@ -282,6 +284,8 @@ fn key_from_encoded(code: u32, modifier: u8) -> Option<Key> {
     if code == 13 {
         return Some(if shift || alt {
             Key::Newline
+        } else if ctrl {
+            Key::Steer
         } else {
             Key::Enter
         });
@@ -353,6 +357,13 @@ mod tests {
     }
 
     #[test]
+    fn decodes_kitty_ctrl_enter_as_steer() -> std::io::Result<()> {
+        let mut reader = EventReader::new(Cursor::new(b"\x1b[13;5u"));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Steer));
+        Ok(())
+    }
+
+    #[test]
     fn decodes_kitty_super_v() -> std::io::Result<()> {
         let mut reader = EventReader::new(&b"\x1b[118;9u"[..]);
         assert_eq!(reader.read_event()?, Event::Key(Key::Super('v')));
@@ -379,6 +390,13 @@ mod tests {
         assert_eq!(reader.read_event()?, Event::Key(Key::Newline));
         assert_eq!(reader.read_event()?, Event::Key(Key::Newline));
         assert_eq!(reader.read_event()?, Event::Key(Key::Enter));
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_xterm_modify_other_keys_ctrl_enter_as_steer() -> std::io::Result<()> {
+        let mut reader = EventReader::new(Cursor::new(b"\x1b[27;5;13~"));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Steer));
         Ok(())
     }
 

@@ -34,20 +34,46 @@ impl Journal {
         }
     }
 
-    pub(super) fn append_compaction(
+    pub(super) fn append_compaction_range(
         &mut self,
         summary: &str,
+        start: usize,
         replaced: usize,
     ) -> Result<(), Error> {
         match self.persistent.as_mut() {
-            Some(session) => session.append_compaction(summary, replaced),
+            Some(session) => session.append_compaction_range(summary, start, replaced),
             None => Ok(()),
         }
     }
 
-    pub(super) fn append_undo(&mut self, dropped: usize) -> Result<(), Error> {
+    pub(super) fn append_undo_event(
+        &mut self,
+        dropped: usize,
+        clear_goal: bool,
+    ) -> Result<(), Error> {
         match self.persistent.as_mut() {
-            Some(session) => session.append_undo(dropped),
+            Some(session) => session.append_undo_event(dropped, clear_goal),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn append_goal_start(&mut self, goal: &str, message: &Message) -> Result<(), Error> {
+        match self.persistent.as_mut() {
+            Some(session) => session.append_goal_start(goal, message),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn append_goal_complete(&mut self, message: &Message) -> Result<(), Error> {
+        match self.persistent.as_mut() {
+            Some(session) => session.append_goal_complete(message),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn append_goal_cancel(&mut self) -> Result<(), Error> {
+        match self.persistent.as_mut() {
+            Some(session) => session.append_goal_cancel(),
             None => Ok(()),
         }
     }

@@ -30,9 +30,9 @@ fn display_settings_apply_during_an_active_turn() {
         editing: None,
         parent: None,
     };
-    let interface_count = 5;
+    let settings_category_count = SettingsCategory::ALL.len();
     let settings = Picker {
-        items: (0..interface_count)
+        items: (0..settings_category_count)
             .map(|index| PickerItem {
                 label: format!("Setting {index}"),
                 description: String::new(),
@@ -73,6 +73,10 @@ fn display_settings_apply_during_an_active_turn() {
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -104,16 +108,15 @@ fn display_settings_apply_during_an_active_turn() {
         project_dir: root.join("project/.yawl"),
         ..Config::test_default()
     };
-    active_pickers.settings_categories = vec![(
-        SettingsCategory::Interface,
-        super::picker::settings_category_picker_from(
-            &config,
-            "test",
-            100,
-            SettingsCategory::Interface,
-            0,
-        ),
-    )];
+    active_pickers.settings_categories = [SettingsCategory::Interface, SettingsCategory::Input]
+        .into_iter()
+        .map(|category| {
+            (
+                category,
+                super::picker::settings_category_picker_from(&config, "test", 100, category, 0),
+            )
+        })
+        .collect();
 
     activate_picker_action_while_busy(
         &mut state,
@@ -163,6 +166,26 @@ fn display_settings_apply_during_an_active_turn() {
     assert!(matches!(
         active_pickers.accent_color.items[active_pickers.accent_color.selected].action,
         PickerAction::SetAccentColor(color) if color == blue
+    ));
+
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::SetEnterSteers(true),
+        &mut active_pickers,
+        &mut config,
+    );
+
+    assert!(config.enter_steers);
+    assert!(state.enter_steers);
+    let settings = state
+        .picker
+        .as_ref()
+        .expect("settings picker should reopen");
+    let enter_steers = settings_item_index(SettingsCategory::Input, SettingsItem::EnterSteers);
+    assert_eq!(settings.selected, enter_steers);
+    assert!(matches!(
+        settings.items[enter_steers].action,
+        PickerAction::SetEnterSteers(false)
     ));
 
     activate_picker_action_while_busy(

@@ -226,6 +226,10 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -301,6 +305,10 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -374,7 +382,7 @@ fn settings_picker_categories_and_items_keep_their_action_contracts() {
     let agent = Agent::new(config, "test".into(), session, Vec::new());
 
     let picker = settings_picker(&agent);
-    assert_eq!(picker.items.len(), 8);
+    assert_eq!(picker.items.len(), 9);
     assert_eq!(
         picker.items[SettingsCategory::Providers.index()].label,
         "Providers"
@@ -404,6 +412,14 @@ fn settings_picker_categories_and_items_keep_their_action_contracts() {
     assert!(matches!(
         interface.items[auto_hide].action,
         PickerAction::SetScrollBarAutoHide(false)
+    ));
+    let input = settings_category_picker(&agent, SettingsCategory::Input, 0);
+    let enter_steers =
+        super::picker::settings_item_index(SettingsCategory::Input, SettingsItem::EnterSteers);
+    assert_eq!(input.items[enter_steers].label, "Enter while busy");
+    assert!(matches!(
+        input.items[enter_steers].action,
+        PickerAction::SetEnterSteers(true)
     ));
 
     let context = settings_category_picker(&agent, SettingsCategory::Context, 0);

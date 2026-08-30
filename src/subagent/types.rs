@@ -76,6 +76,7 @@ pub(crate) enum SubagentTranscriptItem {
         text: String,
         private: bool,
     },
+    Steer(String),
     Assistant(String),
     Reasoning {
         kind: ReasoningKind,
@@ -128,6 +129,7 @@ pub(crate) struct SubagentSnapshot {
     pub(crate) live_reasoning_kind: Option<ReasoningKind>,
     pub(crate) current_tool: Option<LiveTool>,
     pub(crate) queued_messages: Vec<QueuedSubagentMessage>,
+    pub(crate) pending_steers: Vec<String>,
     pub(crate) latest_final_result: String,
     pub(crate) error: String,
     pub(crate) completed_turns: u64,
@@ -166,6 +168,7 @@ impl SubagentSnapshot {
             live_reasoning_kind: None,
             current_tool: None,
             queued_messages: Vec::new(),
+            pending_steers: Vec::new(),
             latest_final_result: String::new(),
             error: String::new(),
             completed_turns: 0,
@@ -234,6 +237,15 @@ impl SubagentSnapshot {
                     self.push_transcript(SubagentTranscriptItem::Assistant(text));
                 }
                 self.current_activity.clear();
+            }
+            TurnEvent::AssistantReplace(text) => {
+                self.live_assistant = bounded(text, MAX_LIVE_TEXT_BYTES);
+            }
+            TurnEvent::SteerAccepted { text } => {
+                if !self.pending_steers.is_empty() {
+                    self.pending_steers.remove(0);
+                }
+                self.push_transcript(SubagentTranscriptItem::Steer(text.to_string()));
             }
             TurnEvent::ToolPreparing { name } => {
                 self.current_activity = match name {
@@ -317,6 +329,7 @@ impl SubagentSnapshot {
     pub(super) fn push_transcript(&mut self, mut item: SubagentTranscriptItem) {
         match &mut item {
             SubagentTranscriptItem::User { text, .. }
+            | SubagentTranscriptItem::Steer(text)
             | SubagentTranscriptItem::Assistant(text)
             | SubagentTranscriptItem::Reasoning { text, .. } => {
                 *text = bounded(text, MAX_TRANSCRIPT_TEXT_BYTES);

@@ -31,6 +31,7 @@ Commands
   /skill:NAME [ARGS]   run a discovered skill
   /resume [ID|NUMBER]  open the session picker or resume directly
   /unqueue [N|all]     cancel queued messages
+  /goal [TEXT]         start, resume, cancel, or show the persistent goal
   /help                show this help
   /quit                leave Yawl
 
@@ -39,8 +40,10 @@ Input
     Type / for commands; Up/Down select, Tab completes, and Enter runs the selected
     command or an exact name such as /copy.
   Model, settings, and provider setup remain available during an active response.
-  Messages submitted during a response appear below it as queued. /unqueue opens
-    an editor: K/J reorder, e edits, d deletes, and Enter stops the turn to send.
+  Messages submitted during a response appear below it as queued. Ctrl+G steers
+    the running turn at the next safe boundary; Ctrl+Enter also works in terminals
+    that report modified Enter. /unqueue opens an editor: K/J
+    reorder, e edits, d deletes, and Enter stops the turn to send.
   Outside the menu, Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
   Ctrl+V pastes a clipboard image as [Image #N] when the model accepts images.
   Tab focuses transcript blocks. Up/Down move, Left/Right fold, Enter opens,
@@ -52,6 +55,86 @@ Input
 
 pub(super) fn is_new_session_command(name: &str) -> bool {
     matches!(name, "new" | "clear")
+}
+
+pub(super) enum GoalAction {
+    None,
+    Start,
+    Resume,
+}
+
+pub(super) fn goal(agent: &mut Agent, argument: &str, state: &mut ViewState) -> GoalAction {
+    match argument {
+        "" => {
+            notice_goal_status(agent, state, false);
+            GoalAction::None
+        }
+        "cancel" => {
+            match agent.cancel_goal() {
+                Ok(true) => {
+                    state.active_goal = None;
+                    state.notice("Goal canceled.");
+                }
+                Ok(false) => state.notice("No active goal."),
+                Err(error) => state.notice(format!("Could not cancel the goal: {error}")),
+            }
+            GoalAction::None
+        }
+        "resume" => {
+            if agent.active_goal().is_none() {
+                state.notice("No paused goal to resume.");
+                return GoalAction::None;
+            }
+            GoalAction::Resume
+        }
+        goal => match agent.start_goal(goal.to_string().into()) {
+            Ok(warning) => {
+                state.active_goal = agent.active_goal().map(str::to_string);
+                if let Some(warning) = warning {
+                    state.notice(warning);
+                }
+                GoalAction::Start
+            }
+            Err(error) => {
+                state.notice(format!("Could not start the goal: {error}"));
+                GoalAction::None
+            }
+        },
+    }
+}
+
+pub(super) fn goal_while_busy(argument: &str, state: &mut ViewState) {
+    match argument {
+        "" => {
+            if let Some(goal) = state.active_goal.as_deref() {
+                if state.goal_running {
+                    state.notice(format!("Working on goal:\n{goal}"));
+                } else {
+                    state.notice(format!(
+                        "Paused goal:\n{goal}\n\nWait for the current turn to settle, then run /goal resume."
+                    ));
+                }
+            } else {
+                state.notice("No active goal.");
+            }
+        }
+        "cancel" => state.notice("Wait for the current turn to settle, then run /goal cancel."),
+        "resume" if state.goal_running => state.notice("A goal is already running."),
+        "resume" => state.notice("Wait for the current turn to settle, then run /goal resume."),
+        _ => state.notice("Wait for the current turn to settle before replacing the goal."),
+    }
+}
+
+fn notice_goal_status(agent: &Agent, state: &mut ViewState, running: bool) {
+    match agent.active_goal() {
+        Some(goal) if running || state.turn_started.is_some() => {
+            state.notice(format!("Working on goal:\n{goal}"));
+        }
+        Some(goal) => state.notice(format!(
+            "Paused goal:\n{goal}\n\n/goal resume continues it. /goal cancel clears it."
+        )),
+        None => state.notice("No active goal. Start one with /goal TEXT."),
+    }
 }
 
 pub(super) fn show_skills(agent: &Agent, state: &mut ViewState) {
@@ -359,6 +442,22 @@ pub(super) fn activate_picker_action(
                 );
             }
         }
+        PickerAction::SetEnterSteers(enabled) => {
+            if settings(
+                agent,
+                &format!("enter_steers {}", if enabled { "on" } else { "off" }),
+                state,
+            ) {
+                open_settings_location(
+                    agent,
+                    state,
+                    SettingsLocation {
+                        category: SettingsCategory::Input,
+                        item: SettingsItem::EnterSteers,
+                    },
+                );
+            }
+        }
         PickerAction::SetAccentColor(color) => {
             if settings(
                 agent,
@@ -565,6 +664,8 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
             one_value(&mut parts, "usage: /settings scroll_bar_auto_hide on|off")
                 .map(|value| ConfigChange::ScrollBarAutoHide(value.to_string()))
         }
+        "enter_steers" => one_value(&mut parts, "usage: /settings enter_steers on|off")
+            .map(|value| ConfigChange::EnterSteers(value.to_string())),
         "auto_compact" => one_value(&mut parts, "usage: /settings auto_compact on|off")
             .map(|value| ConfigChange::AutoCompact(value.to_string())),
         "compact_threshold" => one_value(
@@ -678,6 +779,7 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
             state.hide_reasoning = agent.config().hide_reasoning;
             state.accent_color = agent.config().accent_color;
             state.selection_color = agent.config().effective_selection_color();
+            state.enter_steers = agent.config().enter_steers;
             state.subagents_enabled = agent.config().subagents;
             state.sync_scroll_bar_config(agent.config());
             state.context_window = agent.context_window();
@@ -717,7 +819,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- web_browsing: `{}`\n- web_search_provider: `{}`\n- web_fetch_max_chars: `{}`\n- brave_api_key: `{}`\n- firecrawl_api_key: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- enter_steers: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- web_browsing: `{}`\n- web_search_provider: `{}`\n- web_fetch_max_chars: `{}`\n- brave_api_key: `{}`\n- firecrawl_api_key: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -734,6 +836,11 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
             "off"
         },
         if agent.config().scroll_bar_auto_hide {
+            "on"
+        } else {
+            "off"
+        },
+        if agent.config().enter_steers {
             "on"
         } else {
             "off"
@@ -804,7 +911,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings enter_steers on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);
@@ -887,6 +994,7 @@ pub(super) fn format_copy_all(messages: &[Message], streaming: Option<&str>) -> 
     let mut parts = Vec::new();
     for message in messages {
         match message.role {
+            Role::User if message.is_hidden_control() => {}
             Role::User => parts.push(CopyPart::User(&message.content)),
             Role::Assistant => parts.push(CopyPart::Assistant(&message.content)),
             Role::Tool => {}
@@ -904,7 +1012,9 @@ pub(super) fn format_copy_all_from_transcript(
     let mut parts = Vec::new();
     for entry in transcript.entries() {
         match entry {
-            super::transcript::Entry::User(content) => parts.push(CopyPart::User(content)),
+            super::transcript::Entry::User(content) | super::transcript::Entry::Steer(content) => {
+                parts.push(CopyPart::User(content))
+            }
             super::transcript::Entry::Assistant(content) => {
                 parts.push(CopyPart::Assistant(content));
             }

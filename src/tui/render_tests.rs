@@ -69,6 +69,10 @@ fn frame_keeps_input_and_status_pinned() {
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -378,6 +382,10 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         activity: "sending".into(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -434,6 +442,10 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         activity: "sending".into(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -537,6 +549,10 @@ fn loading_state_ignores_status_activity() {
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -598,6 +614,10 @@ fn overflow_state() -> ViewState {
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -894,6 +914,10 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -1071,6 +1095,10 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: (1..=12)
             .map(|n| Completion {
@@ -1219,6 +1247,10 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -1289,6 +1321,23 @@ fn status_bar_shows_a_live_turn_timer_next_to_the_activity() {
     let (frame, _) = build_frame(&mut state, &editor, 80, 24);
     let plain = markdown::strip_ansi(&frame.join("\n"));
     assert!(!plain.contains("1m 35s"));
+}
+
+#[test]
+fn status_bar_previews_running_and_paused_goals() {
+    let mut state = empty_session_state();
+    state.active_goal = Some("ship the persistent goal implementation".into());
+    state.goal_running = true;
+    let editor = Editor::default();
+
+    let (frame, _) = build_frame(&mut state, &editor, 100, 24);
+    let status = markdown::strip_ansi(frame.last().expect("status bar"));
+    assert!(status.contains("goal: ship the persistent goal"));
+
+    state.goal_running = false;
+    let (frame, _) = build_frame(&mut state, &editor, 100, 24);
+    let status = markdown::strip_ansi(frame.last().expect("status bar"));
+    assert!(status.contains("goal paused: ship the persistent goal"));
 }
 
 #[test]
@@ -1368,6 +1417,10 @@ fn empty_session_state() -> ViewState {
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,

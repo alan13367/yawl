@@ -66,6 +66,7 @@ struct Entry {
     wait_interest: usize,
     pending_delivery: Vec<PendingDelivery>,
     suppress_delivery: bool,
+    steers: crate::agent::SteerInbox,
 }
 
 #[derive(Clone)]
@@ -186,6 +187,7 @@ impl SubagentManager {
                 }
             }
             let cancellation = conversation.cancellation_token();
+            let steers = conversation.steer_inbox();
             let work = WorkItem {
                 message: prompt.clone(),
                 origin: RunOrigin::Model,
@@ -211,11 +213,46 @@ impl SubagentManager {
                 wait_interest: 0,
                 pending_delivery: Vec::new(),
                 suppress_delivery: false,
+                steers,
             });
             (id, conversation, work)
         };
         self.start_worker(id.clone(), conversation, work)?;
         Ok(id)
+    }
+
+    pub(crate) fn steer(&self, id: &str, message: &str) -> Result<String, String> {
+        let message = validate_message(message, "message")?;
+        let (enqueue, send_instead) = {
+            let mut state = self.lock();
+            let index = find_index(&state, id)?;
+            let is_active = state.entries[index].snapshot.status.is_active();
+            if is_active {
+                let entry = &mut state.entries[index];
+                if entry.snapshot.status == SubagentStatus::Canceling {
+                    return Err(format!("{id} is canceling"));
+                }
+                if entry.work.len() + entry.snapshot.pending_steers.len() >= MAX_QUEUE_MESSAGES {
+                    return Err(format!(
+                        "{id} already has {MAX_QUEUE_MESSAGES} queued or steering messages"
+                    ));
+                }
+                entry.steers.push(crate::provider::TurnInput {
+                    text: message.clone(),
+                    images: Vec::new(),
+                });
+                entry.snapshot.pending_steers.push(message.clone());
+                self.shared.changed.notify_all();
+                (true, false)
+            } else {
+                (false, true)
+            }
+        };
+        if send_instead {
+            return self.send(id, &message, RunOrigin::PrivateUser);
+        }
+        let _ = enqueue;
+        Ok(format!("steering {id}"))
     }
 
     pub(crate) fn send(
@@ -234,9 +271,9 @@ impl SubagentManager {
                 if entry.snapshot.status == SubagentStatus::Canceling {
                     return Err(format!("{id} is canceling"));
                 }
-                if entry.work.len() >= MAX_QUEUE_MESSAGES {
+                if entry.work.len() + entry.snapshot.pending_steers.len() >= MAX_QUEUE_MESSAGES {
                     return Err(format!(
-                        "{id} already has {MAX_QUEUE_MESSAGES} queued messages"
+                        "{id} already has {MAX_QUEUE_MESSAGES} queued or steering messages"
                     ));
                 }
                 let run_number = entry.next_run_number;
@@ -769,6 +806,7 @@ impl SubagentManager {
                 // model actually errored, so the label rides the error text.
                 Err(error) => (RunOutcome::Failed, Some(format!("[{run_model}] {error}"))),
             };
+            let leftovers = conversation.take_unaccepted_steers();
             let final_result = conversation.latest_turn_result();
             let mut state = self.lock();
             let Some(entry) = state
@@ -802,6 +840,23 @@ impl SubagentManager {
                         .map_or_else(String::new, |text| bounded(text, MAX_ERROR_BYTES)),
                 });
             }
+            entry.snapshot.pending_steers.clear();
+            for leftover in leftovers {
+                if entry.work.len() >= MAX_QUEUE_MESSAGES {
+                    break;
+                }
+                let run_number = entry.next_run_number;
+                entry.next_run_number = entry.next_run_number.saturating_add(1);
+                entry.work.push_back(WorkItem {
+                    message: leftover.text.clone(),
+                    origin: RunOrigin::PrivateUser,
+                    run_number,
+                });
+                entry.snapshot.queued_messages.push(QueuedSubagentMessage {
+                    text: leftover.text,
+                    origin: RunOrigin::PrivateUser,
+                });
+            }
             let canceling = entry.snapshot.status == SubagentStatus::Canceling;
             let next = entry.work.pop_front();
             if !entry.snapshot.queued_messages.is_empty() {
@@ -827,7 +882,12 @@ impl SubagentManager {
         conversation: Conversation,
         worker_result: std::thread::Result<RunOutcome>,
     ) {
+        let can_restart = worker_result.is_ok();
         let mut state = self.lock();
+        // Steering and queue submission also hold this lock. Draining only
+        // after acquiring it closes the boundary race between a turn ending
+        // and the worker publishing its settled state.
+        let late_steers = conversation.take_unaccepted_steers();
         let Some(index) = state
             .entries
             .iter()
@@ -838,6 +898,7 @@ impl SubagentManager {
         let now = Instant::now();
         let shutting_down = state.shutting_down;
         let mut pending = Vec::new();
+        let mut restart = None;
         {
             let entry = &mut state.entries[index];
             entry.thread_id = None;
@@ -873,6 +934,23 @@ impl SubagentManager {
                     }
                 }
             }
+            entry.snapshot.pending_steers.clear();
+            for steer in late_steers {
+                if entry.work.len() >= MAX_QUEUE_MESSAGES {
+                    break;
+                }
+                let run_number = entry.next_run_number;
+                entry.next_run_number = entry.next_run_number.saturating_add(1);
+                entry.work.push_back(WorkItem {
+                    message: steer.text.clone(),
+                    origin: RunOrigin::PrivateUser,
+                    run_number,
+                });
+                entry.snapshot.queued_messages.push(QueuedSubagentMessage {
+                    text: steer.text,
+                    origin: RunOrigin::PrivateUser,
+                });
+            }
             // Completed runs always defer their full results; a concurrent
             // wait drains them, and otherwise they arrive as background
             // follow-up delivery.
@@ -897,7 +975,27 @@ impl SubagentManager {
             };
             state.deferred.push_back(deferred);
         }
+        if !shutting_down
+            && can_restart
+            && let Some(work) = state.entries[index].work.pop_front()
+        {
+            let entry = &mut state.entries[index];
+            if !entry.snapshot.queued_messages.is_empty() {
+                entry.snapshot.queued_messages.remove(0);
+            }
+            if let Some(conversation) = entry.conversation.take() {
+                entry.snapshot.status = SubagentStatus::Starting;
+                entry.snapshot.settled_at = None;
+                entry.cancellation.clear();
+                state.active = state.active.saturating_add(1);
+                restart = Some((conversation, work));
+            }
+        }
         self.shared.changed.notify_all();
+        drop(state);
+        if let Some((conversation, work)) = restart {
+            let _ = self.start_worker(id, conversation, work);
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -1962,6 +2060,7 @@ mod tests {
                 wait_interest: 0,
                 pending_delivery: Vec::new(),
                 suppress_delivery: false,
+                steers: crate::agent::SteerInbox::default(),
             });
         }
         state.deferred.push_back(DeferredResult {

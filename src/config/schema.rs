@@ -25,6 +25,8 @@ pub(super) struct ConfigFile {
     pub(super) scroll_bar: Option<bool>,
     /// Whether an idle transcript scroll bar hides itself after a pause.
     pub(super) scroll_bar_auto_hide: Option<bool>,
+    /// Whether Enter steers instead of queues during an active TUI turn.
+    pub(super) enter_steers: Option<bool>,
     /// Compatibility with the brief two-color settings format.
     pub(super) status_bar_color: Option<UiColor>,
     /// Compatibility with the brief two-color settings format.

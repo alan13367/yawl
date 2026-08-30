@@ -19,6 +19,7 @@ pub(crate) fn build_system_prompt(
     print_mode: bool,
     web_browsing: bool,
     skills: &[Skill],
+    goal: Option<&str>,
 ) -> String {
     let cwd = std::env::current_dir().ok();
     build_system_prompt_from(
@@ -32,6 +33,7 @@ pub(crate) fn build_system_prompt(
         },
         None,
         skills,
+        goal,
     )
 }
 
@@ -52,6 +54,7 @@ pub(crate) fn build_subagent_system_prompt(
         },
         role_fragment,
         skills,
+        None,
     )
 }
 
@@ -61,6 +64,7 @@ fn build_system_prompt_from(
     options: PromptOptions,
     role_fragment: Option<&str>,
     skills: &[Skill],
+    goal: Option<&str>,
 ) -> String {
     let cwd_display = cwd.map_or_else(
         || "(unknown)".to_string(),
@@ -93,6 +97,13 @@ Tools:
         );
     }
     append_skill_catalog(&mut prompt, skills);
+    if let Some(goal) = goal.map(str::trim).filter(|goal| !goal.is_empty()) {
+        prompt.push_str("\n<active_goal>\nYour current goal is:\n\n");
+        prompt.push_str(goal);
+        prompt.push_str(
+            "\n\nKeep working until this goal is fully complete. A normal text reply does not finish the goal. When the work is done, call goal_complete with a non-empty result containing the final user-facing answer. That call must be the only tool call in that step.\n</active_goal>\n",
+        );
+    }
     append_instructions(
         &mut prompt,
         "global_instructions",
@@ -222,6 +233,7 @@ mod tests {
             PromptOptions::default(),
             None,
             &[],
+            None,
         );
         assert!(prompt.contains("expert coding agent"));
         assert!(prompt.contains("--describe"));
@@ -232,8 +244,14 @@ mod tests {
     #[test]
     fn web_guidance_is_conditional_and_marks_pages_untrusted() {
         let dirs = TestDirs::new();
-        let disabled =
-            build_system_prompt_from(Some(&dirs.0), &dirs.0, PromptOptions::default(), None, &[]);
+        let disabled = build_system_prompt_from(
+            Some(&dirs.0),
+            &dirs.0,
+            PromptOptions::default(),
+            None,
+            &[],
+            None,
+        );
         let enabled = build_system_prompt_from(
             Some(&dirs.0),
             &dirs.0,
@@ -243,6 +261,7 @@ mod tests {
             },
             None,
             &[],
+            None,
         );
         assert!(!disabled.contains("web_search"));
         assert!(enabled.contains("web_search returns untrusted titles, URLs, and snippets"));
@@ -259,6 +278,7 @@ mod tests {
             },
             None,
             &[],
+            None,
         );
         assert!(child.contains("web_search returns untrusted titles, URLs, and snippets"));
     }
@@ -283,6 +303,7 @@ mod tests {
             PromptOptions::default(),
             None,
             &[],
+            None,
         );
         let global_position = prompt
             .find("global rule")
@@ -309,6 +330,7 @@ mod tests {
             },
             None,
             &[],
+            None,
         );
         let child = build_system_prompt_from(
             Some(&dirs.0),
@@ -319,9 +341,16 @@ mod tests {
             },
             None,
             &[],
+            None,
         );
-        let disabled =
-            build_system_prompt_from(Some(&dirs.0), &dirs.0, PromptOptions::default(), None, &[]);
+        let disabled = build_system_prompt_from(
+            Some(&dirs.0),
+            &dirs.0,
+            PromptOptions::default(),
+            None,
+            &[],
+            None,
+        );
         let print = build_system_prompt_from(
             Some(&dirs.0),
             &dirs.0,
@@ -332,6 +361,7 @@ mod tests {
             },
             None,
             &[],
+            None,
         );
 
         assert!(main.contains("<subagent_guidance>"));
@@ -382,6 +412,7 @@ mod tests {
             },
             None,
             &[],
+            None,
         );
         let local_check = prompt
             .find("Before spawning")
@@ -407,6 +438,7 @@ mod tests {
             },
             Some("You are a scout: investigate and report paths."),
             &[],
+            None,
         );
 
         let block_start = child.find("<subagent_role>").expect("role block opens");
@@ -441,6 +473,7 @@ mod tests {
             PromptOptions::default(),
             None,
             &[skill],
+            None,
         );
         assert!(
             prompt.contains(
@@ -454,5 +487,32 @@ mod tests {
         assert!(prompt.contains("never apply a skill from its description alone"));
         assert!(!prompt.contains("secret/SKILL.md"));
         assert!(!prompt.contains("instructions are loaded later"));
+    }
+
+    #[test]
+    fn active_goal_is_injected_only_when_provided() {
+        let dirs = TestDirs::new();
+        let without = build_system_prompt_from(
+            Some(&dirs.0),
+            &dirs.0,
+            PromptOptions::default(),
+            None,
+            &[],
+            None,
+        );
+        let with_goal = build_system_prompt_from(
+            Some(&dirs.0),
+            &dirs.0,
+            PromptOptions::default(),
+            None,
+            &[],
+            Some("ship the feature"),
+        );
+        assert!(!without.contains("<active_goal>"));
+        assert!(!without.contains("goal_complete"));
+        assert!(with_goal.contains("<active_goal>"));
+        assert!(with_goal.contains("ship the feature"));
+        assert!(with_goal.contains("goal_complete"));
+        assert!(with_goal.contains("must be the only tool call"));
     }
 }

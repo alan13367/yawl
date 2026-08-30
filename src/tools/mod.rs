@@ -40,6 +40,7 @@ enum ToolImpl {
     EditFile,
     WebSearch,
     WebFetch,
+    GoalComplete,
     Exec(exec::ExecTool),
     Subagent(SubagentTool),
 }
@@ -250,6 +251,10 @@ impl Registry {
         self.entries.iter().map(|e| e.spec.clone()).collect()
     }
 
+    pub(crate) fn advertise_goal_complete(&mut self) {
+        self.insert(goal_complete_entry());
+    }
+
     pub(crate) fn skills(&self) -> &[Skill] {
         &self.skills
     }
@@ -264,11 +269,13 @@ impl Registry {
     pub fn describe_all(&self) -> Vec<(String, String, String)> {
         self.entries
             .iter()
+            .filter(|entry| !matches!(entry.imp, ToolImpl::GoalComplete))
             .map(|e| {
                 let origin = match &e.imp {
                     ToolImpl::Exec(t) => t.path.display().to_string(),
                     ToolImpl::Subagent(_) => "orchestration".to_string(),
                     ToolImpl::ReadSkill => "skills".to_string(),
+                    ToolImpl::GoalComplete => "internal".to_string(),
                     ToolImpl::ShellList | ToolImpl::ShellOutput | ToolImpl::ShellStop => {
                         "builtin".to_string()
                     }
@@ -315,6 +322,7 @@ impl Registry {
             ToolImpl::EditFile => edit_file(&args),
             ToolImpl::WebSearch => self.execute_web(&args, true),
             ToolImpl::WebFetch => self.execute_web(&args, false),
+            ToolImpl::GoalComplete => goal_complete_outcome(&args),
             ToolImpl::Exec(tool) => {
                 let (content, is_error) = exec::invoke(tool, args_json, session_id);
                 ToolOutcome {
@@ -463,8 +471,10 @@ const RESERVED_TOOL_NAMES: &[&str] = &[
     "subagent_wait",
     "subagent_cancel",
     "subagent_list",
+    "goal_complete",
 ];
 const WEB_TOOL_NAMES: &[&str] = &["web_search", "web_fetch"];
+pub(crate) const GOAL_COMPLETE_TOOL_NAME: &str = "goal_complete";
 
 fn reserved_tool_name(config: &Config, name: &str) -> bool {
     RESERVED_TOOL_NAMES.contains(&name) || (config.web_browsing && WEB_TOOL_NAMES.contains(&name))
@@ -484,6 +494,33 @@ fn read_skill_entry() -> ToolEntry {
             }),
         },
         imp: ToolImpl::ReadSkill,
+    }
+}
+
+fn goal_complete_entry() -> ToolEntry {
+    ToolEntry {
+        spec: ToolSpec {
+            name: GOAL_COMPLETE_TOOL_NAME.into(),
+            description: "Finish the active goal with the final user-facing answer. This must be the only tool call in that step.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "result": {
+                        "type": "string",
+                        "description": "Final user-facing answer for the completed goal"
+                    }
+                },
+                "required": ["result"]
+            }),
+        },
+        imp: ToolImpl::GoalComplete,
+    }
+}
+
+fn goal_complete_outcome(args: &Value) -> ToolOutcome {
+    match args.get("result").and_then(Value::as_str).map(str::trim) {
+        Some(result) if !result.is_empty() => ToolOutcome::ok(result.to_string()),
+        _ => ToolOutcome::error("goal_complete requires a non-empty string 'result'"),
     }
 }
 

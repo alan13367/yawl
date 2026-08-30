@@ -290,17 +290,37 @@ pub(super) fn handle_event(state: &mut ViewState, editor: &mut Editor, event: Ev
                         })
                     }
                     Event::Key(key) => {
-                        if let EditAction::Submit(message) = editor.handle_key(key) {
-                            let message = editor.expand_submission(&message.text);
-                            match state
-                                .subagent_manager
-                                .send(&id, &message, RunOrigin::PrivateUser)
-                            {
-                                Ok(_) => scroll.follow(),
-                                Err(error) => state.notice(format!(
-                                    "Could not send private subagent message: {error}"
-                                )),
+                        match editor.handle_key(key) {
+                            EditAction::Steer(message) => {
+                                let message = editor.expand_submission(&message.text);
+                                match state.subagent_manager.steer(&id, &message) {
+                                    Ok(_) => scroll.follow(),
+                                    Err(error) => state
+                                        .notice(format!("Could not steer the subagent: {error}")),
+                                }
                             }
+                            EditAction::Submit(message) => {
+                                let message = editor.expand_submission(&message.text);
+                                let (action, result) = if state.enter_steers {
+                                    ("steer", state.subagent_manager.steer(&id, &message))
+                                } else {
+                                    (
+                                        "send a private message to",
+                                        state.subagent_manager.send(
+                                            &id,
+                                            &message,
+                                            RunOrigin::PrivateUser,
+                                        ),
+                                    )
+                                };
+                                match result {
+                                    Ok(_) => scroll.follow(),
+                                    Err(error) => state.notice(format!(
+                                        "Could not {action} the subagent: {error}"
+                                    )),
+                                }
+                            }
+                            EditAction::None => {}
                         }
                         Some(SubagentView::Takeover {
                             id,
@@ -368,6 +388,7 @@ pub(super) fn render(
                 snapshots: &state.subagent_snapshots,
                 hide_reasoning: state.hide_reasoning,
                 accent_color: state.accent_color,
+                enter_steers: state.enter_steers,
             },
             editor,
             id,
@@ -613,6 +634,7 @@ struct TakeoverContext<'a> {
     snapshots: &'a [SubagentSnapshot],
     hide_reasoning: bool,
     accent_color: crate::config::UiColor,
+    enter_steers: bool,
 }
 
 fn render_takeover(
@@ -707,8 +729,10 @@ fn render_takeover(
     frame.push(format!("{accent}└{}┘\x1b[0m", "─".repeat(inner_width)));
     let hint = if confirm_cancel {
         "Cancel this run? Enter confirms, Esc keeps it running"
+    } else if context.enter_steers {
+        "Enter steers  Ctrl+G steers  ↑/↓ or PgUp/PgDn scroll  Ctrl+C cancel  Esc dashboard"
     } else {
-        "Enter send privately  ↑/↓ or PgUp/PgDn scroll  Ctrl+C cancel  Esc dashboard"
+        "Enter queues  Ctrl+G steers  ↑/↓ or PgUp/PgDn scroll  Ctrl+C cancel  Esc dashboard"
     };
     frame.push(format!(
         "{}{}\x1b[0m",
@@ -728,6 +752,10 @@ fn render_snapshot(hide_reasoning: bool, snapshot: &SubagentSnapshot, width: usi
                 if *private {
                     lines.push("\x1b[2m[private]\x1b[0m".into());
                 }
+                lines.extend(render_user_panel(text, width));
+            }
+            SubagentTranscriptItem::Steer(text) => {
+                lines.push("\x1b[2;36m[steer]\x1b[0m".into());
                 lines.extend(render_user_panel(text, width));
             }
             SubagentTranscriptItem::Assistant(text) => {
@@ -771,6 +799,10 @@ fn render_snapshot(hide_reasoning: bool, snapshot: &SubagentSnapshot, width: usi
             width,
             false,
         ));
+    }
+    for steer in &snapshot.pending_steers {
+        lines.push("\x1b[2;36m[steering]\x1b[0m".into());
+        lines.extend(render_user_panel(steer, width));
     }
     for queued in &snapshot.queued_messages {
         lines.push("\x1b[2;33m[queued]\x1b[0m".into());
@@ -845,6 +877,10 @@ mod tests {
             activity: String::new(),
             scroll_offset: 0,
             queued_inputs: VecDeque::new(),
+            pending_steers: VecDeque::new(),
+            active_goal: None,
+            goal_running: false,
+            enter_steers: false,
             pending_actions: VecDeque::new(),
             completions: Vec::new(),
             completion_index: 0,

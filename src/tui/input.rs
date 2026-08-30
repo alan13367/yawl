@@ -84,6 +84,7 @@ impl From<&str> for Submission {
 pub enum EditAction {
     None,
     Submit(Submission),
+    Steer(Submission),
 }
 
 #[derive(Debug)]
@@ -341,6 +342,7 @@ impl Editor {
             Key::Char(character) => self.insert(character),
             Key::Newline => self.insert('\n'),
             Key::Enter => return self.submit(),
+            Key::Steer | Key::Ctrl('g') => return self.steer(),
             Key::Backspace => self.backspace(),
             Key::Delete => self.delete(),
             Key::Left => self.cursor = self.cursor.saturating_sub(1),
@@ -487,16 +489,26 @@ impl Editor {
     }
 
     fn submit(&mut self) -> EditAction {
+        self.take_submission()
+            .map_or(EditAction::None, EditAction::Submit)
+    }
+
+    fn steer(&mut self) -> EditAction {
+        self.take_submission()
+            .map_or(EditAction::None, EditAction::Steer)
+    }
+
+    fn take_submission(&mut self) -> Option<Submission> {
         let text: String = self.buffer.iter().collect();
         if text.trim().is_empty() {
-            return EditAction::None;
+            return None;
         }
         let submission = Submission::new(text, self.images.clone());
         if self.history.last() != Some(&submission) {
             self.history.push(submission.clone());
         }
         self.clear();
-        EditAction::Submit(submission)
+        Some(submission)
     }
 
     fn history_previous(&mut self) {
@@ -643,6 +655,16 @@ mod tests {
         assert_eq!(
             editor.handle_key(Key::Enter),
             EditAction::Submit("a\nb".into())
+        );
+    }
+
+    #[test]
+    fn ctrl_g_is_the_legacy_terminal_steering_shortcut() {
+        let mut editor = Editor::default();
+        editor.paste("change direction");
+        assert_eq!(
+            editor.handle_key(Key::Ctrl('g')),
+            EditAction::Steer("change direction".into())
         );
     }
 

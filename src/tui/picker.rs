@@ -16,6 +16,7 @@ use crate::onboarding::provider::{
 pub(super) enum SettingsCategory {
     Model,
     Interface,
+    Input,
     Context,
     Providers,
     Web,
@@ -25,9 +26,10 @@ pub(super) enum SettingsCategory {
 }
 
 impl SettingsCategory {
-    pub(super) const ALL: [Self; 8] = [
+    pub(super) const ALL: [Self; 9] = [
         Self::Model,
         Self::Interface,
+        Self::Input,
         Self::Context,
         Self::Providers,
         Self::Web,
@@ -40,6 +42,7 @@ impl SettingsCategory {
         match self {
             Self::Model => "Model",
             Self::Interface => "Interface",
+            Self::Input => "Input",
             Self::Context => "Context",
             Self::Providers => "Providers",
             Self::Web => "Web",
@@ -53,6 +56,7 @@ impl SettingsCategory {
         match self {
             Self::Model => "Default model, output, and reasoning",
             Self::Interface => "Colors, reasoning display, and scroll bar",
+            Self::Input => "Submission and steering behavior",
             Self::Context => "Compaction and context windows",
             Self::Providers => "Add or update model providers",
             Self::Web => "Browsing, search source, fetch limit, and keys",
@@ -80,6 +84,7 @@ pub(super) enum SettingsItem {
     SelectionColor,
     ScrollBar,
     ScrollBarAutoHide,
+    EnterSteers,
     AutoCompact,
     CompactThreshold,
     ContextWindow,
@@ -154,6 +159,7 @@ pub(super) enum PickerAction {
     SetWebSearchProvider(WebSearchProvider),
     SetScrollBar(bool),
     SetScrollBarAutoHide(bool),
+    SetEnterSteers(bool),
     ResumeSession(String),
     DeleteSession(String),
     /// Reopen the resume picker, restoring `selected` after a canceled delete.
@@ -284,18 +290,14 @@ impl ActivePickers {
     }
 
     pub(super) fn refresh_display_settings(&mut self, config: &Config) {
-        if let Some((_, picker)) = self
-            .settings_categories
-            .iter_mut()
-            .find(|(category, _)| *category == SettingsCategory::Interface)
-        {
-            *picker = settings_category_picker_from(
-                config,
-                "",
-                0,
-                SettingsCategory::Interface,
-                picker.selected,
-            );
+        for category in [SettingsCategory::Interface, SettingsCategory::Input] {
+            if let Some((_, picker)) = self
+                .settings_categories
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == category)
+            {
+                *picker = settings_category_picker_from(config, "", 0, category, picker.selected);
+            }
         }
         self.accent_color = color_picker(config.accent_color);
         self.selection_color = selection_color_picker(config.selection_color);
@@ -496,6 +498,18 @@ pub(super) fn settings_category_picker_from(
                 action: PickerAction::SetScrollBarAutoHide(!config.scroll_bar_auto_hide),
             },
         ],
+        SettingsCategory::Input => vec![PickerItem {
+            label: "Enter while busy".into(),
+            description: format!(
+                "{} · Enter to toggle",
+                if config.enter_steers {
+                    "Steer"
+                } else {
+                    "Queue"
+                }
+            ),
+            action: PickerAction::SetEnterSteers(!config.enter_steers),
+        }],
         SettingsCategory::Context => vec![
             PickerItem {
                 label: "Automatic compaction".into(),
@@ -1111,6 +1125,7 @@ fn settings_items(category: SettingsCategory) -> &'static [SettingsItem] {
             SettingsItem::ScrollBar,
             SettingsItem::ScrollBarAutoHide,
         ],
+        SettingsCategory::Input => &[SettingsItem::EnterSteers],
         SettingsCategory::Context => &[
             SettingsItem::AutoCompact,
             SettingsItem::CompactThreshold,

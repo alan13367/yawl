@@ -337,6 +337,8 @@ fn render_entry(
     let lines = match entry {
         Entry::User(content) if !expanded => render_collapsed("Prompt", content, width),
         Entry::User(content) => render_user_panel(content, width),
+        Entry::Steer(content) if !expanded => render_collapsed("Steer", content, width),
+        Entry::Steer(content) => render_user_panel(content, width),
         Entry::Assistant(content) => {
             if content.trim().is_empty() {
                 return None;
@@ -591,6 +593,16 @@ pub(super) fn render_user_panel(content: &str, width: usize) -> Vec<String> {
 pub(super) fn render_queued_panel(content: &str, position: usize, width: usize) -> Vec<String> {
     let mut lines = vec![markdown::fit_width(
         &format!("\x1b[2;33mQueued {position} · waiting for the active response\x1b[0m"),
+        width,
+    )];
+    lines.extend(render_user_panel(content, width));
+    lines.push(String::new());
+    lines
+}
+
+pub(super) fn render_steer_panel(content: &str, position: usize, width: usize) -> Vec<String> {
+    let mut lines = vec![markdown::fit_width(
+        &format!("\x1b[2;36mSteer {position} · waiting for a safe boundary\x1b[0m"),
         width,
     )];
     lines.extend(render_user_panel(content, width));
@@ -886,6 +898,9 @@ fn render_transcript_window(
         tail.push(loading);
         tail.push(String::new());
     }
+    for (index, input) in state.pending_steers.iter().enumerate() {
+        tail.extend(render_steer_panel(&input.text, index + 1, width));
+    }
     for (index, input) in state.queued_inputs.iter().enumerate() {
         tail.extend(render_queued_panel(&input.text, index + 1, width));
     }
@@ -954,7 +969,7 @@ pub(super) fn has_visible_in_flight_content(state: &ViewState) -> bool {
         return false;
     };
     match last {
-        Entry::User(_) | Entry::Notice(_) | Entry::SubagentResult { .. } => false,
+        Entry::User(_) | Entry::Steer(_) | Entry::Notice(_) | Entry::SubagentResult { .. } => false,
         Entry::Tool { running, .. } => *running,
         Entry::Reasoning { content, .. } => !state.hide_reasoning && !content.trim().is_empty(),
         Entry::Assistant(content) => !content.trim().is_empty(),
@@ -1225,6 +1240,17 @@ pub(super) fn build_frame_with_images(
     }
     if !state.queued_inputs.is_empty() {
         parts.push(format!("{} queued", state.queued_inputs.len()));
+    }
+    if !state.pending_steers.is_empty() {
+        parts.push(format!("{} steering", state.pending_steers.len()));
+    }
+    if let Some(goal) = state.active_goal.as_deref() {
+        let preview = crate::error::truncate(goal, 32);
+        if state.goal_running {
+            parts.push(format!("goal: {preview}"));
+        } else {
+            parts.push(format!("goal paused: {preview}"));
+        }
     }
     if !state.pending_actions.is_empty() {
         parts.push(format!("{} pending", state.pending_actions.len()));

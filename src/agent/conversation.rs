@@ -1,5 +1,7 @@
 //! Provider-neutral conversation state and turn execution.
 
+mod goal;
+mod steer;
 mod turn;
 
 use std::time::Duration;
@@ -10,12 +12,14 @@ use crate::checkpoint::{Checkpoints, RestoreReport};
 use crate::compaction;
 use crate::config::{Config, ConfigChange, ConfigChangeEffect};
 use crate::error::Error;
-use crate::provider::Message;
+use crate::provider::{Message, MessageControl, TurnInput};
 use crate::session::Session;
 use crate::subagent::SubagentManager;
 use crate::tools::{DescribeCache, Registry};
 
 use super::journal::Journal;
+
+pub(crate) use steer::SteerInbox;
 
 /// Per-run guard rails for a memory-only subagent conversation. At
 /// `max_requests` completed model requests a wrap-up instruction is injected;
@@ -40,6 +44,8 @@ pub(crate) fn is_undoable_user_prompt(message: &Message) -> bool {
     message.role == crate::provider::Role::User
         && message.subagent_results.is_empty()
         && !compaction::is_summary_message(message)
+        && !message.is_hidden_control()
+        && !message.is_steering()
 }
 
 pub(crate) fn last_undoable_user_index(messages: &[Message]) -> Option<usize> {
@@ -70,6 +76,8 @@ pub(crate) struct Conversation {
     role_fragment: Option<String>,
     checkpoints: Option<Checkpoints>,
     background: Option<BackgroundProcessManager>,
+    active_goal: Option<String>,
+    steers: SteerInbox,
 }
 
 impl Conversation {
@@ -82,6 +90,7 @@ impl Conversation {
     ) -> Self {
         let subagents = SubagentManager::new(session.id.clone(), config.max_subagents);
         let checkpoints = Some(Checkpoints::open(&config.home_dir, &session.id, work_tree));
+        let active_goal = session.active_goal().map(str::to_string);
         Self {
             config,
             model,
@@ -98,6 +107,8 @@ impl Conversation {
             role_fragment: None,
             checkpoints,
             background: Some(BackgroundProcessManager::default()),
+            active_goal,
+            steers: SteerInbox::default(),
         }
     }
 
@@ -118,6 +129,8 @@ impl Conversation {
             role_fragment: None,
             checkpoints: None,
             background: None,
+            active_goal: None,
+            steers: SteerInbox::default(),
         }
     }
 
@@ -161,6 +174,47 @@ impl Conversation {
         self.cancellation.clone()
     }
 
+    pub(crate) fn steer_inbox(&self) -> SteerInbox {
+        self.steers.clone()
+    }
+
+    pub(crate) fn active_goal(&self) -> Option<&str> {
+        self.active_goal.as_deref()
+    }
+
+    pub(crate) fn take_unaccepted_steers(&self) -> Vec<TurnInput> {
+        self.steers.drain()
+    }
+
+    /// Starts or replaces a persisted goal. The caller then runs a turn with
+    /// no extra user input. Returns a checkpoint warning when snapshotting
+    /// fails.
+    pub(crate) fn start_goal(&mut self, input: TurnInput) -> Result<Option<String>, Error> {
+        let warning = if let Some(checkpoints) = &mut self.checkpoints {
+            checkpoints
+                .snapshot()
+                .err()
+                .map(|error| format!("Could not checkpoint for /undo: {error}"))
+        } else {
+            None
+        };
+        let message = Message::user_input(input).with_control(MessageControl::GoalStart);
+        let goal = message.content.clone();
+        self.session.append_goal_start(&goal, &message)?;
+        self.messages.push(message);
+        self.active_goal = Some(goal);
+        Ok(warning)
+    }
+
+    pub(crate) fn cancel_goal(&mut self) -> Result<bool, Error> {
+        if self.active_goal.is_none() {
+            return Ok(false);
+        }
+        self.session.append_goal_cancel()?;
+        self.active_goal = None;
+        Ok(true)
+    }
+
     pub(super) fn clear_cancellation(&self) {
         self.cancellation.clear();
     }
@@ -200,6 +254,7 @@ impl Conversation {
         self.config.accent_color = config.accent_color;
         self.config.scroll_bar = config.scroll_bar;
         self.config.scroll_bar_auto_hide = config.scroll_bar_auto_hide;
+        self.config.enter_steers = config.enter_steers;
     }
 
     /// Starts a fresh session (used by `/new` and `/clear`).
@@ -224,6 +279,8 @@ impl Conversation {
         self.messages.clear();
         self.context_tokens = 0;
         self.latest_turn_result.clear();
+        self.active_goal = None;
+        let _ = self.steers.drain();
         Checkpoints::remove(&self.config.home_dir, &old_id);
         if abandon_empty {
             let _ = Session::delete(&dirs.project, &old_id);
@@ -273,6 +330,7 @@ impl Conversation {
         let cwd = crate::config::working_dir();
         let (session, messages) =
             Session::open_searching(&self.config.session_dirs(&cwd).search, id)?;
+        let active_goal = session.active_goal().map(str::to_string);
         if let Some(manager) = &self.subagents {
             manager.shutdown_and_discard();
         }
@@ -288,6 +346,8 @@ impl Conversation {
         self.messages = messages;
         self.context_tokens = 0;
         self.latest_turn_result.clear();
+        self.active_goal = active_goal;
+        let _ = self.steers.drain();
         self.checkpoints = Some(Checkpoints::open(
             &self.config.home_dir,
             self.session.id(),
@@ -376,12 +436,16 @@ impl Conversation {
             return Ok(UndoReport::default());
         };
         let dropped = self.messages.len() - start;
+        let clear_goal = self.messages[start..].iter().any(Message::is_goal_start);
         let restore = match &mut self.checkpoints {
             Some(checkpoints) => checkpoints.restore_last()?,
             None => RestoreReport::default(),
         };
-        self.session.append_undo(dropped)?;
+        self.session.append_undo_event(dropped, clear_goal)?;
         self.messages.truncate(start);
+        if clear_goal {
+            self.active_goal = None;
+        }
         self.context_tokens = 0;
         self.latest_turn_result.clear();
         Ok(UndoReport {

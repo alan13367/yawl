@@ -21,6 +21,7 @@ pub(crate) enum ConfigChange {
     SelectionColor(String),
     ScrollBar(String),
     ScrollBarAutoHide(String),
+    EnterSteers(String),
     AutoCompact(String),
     CompactThreshold(String),
     WebBrowsing(String),
@@ -93,6 +94,7 @@ enum ValidatedChange {
     SelectionColor(Option<UiColor>),
     ScrollBar(bool),
     ScrollBarAutoHide(bool),
+    EnterSteers(bool),
     AutoCompact(bool),
     CompactThreshold(f64),
     WebBrowsing(bool),
@@ -221,6 +223,7 @@ impl ValidatedChange {
             ConfigChange::ScrollBarAutoHide(value) => {
                 Ok(Self::ScrollBarAutoHide(parse_on_off(&value)?))
             }
+            ConfigChange::EnterSteers(value) => Ok(Self::EnterSteers(parse_on_off(&value)?)),
             ConfigChange::AutoCompact(value) => Ok(Self::AutoCompact(parse_on_off(&value)?)),
             ConfigChange::CompactThreshold(value) => {
                 Ok(Self::CompactThreshold(parse_threshold(&value)?))
@@ -375,6 +378,7 @@ impl ValidatedChange {
             Self::ScrollBarAutoHide(enabled) => {
                 insert_root(root, "scroll_bar_auto_hide", json!(enabled))
             }
+            Self::EnterSteers(enabled) => insert_root(root, "enter_steers", json!(enabled)),
             Self::AutoCompact(enabled) => insert_root(root, "auto_compact", json!(enabled)),
             Self::CompactThreshold(threshold) => {
                 insert_root(root, "compact_threshold", json!(threshold))
@@ -507,6 +511,7 @@ impl ValidatedChange {
             Self::SelectionColor(selection) => config.selection_color == *selection,
             Self::ScrollBar(enabled) => config.scroll_bar == *enabled,
             Self::ScrollBarAutoHide(enabled) => config.scroll_bar_auto_hide == *enabled,
+            Self::EnterSteers(enabled) => config.enter_steers == *enabled,
             Self::AutoCompact(enabled) => config.auto_compact == *enabled,
             Self::CompactThreshold(threshold) => config.compact_threshold == *threshold,
             Self::WebBrowsing(enabled) => config.web_browsing == *enabled,
@@ -944,6 +949,33 @@ mod tests {
             .err()
             .expect("non-boolean values should fail validation");
         assert!(error.to_string().contains("on or off"));
+    }
+
+    #[test]
+    fn enter_steers_change_is_validated_persisted_and_reloaded() {
+        let dirs = TestDirs::new("enter-steers");
+        let config = dirs.config();
+        assert!(!config.enter_steers);
+
+        let outcome = config
+            .change_global(ConfigChange::EnterSteers("on".into()))
+            .expect("a valid on/off value should apply");
+
+        assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
+        assert!(outcome.config.enter_steers);
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(dirs.home.join("config.json"))
+                .expect("saved config should be readable"),
+        )
+        .expect("saved config should remain JSON");
+        assert_eq!(saved["enter_steers"], true);
+
+        assert!(
+            outcome
+                .config
+                .change_global(ConfigChange::EnterSteers("maybe".into()))
+                .is_err()
+        );
     }
 
     #[test]

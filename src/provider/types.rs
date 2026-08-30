@@ -37,6 +37,17 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Optional control metadata for goal, steering, and synthetic tool protocol
+/// messages. Older session files omit the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageControl {
+    GoalStart,
+    GoalContinuation,
+    Steering,
+    ToolSkipped,
+}
+
 /// Metadata for one synthetic background result delivered to the parent.
 /// Providers still receive the containing message as ordinary user content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +112,9 @@ pub struct Message {
     /// message. Older session files omit the field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagent_results: Vec<SubagentResult>,
+    /// Marks goal and steering control messages. Older session files omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<MessageControl>,
 }
 
 impl Message {
@@ -116,6 +130,7 @@ impl Message {
             is_error: false,
             provider_data: Vec::new(),
             subagent_results: Vec::new(),
+            control: None,
         }
     }
 
@@ -131,6 +146,7 @@ impl Message {
             is_error: false,
             provider_data: Vec::new(),
             subagent_results: Vec::new(),
+            control: None,
         }
     }
 
@@ -146,6 +162,7 @@ impl Message {
             is_error: false,
             provider_data: Vec::new(),
             subagent_results: Vec::new(),
+            control: None,
         }
     }
 
@@ -176,7 +193,29 @@ impl Message {
             is_error,
             provider_data: Vec::new(),
             subagent_results: Vec::new(),
+            control: None,
         }
+    }
+
+    pub fn with_control(mut self, control: MessageControl) -> Message {
+        self.control = Some(control);
+        self
+    }
+
+    pub fn is_hidden_control(&self) -> bool {
+        matches!(self.control, Some(MessageControl::GoalContinuation))
+    }
+
+    pub fn is_steering(&self) -> bool {
+        matches!(self.control, Some(MessageControl::Steering))
+    }
+
+    pub fn is_goal_start(&self) -> bool {
+        matches!(self.control, Some(MessageControl::GoalStart))
+    }
+
+    pub fn is_skipped_tool(&self) -> bool {
+        matches!(self.control, Some(MessageControl::ToolSkipped))
     }
 
     pub fn subagent_results(results: Vec<SubagentResult>) -> Message {
@@ -198,6 +237,7 @@ impl Message {
             is_error: false,
             provider_data: Vec::new(),
             subagent_results: results,
+            control: None,
         }
     }
 }
@@ -269,6 +309,7 @@ mod tests {
     fn old_messages_default_to_no_images() -> Result<(), serde_json::Error> {
         let message: Message = serde_json::from_str(r#"{"role":"user","content":"hello"}"#)?;
         assert!(message.images.is_empty());
+        assert_eq!(message.control, None);
         Ok(())
     }
 

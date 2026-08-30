@@ -33,6 +33,7 @@ pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
         ("/skills", "List available skills"),
         ("/resume", "List or resume sessions"),
         ("/unqueue", "Cancel queued messages"),
+        ("/goal", "Start, resume, or cancel a persistent goal"),
         ("/help", "Show help"),
         ("/quit", "Exit Yawl"),
     ]

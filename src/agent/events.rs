@@ -16,6 +16,12 @@ pub enum TurnEvent<'a> {
     },
     /// One assistant response finished (there may be more after tools run).
     AssistantDone,
+    /// Replace streamed assistant text with the goal_complete result.
+    AssistantReplace(&'a str),
+    /// A steering message was accepted into the current turn.
+    SteerAccepted {
+        text: &'a str,
+    },
     /// A tool was selected but its arguments are still being generated.
     ToolPreparing {
         name: &'a str,

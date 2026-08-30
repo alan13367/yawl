@@ -10,6 +10,19 @@ fn new_and_clear_are_new_session_commands() {
 }
 
 #[test]
+fn goal_submission_expands_long_pastes_for_the_agent() {
+    let mut editor = Editor::default();
+    let pasted = "goal detail ".repeat(50);
+    editor.paste(&pasted);
+    let placeholder = editor.text();
+
+    let (agent_argument, displayed) = prepare_goal_submission(&editor, &placeholder);
+
+    assert_eq!(agent_argument, pasted);
+    assert_eq!(displayed, pasted);
+}
+
+#[test]
 fn direct_web_settings_apply_and_validate() {
     let root = std::env::temp_dir().join(format!(
         "yawl-tui-web-settings-{}-{}",
@@ -104,6 +117,10 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: ["first".into(), "second".into()].into(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,

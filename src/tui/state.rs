@@ -56,6 +56,10 @@ pub(super) struct ViewState {
     pub(super) activity: String,
     pub(super) scroll_offset: usize,
     pub(super) queued_inputs: std::collections::VecDeque<super::input::Submission>,
+    pub(super) pending_steers: std::collections::VecDeque<super::input::Submission>,
+    pub(super) active_goal: Option<String>,
+    pub(super) goal_running: bool,
+    pub(super) enter_steers: bool,
     pub(super) pending_actions: std::collections::VecDeque<PickerAction>,
     pub(super) completions: Vec<Completion>,
     pub(super) completion_index: usize,
@@ -104,6 +108,10 @@ impl ViewState {
             activity: String::new(),
             scroll_offset: 0,
             queued_inputs: std::collections::VecDeque::new(),
+            pending_steers: std::collections::VecDeque::new(),
+            active_goal: agent.active_goal().map(str::to_string),
+            goal_running: false,
+            enter_steers: agent.config().enter_steers,
             pending_actions: std::collections::VecDeque::new(),
             completions: command_completions(agent),
             completion_index: 0,
@@ -154,29 +162,47 @@ impl ViewState {
         let follow_bottom = self.scroll_offset == 0;
         match update {
             Update::Transcript(event) => {
-                self.activity = match &event {
-                    TranscriptEvent::TextDelta(_) => "responding".into(),
-                    TranscriptEvent::ReasoningDelta { .. } if !self.hide_reasoning => {
-                        "reasoning".into()
+                let hide_goal_complete = match &event {
+                    TranscriptEvent::ToolStart { name, .. }
+                    | TranscriptEvent::ToolEnd { name, .. } => {
+                        name == crate::tools::GOAL_COMPLETE_TOOL_NAME
                     }
-                    TranscriptEvent::ReasoningDelta { .. } => "responding".into(),
-                    TranscriptEvent::ToolStart { name, .. } if name == "read_skill" => {
-                        "loading skill".into()
-                    }
-                    TranscriptEvent::ToolStart { .. } => "running tool".into(),
-                    TranscriptEvent::AssistantDone => String::new(),
-                    TranscriptEvent::ToolEnd { .. } => "sending".into(),
-                    TranscriptEvent::RetryReset => self.activity.clone(),
+                    _ => false,
                 };
-                self.transcript.apply(event);
+                if hide_goal_complete {
+                    // Keep history valid without showing the internal tool.
+                } else {
+                    self.activity = match &event {
+                        TranscriptEvent::TextDelta(_) => "responding".into(),
+                        TranscriptEvent::ReasoningDelta { .. } if !self.hide_reasoning => {
+                            "reasoning".into()
+                        }
+                        TranscriptEvent::ReasoningDelta { .. } => "responding".into(),
+                        TranscriptEvent::ToolStart { name, .. } if name == "read_skill" => {
+                            "loading skill".into()
+                        }
+                        TranscriptEvent::ToolStart { .. } => "running tool".into(),
+                        TranscriptEvent::AssistantDone => String::new(),
+                        TranscriptEvent::AssistantReplace(_) => self.activity.clone(),
+                        TranscriptEvent::ToolEnd { .. } => "sending".into(),
+                        TranscriptEvent::RetryReset => self.activity.clone(),
+                    };
+                    self.transcript.apply(event);
+                }
+            }
+            Update::SteerAccepted { text } => {
+                let _ = self.pending_steers.pop_front();
+                self.transcript.push_steer(text);
             }
             Update::ToolPreparing { name } => {
-                self.activity = match name.as_str() {
-                    "write_file" => "preparing write".into(),
-                    "edit_file" => "preparing edit".into(),
-                    "read_skill" => "loading skill".into(),
-                    _ => "preparing tool".into(),
-                };
+                if name != crate::tools::GOAL_COMPLETE_TOOL_NAME {
+                    self.activity = match name.as_str() {
+                        "write_file" => "preparing write".into(),
+                        "edit_file" => "preparing edit".into(),
+                        "read_skill" => "loading skill".into(),
+                        _ => "preparing tool".into(),
+                    };
+                }
             }
             Update::Retrying {
                 attempt,
@@ -226,6 +252,9 @@ pub(super) enum Update {
         replaced: usize,
     },
     Warning(String),
+    SteerAccepted {
+        text: String,
+    },
     Usage {
         context_tokens: u64,
         context_window: u64,
@@ -255,6 +284,12 @@ impl Update {
                 error,
             },
             TurnEvent::AssistantDone => Self::Transcript(TranscriptEvent::AssistantDone),
+            TurnEvent::AssistantReplace(text) => {
+                Self::Transcript(TranscriptEvent::AssistantReplace(text.to_string()))
+            }
+            TurnEvent::SteerAccepted { text } => Self::SteerAccepted {
+                text: text.to_string(),
+            },
             TurnEvent::ToolPreparing { name } => Self::ToolPreparing {
                 name: name.to_string(),
             },

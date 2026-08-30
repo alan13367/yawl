@@ -9,6 +9,7 @@ use super::search::TranscriptSearch;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Entry {
     User(String),
+    Steer(String),
     Assistant(String),
     Reasoning {
         kind: ReasoningKind,
@@ -42,6 +43,7 @@ pub(super) enum TranscriptEvent {
     },
     RetryReset,
     AssistantDone,
+    AssistantReplace(String),
     ToolStart {
         name: String,
         args: String,
@@ -72,8 +74,17 @@ impl Transcript {
     pub(super) fn from_messages(messages: &[Message]) -> Self {
         let mut entries = Vec::new();
         let mut pending_tools = VecDeque::new();
+        let skipped_tool_ids = messages
+            .iter()
+            .filter(|message| message.is_skipped_tool())
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect::<std::collections::HashSet<_>>();
         for message in messages {
             match message.role {
+                Role::User if message.is_hidden_control() => {}
+                Role::User if message.is_steering() => {
+                    entries.push(Entry::Steer(message.content.clone()));
+                }
                 Role::User if message.content.starts_with("[conversation summary]") => {
                     entries.push(Entry::Notice(message.content.clone()));
                 }
@@ -101,6 +112,11 @@ impl Transcript {
                         entries.push(Entry::Assistant(message.content.clone()));
                     }
                     for call in &message.tool_calls {
+                        if call.name == crate::tools::GOAL_COMPLETE_TOOL_NAME
+                            || skipped_tool_ids.contains(call.id.as_str())
+                        {
+                            continue;
+                        }
                         entries.push(Entry::Tool {
                             name: call.name.clone(),
                             args: call.arguments.clone(),
@@ -113,6 +129,10 @@ impl Transcript {
                         pending_tools.push_back((call.id.as_str(), entries.len() - 1));
                     }
                 }
+                Role::Tool
+                    if message.tool_name.as_deref()
+                        == Some(crate::tools::GOAL_COMPLETE_TOOL_NAME)
+                        || message.is_skipped_tool() => {}
                 Role::Tool => {
                     let pending_position = message.tool_call_id.as_deref().and_then(|id| {
                         pending_tools
@@ -348,6 +368,13 @@ impl Transcript {
         }
     }
 
+    pub(super) fn push_steer(&mut self, content: String) {
+        self.entries.push(Entry::Steer(content));
+        if self.focused {
+            self.selected = Some(self.entries.len() - 1);
+        }
+    }
+
     pub(super) fn notice(&mut self, text: String) {
         self.entries.push(Entry::Notice(text));
     }
@@ -406,6 +433,13 @@ impl Transcript {
                 self.streaming_assistant = None;
                 self.streaming_reasoning = None;
             }
+            TranscriptEvent::AssistantReplace(text) => {
+                if let Some(index) = self.streaming_assistant
+                    && let Some(Entry::Assistant(content)) = self.entries.get_mut(index)
+                {
+                    *content = text;
+                }
+            }
             TranscriptEvent::ToolStart { name, args } => {
                 self.entries.push(Entry::Tool {
                     name,
@@ -451,6 +485,7 @@ impl Entry {
     pub(super) fn searchable_text(&self) -> String {
         match self {
             Self::User(text)
+            | Self::Steer(text)
             | Self::Assistant(text)
             | Self::Notice(text)
             | Self::Reasoning { content: text, .. } => text.clone(),
@@ -471,6 +506,7 @@ impl Entry {
             Self::Tool { output, args, .. } if output.is_empty() => args.clone(),
             Self::Tool { output, .. } => output.clone(),
             Self::User(text)
+            | Self::Steer(text)
             | Self::Assistant(text)
             | Self::Notice(text)
             | Self::Reasoning { content: text, .. } => text.clone(),
@@ -481,6 +517,7 @@ impl Entry {
     pub(super) fn label(&self) -> &str {
         match self {
             Self::User(_) => "Prompt",
+            Self::Steer(_) => "Steer",
             Self::Assistant(_) => "Reply",
             Self::Reasoning { .. } => "Reasoning",
             Self::Tool { name, .. } => name,
@@ -545,6 +582,29 @@ mod tests {
         });
 
         assert_eq!(live.entries(), replayed.entries());
+    }
+
+    #[test]
+    fn replay_hides_tool_calls_skipped_by_steering() {
+        let assistant = Message::assistant(
+            "working".into(),
+            vec![ToolCall {
+                id: "skipped".into(),
+                name: "shell".into(),
+                arguments: r#"{"command":"pwd"}"#.into(),
+            }],
+        );
+        let skipped = Message::tool_result(
+            "skipped",
+            "shell",
+            "[skipped because the user steered]".into(),
+            true,
+        )
+        .with_control(crate::provider::MessageControl::ToolSkipped);
+
+        let replayed = Transcript::from_messages(&[assistant, skipped]);
+
+        assert_eq!(replayed.entries(), &[Entry::Assistant("working".into())]);
     }
 
     #[test]

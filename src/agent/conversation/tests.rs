@@ -450,6 +450,42 @@ fn last_undoable_user_skips_summaries_and_subagent_results() {
 }
 
 #[test]
+fn undo_keeps_working_after_compaction_during_a_goal() {
+    let mut test = TestAgent::new("undo-compacted-goal");
+    test.agent
+        .append_input_message(Message::user("earlier prompt"))
+        .expect("earlier user message");
+    test.agent
+        .append_input_message(Message::assistant("earlier answer".into(), vec![]))
+        .expect("earlier assistant message");
+    test.agent
+        .start_goal("finish the feature".to_string().into())
+        .expect("goal should start");
+    for index in 0..20 {
+        test.agent
+            .append_input_message(Message::assistant(format!("goal progress {index}"), vec![]))
+            .expect("goal progress should persist");
+    }
+
+    let protected = last_undoable_user_index(&test.agent.messages);
+    let range = compaction::compaction_range(&test.agent.messages, protected);
+    let start = range.start;
+    let replaced = range.len();
+    test.agent
+        .session
+        .append_compaction_range("compacted goal progress", start, replaced)
+        .expect("compaction should persist");
+    compaction::apply_summary_range(&mut test.agent.messages, "compacted goal progress", range);
+
+    assert_eq!(last_undoable_user_index(&test.agent.messages), Some(2));
+    let report = test.agent.undo_last_turn().expect("undo should succeed");
+    assert!(report.dropped > 0);
+    assert_eq!(test.agent.messages.len(), 2);
+    assert_eq!(test.agent.messages[0].content, "earlier prompt");
+    assert_eq!(test.agent.active_goal(), None);
+}
+
+#[test]
 fn undo_last_turn_drops_the_prompt_and_restores_files() {
     let mut test = TestAgent::new("undo-turn");
     let file = test.root.join("cwd").join("note.txt");
@@ -486,4 +522,249 @@ fn undo_without_a_user_turn_is_a_no_op() {
     let report = test.agent.undo_last_turn().expect("undo");
     assert_eq!(report.dropped, 0);
     assert!(test.agent.messages.is_empty());
+}
+
+fn scripted_resolve(
+    steps: Rc<RefCell<VecDeque<ProviderStep>>>,
+    requests: Rc<RefCell<Vec<Vec<Role>>>>,
+) -> impl FnMut(&str, &Config) -> Result<(Box<dyn Provider>, String), Error> {
+    move |_: &str, _: &Config| {
+        Ok::<(Box<dyn Provider>, String), Error>((
+            Box::new(ScriptedProvider {
+                steps: Rc::clone(&steps),
+                requests: Rc::clone(&requests),
+            }),
+            "test".into(),
+        ))
+    }
+}
+
+#[test]
+fn goal_mode_continues_on_text_only_then_finishes_with_goal_complete() {
+    let mut test = TestAgent::new("goal-complete");
+    test.agent
+        .start_goal("ship the feature".to_string().into())
+        .expect("start goal");
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        ProviderStep::Output {
+            text: "still working",
+            tool_calls: Vec::new(),
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "goal-1".into(),
+                name: crate::tools::GOAL_COMPLETE_TOOL_NAME.into(),
+                arguments: r#"{"result":"shipped"}"#.into(),
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+    ])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
+
+    let completed = test
+        .agent
+        .run_goal_with(&mut |_| {}, &mut resolve)
+        .expect("goal turn should complete");
+
+    assert!(completed);
+    assert_eq!(test.agent.active_goal(), None);
+    assert_eq!(test.agent.latest_turn_result(), "shipped");
+    assert!(
+        test.agent
+            .messages
+            .iter()
+            .any(|message| message.is_hidden_control()),
+        "goal continuation should be recorded in history"
+    );
+    assert_eq!(
+        test.agent
+            .messages
+            .last()
+            .map(|message| message.content.as_str()),
+        Some("shipped")
+    );
+}
+
+#[test]
+fn ordinary_turn_does_not_resume_a_paused_goal() {
+    let mut test = TestAgent::new("goal-paused-normal-turn");
+    test.agent
+        .start_goal("ship the feature".to_string().into())
+        .expect("start goal");
+    let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
+        text: "answer to the separate question",
+        tool_calls: Vec::new(),
+        input_tokens: 10,
+        output_tokens: 2,
+    }])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
+
+    let completed = test
+        .agent
+        .run_turn_with(
+            Some("a separate question".into()),
+            &mut |_| {},
+            &mut resolve,
+        )
+        .expect("ordinary turn should complete");
+
+    assert!(completed);
+    assert_eq!(test.agent.active_goal(), Some("ship the feature"));
+    assert_eq!(
+        test.agent.latest_turn_result(),
+        "answer to the separate question"
+    );
+    assert_eq!(requests.borrow().len(), 1);
+    assert_eq!(
+        test.agent
+            .messages
+            .iter()
+            .filter(|message| message.control
+                == Some(crate::provider::MessageControl::GoalContinuation))
+            .count(),
+        0
+    );
+    assert!(
+        !test
+            .agent
+            .scan_tools()
+            .specs()
+            .iter()
+            .any(|tool| tool.name == crate::tools::GOAL_COMPLETE_TOOL_NAME),
+        "goal_complete must stay private to an actively running goal"
+    );
+}
+
+#[test]
+fn goal_mode_rejects_mixed_goal_complete_batches() {
+    let mut test = TestAgent::new("goal-mixed");
+    test.agent
+        .start_goal("finish".to_string().into())
+        .expect("start goal");
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![
+                ToolCall {
+                    id: "goal-1".into(),
+                    name: crate::tools::GOAL_COMPLETE_TOOL_NAME.into(),
+                    arguments: r#"{"result":"done"}"#.into(),
+                },
+                ToolCall {
+                    id: "shell-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"printf ok"}"#.into(),
+                },
+            ],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "goal-2".into(),
+                name: crate::tools::GOAL_COMPLETE_TOOL_NAME.into(),
+                arguments: r#"{"result":"done"}"#.into(),
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+    ])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
+
+    let completed = test
+        .agent
+        .run_goal_with(&mut |_| {}, &mut resolve)
+        .expect("goal turn should complete");
+
+    assert!(completed);
+    assert_eq!(test.agent.active_goal(), None);
+    let first_batch_results = test
+        .agent
+        .messages
+        .iter()
+        .filter(|message| {
+            message.role == Role::Tool
+                && matches!(message.tool_call_id.as_deref(), Some("goal-1" | "shell-1"))
+        })
+        .map(|message| message.tool_call_id.as_deref().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(first_batch_results, ["goal-1", "shell-1"]);
+    assert!(
+        test.agent.messages.iter().any(|message| {
+            message.role == Role::Tool
+                && message.tool_name.as_deref() == Some(crate::tools::GOAL_COMPLETE_TOOL_NAME)
+                && message.is_error
+                && message.content.contains("only tool call")
+        }),
+        "mixed completion should be rejected before a later success"
+    );
+}
+
+#[test]
+fn steering_skips_pending_tools_and_injects_the_steer_message() {
+    let mut test = TestAgent::new("steer-tools");
+    test.agent.steer_inbox().push(crate::provider::TurnInput {
+        text: "stop and summarize".into(),
+        images: Vec::new(),
+    });
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        ProviderStep::Output {
+            text: "working",
+            tool_calls: vec![ToolCall {
+                id: "shell-1".into(),
+                name: "shell".into(),
+                arguments: r#"{"command":"printf tool-output"}"#.into(),
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+        ProviderStep::Output {
+            text: "summary",
+            tool_calls: Vec::new(),
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+    ])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
+    let mut steer_accepted = false;
+
+    let completed = test
+        .agent
+        .run_turn_with(
+            Some("start".into()),
+            &mut |event| {
+                if matches!(event, TurnEvent::SteerAccepted { .. }) {
+                    steer_accepted = true;
+                }
+            },
+            &mut resolve,
+        )
+        .expect("steered turn should complete");
+
+    assert!(completed);
+    assert!(
+        test.agent.messages.iter().any(|message| {
+            message.role == Role::Tool
+                && message.content == "[skipped because the user steered]"
+                && message.is_error
+        }),
+        "pending tools should be skipped once steering is accepted"
+    );
+    assert!(
+        test.agent
+            .messages
+            .iter()
+            .any(|message| message.is_steering() && message.content == "stop and summarize"),
+        "accepted steer should be recorded as a steering user message"
+    );
+    assert!(steer_accepted, "steer acceptance should surface to the UI");
 }

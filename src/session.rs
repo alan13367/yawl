@@ -30,22 +30,37 @@ enum SessionEvent {
     Message {
         message: Message,
     },
-    /// The first `replaced` messages of the conversation (at that point in
-    /// the replay) were folded into `summary`.
+    /// `replaced` messages beginning at `start` (at that point in replay)
+    /// were folded into `summary`. Older logs omit `start` and default to the
+    /// original prefix-compaction behavior.
     Compaction {
         summary: String,
+        #[serde(default)]
+        start: usize,
         replaced: usize,
     },
     /// The last `dropped` messages were removed by `/undo`.
     Undo {
         dropped: usize,
+        /// Set when the dropped range includes a goal's starting message.
+        #[serde(default)]
+        clear_goal: bool,
     },
+    GoalStart {
+        goal: String,
+        message: Message,
+    },
+    GoalComplete {
+        message: Message,
+    },
+    GoalCancel,
 }
 
 #[derive(Debug)]
 pub struct Session {
     pub id: String,
     file: File,
+    active_goal: Option<String>,
 }
 
 impl Session {
@@ -80,6 +95,7 @@ impl Session {
         let mut session = Session {
             id: id.clone(),
             file,
+            active_goal: None,
         };
         session.append(&SessionEvent::Meta {
             id,
@@ -94,12 +110,13 @@ impl Session {
     pub fn open(dir: &Path, id: &str) -> Result<(Session, Vec<Message>), Error> {
         validate_id(id)?;
         let path = dir.join(format!("{id}.jsonl"));
-        let messages = replay(&path)?;
+        let (messages, active_goal) = replay(&path)?;
         let file = OpenOptions::new().append(true).open(&path)?;
         Ok((
             Session {
                 id: id.to_string(),
                 file,
+                active_goal,
             },
             messages,
         ))
@@ -147,14 +164,66 @@ impl Session {
     }
 
     pub fn append_compaction(&mut self, summary: &str, replaced: usize) -> Result<(), Error> {
+        self.append_compaction_range(summary, 0, replaced)
+    }
+
+    pub(crate) fn append_compaction_range(
+        &mut self,
+        summary: &str,
+        start: usize,
+        replaced: usize,
+    ) -> Result<(), Error> {
         self.append(&SessionEvent::Compaction {
             summary: summary.to_string(),
+            start,
             replaced,
         })
     }
 
     pub fn append_undo(&mut self, dropped: usize) -> Result<(), Error> {
-        self.append(&SessionEvent::Undo { dropped })
+        self.append_undo_event(dropped, false)
+    }
+
+    pub(crate) fn append_undo_event(
+        &mut self,
+        dropped: usize,
+        clear_goal: bool,
+    ) -> Result<(), Error> {
+        self.append(&SessionEvent::Undo {
+            dropped,
+            clear_goal,
+        })?;
+        if clear_goal {
+            self.active_goal = None;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_goal_start(&mut self, goal: &str, message: &Message) -> Result<(), Error> {
+        self.append(&SessionEvent::GoalStart {
+            goal: goal.to_string(),
+            message: message.clone(),
+        })?;
+        self.active_goal = Some(goal.to_string());
+        Ok(())
+    }
+
+    pub(crate) fn append_goal_complete(&mut self, message: &Message) -> Result<(), Error> {
+        self.append(&SessionEvent::GoalComplete {
+            message: message.clone(),
+        })?;
+        self.active_goal = None;
+        Ok(())
+    }
+
+    pub(crate) fn append_goal_cancel(&mut self) -> Result<(), Error> {
+        self.append(&SessionEvent::GoalCancel)?;
+        self.active_goal = None;
+        Ok(())
+    }
+
+    pub(crate) fn active_goal(&self) -> Option<&str> {
+        self.active_goal.as_deref()
     }
 
     /// Removes a session log from `dir`. Missing files are treated as success.
@@ -188,9 +257,10 @@ fn validate_id(id: &str) -> Result<(), Error> {
 }
 
 /// Rebuilds the effective conversation from a session log.
-fn replay(path: &Path) -> Result<Vec<Message>, Error> {
+fn replay(path: &Path) -> Result<(Vec<Message>, Option<String>), Error> {
     let file = File::open(path)?;
     let mut messages: Vec<Message> = Vec::new();
+    let mut active_goal = None;
     let mut has_meta = false;
     for line in BufReader::new(file).lines() {
         let line = line?;
@@ -218,22 +288,45 @@ fn replay(path: &Path) -> Result<Vec<Message>, Error> {
         match event {
             SessionEvent::Meta { .. } => {}
             SessionEvent::Message { message } => messages.push(message),
-            SessionEvent::Compaction { summary, replaced } => {
-                let replaced = replaced.min(messages.len());
-                let tail = messages.split_off(replaced);
-                messages = vec![crate::compaction::summary_message(&summary)];
-                messages.extend(tail);
+            SessionEvent::Compaction {
+                summary,
+                start,
+                replaced,
+            } => {
+                let start = start.min(messages.len());
+                let end = start.saturating_add(replaced).min(messages.len());
+                drop(messages.splice(
+                    start..end,
+                    std::iter::once(crate::compaction::summary_message(&summary)),
+                ));
             }
-            SessionEvent::Undo { dropped } => {
+            SessionEvent::Undo {
+                dropped,
+                clear_goal,
+            } => {
                 let keep = messages.len().saturating_sub(dropped);
                 messages.truncate(keep);
+                if clear_goal {
+                    active_goal = None;
+                }
+            }
+            SessionEvent::GoalStart { goal, message } => {
+                active_goal = Some(goal);
+                messages.push(message);
+            }
+            SessionEvent::GoalComplete { message } => {
+                active_goal = None;
+                messages.push(message);
+            }
+            SessionEvent::GoalCancel => {
+                active_goal = None;
             }
         }
     }
     if !has_meta {
         return Err(Error::Protocol("session log is missing metadata".into()));
     }
-    Ok(messages)
+    Ok((messages, active_goal))
 }
 
 pub struct SessionInfo {
@@ -324,6 +417,17 @@ fn read_header(path: &Path) -> SessionHeader {
                     return header;
                 }
             }
+            Ok(SessionEvent::GoalStart { message, .. }) => {
+                header.has_message = true;
+                if message.role == Role::User && header.preview.is_empty() {
+                    let first = message.content.lines().next().unwrap_or("");
+                    header.preview = crate::error::truncate(first, 60);
+                    return header;
+                }
+            }
+            Ok(SessionEvent::GoalComplete { .. }) => {
+                header.has_message = true;
+            }
             _ => {}
         }
     }
@@ -391,6 +495,31 @@ mod tests {
     }
 
     #[test]
+    fn session_roundtrip_with_middle_compaction() -> Result<(), Error> {
+        let dir = std::env::temp_dir().join(format!(
+            "yawl-middle-compaction-session-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
+        let id = session.id.clone();
+        for content in ["before", "goal", "progress one", "progress two", "tail"] {
+            session.append_message(&Message::user(content))?;
+        }
+        session.append_compaction_range("progress summary", 2, 2)?;
+        drop(session);
+
+        let (_, messages) = Session::open(&dir, &id)?;
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].content, "before");
+        assert_eq!(messages[1].content, "goal");
+        assert!(messages[2].content.contains("progress summary"));
+        assert_eq!(messages[3].content, "tail");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
     fn session_roundtrip_with_undo() -> Result<(), Error> {
         let dir = std::env::temp_dir().join(format!("yawl-undo-session-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -410,6 +539,80 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "one");
         assert_eq!(messages[1].content, "two");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn session_roundtrip_replays_a_paused_goal() -> Result<(), Error> {
+        let dir = std::env::temp_dir().join(format!("yawl-goal-session-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
+        let id = session.id.clone();
+        let start = Message::user("ship the feature")
+            .with_control(crate::provider::MessageControl::GoalStart);
+        session.append_goal_start("ship the feature", &start)?;
+        session.append_message(&Message::assistant("working".into(), vec![]))?;
+        drop(session);
+
+        let (session, messages) = Session::open(&dir, &id)?;
+        assert_eq!(session.active_goal(), Some("ship the feature"));
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].is_goal_start());
+        assert_eq!(messages[0].content, "ship the feature");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn session_goal_complete_and_cancel_clear_the_replayed_goal() -> Result<(), Error> {
+        let dir = std::env::temp_dir().join(format!("yawl-goal-clear-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
+        let id = session.id.clone();
+        let start =
+            Message::user("done later").with_control(crate::provider::MessageControl::GoalStart);
+        session.append_goal_start("done later", &start)?;
+        session.append_goal_complete(&Message::assistant("finished".into(), vec![]))?;
+        drop(session);
+
+        let (session, messages) = Session::open(&dir, &id)?;
+        assert_eq!(session.active_goal(), None);
+        assert_eq!(
+            messages.last().map(|message| message.content.as_str()),
+            Some("finished")
+        );
+
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
+        let canceled_id = session.id.clone();
+        let start =
+            Message::user("cancel me").with_control(crate::provider::MessageControl::GoalStart);
+        session.append_goal_start("cancel me", &start)?;
+        session.append_goal_cancel()?;
+        drop(session);
+
+        let (session, messages) = Session::open(&dir, &canceled_id)?;
+        assert_eq!(session.active_goal(), None);
+        assert_eq!(messages.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn session_undo_can_clear_an_active_goal() -> Result<(), Error> {
+        let dir = std::env::temp_dir().join(format!("yawl-goal-undo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
+        let id = session.id.clone();
+        let start = Message::user("goal").with_control(crate::provider::MessageControl::GoalStart);
+        session.append_goal_start("goal", &start)?;
+        session.append_message(&Message::assistant("partial".into(), vec![]))?;
+        session.append_undo_event(2, true)?;
+        drop(session);
+
+        let (session, messages) = Session::open(&dir, &id)?;
+        assert_eq!(session.active_goal(), None);
+        assert!(messages.is_empty());
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

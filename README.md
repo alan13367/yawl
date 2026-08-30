@@ -119,6 +119,7 @@ Run `yawl --help` for the complete command-line reference.
 ## Terminal controls
 
 - `Enter` submits the editor contents.
+- `Ctrl+G` steers the running turn at the next safe boundary and works in legacy terminals, including macOS Terminal. `Ctrl+Enter` does the same when the terminal reports modifiers (Kitty CSI-u or xterm modifyOtherKeys), but some terminals intercept it or cannot encode it distinctly. At idle either shortcut behaves like Enter.
 - `Shift+Enter` inserts a newline. `Ctrl+J` and `Alt+Enter` also insert a newline if the terminal does not report Shift.
 - Pasted multiline text stays multiline through bracketed paste mode. Pastes longer than 400 characters or 8 lines appear as `[Pasted #N 1234 characters]` while they are in the editor. After submission, the transcript shows the full text and the model receives it unchanged.
 - `Ctrl+V` pastes a clipboard image into the editor as `[Image #N]`. Terminals that forward Super+V or an empty bracketed-paste event work too. Yawl accepts up to five PNG, JPEG, GIF, or WebP images of 5 MB each per prompt. Deleting a marker detaches that image. Queued prompts and input history keep their attachments until Yawl exits. On Linux, image paste requires `wl-paste` or `xclip`.
@@ -140,13 +141,15 @@ The terminal interface renders headings, emphasis, inline code, lists, blockquot
 
 ## Slash commands
 
-`/model`, `/settings`, and `/connect` open keyboard pickers, including while a model response is still running. Settings are grouped under Model, Interface, Context, Providers, Web, Subagents, Skills, and Advanced. Use the arrow keys and Enter to choose; Escape returns to the parent category before closing settings. Editable settings stay in the picker: Enter starts editing the current value, Enter again saves it, and the refreshed value is shown in the menu. Reasoning visibility, accent color, and selection color changes apply immediately during an active response. Settings that can affect generation apply as soon as the response releases the agent and before the next queued message starts.
+`/model`, `/settings`, and `/connect` open keyboard pickers, including while a model response is still running. Settings are grouped under Model, Interface, Input, Context, Providers, Web, Subagents, Skills, and Advanced. Use the arrow keys and Enter to choose; Escape returns to the parent category before closing settings. Editable settings stay in the picker: Enter starts editing the current value, Enter again saves it, and the refreshed value is shown in the menu. Reasoning visibility, accent color, and selection color changes apply immediately during an active response. Settings that can affect generation apply as soon as the response releases the agent and before the next queued message starts.
 
 `/connect` and Settings > Providers use the same guided setup. Fixed providers appear first, followed by configured custom providers in name order. Existing endpoints are prefilled and credentials are preserved unless you choose an environment variable, enter a replacement key, or explicitly use no key. The no-key option appears only for providers that support keyless requests and do not have an active fallback environment credential. Secret input is masked. Discovery and Codex device login remain interactive while a model response continues; Escape cancels only the setup job. The review can save and use the model globally, save and use it for this session, or save only the connection. Saving an OpenAI-compatible connection also keeps the selected model in `/model`, even when the session does not switch to it.
 
 While a turn is active, the status bar shows a compact elapsed timer (for example `1m 23s`). A running tool card counts its own time in the header, such as `$ cargo test  [running 42s]` or `Waiting for LucidOtter · 4m 10s`. A background shell card changes from `starting in background` to `started in background · bg-N` and links the run to `/ps`. Timers disappear once the turn settles. The rest of the status bar stays short: model, optional reasoning effort, context as `20% / 400k`, the running subagent name (or a count when several are active), and queued messages.
 
-Messages submitted during an active response are queued automatically. Each pending message is shown below the live transcript with a `Queued` label, and the status bar shows the queue length. Run `/unqueue` to open the queue editor: `K`/`J` reorder the selected message, `e` edits it, `d` or Delete removes it, and Enter stops the active turn and sends that message next. `/unqueue NUMBER` still removes one directly, and `/unqueue all` clears the queue.
+Messages submitted during an active response are queued automatically. Each pending message is shown below the live transcript with a `Queued` label, and the status bar shows the queue length. `Ctrl+G` (or `Ctrl+Enter` in terminals that support it) steers the running turn instead of queueing: accepted steering messages appear with a `Steer` label and join the current logical turn, so one `/undo` removes the original prompt, its steers, responses, and file changes. Set `enter_steers` to `true`, choose “Enter while busy” in `/settings`, or run `/settings enter_steers on` to make ordinary Enter steer while a response is active. Pending steers that never reached a safe boundary are recovered into the queue if the turn stops early. Run `/unqueue` to open the queue editor: `K`/`J` reorder the selected message, `e` edits it, `d` or Delete removes it, and Enter stops the active turn and sends that message next. `/unqueue NUMBER` still removes one directly, and `/unqueue all` clears the queue.
+
+`/goal TEXT` starts a persistent goal that keeps making model requests until the model calls an internal `goal_complete` tool with the final user-facing answer. A normal text reply does not finish the goal; Yawl injects a hidden continuation and tries again. `/goal resume` continues a paused goal, `/goal cancel` clears it, and `/goal` shows status. Resuming a session restores a paused goal but does not restart it automatically. `/new` starts a goal-free session. Ctrl+C, provider errors, or exit pause the goal without clearing it.
 
 | Command | Effect |
 | --- | --- |
@@ -166,6 +169,7 @@ Messages submitted during an active response are queued automatically. Each pend
 | `/ps` | Open the full-screen background-process dashboard, or print a note when nothing has been started |
 | `/resume [ID\|NUMBER]` | Open the session picker scoped to the current directory, or resume directly by ID or number. In the picker, `d` or Delete opens a confirmation dialog before removing the selected session |
 | `/unqueue [NUMBER\|all]` | Open the queue editor, remove one pending message directly, or clear the queue |
+| `/goal [TEXT]` | Start, resume, cancel, or show the persistent goal |
 | `/help` | Show terminal controls and commands |
 | `/quit` | Exit the terminal interface and print `yawl --session ID` (resumable from any directory) |
 
@@ -185,6 +189,7 @@ Yawl reads `~/.yawl/config.json`, then applies values from `./.yawl/config.json`
   "selection_color": "accent",
   "scroll_bar": true,
   "scroll_bar_auto_hide": true,
+  "enter_steers": false,
   "auto_compact": true,
   "compact_threshold": 0.85,
   "web_browsing": false,
@@ -260,6 +265,8 @@ Choose "Accent color" in `/settings` to color the status bar, text-box border, t
 The highlighted row in the completion menu, pickers, and the subagent dashboard follows the accent color by default. Choose "Selection color" in `/settings`, or run `/settings selection_color accent|NAME|#RRGGBB`, to keep it on the accent (`accent`, the default) or pick an independent color. Whatever color is chosen, Yawl draws the selected row's text in near-black or near-white based on the color's luminance so the row always stays readable.
 
 When the transcript overflows the screen, Yawl overlays a solid thumb along its right edge without drawing a track or reserving a column. The thumb changes the background of the existing final cell, so reasoning and tool text remain visible beneath it and keep the full transcript width. Click the last column to jump, or press and drag to scrub through the history. With auto-hide on (the default), the thumb appears while you scroll with the mouse wheel, PageUp/PageDown, or dragging, then disappears after two idle seconds. Set `scroll_bar` to `false`, choose "Scroll bar" in `/settings`, or run `/settings scroll_bar off` to disable it entirely. Set `scroll_bar_auto_hide` to `false`, choose "Auto-hide scroll bar" in `/settings`, or run `/settings scroll_bar_auto_hide off` to keep the thumb permanently visible. Both default to on.
+
+`enter_steers` controls ordinary Enter only while a response is active. It defaults to `false`, which queues the message; set it to `true` to steer at the next safe boundary. Commands still follow the busy-command rules, and `Ctrl+G` remains an explicit steer regardless of this setting.
 
 Provider keys and header values accept `$ENV_VAR` and `${ENV_VAR}` references. If `apiKey` is omitted, Yawl also checks an environment variable derived from the provider name, such as `OMLX_API_KEY` or `LMSTUDIO_API_KEY`. Keyless local servers need no placeholder key. Extra pi model fields such as `cost` and `reasoning` are ignored.
 
@@ -370,7 +377,7 @@ Model-originated results arrive as one automatic follow-up after the main turn b
 
 All fields are optional. `model` follows the usual precedence when omitted or `inherit`; `tools` grants everything when omitted; `prompt` is appended to the child's role block. The preset name comes from the file name and must use ASCII letters, digits, `_`, or `-`. Malformed files are skipped with a warning shown by `/tools`.
 
-Run `/subagents` to open the dashboard, including while the main model is busy. When no subagents are tracked, the command prints a note in the chat instead: it says how to enable subagents when they are off, and that the dashboard opens once the model spawns one. Arrow keys or `j` and `k` move between rows, Enter opens a takeover, `x` asks to cancel the selected run, and Escape closes the dashboard. Rows show the preset after the name for non-default agents. The takeover shows the bounded transcript, live reasoning and answer text, tool previews, errors, and queued messages. Enter sends a private message, the arrow keys and Page Up/Page Down scroll, Ctrl+C asks to cancel the child, and Escape returns to the dashboard. Scrolling up holds the view in place while the child keeps generating; scrolling back to the bottom resumes following new output. Private takeover messages and results stay out of the main transcript.
+Run `/subagents` to open the dashboard, including while the main model is busy. When no subagents are tracked, the command prints a note in the chat instead: it says how to enable subagents when they are off, and that the dashboard opens once the model spawns one. Arrow keys or `j` and `k` move between rows, Enter opens a takeover, `x` asks to cancel the selected run, and Escape closes the dashboard. Rows show the preset after the name for non-default agents. The takeover shows the bounded transcript, live reasoning and answer text, tool previews, errors, and queued messages. Enter queues a private message by default or steers when `enter_steers` is enabled; `Ctrl+G` always steers the child at the next safe boundary, as does `Ctrl+Enter` when supported. The arrow keys and Page Up/Page Down scroll, Ctrl+C asks to cancel the child, and Escape returns to the dashboard. Scrolling up holds the view in place while the child keeps generating; scrolling back to the bottom resumes following new output. Private takeover messages and results stay out of the main transcript.
 
 ## Builtin tools
 

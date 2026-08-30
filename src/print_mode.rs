@@ -128,6 +128,23 @@ impl PrintSink {
                     self.response_has_text = false;
                 }
             }
+            TurnEvent::AssistantReplace(text) => {
+                print_reasoning(&mut self.pending_reasoning);
+                if self.output_error.is_none() {
+                    match self
+                        .stdout
+                        .write_all(text.as_bytes())
+                        .and_then(|()| self.stdout.flush())
+                    {
+                        Ok(()) => self.response_has_text = true,
+                        Err(error) => {
+                            self.output_error = Some(error);
+                            yawl::set_interrupted(true);
+                        }
+                    }
+                }
+            }
+            TurnEvent::SteerAccepted { .. } => {}
             TurnEvent::Compacting => eprintln!("compacting conversation..."),
             TurnEvent::Compacted { replaced } => eprintln!("compacted {replaced} messages"),
             TurnEvent::Warning(text) => eprintln!("{text}"),

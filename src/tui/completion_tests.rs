@@ -25,6 +25,10 @@ fn completion_state(commands: &[&str]) -> ViewState {
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
+        pending_steers: std::collections::VecDeque::new(),
+        active_goal: None,
+        goal_running: false,
+        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: commands
             .iter()

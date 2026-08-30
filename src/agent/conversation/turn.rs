@@ -1,11 +1,20 @@
 use crate::compaction;
 use crate::config::Config;
 use crate::error::Error;
-use crate::provider::{self, Message, SubagentResult, ToolCall, TurnInput, stream_turn};
+use crate::provider::{
+    self, Message, MessageControl, SubagentResult, ToolCall, TurnInput, stream_turn,
+};
 use crate::tools::Registry;
 
-use super::Conversation;
+use super::goal;
+use super::{Conversation, last_undoable_user_index};
 use crate::agent::events::{TurnEvent, forward};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnMode {
+    Normal,
+    Goal,
+}
 
 impl Conversation {
     /// Runs one full turn. `user_input` is `None` when re-driving an existing
@@ -29,7 +38,12 @@ impl Conversation {
         let cancellation = self.cancellation.clone();
         crate::cancellation::scope(&cancellation, || {
             self.cancellation.clear();
-            self.run_turn_input_with(user_input, sink, &mut provider::resolve)
+            self.run_turn_input_with_mode(
+                user_input,
+                sink,
+                &mut provider::resolve,
+                TurnMode::Normal,
+            )
         })
     }
 
@@ -49,16 +63,36 @@ impl Conversation {
         let cancellation = self.cancellation.clone();
         crate::cancellation::scope(&cancellation, || {
             let Some(timeout) = self.run_limits.and_then(|limits| limits.timeout) else {
-                return self.run_turn_input_with(user_input, sink, &mut provider::resolve);
+                return self.run_turn_input_with_mode(
+                    user_input,
+                    sink,
+                    &mut provider::resolve,
+                    TurnMode::Normal,
+                );
             };
             let (result, timed_out) =
                 crate::cancellation::with_timeout(&cancellation, timeout, || {
-                    self.run_turn_input_with(user_input, sink, &mut provider::resolve)
+                    self.run_turn_input_with_mode(
+                        user_input,
+                        sink,
+                        &mut provider::resolve,
+                        TurnMode::Normal,
+                    )
                 });
             if timed_out {
                 sink(TurnEvent::Warning("subagent timeout exceeded".into()));
             }
             result
+        })
+    }
+
+    pub(crate) fn run_goal_preserving_cancellation(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        let cancellation = self.cancellation.clone();
+        crate::cancellation::scope(&cancellation, || {
+            self.run_turn_input_with_mode(None, sink, &mut provider::resolve, TurnMode::Goal)
         })
     }
 
@@ -191,6 +225,34 @@ impl Conversation {
     where
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
     {
+        self.run_turn_input_with_mode(user_input, sink, resolve_provider, TurnMode::Normal)
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_goal_with<F>(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        self.run_turn_input_with_mode(None, sink, resolve_provider, TurnMode::Goal)
+    }
+
+    fn run_turn_input_with_mode<F>(
+        &mut self,
+        user_input: Option<TurnInput>,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+        mode: TurnMode,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        if mode == TurnMode::Goal && self.active_goal.is_none() {
+            return Err(Error::Config("no active goal to resume".into()));
+        }
         self.latest_turn_result.clear();
         if let Some(input) = user_input {
             if !input.images.is_empty() && !crate::model::supports_images(&self.config, &self.model)
@@ -216,10 +278,14 @@ impl Conversation {
         let mut requests_made: u64 = 0;
         let mut steer_sent = false;
 
-        // Uncapped: the loop ends when the model stops calling tools.
+        // Uncapped: the loop ends when the model stops calling tools, or
+        // when a goal completes through goal_complete.
         loop {
             if crate::cancellation::interrupted() {
                 return Ok(false);
+            }
+            if mode == TurnMode::Goal {
+                self.drain_deferred_subagent_results_into_history()?;
             }
             if max_requests > 0 {
                 if requests_made == max_requests && !steer_sent {
@@ -241,7 +307,10 @@ impl Conversation {
             }
             // Rescan every iteration so a tool the model just wrote is
             // available on its very next step.
-            let registry = self.scan_tools();
+            let mut registry = self.scan_tools();
+            if mode == TurnMode::Goal {
+                registry.advertise_goal_complete();
+            }
             let specs = registry.specs();
             let system = if self.subagents.is_some() {
                 crate::prompt::build_system_prompt(
@@ -250,6 +319,9 @@ impl Conversation {
                     self.print_mode,
                     registry.has_web_tools(),
                     registry.skills(),
+                    (mode == TurnMode::Goal)
+                        .then_some(self.active_goal.as_deref())
+                        .flatten(),
                 )
             } else {
                 crate::prompt::build_subagent_system_prompt(
@@ -293,16 +365,74 @@ impl Conversation {
             let mut assistant = Message::assistant(out.text, out.tool_calls.clone());
             assistant.reasoning = out.reasoning;
             assistant.provider_data = out.provider_data;
-            self.session.append_message(&assistant)?;
-            self.messages.push(assistant);
-            sink(TurnEvent::AssistantDone);
 
+            if self.steers.has_pending() {
+                self.session.append_message(&assistant)?;
+                self.messages.push(assistant);
+                sink(TurnEvent::AssistantDone);
+                self.skip_tool_calls(&out.tool_calls, goal::STEER_SKIPPED)?;
+                if self.inject_pending_steers(sink)? || !out.tool_calls.is_empty() {
+                    continue;
+                }
+                if mode == TurnMode::Goal {
+                    self.append_goal_continuation()?;
+                    continue;
+                }
+                return Ok(true);
+            }
+
+            let (completes, ordinary) = if mode == TurnMode::Goal {
+                goal::split_goal_complete(&out.tool_calls)
+            } else {
+                (Vec::new(), out.tool_calls.iter().collect())
+            };
+            if completes.len() == 1 && ordinary.is_empty() {
+                match goal::parse_goal_complete_result(&completes[0].arguments) {
+                    Ok(result) => {
+                        self.finish_goal_complete(assistant, result, sink)?;
+                        return Ok(true);
+                    }
+                    Err(error) => {
+                        self.persist_assistant(assistant, sink)?;
+                        self.reject_goal_complete(completes[0], &error)?;
+                    }
+                }
+                continue;
+            }
+            if !completes.is_empty() {
+                self.persist_assistant(assistant, sink)?;
+                let aborted = self.run_tools_rejecting_goal_complete(
+                    &registry,
+                    &out.tool_calls,
+                    sink,
+                    "goal_complete must be the only tool call in its step",
+                )?;
+                if aborted {
+                    return Ok(false);
+                }
+                if self.inject_pending_steers(sink)? {
+                    continue;
+                }
+                continue;
+            }
+
+            self.persist_assistant(assistant, sink)?;
             if out.tool_calls.is_empty() {
+                if self.inject_pending_steers(sink)? {
+                    continue;
+                }
+                if mode == TurnMode::Goal {
+                    self.append_goal_continuation()?;
+                    continue;
+                }
                 return Ok(true);
             }
             let aborted = self.run_tools(&registry, &out.tool_calls, sink)?;
             if aborted {
                 return Ok(false);
+            }
+            if self.inject_pending_steers(sink)? {
+                continue;
             }
         }
     }
@@ -316,9 +446,32 @@ impl Conversation {
         calls: &[ToolCall],
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
-        self.run_tools_while(registry, calls, sink, crate::cancellation::interrupted)
+        self.run_tools_while_inner(
+            registry,
+            calls,
+            sink,
+            crate::cancellation::interrupted,
+            None,
+        )
     }
 
+    fn run_tools_rejecting_goal_complete(
+        &mut self,
+        registry: &Registry,
+        calls: &[ToolCall],
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        error: &str,
+    ) -> Result<bool, Error> {
+        self.run_tools_while_inner(
+            registry,
+            calls,
+            sink,
+            crate::cancellation::interrupted,
+            Some(error),
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn run_tools_while(
         &mut self,
         registry: &Registry,
@@ -326,9 +479,38 @@ impl Conversation {
         sink: &mut dyn FnMut(TurnEvent<'_>),
         mut interrupted: impl FnMut() -> bool,
     ) -> Result<bool, Error> {
+        self.run_tools_while_inner(registry, calls, sink, &mut interrupted, None)
+    }
+
+    fn run_tools_while_inner(
+        &mut self,
+        registry: &Registry,
+        calls: &[ToolCall],
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        mut interrupted: impl FnMut() -> bool,
+        goal_complete_error: Option<&str>,
+    ) -> Result<bool, Error> {
         let mut aborted = false;
+        let mut skip_remaining = false;
         for call in calls {
-            let result = if aborted || interrupted() {
+            let result = if aborted {
+                Message::tool_result(
+                    &call.id,
+                    &call.name,
+                    "[interrupted by user]".to_string(),
+                    true,
+                )
+            } else if skip_remaining {
+                Message::tool_result(&call.id, &call.name, goal::STEER_SKIPPED.to_string(), true)
+                    .with_control(MessageControl::ToolSkipped)
+            } else if goal_complete_error.is_some() && goal::is_goal_complete(call) {
+                Message::tool_result(
+                    &call.id,
+                    &call.name,
+                    goal_complete_error.unwrap_or_default().to_string(),
+                    true,
+                )
+            } else if interrupted() {
                 aborted = true;
                 Message::tool_result(
                     &call.id,
@@ -365,6 +547,8 @@ impl Conversation {
                 });
                 if interrupted() {
                     aborted = true;
+                } else if self.steers.has_pending() {
+                    skip_remaining = true;
                 }
                 Message::tool_result_with_images(
                     &call.id,
@@ -378,6 +562,133 @@ impl Conversation {
             self.messages.push(result);
         }
         Ok(aborted)
+    }
+
+    fn persist_assistant(
+        &mut self,
+        assistant: Message,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<(), Error> {
+        self.session.append_message(&assistant)?;
+        self.messages.push(assistant);
+        sink(TurnEvent::AssistantDone);
+        Ok(())
+    }
+
+    fn skip_tool_calls(&mut self, calls: &[ToolCall], reason: &str) -> Result<(), Error> {
+        for call in calls {
+            let result = Message::tool_result(&call.id, &call.name, reason.to_string(), true)
+                .with_control(MessageControl::ToolSkipped);
+            self.session.append_message(&result)?;
+            self.messages.push(result);
+        }
+        Ok(())
+    }
+
+    fn reject_goal_complete(&mut self, call: &ToolCall, error: &str) -> Result<(), Error> {
+        let result = Message::tool_result(&call.id, &call.name, error.to_string(), true);
+        self.session.append_message(&result)?;
+        self.messages.push(result);
+        Ok(())
+    }
+
+    fn inject_pending_steers(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        let mut steers = std::collections::VecDeque::from(self.steers.drain());
+        if steers.is_empty() {
+            return Ok(false);
+        }
+        let mut accepted = false;
+        while let Some(input) = steers.pop_front() {
+            if !input.images.is_empty() && !crate::model::supports_images(&self.config, &self.model)
+            {
+                sink(TurnEvent::Warning(format!(
+                    "model '{}' does not accept image input",
+                    self.model
+                )));
+                continue;
+            }
+            let message = Message::user_input(input.clone()).with_control(MessageControl::Steering);
+            let text = message.content.clone();
+            if let Err(error) = self.append_input_message(message) {
+                let pending = std::iter::once(input).chain(steers).collect::<Vec<_>>();
+                self.steers.prepend(pending);
+                return Err(error);
+            }
+            sink(TurnEvent::SteerAccepted { text: &text });
+            accepted = true;
+        }
+        Ok(accepted)
+    }
+
+    fn append_goal_continuation(&mut self) -> Result<(), Error> {
+        self.append_input_message(
+            Message::user(goal::GOAL_CONTINUATION).with_control(MessageControl::GoalContinuation),
+        )
+    }
+
+    fn finish_goal_complete(
+        &mut self,
+        mut assistant: Message,
+        result: String,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<(), Error> {
+        if assistant.content.is_empty() {
+            sink(TurnEvent::TextDelta(&result));
+        } else if assistant.content != result {
+            sink(TurnEvent::AssistantReplace(&result));
+        }
+        assistant.content.clone_from(&result);
+        assistant.tool_calls.clear();
+        self.session.append_goal_complete(&assistant)?;
+        self.messages.push(assistant);
+        self.latest_turn_result.clone_from(&result);
+        self.active_goal = None;
+        sink(TurnEvent::AssistantDone);
+        Ok(())
+    }
+
+    fn drain_deferred_subagent_results_into_history(&mut self) -> Result<(), Error> {
+        let Some(manager) = self.subagents.clone() else {
+            return Ok(());
+        };
+        if !manager.has_deferred() {
+            return Ok(());
+        }
+        let deliveries = manager.drain_deferred();
+        if deliveries.is_empty() {
+            return Ok(());
+        }
+        let backup = deliveries.clone();
+        let mut results = Vec::new();
+        for delivery in deliveries {
+            let status = match delivery.outcome {
+                crate::subagent::RunOutcome::Completed => "completed",
+                crate::subagent::RunOutcome::Failed => "failed",
+                crate::subagent::RunOutcome::Interrupted => "interrupted",
+            };
+            let content = if delivery.error.is_empty() {
+                delivery.result
+            } else if delivery.result.is_empty() {
+                delivery.error
+            } else {
+                format!("{}\n\nError: {}", delivery.result, delivery.error)
+            };
+            results.push(SubagentResult {
+                id: delivery.id.to_string(),
+                name: delivery.name,
+                status: status.into(),
+                run_number: delivery.run_number,
+                content,
+            });
+        }
+        if let Err(error) = self.append_input_message(Message::subagent_results(results)) {
+            manager.restore_deferred(backup);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn maybe_compact<F>(
@@ -441,16 +752,20 @@ impl Conversation {
     {
         sink(TurnEvent::Compacting);
         let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;
-        let (summary, replaced) = compaction::summarize(
+        let (summary, range) = compaction::summarize(
             provider.as_ref(),
             &bare_model,
             crate::model::max_tokens(&self.config, &self.model),
             &self.messages,
+            last_undoable_user_index(&self.messages),
             // Summarizer output is not user-facing; swallow its deltas.
             &mut |_| {},
         )?;
-        self.session.append_compaction(&summary, replaced)?;
-        compaction::apply_summary(&mut self.messages, &summary, replaced);
+        let start = range.start;
+        let replaced = range.len();
+        self.session
+            .append_compaction_range(&summary, start, replaced)?;
+        compaction::apply_summary_range(&mut self.messages, &summary, range);
         // Old usage estimate is stale after compaction; a fresh number
         // arrives with the next response.
         self.context_tokens = 0;
