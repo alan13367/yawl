@@ -12,6 +12,7 @@ fn settings_and_model_pickers_are_recognized_during_an_active_turn() {
     assert_eq!(busy_command("/ps"), Some(BusyCommand::Processes));
     assert_eq!(busy_command("/copy"), Some(BusyCommand::Copy));
     assert_eq!(busy_command("/copy-all"), Some(BusyCommand::CopyAll));
+    assert_eq!(busy_command("/usage"), Some(BusyCommand::Usage));
     assert_eq!(
         busy_command("/unqueue 2"),
         Some(BusyCommand::Unqueue("2".into()))
@@ -70,6 +71,7 @@ fn display_settings_apply_during_an_active_turn() {
         turn_started: None,
         context_tokens: 0,
         context_window: 100,
+        usage: crate::provider::UsageSummary::default(),
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),

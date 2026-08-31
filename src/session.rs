@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
-use crate::provider::{Message, Role};
+use crate::provider::{Message, Role, TokenUsage, UsageSummary};
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -54,6 +54,10 @@ enum SessionEvent {
         message: Message,
     },
     GoalCancel,
+    /// Provider-reported usage for one successful model request.
+    Usage {
+        usage: TokenUsage,
+    },
 }
 
 #[derive(Debug)]
@@ -61,6 +65,7 @@ pub struct Session {
     pub id: String,
     file: File,
     active_goal: Option<String>,
+    usage: UsageSummary,
 }
 
 impl Session {
@@ -96,6 +101,7 @@ impl Session {
             id: id.clone(),
             file,
             active_goal: None,
+            usage: UsageSummary::default(),
         };
         session.append(&SessionEvent::Meta {
             id,
@@ -110,13 +116,14 @@ impl Session {
     pub fn open(dir: &Path, id: &str) -> Result<(Session, Vec<Message>), Error> {
         validate_id(id)?;
         let path = dir.join(format!("{id}.jsonl"));
-        let (messages, active_goal) = replay(&path)?;
+        let (messages, active_goal, usage) = replay(&path)?;
         let file = OpenOptions::new().append(true).open(&path)?;
         Ok((
             Session {
                 id: id.to_string(),
                 file,
                 active_goal,
+                usage,
             },
             messages,
         ))
@@ -177,7 +184,9 @@ impl Session {
             summary: summary.to_string(),
             start,
             replaced,
-        })
+        })?;
+        self.usage.record_cache_reset();
+        Ok(())
     }
 
     pub fn append_undo(&mut self, dropped: usize) -> Result<(), Error> {
@@ -226,6 +235,16 @@ impl Session {
         self.active_goal.as_deref()
     }
 
+    pub(crate) fn usage(&self) -> UsageSummary {
+        self.usage
+    }
+
+    pub(crate) fn append_usage(&mut self, usage: TokenUsage) -> Result<(), Error> {
+        self.append(&SessionEvent::Usage { usage })?;
+        self.usage.record(usage);
+        Ok(())
+    }
+
     /// Removes a session log from `dir`. Missing files are treated as success.
     pub fn delete(dir: &Path, id: &str) -> Result<(), Error> {
         validate_id(id)?;
@@ -257,10 +276,11 @@ fn validate_id(id: &str) -> Result<(), Error> {
 }
 
 /// Rebuilds the effective conversation from a session log.
-fn replay(path: &Path) -> Result<(Vec<Message>, Option<String>), Error> {
+fn replay(path: &Path) -> Result<(Vec<Message>, Option<String>, UsageSummary), Error> {
     let file = File::open(path)?;
     let mut messages: Vec<Message> = Vec::new();
     let mut active_goal = None;
+    let mut usage = UsageSummary::default();
     let mut has_meta = false;
     for line in BufReader::new(file).lines() {
         let line = line?;
@@ -299,6 +319,7 @@ fn replay(path: &Path) -> Result<(Vec<Message>, Option<String>), Error> {
                     start..end,
                     std::iter::once(crate::compaction::summary_message(&summary)),
                 ));
+                usage.record_cache_reset();
             }
             SessionEvent::Undo {
                 dropped,
@@ -321,12 +342,15 @@ fn replay(path: &Path) -> Result<(Vec<Message>, Option<String>), Error> {
             SessionEvent::GoalCancel => {
                 active_goal = None;
             }
+            SessionEvent::Usage {
+                usage: request_usage,
+            } => usage.record(request_usage),
         }
     }
     if !has_meta {
         return Err(Error::Protocol("session log is missing metadata".into()));
     }
-    Ok((messages, active_goal))
+    Ok((messages, active_goal, usage))
 }
 
 pub struct SessionInfo {
@@ -490,6 +514,31 @@ mod tests {
         assert!(messages[0].content.contains("summary of one+two"));
         assert_eq!(messages[1].content, "three");
         assert_eq!(messages[2].content, "four");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn session_replays_usage_and_compaction_cache_resets() -> Result<(), Error> {
+        let dir = temp_root("usage");
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
+        let id = session.id.clone();
+        session.append_message(&Message::user("one"))?;
+        session.append_usage(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_input_tokens: 75,
+            cache_write_input_tokens: 10,
+            cache_details_reported: true,
+        })?;
+        session.append_compaction("summary", 1)?;
+        drop(session);
+
+        let (session, _) = Session::open(&dir, &id)?;
+        assert_eq!(session.usage().requests, 1);
+        assert_eq!(session.usage().tokens.cached_input_tokens, 75);
+        assert_eq!(session.usage().cache_hit_percent(), 75);
+        assert_eq!(session.usage().cache_resets, 1);
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::ops::Range;
 
 use crate::error::Error;
-use crate::provider::{Message, Provider, Request, Role, StreamNotice, stream_turn};
+use crate::provider::{Message, Provider, Request, Role, StreamNotice, TokenUsage, stream_turn};
 
 /// How many trailing messages survive compaction verbatim.
 pub const KEEP_TAIL: usize = 10;
@@ -115,7 +115,7 @@ pub fn compact(
     messages: &mut Vec<Message>,
     sink: &mut dyn FnMut(StreamNotice<'_>),
 ) -> Result<(String, usize), Error> {
-    let (summary, range) = summarize(provider, model, max_tokens, messages, None, sink)?;
+    let (summary, range, _) = summarize(provider, model, max_tokens, messages, None, sink)?;
     debug_assert_eq!(range.start, 0);
     let split = range.end;
     apply_summary(messages, &summary, split);
@@ -131,7 +131,7 @@ pub(crate) fn summarize(
     messages: &[Message],
     protected: Option<usize>,
     sink: &mut dyn FnMut(StreamNotice<'_>),
-) -> Result<(String, Range<usize>), Error> {
+) -> Result<(String, Range<usize>, TokenUsage), Error> {
     let range = compaction_range(messages, protected);
     if range.is_empty() {
         return Err(Error::Config(
@@ -149,13 +149,17 @@ pub(crate) fn summarize(
         tools: &[],
         max_tokens,
         supports_images: false,
+        // Do not add cache controls or routing hints for this one-off request.
+        // Providers with implicit caching may still cache it.
+        prompt_cache_control: false,
+        prompt_cache_key: None,
     };
     let out = stream_turn(provider, &request, sink)?;
     if out.text.trim().is_empty() {
         return Err(Error::Protocol("summarizer returned empty text".into()));
     }
     let summary = out.text.trim().to_string();
-    Ok((summary, range))
+    Ok((summary, range, out.usage))
 }
 
 pub(crate) fn apply_summary(messages: &mut Vec<Message>, summary: &str, split: usize) {
@@ -176,9 +180,11 @@ mod tests {
     impl Provider for SummaryProvider {
         fn stream_once(
             &self,
-            _request: &Request<'_>,
+            request: &Request<'_>,
             on_event: &mut dyn FnMut(Event),
         ) -> Result<(), Error> {
+            assert!(!request.prompt_cache_control);
+            assert!(request.prompt_cache_key.is_none());
             on_event(Event::TextDelta("earlier work".into()));
             on_event(Event::Done);
             Ok(())

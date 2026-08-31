@@ -66,6 +66,7 @@ fn frame_keeps_input_and_status_pinned() {
         turn_started: None,
         context_tokens: 12,
         context_window: 100,
+        usage: crate::provider::UsageSummary::default(),
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
@@ -96,7 +97,9 @@ fn frame_keeps_input_and_status_pinned() {
     let status = frame
         .last()
         .expect("the frame length was asserted immediately above");
-    assert!(markdown::strip_ansi(status).contains("test"));
+    let status_plain = markdown::strip_ansi(status);
+    assert!(status_plain.contains("test"));
+    assert!(!status_plain.contains("cache"));
     assert_eq!(cursor.0, 10);
     assert!(
         !status.contains("48;2;"),
@@ -111,6 +114,18 @@ fn frame_keeps_input_and_status_pinned() {
         "the remaining status text uses the muted accent"
     );
     assert!(frame[8].contains("38;2;238;238;238"));
+
+    state.usage.tokens.input_tokens = 100;
+    state.usage.tokens.cached_input_tokens = 50;
+    state.usage.tokens.cache_details_reported = true;
+    state.usage.cache_reported_input_tokens = 100;
+    let (frame, _) = build_frame(&mut state, &editor, 40, 12);
+    let status_plain = markdown::strip_ansi(
+        frame
+            .last()
+            .expect("the frame length was asserted immediately above"),
+    );
+    assert!(status_plain.contains("cache 50%"));
 
     state.copy_toast_ticks = 1;
     let (frame, _) = build_frame(&mut state, &editor, 40, 12);
@@ -379,6 +394,7 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         turn_started: None,
         context_tokens: 0,
         context_window: 100,
+        usage: crate::provider::UsageSummary::default(),
         activity: "sending".into(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
@@ -439,6 +455,7 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         turn_started: None,
         context_tokens: 0,
         context_window: 100,
+        usage: crate::provider::UsageSummary::default(),
         activity: "sending".into(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
@@ -546,6 +563,7 @@ fn loading_state_ignores_status_activity() {
         turn_started: None,
         context_tokens: 0,
         context_window: 100,
+        usage: crate::provider::UsageSummary::default(),
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
@@ -611,6 +629,7 @@ fn overflow_state() -> ViewState {
         turn_started: None,
         context_tokens: 0,
         context_window: 100,
+        usage: crate::provider::UsageSummary::default(),
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
@@ -911,6 +930,7 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         turn_started: None,
         context_tokens: 0,
         context_window: 100,
+        usage: crate::provider::UsageSummary::default(),
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
@@ -1092,6 +1112,7 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         turn_started: None,
         context_tokens: 0,
         context_window: 100,
+        usage: crate::provider::UsageSummary::default(),
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
@@ -1244,6 +1265,7 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         turn_started: None,
         context_tokens: 0,
         context_window: 100,
+        usage: crate::provider::UsageSummary::default(),
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
@@ -1414,6 +1436,7 @@ fn empty_session_state() -> ViewState {
         turn_started: None,
         context_tokens: 0,
         context_window: 100,
+        usage: crate::provider::UsageSummary::default(),
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),

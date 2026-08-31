@@ -2,7 +2,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::agent::TurnEvent;
-use crate::provider::ReasoningKind;
+use crate::provider::{ReasoningKind, UsageSummary};
 
 pub(crate) const MAX_TRACKED_SUBAGENTS: usize = 64;
 pub(crate) const MAX_QUEUE_MESSAGES: usize = 16;
@@ -123,6 +123,9 @@ pub(crate) struct SubagentSnapshot {
     pub(crate) requests: u64,
     /// Summed usage tokens across the requests of the current run.
     pub(crate) run_tokens: u64,
+    pub(crate) run_usage: UsageSummary,
+    /// Usage across the retained lifetime of this child conversation.
+    pub(crate) usage: UsageSummary,
     pub(crate) transcript: Vec<SubagentTranscriptItem>,
     pub(crate) live_assistant: String,
     pub(crate) live_reasoning: String,
@@ -162,6 +165,8 @@ impl SubagentSnapshot {
             context_window,
             requests: 0,
             run_tokens: 0,
+            run_usage: UsageSummary::default(),
+            usage: UsageSummary::default(),
             transcript: Vec::new(),
             live_assistant: String::new(),
             live_reasoning: String::new(),
@@ -195,6 +200,7 @@ impl SubagentSnapshot {
         self.latest_outcome = None;
         self.requests = 0;
         self.run_tokens = 0;
+        self.run_usage = UsageSummary::default();
         self.current_activity = "sending".into();
         self.push_transcript(SubagentTranscriptItem::User {
             text: bounded(text, MAX_TRANSCRIPT_TEXT_BYTES),
@@ -287,16 +293,23 @@ impl SubagentSnapshot {
                 self.current_activity = "sending".into();
             }
             TurnEvent::Compacting => self.current_activity = "compacting".into(),
-            TurnEvent::Compacted { .. } => self.current_activity = "sending".into(),
+            TurnEvent::Compacted { .. } => {
+                self.run_usage.record_cache_reset();
+                self.current_activity = "sending".into();
+            }
             TurnEvent::Warning(text) => self.error = bounded(&text, MAX_ERROR_BYTES),
             TurnEvent::Usage {
                 context_tokens,
                 context_window,
+                request_usage,
+                session_usage,
             } => {
                 self.context_tokens = context_tokens;
                 self.context_window = context_window;
-                self.requests = self.requests.saturating_add(1);
-                self.run_tokens = self.run_tokens.saturating_add(context_tokens);
+                self.run_usage.record(request_usage);
+                self.requests = self.run_usage.requests;
+                self.run_tokens = self.run_usage.tokens.total_tokens();
+                self.usage = session_usage;
             }
         }
     }
@@ -487,11 +500,31 @@ mod tests {
         snapshot.apply_event(TurnEvent::Usage {
             context_tokens: 40,
             context_window: 100,
+            request_usage: crate::provider::TokenUsage {
+                input_tokens: 32,
+                output_tokens: 8,
+                cached_input_tokens: 24,
+                cache_write_input_tokens: 0,
+                cache_details_reported: true,
+            },
+            session_usage: crate::provider::UsageSummary {
+                requests: 1,
+                tokens: crate::provider::TokenUsage {
+                    input_tokens: 32,
+                    output_tokens: 8,
+                    cached_input_tokens: 24,
+                    cache_write_input_tokens: 0,
+                    cache_details_reported: true,
+                },
+                cache_reported_input_tokens: 32,
+                cache_resets: 0,
+            },
         });
         snapshot.finish_turn(RunOutcome::Completed, "done", None);
 
         assert_eq!(snapshot.run_number, 2);
         assert_eq!(snapshot.context_tokens, 40);
+        assert_eq!(snapshot.usage.cache_hit_percent(), 75);
         assert_eq!(snapshot.latest_outcome, Some(RunOutcome::Completed));
         assert_eq!(snapshot.latest_final_result, "done");
         assert!(snapshot.transcript.iter().any(|item| {

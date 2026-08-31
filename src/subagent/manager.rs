@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use crate::agent::{Conversation, RunLimits};
 use crate::cancellation::CancellationToken;
 use crate::config::Config;
+use crate::provider::UsageSummary;
 
 use super::presets::AgentPreset;
 use super::types::{
@@ -50,9 +51,9 @@ struct State {
     deferred: VecDeque<DeferredResult>,
     settlement_sequence: u64,
     shutting_down: bool,
-    /// Usage tokens accumulated by finished subagent runs, kept for the
-    /// session-wide total even after entries are pruned.
-    total_child_tokens: u64,
+    /// Usage accumulated by finished subagent runs, kept after entries are
+    /// pruned.
+    total_child_usage: UsageSummary,
 }
 
 struct Entry {
@@ -106,7 +107,7 @@ impl SubagentManager {
                     deferred: VecDeque::new(),
                     settlement_sequence: 0,
                     shutting_down: false,
-                    total_child_tokens: 0,
+                    total_child_usage: UsageSummary::default(),
                 }),
                 changed: Condvar::new(),
             }),
@@ -172,6 +173,9 @@ impl SubagentManager {
             let synthetic_session = format!("{}-{id}", state.session_id);
             let mut conversation =
                 Conversation::memory(config.clone(), model.clone(), synthetic_session);
+            // Match Codex's root/child cache-routing group while repeated
+            // prefixes within each child remain independently reusable.
+            conversation.set_prompt_cache_key(state.session_id.clone());
             conversation.set_run_limits(RunLimits {
                 max_requests: config.subagent_request_budget as u64,
                 timeout: (config.subagent_timeout_secs > 0)
@@ -542,9 +546,13 @@ impl SubagentManager {
             .collect()
     }
 
-    /// Session-wide usage tokens across every finished subagent run.
+    /// Session-wide usage tokens across every subagent run.
     pub(crate) fn total_child_tokens(&self) -> u64 {
-        self.lock().total_child_tokens
+        self.lock().total_child_usage.tokens.total_tokens()
+    }
+
+    pub(crate) fn total_child_usage(&self) -> UsageSummary {
+        self.lock().total_child_usage
     }
 
     pub(crate) fn active_count(&self) -> usize {
@@ -763,13 +771,7 @@ impl SubagentManager {
                 Some(work.message.clone()),
                 &mut |event| {
                     let mut state = self.lock();
-                    if let Some(entry) = state
-                        .entries
-                        .iter_mut()
-                        .find(|entry| entry.snapshot.id == *id)
-                    {
-                        entry.snapshot.apply_event(event);
-                    }
+                    apply_turn_event(&mut state, id, event);
                 },
             );
             let (outcome, error) = match result {
@@ -800,7 +802,6 @@ impl SubagentManager {
             entry
                 .snapshot
                 .finish_turn(outcome, &final_result, error.as_deref());
-            let run_tokens = entry.snapshot.run_tokens;
             // finish_turn has already folded any live partial text into the
             // transcript, so the salvage scan sees the complete history.
             let delivered_result = match outcome {
@@ -844,8 +845,6 @@ impl SubagentManager {
                 entry.snapshot.queued_messages.remove(0);
             }
             entry.cancellation.clear();
-            // The entry borrow ends here; the session total outlives entries.
-            state.total_child_tokens = state.total_child_tokens.saturating_add(run_tokens);
             if !canceling && let Some(next) = next {
                 next_work = Some(next);
                 self.shared.changed.notify_all();
@@ -970,6 +969,26 @@ impl SubagentManager {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
+}
+
+fn apply_turn_event(state: &mut State, id: &SubagentId, event: crate::agent::TurnEvent<'_>) {
+    let Some(index) = state
+        .entries
+        .iter()
+        .position(|entry| entry.snapshot.id == *id)
+    else {
+        return;
+    };
+    match &event {
+        crate::agent::TurnEvent::Usage { request_usage, .. } => {
+            state.total_child_usage.record(*request_usage);
+        }
+        crate::agent::TurnEvent::Compacted { .. } => {
+            state.total_child_usage.record_cache_reset();
+        }
+        _ => {}
+    }
+    state.entries[index].snapshot.apply_event(event);
 }
 
 fn settle_entry(state: &mut State, index: usize, outcome: RunOutcome, shared: &Shared) {
@@ -1342,6 +1361,39 @@ mod tests {
             suppress_delivery: false,
             steers: crate::agent::SteerInbox::default(),
         }
+    }
+
+    #[test]
+    fn usage_is_counted_before_an_active_subagent_settles() {
+        let manager = SubagentManager::new("session".into(), 1);
+        let id = SubagentId::new(1);
+        {
+            let mut state = manager.lock();
+            state.entries.push(test_entry(SubagentStatus::Running));
+            apply_turn_event(
+                &mut state,
+                &id,
+                crate::agent::TurnEvent::Usage {
+                    context_tokens: 120,
+                    context_window: 1_000,
+                    request_usage: crate::provider::TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 20,
+                        cached_input_tokens: 75,
+                        cache_write_input_tokens: 0,
+                        cache_details_reported: true,
+                    },
+                    session_usage: crate::provider::UsageSummary::default(),
+                },
+            );
+            assert_eq!(state.entries[0].snapshot.status, SubagentStatus::Running);
+        }
+
+        let usage = manager.total_child_usage();
+        assert_eq!(usage.requests, 1);
+        assert_eq!(usage.tokens.total_tokens(), 120);
+        assert_eq!(usage.cache_hit_percent(), 75);
+        manager.shutdown_and_discard();
     }
 
     fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {

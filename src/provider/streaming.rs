@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::{Event, Provider, Reasoning, ReasoningKind, Request};
+use super::{Event, Provider, Reasoning, ReasoningKind, Request, TokenUsage};
 use crate::error::Error;
 
 /// Accumulated result of one assistant response.
@@ -9,8 +9,7 @@ pub struct TurnOutput {
     pub text: String,
     pub reasoning: Vec<Reasoning>,
     pub tool_calls: Vec<super::ToolCall>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    pub usage: TokenUsage,
     pub provider_data: Vec<serde_json::Value>,
 }
 
@@ -61,13 +60,7 @@ pub fn stream_turn(
             }
             Event::ToolCallName(name) => sink(StreamNotice::ToolPreparing { name: &name }),
             Event::ToolCall(tc) => out.tool_calls.push(tc),
-            Event::Usage {
-                input_tokens,
-                output_tokens,
-            } => {
-                out.input_tokens = input_tokens;
-                out.output_tokens = output_tokens;
-            }
+            Event::Usage(usage) => out.usage = usage,
             Event::ProviderData(value) => out.provider_data.push(value),
             Event::Done => {}
         });
@@ -139,10 +132,13 @@ mod tests {
             });
             on_event(Event::TextDelta("complete".into()));
             on_event(Event::ToolCallName("write_file".into()));
-            on_event(Event::Usage {
+            on_event(Event::Usage(TokenUsage {
                 input_tokens: 10,
                 output_tokens: 2,
-            });
+                cached_input_tokens: 8,
+                cache_write_input_tokens: 0,
+                cache_details_reported: true,
+            }));
             on_event(Event::Done);
             Ok(())
         }
@@ -161,6 +157,8 @@ mod tests {
             tools: &[],
             max_tokens: 10,
             supports_images: false,
+            prompt_cache_control: true,
+            prompt_cache_key: Some("session-test"),
         };
         let mut notices = Vec::new();
         let output = stream_turn(&provider, &request, &mut |notice| match notice {
@@ -180,6 +178,7 @@ mod tests {
         assert_eq!(provider.calls.get(), 2);
         assert_eq!(output.text, "complete");
         assert_eq!(output.reasoning[0].content, "complete thought");
+        assert_eq!(output.usage.cached_input_tokens, 8);
         assert_eq!(
             notices,
             [
@@ -192,6 +191,9 @@ mod tests {
                 "preparing:write_file"
             ]
         );
-        assert_eq!((output.input_tokens, output.output_tokens), (10, 2));
+        assert_eq!(
+            (output.usage.input_tokens, output.usage.output_tokens),
+            (10, 2)
+        );
     }
 }

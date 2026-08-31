@@ -874,6 +874,7 @@ mod tests {
             turn_started: None,
             context_tokens: 0,
             context_window: 100,
+            usage: crate::provider::UsageSummary::default(),
             activity: String::new(),
             scroll_offset: 0,
             queued_inputs: VecDeque::new(),

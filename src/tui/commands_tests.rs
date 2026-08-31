@@ -118,6 +118,7 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         turn_started: None,
         context_tokens: 0,
         context_window: 100,
+        usage: crate::provider::UsageSummary::default(),
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: ["first".into(), "second".into()].into(),
@@ -324,6 +325,7 @@ fn help_lists_undo_and_copy_commands() {
     assert!(HELP.contains("/undo"));
     assert!(HELP.contains("/copy"));
     assert!(HELP.contains("/copy-all"));
+    assert!(HELP.contains("/usage"));
     assert!(HELP.contains("/ps"));
 }
 

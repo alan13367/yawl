@@ -433,6 +433,7 @@ pub(super) fn handle_submission_while_busy(
         Some(BusyCommand::Processes) => super::processes::open_dashboard(state, background.clone()),
         Some(BusyCommand::Copy) => copy_last_reply(terminal, state, &[])?,
         Some(BusyCommand::CopyAll) => copy_all_from_transcript(terminal, state)?,
+        Some(BusyCommand::Usage) => super::commands::show_usage(state),
         Some(BusyCommand::Goal(argument)) => super::commands::goal_while_busy(&argument, state),
         None => {
             state.queued_inputs.push_back(input);
@@ -452,6 +453,7 @@ pub(super) enum BusyCommand {
     Processes,
     Copy,
     CopyAll,
+    Usage,
     Goal(String),
 }
 
@@ -469,6 +471,7 @@ pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
         "ps" if argument.is_empty() => Some(BusyCommand::Processes),
         "copy" if argument.is_empty() => Some(BusyCommand::Copy),
         "copy-all" if argument.is_empty() => Some(BusyCommand::CopyAll),
+        "usage" if argument.is_empty() => Some(BusyCommand::Usage),
         "goal" => Some(BusyCommand::Goal(argument.to_string())),
         _ => None,
     }

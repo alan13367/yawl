@@ -5,9 +5,10 @@ use serde_json::{Value, json};
 
 use super::Codex;
 use crate::error::Error;
+use crate::provider::types::clamp_openai_prompt_cache_key;
 use crate::provider::{
-    Event, Message, Provider, ReasoningKind, Request, Role, SseEvent, SseReader, ToolCall,
-    error_body,
+    Event, Message, Provider, ReasoningKind, Request, Role, SseEvent, SseReader, TokenUsage,
+    ToolCall, error_body,
 };
 
 const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -126,7 +127,19 @@ fn build_body(request: &Request<'_>, reasoning_effort: Option<&str>) -> Value {
                 .collect(),
         );
     }
+    if request.prompt_cache_control
+        && let Some(key) = clamp_openai_prompt_cache_key(request.prompt_cache_key)
+    {
+        body["prompt_cache_key"] = json!(key);
+    }
     body
+}
+
+fn cache_affinity_headers(cache_key: &str) -> [(&'static str, &str); 2] {
+    [
+        ("session-id", cache_key),
+        ("x-client-request-id", cache_key),
+    ]
 }
 
 #[derive(Default)]
@@ -183,10 +196,16 @@ impl Decoder {
                     }
                 }
                 let usage = &terminal["usage"];
-                on_event(Event::Usage {
+                let input_details = &usage["input_tokens_details"];
+                on_event(Event::Usage(TokenUsage {
                     input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
                     output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-                });
+                    cached_input_tokens: input_details["cached_tokens"].as_u64().unwrap_or(0),
+                    cache_write_input_tokens: input_details["cache_write_tokens"]
+                        .as_u64()
+                        .unwrap_or(0),
+                    cache_details_reported: input_details.is_object(),
+                }));
                 let mut reasoning = std::mem::take(&mut self.reasoning_items)
                     .into_iter()
                     .collect::<Vec<_>>();
@@ -236,8 +255,13 @@ impl Decoder {
 
 impl Provider for Codex {
     fn stream_once(&self, req: &Request<'_>, on_event: &mut dyn FnMut(Event)) -> Result<(), Error> {
+        let cache_key = if req.prompt_cache_control {
+            clamp_openai_prompt_cache_key(req.prompt_cache_key)
+        } else {
+            None
+        };
         let body = build_body(req, self.reasoning_effort.as_deref()).to_string();
-        let mut response = self
+        let mut request = self
             .agent
             .post(CODEX_RESPONSES_URL)
             .header("authorization", format!("Bearer {}", self.access_token))
@@ -246,8 +270,13 @@ impl Provider for Codex {
             .header("user-agent", format!("yawl/{}", env!("CARGO_PKG_VERSION")))
             .header("openai-beta", "responses=experimental")
             .header("accept", "text/event-stream")
-            .header("content-type", "application/json")
-            .send(body)?;
+            .header("content-type", "application/json");
+        if let Some(cache_key) = cache_key.as_deref() {
+            for (name, value) in cache_affinity_headers(cache_key) {
+                request = request.header(name, value);
+            }
+        }
+        let mut response = request.send(body)?;
         let status = response.status().as_u16();
         if status != 200 {
             return Err(Error::Http {
@@ -372,6 +401,8 @@ mod tests {
             tools: &[],
             max_tokens: 1024,
             supports_images: false,
+            prompt_cache_control: true,
+            prompt_cache_key: Some("session-test"),
         };
         let body = build_body(&request, Some("max"));
         assert_eq!(body["reasoning"]["effort"], "max");
@@ -381,6 +412,40 @@ mod tests {
             "low"
         );
         assert!(build_body(&request, None).get("reasoning").is_none());
+        assert_eq!(body["prompt_cache_key"], "session-test");
+
+        let long_key = "x".repeat(65);
+        let long_request = Request {
+            prompt_cache_key: Some(&long_key),
+            ..request
+        };
+        assert_eq!(
+            build_body(&long_request, None)["prompt_cache_key"],
+            "x".repeat(64)
+        );
+        let uncached_request = Request {
+            prompt_cache_control: false,
+            ..long_request
+        };
+        assert!(
+            build_body(&uncached_request, None)
+                .get("prompt_cache_key")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cache_affinity_headers_match_the_clamped_body_key() {
+        let long_key = "x".repeat(65);
+        let key = clamp_openai_prompt_cache_key(Some(&long_key)).expect("cache key");
+        let expected = "x".repeat(64);
+        assert_eq!(
+            cache_affinity_headers(&key),
+            [
+                ("session-id", expected.as_str()),
+                ("x-client-request-id", expected.as_str()),
+            ]
+        );
     }
 
     #[test]
@@ -418,7 +483,7 @@ mod tests {
                 "data: {{\"type\":\"response.output_item.added\",\"item\":{function_call}}}\n\n",
                 "data: {{\"type\":\"response.output_item.done\",\"item\":{function_call}}}\n\n",
                 "data: {{\"type\":\"response.output_item.done\",\"item\":{reasoning}}}\n\n",
-                "data: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{function_call},{reasoning}],\"usage\":{{\"input_tokens\":13,\"output_tokens\":6}}}}}}\n\n",
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{function_call},{reasoning}],\"usage\":{{\"input_tokens\":13,\"output_tokens\":6,\"input_tokens_details\":{{\"cached_tokens\":9,\"cache_write_tokens\":2}}}}}}}}\n\n",
             ),
             function_call = function_call,
             reasoning = reasoning,
@@ -461,10 +526,13 @@ mod tests {
         ));
         assert!(matches!(
             events[5],
-            Event::Usage {
+            Event::Usage(TokenUsage {
                 input_tokens: 13,
-                output_tokens: 6
-            }
+                output_tokens: 6,
+                cached_input_tokens: 9,
+                cache_write_input_tokens: 2,
+                cache_details_reported: true,
+            })
         ));
         assert!(matches!(
             &events[6],

@@ -1,4 +1,4 @@
-use crate::provider::{ImageContent, ReasoningKind, StreamNotice};
+use crate::provider::{ImageContent, ReasoningKind, StreamNotice, TokenUsage, UsageSummary};
 
 /// Progress events surfaced to the UI (print mode or TUI) during a turn.
 pub enum TurnEvent<'a> {
@@ -45,6 +45,8 @@ pub enum TurnEvent<'a> {
     Usage {
         context_tokens: u64,
         context_window: u64,
+        request_usage: TokenUsage,
+        session_usage: UsageSummary,
     },
 }
 

@@ -3,6 +3,7 @@
 use crate::agent::{Agent, TurnEvent};
 use crate::background::BackgroundProcessManager;
 use crate::config::{Config, UiColor};
+use crate::provider::UsageSummary;
 use crate::subagent::{SubagentManager, SubagentSnapshot};
 
 use super::completion::{Completion, command_completions};
@@ -53,6 +54,7 @@ pub(super) struct ViewState {
     pub(super) turn_started: Option<std::time::Instant>,
     pub(super) context_tokens: u64,
     pub(super) context_window: u64,
+    pub(super) usage: UsageSummary,
     pub(super) activity: String,
     pub(super) scroll_offset: usize,
     pub(super) queued_inputs: std::collections::VecDeque<super::input::Submission>,
@@ -105,6 +107,7 @@ impl ViewState {
             turn_started: None,
             context_tokens: agent.context_tokens(),
             context_window: agent.context_window(),
+            usage: agent.usage(),
             activity: String::new(),
             scroll_offset: 0,
             queued_inputs: std::collections::VecDeque::new(),
@@ -226,9 +229,11 @@ impl ViewState {
             Update::Usage {
                 context_tokens,
                 context_window,
+                session_usage,
             } => {
                 self.context_tokens = context_tokens;
                 self.context_window = context_window;
+                self.usage = session_usage;
             }
         }
         if follow_bottom {
@@ -258,6 +263,7 @@ pub(super) enum Update {
     Usage {
         context_tokens: u64,
         context_window: u64,
+        session_usage: UsageSummary,
     },
 }
 
@@ -314,9 +320,12 @@ impl Update {
             TurnEvent::Usage {
                 context_tokens,
                 context_window,
+                request_usage: _,
+                session_usage,
             } => Self::Usage {
                 context_tokens,
                 context_window,
+                session_usage,
             },
         }
     }

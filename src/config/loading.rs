@@ -378,6 +378,7 @@ mod tests {
                     "authHeader": true,
                     "compat": {
                         "supportsUsageInStreaming": false,
+                        "supportsPromptCacheKey": true,
                         "maxTokensField": "max_tokens"
                     },
                     "models": [{
@@ -396,6 +397,7 @@ mod tests {
         assert_eq!(provider.models[0].id, "qwen");
         assert_eq!(provider.models[0].input, ["text", "image"]);
         assert!(!provider.compat.usage_in_stream());
+        assert!(provider.compat.prompt_cache_key_supported());
         assert!(provider.compat.reasoning_content_on_assistant_messages());
         Ok(())
     }

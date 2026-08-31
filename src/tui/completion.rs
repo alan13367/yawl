@@ -26,6 +26,7 @@ pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
         ("/new", "Start a session without changing directories"),
         ("/clear", "Alias for /new"),
         ("/compact", "Summarize older messages"),
+        ("/usage", "Show token and prompt-cache usage"),
         ("/undo", "Undo the last turn"),
         ("/copy", "Copy the last assistant reply"),
         ("/copy-all", "Copy the conversation without reasoning"),

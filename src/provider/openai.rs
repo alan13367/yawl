@@ -5,9 +5,10 @@ use std::io::BufReader;
 
 use serde_json::{Value, json};
 
+use super::types::clamp_openai_prompt_cache_key;
 use super::{
-    Event, Provider, ReasoningKind, Request, Role, SseEvent, SseReader, ToolCall, error_body,
-    http_agent,
+    Event, Provider, ReasoningKind, Request, Role, SseEvent, SseReader, TokenUsage, ToolCall,
+    error_body, http_agent,
 };
 use crate::config::OpenAiCompatibility;
 use crate::error::Error;
@@ -19,17 +20,22 @@ pub struct OpenAi {
     auth_header: bool,
     headers: Vec<(String, String)>,
     compat: OpenAiCompatibility,
+    prompt_cache_key: bool,
 }
 
 impl OpenAi {
     pub fn new(base_url: String, api_key: String) -> OpenAi {
-        OpenAi::configured(
+        let prompt_cache_key =
+            base_url.trim_end_matches('/') == crate::config::DEFAULT_OPENAI_BASE_URL;
+        OpenAi {
+            agent: http_agent(),
             base_url,
             api_key,
-            true,
-            Vec::new(),
-            OpenAiCompatibility::default(),
-        )
+            auth_header: true,
+            headers: Vec::new(),
+            compat: OpenAiCompatibility::default(),
+            prompt_cache_key,
+        }
     }
 
     pub fn configured(
@@ -39,6 +45,7 @@ impl OpenAi {
         headers: Vec<(String, String)>,
         compat: OpenAiCompatibility,
     ) -> OpenAi {
+        let prompt_cache_key = compat.prompt_cache_key_supported();
         OpenAi {
             agent: http_agent(),
             base_url,
@@ -46,6 +53,7 @@ impl OpenAi {
             auth_header,
             headers,
             compat,
+            prompt_cache_key,
         }
     }
 }
@@ -151,7 +159,7 @@ fn push_tool_images(out: &mut Vec<Value>, images: &mut Vec<(&str, &str, &super::
     images.clear();
 }
 
-fn build_body(req: &Request<'_>, compat: &OpenAiCompatibility) -> Value {
+fn build_body(req: &Request<'_>, compat: &OpenAiCompatibility, prompt_cache_key: bool) -> Value {
     let mut body = json!({
         "model": req.model,
         "stream": true,
@@ -178,6 +186,12 @@ fn build_body(req: &Request<'_>, compat: &OpenAiCompatibility) -> Value {
             .collect();
         body["tools"] = json!(tools);
     }
+    if prompt_cache_key
+        && req.prompt_cache_control
+        && let Some(key) = clamp_openai_prompt_cache_key(req.prompt_cache_key)
+    {
+        body["prompt_cache_key"] = json!(key);
+    }
     body
 }
 
@@ -192,6 +206,9 @@ struct Decoder {
     pending: Vec<(u64, PendingCall)>,
     input_tokens: u64,
     output_tokens: u64,
+    cached_input_tokens: u64,
+    cache_write_input_tokens: u64,
+    cache_details_reported: bool,
     finished: bool,
     finish_reason_required: bool,
 }
@@ -202,6 +219,9 @@ impl Decoder {
             pending: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            cache_details_reported: false,
             finished: false,
             finish_reason_required: compat.finish_reason_in_stream(),
         }
@@ -246,6 +266,14 @@ impl Decoder {
             }
             if let Some(completion_tokens) = usage["completion_tokens"].as_u64() {
                 self.output_tokens = completion_tokens;
+            }
+            let details = usage
+                .get("prompt_tokens_details")
+                .or_else(|| usage.get("input_tokens_details"));
+            if let Some(details) = details {
+                self.cache_details_reported = details.is_object();
+                self.cached_input_tokens = details["cached_tokens"].as_u64().unwrap_or(0);
+                self.cache_write_input_tokens = details["cache_write_tokens"].as_u64().unwrap_or(0);
             }
         }
         let Some(choice) = value["choices"].get(0) else {
@@ -337,10 +365,13 @@ impl Decoder {
                 arguments,
             }));
         }
-        on_event(Event::Usage {
+        on_event(Event::Usage(TokenUsage {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
-        });
+            cached_input_tokens: self.cached_input_tokens,
+            cache_write_input_tokens: self.cache_write_input_tokens,
+            cache_details_reported: self.cache_details_reported,
+        }));
         on_event(Event::Done);
     }
 }
@@ -348,7 +379,7 @@ impl Decoder {
 impl Provider for OpenAi {
     fn stream_once(&self, req: &Request<'_>, on_event: &mut dyn FnMut(Event)) -> Result<(), Error> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = build_body(req, &self.compat).to_string();
+        let body = build_body(req, &self.compat, self.prompt_cache_key).to_string();
         let mut request = self
             .agent
             .post(&url)
@@ -438,10 +469,80 @@ mod tests {
             tools: &[],
             max_tokens: 321,
             supports_images: false,
+            prompt_cache_control: true,
+            prompt_cache_key: Some("session-test"),
         };
         assert_eq!(
-            build_body(&request, &OpenAiCompatibility::default())["max_tokens"],
+            build_body(&request, &OpenAiCompatibility::default(), false)["max_tokens"],
             321
+        );
+    }
+
+    #[test]
+    fn cache_key_is_off_for_local_compatibility_unless_opted_in() {
+        let messages = [Message::user("hello")];
+        let request = Request {
+            model: "test",
+            system: "system",
+            messages: &messages,
+            tools: &[],
+            max_tokens: 100,
+            supports_images: false,
+            prompt_cache_control: true,
+            prompt_cache_key: Some("session-test"),
+        };
+
+        let local = OpenAi::configured(
+            "http://127.0.0.1:8000/v1".into(),
+            String::new(),
+            false,
+            Vec::new(),
+            OpenAiCompatibility::default(),
+        );
+        assert!(!local.prompt_cache_key);
+        assert!(
+            build_body(&request, &local.compat, local.prompt_cache_key)
+                .get("prompt_cache_key")
+                .is_none()
+        );
+
+        let opted_in = OpenAiCompatibility {
+            supports_prompt_cache_key: Some(true),
+            ..OpenAiCompatibility::default()
+        };
+        assert_eq!(
+            build_body(&request, &opted_in, opted_in.prompt_cache_key_supported())["prompt_cache_key"],
+            "session-test"
+        );
+        let long_key = "x".repeat(65);
+        let long_request = Request {
+            prompt_cache_key: Some(&long_key),
+            ..request
+        };
+        assert_eq!(
+            build_body(
+                &long_request,
+                &opted_in,
+                opted_in.prompt_cache_key_supported()
+            )["prompt_cache_key"],
+            "x".repeat(64)
+        );
+        let without_cache_controls = Request {
+            prompt_cache_control: false,
+            ..long_request
+        };
+        assert!(
+            build_body(
+                &without_cache_controls,
+                &opted_in,
+                opted_in.prompt_cache_key_supported()
+            )
+            .get("prompt_cache_key")
+            .is_none()
+        );
+        assert!(
+            OpenAi::new(crate::config::DEFAULT_OPENAI_BASE_URL.into(), "key".into())
+                .prompt_cache_key
         );
     }
 
@@ -533,8 +634,10 @@ mod tests {
             tools: &[],
             max_tokens: 123,
             supports_images: false,
+            prompt_cache_control: true,
+            prompt_cache_key: Some("session-test"),
         };
-        let body = build_body(&request, &compat);
+        let body = build_body(&request, &compat, false);
         assert!(body.get("stream_options").is_none());
         assert_eq!(body["max_completion_tokens"], 123);
         assert_eq!(body["messages"][0]["name"], "shell");
@@ -547,7 +650,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":8,\"cache_write_tokens\":2}}}\n\n",
             "data: [DONE]\n\n",
         );
         let mut decoder = Decoder::new(&OpenAiCompatibility::default());
@@ -581,10 +684,13 @@ mod tests {
         ));
         assert!(matches!(
             events[4],
-            Event::Usage {
+            Event::Usage(TokenUsage {
                 input_tokens: 11,
-                output_tokens: 5
-            }
+                output_tokens: 5,
+                cached_input_tokens: 8,
+                cache_write_input_tokens: 2,
+                cache_details_reported: true,
+            })
         ));
         assert!(matches!(events[5], Event::Done));
     }

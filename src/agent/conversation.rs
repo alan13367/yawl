@@ -12,7 +12,7 @@ use crate::checkpoint::Checkpoints;
 use crate::compaction;
 use crate::config::{Config, ConfigChange, ConfigChangeEffect};
 use crate::error::Error;
-use crate::provider::{Message, MessageControl, TurnInput};
+use crate::provider::{Message, MessageControl, TokenUsage, TurnInput, UsageSummary};
 use crate::session::Session;
 use crate::subagent::SubagentManager;
 use crate::tools::{DescribeCache, Registry};
@@ -60,6 +60,8 @@ struct PersistentState {
 
 struct ChildState {
     session_id: String,
+    prompt_cache_key: String,
+    usage: UsageSummary,
     run_limits: Option<RunLimits>,
     tool_allowlist: Option<Vec<String>>,
     role_fragment: Option<String>,
@@ -126,7 +128,9 @@ impl Conversation {
             model,
             messages: Vec::new(),
             kind: ConversationKind::Child(ChildState {
+                prompt_cache_key: session_id.clone(),
                 session_id,
+                usage: UsageSummary::default(),
                 run_limits: None,
                 tool_allowlist: None,
                 role_fragment: None,
@@ -150,6 +154,10 @@ impl Conversation {
 
     pub(crate) fn set_role_fragment(&mut self, fragment: String) {
         self.child_mut().role_fragment = Some(fragment);
+    }
+
+    pub(crate) fn set_prompt_cache_key(&mut self, key: String) {
+        self.child_mut().prompt_cache_key = key;
     }
 
     pub(crate) fn context_window(&self) -> u64 {
@@ -177,6 +185,20 @@ impl Conversation {
 
     pub(crate) fn context_tokens(&self) -> u64 {
         self.context_tokens
+    }
+
+    pub(crate) fn usage(&self) -> UsageSummary {
+        match &self.kind {
+            ConversationKind::Persistent(state) => state.session.usage(),
+            ConversationKind::Child(state) => state.usage,
+        }
+    }
+
+    fn prompt_cache_key(&self) -> &str {
+        match &self.kind {
+            ConversationKind::Persistent(state) => &state.session.id,
+            ConversationKind::Child(state) => &state.prompt_cache_key,
+        }
     }
 
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
@@ -525,6 +547,28 @@ impl Conversation {
                 .session
                 .append_compaction_range(summary, start, replaced),
             ConversationKind::Child(_) => Ok(()),
+        }
+    }
+
+    fn record_usage(&mut self, usage: TokenUsage) -> Result<(), Error> {
+        match &mut self.kind {
+            ConversationKind::Persistent(state) => state.session.append_usage(usage),
+            ConversationKind::Child(state) => {
+                state.usage.record(usage);
+                Ok(())
+            }
+        }
+    }
+
+    fn record_cache_reset(&mut self) -> Result<(), Error> {
+        match &mut self.kind {
+            // Persistent compactions record the reset in their existing
+            // append-only compaction event.
+            ConversationKind::Persistent(_) => Ok(()),
+            ConversationKind::Child(state) => {
+                state.usage.record_cache_reset();
+                Ok(())
+            }
         }
     }
 }

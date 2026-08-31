@@ -1,7 +1,19 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::Error;
+
+const OPENAI_PROMPT_CACHE_KEY_MAX_CHARS: usize = 64;
+
+pub(super) fn clamp_openai_prompt_cache_key(key: Option<&str>) -> Option<Cow<'_, str>> {
+    key.map(|key| {
+        key.char_indices()
+            .nth(OPENAI_PROMPT_CACHE_KEY_MAX_CHARS)
+            .map_or(Cow::Borrowed(key), |(end, _)| Cow::Owned(key[..end].into()))
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -249,6 +261,95 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
+/// Normalized token accounting for one completed provider request.
+///
+/// `input_tokens` is the full logical prompt size, including cache reads and
+/// writes. The cache fields are subsets of that total when the provider
+/// reports them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    /// The provider included cache-specific usage details, even if both
+    /// reported counts were zero.
+    pub cache_details_reported: bool,
+}
+
+impl TokenUsage {
+    pub fn total_tokens(self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    pub fn fresh_input_tokens(self) -> u64 {
+        self.input_tokens
+            .saturating_sub(self.cached_input_tokens)
+            .saturating_sub(self.cache_write_input_tokens)
+    }
+
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cached_input_tokens: self
+                .cached_input_tokens
+                .saturating_add(other.cached_input_tokens),
+            cache_write_input_tokens: self
+                .cache_write_input_tokens
+                .saturating_add(other.cache_write_input_tokens),
+            cache_details_reported: self.cache_details_reported || other.cache_details_reported,
+        }
+    }
+}
+
+/// Token and prompt-cache totals accumulated across a conversation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct UsageSummary {
+    pub requests: u64,
+    pub tokens: TokenUsage,
+    /// Input tokens from requests that supplied cache-specific usage. This is
+    /// the denominator for cache-hit percentages when a session mixes
+    /// providers with different reporting support.
+    pub cache_reported_input_tokens: u64,
+    pub cache_resets: u64,
+}
+
+impl UsageSummary {
+    pub fn record(&mut self, usage: TokenUsage) {
+        self.requests = self.requests.saturating_add(1);
+        if usage.cache_details_reported {
+            self.cache_reported_input_tokens = self
+                .cache_reported_input_tokens
+                .saturating_add(usage.input_tokens);
+        }
+        self.tokens = self.tokens.saturating_add(usage);
+    }
+
+    pub fn record_cache_reset(&mut self) {
+        self.cache_resets = self.cache_resets.saturating_add(1);
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.tokens = self.tokens.saturating_add(other.tokens);
+        self.cache_reported_input_tokens = self
+            .cache_reported_input_tokens
+            .saturating_add(other.cache_reported_input_tokens);
+        self.cache_resets = self.cache_resets.saturating_add(other.cache_resets);
+    }
+
+    pub fn cache_hit_percent(self) -> u64 {
+        if self.cache_reported_input_tokens == 0 {
+            return 0;
+        }
+        ((u128::from(self.tokens.cached_input_tokens) * 100)
+            / u128::from(self.cache_reported_input_tokens))
+        .min(100) as u64
+    }
+}
+
 /// One streaming request. Providers translate this to their wire format.
 pub struct Request<'a> {
     pub model: &'a str,
@@ -258,6 +359,13 @@ pub struct Request<'a> {
     pub max_tokens: u32,
     /// Whether this request's selected model accepts image inputs.
     pub supports_images: bool,
+    /// Whether providers should add explicit prompt-cache controls and
+    /// routing hints. Providers with implicit caching may still cache the
+    /// request when this is false.
+    pub prompt_cache_control: bool,
+    /// Stable session identifier used only by providers that support prompt
+    /// cache routing. Other providers leave the wire request unchanged.
+    pub prompt_cache_key: Option<&'a str>,
 }
 
 /// Events surfaced by a provider while streaming one assistant response.
@@ -272,10 +380,7 @@ pub enum Event {
     ToolCallName(String),
     /// A complete tool call (emitted once its arguments finished streaming).
     ToolCall(ToolCall),
-    Usage {
-        input_tokens: u64,
-        output_tokens: u64,
-    },
+    Usage(TokenUsage),
     /// Opaque data needed to replay a provider response on the next request.
     ProviderData(Value),
     Done,
@@ -311,6 +416,62 @@ mod tests {
         assert!(message.images.is_empty());
         assert_eq!(message.control, None);
         Ok(())
+    }
+
+    #[test]
+    fn old_usage_records_default_to_no_cache_details() -> Result<(), serde_json::Error> {
+        let usage: TokenUsage = serde_json::from_str(r#"{"input_tokens":10,"output_tokens":2}"#)?;
+        assert_eq!(usage.total_tokens(), 12);
+        assert!(!usage.cache_details_reported);
+        Ok(())
+    }
+
+    #[test]
+    fn openai_cache_keys_are_clamped_to_64_characters() {
+        let unicode = "å".repeat(65);
+        assert_eq!(
+            clamp_openai_prompt_cache_key(Some(&unicode)).as_deref(),
+            Some("å".repeat(64).as_str())
+        );
+        assert_eq!(
+            clamp_openai_prompt_cache_key(Some("short")).as_deref(),
+            Some("short")
+        );
+        assert!(clamp_openai_prompt_cache_key(None).is_none());
+    }
+
+    #[test]
+    fn fresh_input_excludes_cache_reads_and_writes() {
+        let usage = TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 60,
+            cache_write_input_tokens: 15,
+            ..TokenUsage::default()
+        };
+
+        assert_eq!(usage.fresh_input_tokens(), 25);
+    }
+
+    #[test]
+    fn cache_hit_rate_excludes_input_without_cache_details() {
+        let mut usage = UsageSummary::default();
+        usage.record(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cached_input_tokens: 50,
+            cache_write_input_tokens: 0,
+            cache_details_reported: true,
+        });
+        usage.record(TokenUsage {
+            input_tokens: 900,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            cache_details_reported: false,
+        });
+
+        assert_eq!(usage.cache_reported_input_tokens, 100);
+        assert_eq!(usage.cache_hit_percent(), 50);
     }
 
     #[test]

@@ -48,6 +48,7 @@ fn state_with(geometry: Option<ScrollGeometry>) -> ViewState {
         turn_started: None,
         context_tokens: 0,
         context_window: 100,
+        usage: crate::provider::UsageSummary::default(),
         activity: String::new(),
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),

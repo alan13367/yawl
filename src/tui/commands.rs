@@ -25,6 +25,7 @@ Commands
   /new                 start a new session without changing directories
   /clear               alias for /new
   /compact             summarize older messages now
+  /usage               show token and prompt-cache usage
   /undo                restore files and drop the last turn
   /copy                copy the last assistant reply
   /copy-all            copy the conversation without reasoning
@@ -927,6 +928,62 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         agent.config().global_config_path().display()
     ));
     state.notice(text);
+}
+
+pub(super) fn show_usage(state: &mut ViewState) {
+    let main = state.usage;
+    let children = state.subagent_manager.total_child_usage();
+    let mut text = String::from("Token usage\n\nMain conversation\n");
+    append_usage_summary(&mut text, main);
+    if children.requests > 0 {
+        text.push_str("\nSubagents\n");
+        append_usage_summary(&mut text, children);
+    }
+    text.push_str(
+        "\nProvider-reported totals are persisted for the main session. Cache writes are reported separately from fresh input.",
+    );
+    state.notice(text);
+}
+
+fn append_usage_summary(text: &mut String, usage: crate::provider::UsageSummary) {
+    use std::fmt::Write as _;
+
+    let tokens = usage.tokens;
+    writeln!(text, "- Requests: {}", usage.requests).expect("writing to a String cannot fail");
+    writeln!(
+        text,
+        "- Input: {} total, {} fresh, {} read from cache",
+        super::render::format_token_count(tokens.input_tokens),
+        super::render::format_token_count(tokens.fresh_input_tokens()),
+        super::render::format_token_count(tokens.cached_input_tokens),
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        text,
+        "- Cache writes: {}",
+        super::render::format_token_count(tokens.cache_write_input_tokens),
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        text,
+        "- Output: {}",
+        super::render::format_token_count(tokens.output_tokens),
+    )
+    .expect("writing to a String cannot fail");
+    if tokens.cache_details_reported {
+        writeln!(text, "- Cache hit rate: {}%", usage.cache_hit_percent())
+            .expect("writing to a String cannot fail");
+    } else {
+        text.push_str("- Prompt cache: not reported\n");
+    }
+    if usage.cache_resets > 0 {
+        writeln!(
+            text,
+            "- Cache resets from compaction: {}",
+            usage.cache_resets
+        )
+        .expect("writing to a String cannot fail");
+    }
 }
 
 fn configured_key_status(environment: &str, stored: Option<&str>) -> &'static str {

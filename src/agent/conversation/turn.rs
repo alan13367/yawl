@@ -338,6 +338,8 @@ impl Conversation {
                 tools: &specs,
                 max_tokens: crate::model::max_tokens(&self.config, &self.model),
                 supports_images: crate::model::supports_images(&self.config, &self.model),
+                prompt_cache_control: true,
+                prompt_cache_key: Some(self.prompt_cache_key()),
             };
             let out = match stream_turn(provider.as_ref(), &request, &mut forward(sink)) {
                 Ok(out) => out,
@@ -350,11 +352,14 @@ impl Conversation {
                 return Ok(false);
             }
 
-            self.context_tokens = out.input_tokens.saturating_add(out.output_tokens);
+            self.record_usage(out.usage)?;
+            self.context_tokens = out.usage.total_tokens();
             requests_made = requests_made.saturating_add(1);
             sink(TurnEvent::Usage {
                 context_tokens: self.context_tokens,
                 context_window: self.context_window(),
+                request_usage: out.usage,
+                session_usage: self.usage(),
             });
 
             self.latest_turn_result.clone_from(&out.text);
@@ -749,7 +754,7 @@ impl Conversation {
     {
         sink(TurnEvent::Compacting);
         let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;
-        let (summary, range) = compaction::summarize(
+        let (summary, range, usage) = compaction::summarize(
             provider.as_ref(),
             &bare_model,
             crate::model::max_tokens(&self.config, &self.model),
@@ -758,13 +763,21 @@ impl Conversation {
             // Summarizer output is not user-facing; swallow its deltas.
             &mut |_| {},
         )?;
+        self.record_usage(usage)?;
         let start = range.start;
         let replaced = range.len();
         self.persist_compaction(&summary, start, replaced)?;
         compaction::apply_summary_range(&mut self.messages, &summary, range);
+        self.record_cache_reset()?;
         // Old usage estimate is stale after compaction; a fresh number
         // arrives with the next response.
         self.context_tokens = 0;
+        sink(TurnEvent::Usage {
+            context_tokens: 0,
+            context_window: self.context_window(),
+            request_usage: usage,
+            session_usage: self.usage(),
+        });
         sink(TurnEvent::Compacted { replaced });
         Ok(())
     }

@@ -9,7 +9,7 @@ use crate::background::BackgroundProcessManager;
 use crate::cancellation::CancellationToken;
 use crate::config::{Config, ConfigChange, ConfigChangeEffect};
 use crate::error::Error;
-use crate::provider::{Message, TurnInput};
+use crate::provider::{Message, TurnInput, UsageSummary};
 use crate::session::Session;
 use crate::subagent::SubagentManager;
 use crate::tools::Registry;
@@ -58,6 +58,10 @@ impl Agent {
 
     pub fn context_tokens(&self) -> u64 {
         self.conversation.context_tokens()
+    }
+
+    pub fn usage(&self) -> UsageSummary {
+        self.conversation.usage()
     }
 
     pub(crate) fn subagents(&self) -> SubagentManager {

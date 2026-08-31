@@ -5,7 +5,8 @@ use std::io::BufReader;
 use serde_json::{Value, json};
 
 use super::{
-    Event, Provider, Request, Role, SseEvent, SseReader, ToolCall, error_body, http_agent,
+    Event, Provider, Request, Role, SseEvent, SseReader, TokenUsage, ToolCall, error_body,
+    http_agent,
 };
 use crate::error::Error;
 
@@ -13,14 +14,18 @@ pub struct Anthropic {
     agent: ureq::Agent,
     base_url: String,
     api_key: String,
+    prompt_caching: bool,
 }
 
 impl Anthropic {
     pub fn new(base_url: String, api_key: String) -> Anthropic {
+        let prompt_caching =
+            base_url.trim_end_matches('/') == crate::config::DEFAULT_ANTHROPIC_BASE_URL;
         Anthropic {
             agent: http_agent(),
             base_url,
             api_key,
+            prompt_caching,
         }
     }
 }
@@ -103,7 +108,7 @@ fn build_messages(messages: &[super::Message], supports_images: bool) -> Vec<Val
     out
 }
 
-fn build_body(req: &Request<'_>) -> Value {
+fn build_body(req: &Request<'_>, prompt_caching_supported: bool) -> Value {
     let mut body = json!({
         "model": req.model,
         "max_tokens": req.max_tokens,
@@ -127,6 +132,9 @@ fn build_body(req: &Request<'_>) -> Value {
             .collect();
         body["tools"] = json!(tools);
     }
+    if prompt_caching_supported && req.prompt_cache_control {
+        body["cache_control"] = json!({"type": "ephemeral"});
+    }
     body
 }
 
@@ -145,6 +153,9 @@ struct Decoder {
     blocks: Vec<(u64, Block)>,
     input_tokens: u64,
     output_tokens: u64,
+    cached_input_tokens: u64,
+    cache_write_input_tokens: u64,
+    cache_details_reported: bool,
 }
 
 impl Decoder {
@@ -155,20 +166,17 @@ impl Decoder {
         let value: Value = serde_json::from_str(&sse.data)?;
         match sse.event.as_str() {
             "message_start" => {
-                self.input_tokens = value["message"]["usage"]["input_tokens"]
-                    .as_u64()
-                    .unwrap_or(0);
-                // Prompt-cache reads/writes count toward context size.
-                self.input_tokens = self.input_tokens.saturating_add(
-                    value["message"]["usage"]["cache_read_input_tokens"]
-                        .as_u64()
-                        .unwrap_or(0),
-                );
-                self.input_tokens = self.input_tokens.saturating_add(
-                    value["message"]["usage"]["cache_creation_input_tokens"]
-                        .as_u64()
-                        .unwrap_or(0),
-                );
+                let usage = &value["message"]["usage"];
+                self.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
+                self.cache_details_reported = usage.get("cache_read_input_tokens").is_some()
+                    || usage.get("cache_creation_input_tokens").is_some();
+                self.cached_input_tokens = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                self.cache_write_input_tokens =
+                    usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                self.input_tokens = self
+                    .input_tokens
+                    .saturating_add(self.cached_input_tokens)
+                    .saturating_add(self.cache_write_input_tokens);
             }
             "content_block_start" => {
                 let index = value["index"].as_u64().unwrap_or(0);
@@ -232,10 +240,13 @@ impl Decoder {
                 }
             }
             "message_stop" => {
-                on_event(Event::Usage {
+                on_event(Event::Usage(TokenUsage {
                     input_tokens: self.input_tokens,
                     output_tokens: self.output_tokens,
-                });
+                    cached_input_tokens: self.cached_input_tokens,
+                    cache_write_input_tokens: self.cache_write_input_tokens,
+                    cache_details_reported: self.cache_details_reported,
+                }));
                 on_event(Event::Done);
                 return Ok(true);
             }
@@ -267,7 +278,7 @@ impl Decoder {
 impl Provider for Anthropic {
     fn stream_once(&self, req: &Request<'_>, on_event: &mut dyn FnMut(Event)) -> Result<(), Error> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let body = build_body(req).to_string();
+        let body = build_body(req, self.prompt_caching).to_string();
         let mut response = self
             .agent
             .post(&url)
@@ -304,6 +315,45 @@ mod tests {
     use super::*;
     use crate::provider::Message;
     use std::io::Cursor;
+
+    fn request<'a>(messages: &'a [Message]) -> Request<'a> {
+        Request {
+            model: "test",
+            system: "system",
+            messages,
+            tools: &[],
+            max_tokens: 100,
+            supports_images: false,
+            prompt_cache_control: true,
+            prompt_cache_key: Some("session-test"),
+        }
+    }
+
+    #[test]
+    fn automatic_caching_is_limited_to_the_official_endpoint() {
+        let messages = [Message::user("hello")];
+        assert_eq!(
+            build_body(&request(&messages), true)["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(
+            build_body(&request(&messages), false)
+                .get("cache_control")
+                .is_none()
+        );
+        let mut uncached = request(&messages);
+        uncached.prompt_cache_control = false;
+        assert!(build_body(&uncached, true).get("cache_control").is_none());
+
+        assert!(
+            Anthropic::new(
+                crate::config::DEFAULT_ANTHROPIC_BASE_URL.into(),
+                "key".into()
+            )
+            .prompt_caching
+        );
+        assert!(!Anthropic::new("http://127.0.0.1:8080".into(), String::new()).prompt_caching);
+    }
 
     #[test]
     fn tool_results_merge_into_one_user_message() {
@@ -405,10 +455,13 @@ mod tests {
         ));
         assert!(matches!(
             events[3],
-            Event::Usage {
+            Event::Usage(TokenUsage {
                 input_tokens: 15,
-                output_tokens: 4
-            }
+                output_tokens: 4,
+                cached_input_tokens: 2,
+                cache_write_input_tokens: 3,
+                cache_details_reported: true,
+            })
         ));
         assert!(matches!(events[4], Event::Done));
     }
@@ -445,10 +498,13 @@ mod tests {
 
         assert!(matches!(
             events[0],
-            Event::Usage {
+            Event::Usage(TokenUsage {
                 input_tokens: u64::MAX,
-                output_tokens: 0
-            }
+                output_tokens: 0,
+                cached_input_tokens: 1,
+                cache_write_input_tokens: 1,
+                cache_details_reported: true,
+            })
         ));
     }
 }

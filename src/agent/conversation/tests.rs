@@ -9,7 +9,9 @@ use crate::agent::TurnEvent;
 use crate::compaction;
 use crate::config::Config;
 use crate::error::Error;
-use crate::provider::{Event as ProviderEvent, Message, Provider, Request, Role, ToolCall};
+use crate::provider::{
+    Event as ProviderEvent, Message, Provider, Request, Role, TokenUsage, ToolCall,
+};
 use crate::session::Session;
 
 enum ProviderStep {
@@ -56,10 +58,13 @@ impl Provider for ScriptedProvider {
                 for call in tool_calls {
                     on_event(ProviderEvent::ToolCall(call));
                 }
-                on_event(ProviderEvent::Usage {
+                on_event(ProviderEvent::Usage(TokenUsage {
                     input_tokens,
                     output_tokens,
-                });
+                    cached_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    cache_details_reported: false,
+                }));
                 on_event(ProviderEvent::Done);
                 Ok(())
             }

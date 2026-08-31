@@ -158,6 +158,11 @@ pub struct OpenAiCompatibility {
     pub requires_reasoning_content_on_assistant_messages: Option<bool>,
     #[serde(alias = "maxTokensField")]
     pub max_tokens_field: Option<String>,
+    /// Whether this endpoint accepts OpenAI's `prompt_cache_key` request
+    /// field. Disabled by default so local and generic compatible servers see
+    /// the same requests as before.
+    #[serde(alias = "supportsPromptCacheKey")]
+    pub supports_prompt_cache_key: Option<bool>,
 }
 
 impl OpenAiCompatibility {
@@ -181,6 +186,9 @@ impl OpenAiCompatibility {
         if other.max_tokens_field.is_some() {
             self.max_tokens_field = other.max_tokens_field;
         }
+        if other.supports_prompt_cache_key.is_some() {
+            self.supports_prompt_cache_key = other.supports_prompt_cache_key;
+        }
     }
 
     pub fn usage_in_stream(&self) -> bool {
@@ -202,6 +210,10 @@ impl OpenAiCompatibility {
 
     pub fn max_tokens_field(&self) -> &str {
         self.max_tokens_field.as_deref().unwrap_or("max_tokens")
+    }
+
+    pub fn prompt_cache_key_supported(&self) -> bool {
+        self.supports_prompt_cache_key.unwrap_or(false)
     }
 }
 

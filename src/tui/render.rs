@@ -1235,6 +1235,9 @@ pub(super) fn build_frame_with_images(
         percentage,
         format_token_count(state.context_window)
     ));
+    if state.usage.tokens.cache_details_reported {
+        parts.push(format!("cache {}%", state.usage.cache_hit_percent()));
+    }
     if let Some(started) = state.turn_started {
         parts.push(tool_view::format_elapsed(started.elapsed()));
     }

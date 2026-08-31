@@ -398,6 +398,8 @@ fn handle_submission<R: Read>(
                     Err(error) => state.notice(format!("Compaction failed: {error}")),
                 }
             }
+            "usage" if argument.is_empty() => commands::show_usage(state),
+            "usage" => state.notice("Usage: /usage"),
             "tools" => {
                 let registry = agent.scan_tools();
                 let mut text = String::from("Available tools\n\n");

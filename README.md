@@ -159,6 +159,7 @@ Messages submitted during an active response are queued automatically. Each pend
 | `/new` | Start a new session without changing the current working directory |
 | `/clear` | Alias for `/new` |
 | `/compact` | Summarize older messages now |
+| `/usage` | Show provider-reported token and prompt-cache usage for the main session and subagents |
 | `/undo` | Restore files from before the last prompt and drop that user/assistant turn |
 | `/copy` | Copy the last assistant reply |
 | `/copy-all` | Copy the conversation (user and assistant text, no reasoning) |
@@ -227,7 +228,7 @@ Choose "OpenAI Codex" during onboarding to use a ChatGPT Plus or Pro subscriptio
 yawl --login openai-codex
 ```
 
-The provider uses the ChatGPT Codex Responses endpoint with SSE streaming, tool calls, token usage, and encrypted reasoning replay for multi-step tool runs. When Codex returns a reasoning summary, Yawl displays it as one muted line before the answer. Supported model IDs are listed by `/model`. After choosing a Codex model, Yawl opens a second picker containing the reasoning efforts supported by that model. The selection is sent as the Responses API `reasoning.effort`; OAuth authenticates the account but does not itself return model capability metadata.
+The provider uses the ChatGPT Codex Responses endpoint with SSE streaming, tool calls, token usage, prompt-cache routing, and encrypted reasoning replay for multi-step tool runs. A session-stable cache key is shared with its subagents and sent through the Codex request body and affinity headers so related requests are routed consistently. When Codex returns a reasoning summary, Yawl displays it as one muted line before the answer. Supported model IDs are listed by `/model`. After choosing a Codex model, Yawl opens a second picker containing the reasoning efforts supported by that model. The selection is sent as the Responses API `reasoning.effort`; OAuth authenticates the account but does not itself return model capability metadata.
 
 ### Add an OpenAI-compatible provider
 
@@ -279,10 +280,13 @@ These compatibility fields are supported at provider or model level:
     "supportsFinishReason": false,
     "requiresToolResultName": true,
     "requiresReasoningContentOnAssistantMessages": true,
+    "supportsPromptCacheKey": false,
     "maxTokensField": "max_tokens"
   }
 }
 ```
+
+Built-in requests to the official Anthropic and OpenAI endpoints enable those providers' prompt-cache controls automatically, and Codex Responses always sends its cache-routing key. Custom OpenAI-compatible providers, including Ollama, LM Studio, and OMLX, do not receive `prompt_cache_key` by default, so local serving behavior and wire compatibility stay unchanged. Set `supportsPromptCacheKey` to `true` only when a compatible endpoint documents that field. Local runtimes that reuse matching prompt prefixes internally can still benefit naturally because Yawl keeps the system prompt and conversation prefix stable across turns.
 
 You can configure an endpoint interactively with `/connect` or Settings > Providers. The direct settings forms remain available for scripts and compatibility:
 
@@ -312,13 +316,13 @@ The doctor also reports problems it will not touch automatically: a `model` nami
 
 ## Sessions and compaction
 
-Yawl stores append-only JSONL session files in `~/.yawl/sessions/projects/<project-key>/<id>.jsonl`, scoped to the canonical working directory. The first line records the session ID, creation timestamp, working directory, and model. Both `-c` (`--continue`) and the `/resume` picker list sessions only for the active working directory, and only sessions that contain at least one turn. Opening Yawl and quitting without sending a message does not leave a resumable session. Passing `--session ID` or `/resume ID` searches the current and other project directories, so an ID can be resumed from any directory. Session IDs must be unique across project directories; Yawl reports duplicate matches as ambiguous instead of choosing one. Each user message, assistant response, reasoning block, tool result, and compaction event is written as it happens. The original history remains in the log after compaction. `/new` starts a blank session without changing the current working directory. In the `/resume` picker, `d` or Delete opens a confirmation dialog before removing the selected session. Leaving the terminal interface after a real turn prints `yawl --session ID` so you can resume that conversation.
+Yawl stores append-only JSONL session files in `~/.yawl/sessions/projects/<project-key>/<id>.jsonl`, scoped to the canonical working directory. The first line records the session ID, creation timestamp, working directory, and model. Both `-c` (`--continue`) and the `/resume` picker list sessions only for the active working directory, and only sessions that contain at least one turn. Opening Yawl and quitting without sending a message does not leave a resumable session. Passing `--session ID` or `/resume ID` searches the current and other project directories, so an ID can be resumed from any directory. Session IDs must be unique across project directories; Yawl reports duplicate matches as ambiguous instead of choosing one. Each user message, assistant response, reasoning block, tool result, compaction event, and provider-reported usage record is written as it happens. The original history and usage totals remain in the log after compaction and resume. `/usage` separates total input, fresh input, cache reads, cache writes, and output; providers that do not report cache details simply show the cache as unreported. If a session mixes reporting support, the cache-hit rate uses only requests that supplied cache details. `/new` starts a blank session without changing the current working directory. In the `/resume` picker, `d` or Delete opens a confirmation dialog before removing the selected session. Leaving the terminal interface after a real turn prints `yawl --session ID` so you can resume that conversation.
 
 Background process metadata and logs stay in memory. They are not replayed from session files. Yawl keeps them across prompts in the active session, then terminates their process groups on `/new`, `/resume`, active-session replacement, or exit. `/undo` does not change background process state. Abrupt termination such as `SIGKILL` cannot run this cleanup.
 
 `/undo` opens an empty restore point at the start of a prompt, then saves a file's pre-image the first time `write_file` or `edit_file` touches it. It never scans or copies the working directory, so starting Yawl in `~/` does not make prompt startup depend on the contents of the home directory; checkpoint size grows only with files the agent edits. Individual pre-images are capped at 32 MiB. Files changed by `shell` or custom exec tools are not restored because those tools do not report their mutations. When the agent moves git `HEAD`, `/undo` uses a soft reset and restores the paths that were staged before the turn; it does not update remotes. Checkpoints from the old whole-tree implementation are deleted when their session is opened, and that session starts with an empty undo stack.
 
-Yawl checks the last provider-reported token usage before each request. At the configured threshold, 85 percent by default, it asks the current model to summarize the older conversation and keeps roughly the last ten messages unchanged. Use `/compact` to do this manually. If automatic compaction fails, Yawl shows a warning and continues without compacting; the next request may still fit.
+Yawl checks the last provider-reported token usage before each request. At the configured threshold, 85 percent by default, it asks the current model to summarize the older conversation and keeps roughly the last ten messages unchanged. Use `/compact` to do this manually. One-off summary requests omit explicit cache controls and routing hints because their prefix is replaced immediately afterward; providers with implicit caching may still cache them. Compaction changes the conversation's prompt prefix, so `/usage` counts it as a cache reset. If automatic compaction fails, Yawl shows a warning and continues without compacting; the next request may still fit.
 
 ## Web browsing
 
