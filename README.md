@@ -291,7 +291,7 @@ You can configure an endpoint interactively with `/connect` or Settings > Provid
 /settings model omlx:Qwen3-Coder
 ```
 
-Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; `./.yawl/config.json` can still override it. When that happens, Yawl reports that the global value was saved while the project value remains effective. `/settings` also changes `max_tokens`, Codex reasoning effort, reasoning visibility, the TUI accent color, automatic compaction, the compaction threshold, context windows, subagent settings, built-in endpoint URLs, and the stored built-in API keys (`/settings anthropic_api_key KEY|-`, `/settings openai_api_key KEY|-`).
+Omit the key for a keyless server. Pass `-` in the key position to remove a saved key. `/settings` writes `~/.yawl/config.json` with mode `0600`; successful ordinary saves update the interface without adding a system message to the transcript. `./.yawl/config.json` can still override the global file. When that happens, Yawl reports that the global value was saved while the project value remains effective. `/settings` also changes `max_tokens`, Codex reasoning effort, reasoning visibility, the TUI accent color, automatic compaction, the compaction threshold, context windows, subagent settings, built-in endpoint URLs, and the stored built-in API keys (`/settings anthropic_api_key KEY|-`, `/settings openai_api_key KEY|-`).
 
 ## Diagnose the configuration
 
@@ -489,10 +489,11 @@ Yawl reads global instructions from `~/.yawl/AGENTS.md` and project instructions
 Yawl stays in one Cargo package. Stable facade modules keep callers independent of the internal file layout:
 
 - `src/main.rs` coordinates startup. `src/cli.rs` and `src/print_mode.rs` contain the two binary frontends.
-- `src/agent.rs` preserves the public `Agent` API. Private child modules own conversation lifecycle, model/tool turns, streamed event translation, and session journaling for persistent main agents and memory-only subagents.
+- `src/agent.rs` preserves the public `Agent` API. Private child modules own conversation lifecycle, model/tool turns, streamed event translation, and explicit persistent-agent versus memory-only-child state.
 - `src/background.rs` owns session-bound shell processes, bounded output, process-group shutdown, and restart history.
-- `src/subagent/` contains typed snapshots, capacity accounting, worker lifecycles, deferred delivery, cancellation, retained conversations, generated handles, request budgets, and JSON agent presets.
+- `src/subagent/` contains typed snapshots, capacity accounting, long-lived conversation workers, deferred delivery, cancellation, generated handles, request budgets, and JSON agent presets.
 - `src/cancellation.rs` binds cancellation tokens to worker threads while preserving process-wide SIGINT handling.
+- `src/terminal_mode.rs` shares the raw-terminal lifecycle used by the TUI and onboarding selector.
 - `src/provider/mod.rs` re-exports the provider-neutral protocol. Private modules contain streaming retries, provider resolution, and SSE/HTTP support. Codex OAuth and Responses handling live separately under `src/provider/codex/`.
 - `src/config.rs` exposes the effective configuration. Its child modules separate runtime types, persisted schema, loading and merging, storage, and validated changes.
 - `src/tools/` contains the builtin registry, executable-tool discovery, and the isolated web search/fetch adapters and HTML cleanup.

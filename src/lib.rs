@@ -20,6 +20,7 @@ pub mod provider;
 pub mod session;
 pub mod skills;
 pub(crate) mod subagent;
+pub(crate) mod terminal_mode;
 pub mod tools;
 pub mod trust;
 pub mod tui;

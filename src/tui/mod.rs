@@ -86,7 +86,7 @@ use self::render::{
 use self::state::Update;
 #[cfg(test)]
 use self::terminal::{
-    ScreenPoint, TextSelection, base64_encode, cursor_control, highlighted_selection, selected_text,
+    ScreenPoint, TextSelection, cursor_control, highlighted_selection, selected_text,
 };
 #[cfg(test)]
 use self::transcript::{Entry, TranscriptEvent};

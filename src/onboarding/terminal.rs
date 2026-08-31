@@ -166,7 +166,7 @@ fn read_line() -> Result<String, Error> {
 }
 
 pub(super) fn validate_environment_name(name: &str) -> Result<(), Error> {
-    super::provider::validate_environment_name(name)
+    crate::config::validate_environment_name(name)
 }
 
 #[cfg(test)]

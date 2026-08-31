@@ -2,7 +2,10 @@
 
 use std::io::{self, IsTerminal, Write};
 
+use base64::Engine as _;
+
 use crate::error::Error;
+use crate::terminal_mode::RawMode;
 
 use super::events::{MouseEvent, MouseKind};
 use super::input::Editor;
@@ -10,7 +13,7 @@ use super::render::{FrameImage, HIDDEN_CURSOR, ImageSupport, build_frame_with_im
 use super::{ViewState, markdown};
 
 pub(super) struct Terminal {
-    original: libc::termios,
+    _raw_mode: RawMode,
     stdout: io::Stdout,
     active: bool,
     last_frame: Vec<String>,
@@ -103,33 +106,10 @@ impl Terminal {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Err(Error::Config("the terminal UI needs a TTY".into()));
         }
-        // SAFETY: A zeroed termios value is immediately initialized by
-        // `tcgetattr` before any field is read.
-        let mut original: libc::termios = unsafe { std::mem::zeroed() };
-        // SAFETY: STDIN_FILENO is valid for this process and `original`
-        // points to writable termios storage.
-        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
-        let mut raw = original;
-        // SAFETY: `raw` is an initialized termios value.
-        unsafe { libc::cfmakeraw(&mut raw) };
-        // Keep legacy Ctrl+C as SIGINT. Disable the other signal-generating
-        // control characters because suspending would leave the terminal in
-        // raw mode.
-        raw.c_lflag |= libc::ISIG;
-        raw.c_cc[libc::VQUIT] = 0;
-        raw.c_cc[libc::VSUSP] = 0;
-        raw.c_cc[libc::VMIN] = 0;
-        raw.c_cc[libc::VTIME] = 1;
-        // SAFETY: STDIN_FILENO is valid and `raw` points to initialized
-        // termios storage for this terminal.
-        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw) } != 0 {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
+        let raw_mode = RawMode::enter()?;
 
         let mut terminal = Self {
-            original,
+            _raw_mode: raw_mode,
             stdout: io::stdout(),
             active: true,
             last_frame: Vec::new(),
@@ -257,7 +237,7 @@ impl Terminal {
             return Ok(false);
         }
         if !copy_with_platform_command(text) {
-            let encoded = base64_encode(text.as_bytes());
+            let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
             write!(self.stdout, "\x1b]52;c;{encoded}\x07")?;
             self.stdout.flush()?;
         }
@@ -335,11 +315,6 @@ impl Drop for Terminal {
             b"\x1b[>4;0m\x1b[=0;1u\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l",
         );
         let _ = self.stdout.flush();
-        // SAFETY: `original` came from a successful `tcgetattr` call for
-        // STDIN_FILENO and remains initialized for the life of this guard.
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.original);
-        }
         self.active = false;
     }
 }
@@ -462,31 +437,6 @@ pub(super) fn highlight_cells(line: &str, from: usize, through: usize) -> String
         output.push_str("\x1b[27m");
     }
     output
-}
-
-pub(super) fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let first = chunk[0];
-        let second = chunk.get(1).copied().unwrap_or(0);
-        let third = chunk.get(2).copied().unwrap_or(0);
-        encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
-        encoded.push(char::from(
-            ALPHABET[usize::from((first & 0x03) << 4 | second >> 4)],
-        ));
-        encoded.push(if chunk.len() > 1 {
-            char::from(ALPHABET[usize::from((second & 0x0f) << 2 | third >> 6)])
-        } else {
-            '='
-        });
-        encoded.push(if chunk.len() > 2 {
-            char::from(ALPHABET[usize::from(third & 0x3f)])
-        } else {
-            '='
-        });
-    }
-    encoded
 }
 
 pub(super) fn copy_command(program: &str, arguments: &[&str], text: &str) -> bool {

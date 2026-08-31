@@ -5,83 +5,13 @@ use serde_json::{Map, Value, json};
 use super::{
     Config, MAX_SUBAGENT_REQUEST_BUDGET, MAX_SUBAGENT_TIMEOUT_SECS, MAX_WEB_FETCH_MAX_CHARS,
     OPENAI_COMPLETIONS_API, ProviderConfig, UiColor, WebSearchProvider, expand_home_path,
-    object_field, parse_bounded, validate_bounded, validate_provider_name,
+    object_field, validate_bounded, validate_provider_name,
 };
 use crate::error::Error;
 
 /// One requested change to the global configuration.
 #[derive(Debug, Clone)]
 pub(crate) enum ConfigChange {
-    Reload,
-    Model(String),
-    MaxTokens(String),
-    ReasoningEffort(String),
-    HideReasoning(String),
-    AccentColor(String),
-    SelectionColor(String),
-    ScrollBar(String),
-    ScrollBarAutoHide(String),
-    EnterSteers(String),
-    AutoCompact(String),
-    CompactThreshold(String),
-    WebBrowsing(String),
-    WebSearchProvider(String),
-    WebFetchMaxChars(String),
-    BraveApiKey(String),
-    FirecrawlApiKey(String),
-    Subagents(String),
-    MaxSubagents(String),
-    SubagentModel(String),
-    SubagentRequestBudget(String),
-    SubagentTimeoutSecs(String),
-    ContextWindow {
-        model: String,
-        value: String,
-    },
-    SkillDirectory {
-        action: SkillDirectoryAction,
-        path: String,
-    },
-    Provider {
-        name: String,
-        base_url: String,
-        api_key: Option<String>,
-    },
-    ProviderModel {
-        name: String,
-        model: String,
-    },
-    AnthropicBaseUrl(String),
-    OpenAiBaseUrl(String),
-    AnthropicApiKey(String),
-    OpenAiApiKey(String),
-    SetupSkipped(bool),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SkillDirectoryAction {
-    Add,
-    Remove,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ConfigChangeEffect {
-    Applied,
-    Overridden,
-    SkillDirectoryNotConfigured(PathBuf),
-}
-
-pub(crate) struct ConfigChangeOutcome {
-    pub(crate) config: Config,
-    pub(crate) effect: ConfigChangeEffect,
-}
-
-pub(crate) struct ConfigChangeBatchOutcome {
-    pub(crate) config: Config,
-    pub(crate) effects: Vec<ConfigChangeEffect>,
-}
-
-enum ValidatedChange {
     Reload,
     Model(String),
     MaxTokens(u32),
@@ -129,6 +59,29 @@ enum ValidatedChange {
     SetupSkipped(bool),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SkillDirectoryAction {
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfigChangeEffect {
+    Applied,
+    Overridden,
+    SkillDirectoryNotConfigured(PathBuf),
+}
+
+pub(crate) struct ConfigChangeOutcome {
+    pub(crate) config: Config,
+    pub(crate) effect: ConfigChangeEffect,
+}
+
+pub(crate) struct ConfigChangeBatchOutcome {
+    pub(crate) config: Config,
+    pub(crate) effects: Vec<ConfigChangeEffect>,
+}
+
 impl Config {
     /// Applies one validated global change, then reloads the merged effective
     /// configuration. The result says whether a project value overrode it.
@@ -151,11 +104,10 @@ impl Config {
         &self,
         changes: Vec<ConfigChange>,
     ) -> Result<ConfigChangeBatchOutcome, Error> {
-        let changes = changes
-            .into_iter()
-            .map(|change| ValidatedChange::parse(self, change))
-            .collect::<Result<Vec<_>, _>>()?;
-        if changes.iter().any(ValidatedChange::writes) {
+        for change in &changes {
+            change.validate()?;
+        }
+        if changes.iter().any(ConfigChange::writes) {
             self.update_global_json(|root| {
                 for change in &changes {
                     change.apply_to_root(root, self)?;
@@ -167,7 +119,7 @@ impl Config {
         let effects = changes
             .iter()
             .map(|change| match change {
-                ValidatedChange::SkillDirectoryNotConfigured(path) => {
+                ConfigChange::SkillDirectoryNotConfigured(path) => {
                     ConfigChangeEffect::SkillDirectoryNotConfigured(path.clone())
                 }
                 _ if change.is_effective(&config) => ConfigChangeEffect::Applied,
@@ -178,176 +130,94 @@ impl Config {
     }
 }
 
-impl ValidatedChange {
-    fn parse(config: &Config, change: ConfigChange) -> Result<Self, Error> {
-        match change {
-            ConfigChange::Reload => Ok(Self::Reload),
-            ConfigChange::Model(model) => {
-                if model.trim().is_empty() {
-                    Err(Error::Config("model name must not be empty".into()))
-                } else {
-                    Ok(Self::Model(model))
-                }
+impl ConfigChange {
+    fn validate(&self) -> Result<(), Error> {
+        match self {
+            Self::Model(model) if model.trim().is_empty() => {
+                Err(Error::Config("model name must not be empty".into()))
             }
-            ConfigChange::MaxTokens(value) => {
-                let tokens = value
-                    .parse::<u32>()
-                    .map_err(|_| Error::Config("max_tokens must be a positive integer".into()))?;
-                if tokens == 0 {
-                    Err(Error::Config(
-                        "max_tokens must be a positive integer".into(),
-                    ))
-                } else {
-                    Ok(Self::MaxTokens(tokens))
-                }
+            Self::MaxTokens(0) => Err(Error::Config(
+                "max_tokens must be a positive integer".into(),
+            )),
+            Self::CompactThreshold(value) => {
+                validate_bounded(*value, 0.1, 0.99, "compact_threshold").map(|_| ())
             }
-            ConfigChange::ReasoningEffort(value) => {
-                let effective = match value.as_str() {
-                    "default" | "off" => None,
-                    "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(value.clone()),
-                    _ => return Err(Error::Config("unsupported reasoning effort".into())),
-                };
-                Ok(Self::ReasoningEffort {
-                    stored: value,
-                    effective,
-                })
+            Self::WebFetchMaxChars(value) => {
+                validate_bounded(*value, 1, MAX_WEB_FETCH_MAX_CHARS, "web_fetch_max_chars")
+                    .map(|_| ())
             }
-            ConfigChange::HideReasoning(value) => Ok(Self::HideReasoning(parse_on_off(&value)?)),
-            ConfigChange::AccentColor(value) => UiColor::parse(&value)
-                .map(Self::AccentColor)
-                .map_err(Error::Config),
-            ConfigChange::SelectionColor(value) => UiColor::parse_selection(&value)
-                .map(Self::SelectionColor)
-                .map_err(Error::Config),
-            ConfigChange::ScrollBar(value) => Ok(Self::ScrollBar(parse_on_off(&value)?)),
-            ConfigChange::ScrollBarAutoHide(value) => {
-                Ok(Self::ScrollBarAutoHide(parse_on_off(&value)?))
+            Self::MaxSubagents(value) => {
+                validate_bounded(*value, 1, 16, "max_subagents").map(|_| ())
             }
-            ConfigChange::EnterSteers(value) => Ok(Self::EnterSteers(parse_on_off(&value)?)),
-            ConfigChange::AutoCompact(value) => Ok(Self::AutoCompact(parse_on_off(&value)?)),
-            ConfigChange::CompactThreshold(value) => {
-                Ok(Self::CompactThreshold(parse_threshold(&value)?))
+            Self::SubagentModel(model) if model.trim().is_empty() => {
+                Err(Error::Config("subagent_model must not be empty".into()))
             }
-            ConfigChange::WebBrowsing(value) => Ok(Self::WebBrowsing(parse_on_off(&value)?)),
-            ConfigChange::WebSearchProvider(value) => value
-                .parse()
-                .map(Self::WebSearchProvider)
-                .map_err(Error::Config),
-            ConfigChange::WebFetchMaxChars(value) => Ok(Self::WebFetchMaxChars(parse_bounded(
-                &value,
-                1,
-                MAX_WEB_FETCH_MAX_CHARS,
-                "web_fetch_max_chars",
-            )?)),
-            ConfigChange::BraveApiKey(value) => {
-                Ok(Self::BraveApiKey(parse_builtin_api_key(&value)?))
+            Self::SubagentRequestBudget(value) => validate_bounded(
+                *value,
+                0,
+                MAX_SUBAGENT_REQUEST_BUDGET,
+                "subagent_request_budget",
+            )
+            .map(|_| ()),
+            Self::SubagentTimeoutSecs(value) => validate_bounded(
+                *value,
+                0,
+                MAX_SUBAGENT_TIMEOUT_SECS,
+                "subagent_timeout_secs",
+            )
+            .map(|_| ()),
+            Self::ContextWindow { model, window } if model.trim().is_empty() || *window == 0 => {
+                Err(Error::Config(
+                    "context_window requires a model and a positive integer".into(),
+                ))
             }
-            ConfigChange::FirecrawlApiKey(value) => {
-                Ok(Self::FirecrawlApiKey(parse_builtin_api_key(&value)?))
-            }
-            ConfigChange::Subagents(value) => Ok(Self::Subagents(parse_on_off(&value)?)),
-            ConfigChange::MaxSubagents(value) => Ok(Self::MaxSubagents(parse_bounded(
-                &value,
-                1,
-                16,
-                "max_subagents",
-            )?)),
-            ConfigChange::SubagentModel(value) => {
-                let value = value.trim();
-                if value.is_empty() {
-                    return Err(Error::Config("subagent_model must not be empty".into()));
-                }
-                Ok(Self::SubagentModel(value.to_string()))
-            }
-            ConfigChange::SubagentRequestBudget(value) => {
-                Ok(Self::SubagentRequestBudget(parse_bounded(
-                    &value,
-                    0,
-                    MAX_SUBAGENT_REQUEST_BUDGET,
-                    "subagent_request_budget",
-                )?))
-            }
-            ConfigChange::SubagentTimeoutSecs(value) => {
-                Ok(Self::SubagentTimeoutSecs(parse_bounded(
-                    &value,
-                    0,
-                    MAX_SUBAGENT_TIMEOUT_SECS,
-                    "subagent_timeout_secs",
-                )?))
-            }
-            ConfigChange::ContextWindow { model, value } => {
-                if model.trim().is_empty() {
-                    return Err(Error::Config("model name must not be empty".into()));
-                }
-                let window = value.parse::<u64>().map_err(|_| {
-                    Error::Config("context_window must be a positive integer".into())
-                })?;
-                if window == 0 {
-                    return Err(Error::Config(
-                        "context_window must be a positive integer".into(),
-                    ));
-                }
-                Ok(Self::ContextWindow { model, window })
-            }
-            ConfigChange::SkillDirectory { action, path } => {
-                if path.trim().is_empty() {
-                    return Err(Error::Config("skill directory must not be empty".into()));
-                }
-                let path = expand_home_path(&path, &config.home_dir);
-                let mut dirs = config.skill_dirs.clone();
-                match action {
-                    SkillDirectoryAction::Add if !dirs.contains(&path) => dirs.push(path),
-                    SkillDirectoryAction::Add => {}
-                    SkillDirectoryAction::Remove => {
-                        let Some(index) = dirs.iter().position(|dir| dir == &path) else {
-                            return Ok(Self::SkillDirectoryNotConfigured(path));
-                        };
-                        dirs.remove(index);
-                    }
-                }
-                Ok(Self::SkillDirectories(dirs))
-            }
-            ConfigChange::Provider {
-                name,
-                base_url,
-                api_key,
-            } => {
-                validate_provider_name(&name)?;
+            Self::Provider { name, base_url, .. } => {
+                validate_provider_name(name)?;
                 if matches!(name.as_str(), "anthropic" | "openai") {
                     return Err(Error::Config(format!(
                         "'{name}' is built in; use anthropic_base_url or openai_base_url"
                     )));
                 }
-                validate_http_url(&base_url)?;
-                Ok(Self::Provider {
-                    name,
-                    base_url,
-                    api_key,
-                })
+                validate_http_url(base_url)
             }
-            ConfigChange::ProviderModel { name, model } => {
-                validate_provider_name(&name)?;
+            Self::ProviderModel { name, model } => {
+                validate_provider_name(name)?;
                 if model.trim().is_empty() {
-                    return Err(Error::Config("provider model must not be empty".into()));
+                    Err(Error::Config("provider model must not be empty".into()))
+                } else {
+                    Ok(())
                 }
-                Ok(Self::ProviderModel { name, model })
             }
-            ConfigChange::AnthropicBaseUrl(url) => {
-                validate_http_url(&url)?;
-                Ok(Self::AnthropicBaseUrl(url))
-            }
-            ConfigChange::OpenAiBaseUrl(url) => {
-                validate_http_url(&url)?;
-                Ok(Self::OpenAiBaseUrl(url))
-            }
-            ConfigChange::AnthropicApiKey(value) => {
-                Ok(Self::AnthropicApiKey(parse_builtin_api_key(&value)?))
-            }
-            ConfigChange::OpenAiApiKey(value) => {
-                Ok(Self::OpenAiApiKey(parse_builtin_api_key(&value)?))
-            }
-            ConfigChange::SetupSkipped(skipped) => Ok(Self::SetupSkipped(skipped)),
+            Self::AnthropicBaseUrl(url) | Self::OpenAiBaseUrl(url) => validate_http_url(url),
+            Self::BraveApiKey(Some(key))
+            | Self::FirecrawlApiKey(Some(key))
+            | Self::AnthropicApiKey(Some(key))
+            | Self::OpenAiApiKey(Some(key)) => validate_stored_api_key(key),
+            _ => Ok(()),
         }
+    }
+
+    pub(crate) fn skill_directory(
+        config: &Config,
+        action: SkillDirectoryAction,
+        raw_path: &str,
+    ) -> Result<Self, Error> {
+        if raw_path.trim().is_empty() {
+            return Err(Error::Config("skill directory must not be empty".into()));
+        }
+        let path = expand_home_path(raw_path, &config.home_dir);
+        let mut dirs = config.skill_dirs.clone();
+        match action {
+            SkillDirectoryAction::Add if !dirs.contains(&path) => dirs.push(path),
+            SkillDirectoryAction::Add => {}
+            SkillDirectoryAction::Remove => {
+                let Some(index) = dirs.iter().position(|dir| dir == &path) else {
+                    return Ok(Self::SkillDirectoryNotConfigured(path));
+                };
+                dirs.remove(index);
+            }
+        }
+        Ok(Self::SkillDirectories(dirs))
     }
 
     fn writes(&self) -> bool {
@@ -561,7 +431,7 @@ fn remove_root(root: &mut Map<String, Value>, key: &str) -> Result<(), Error> {
 
 /// Validates a built-in API key. `-` removes the stored key; otherwise the
 /// value may be a literal, a `$NAME` or `${NAME}` reference, or `-` to clear.
-fn parse_builtin_api_key(value: &str) -> Result<Option<String>, Error> {
+pub(crate) fn parse_builtin_api_key(value: &str) -> Result<Option<String>, Error> {
     if value == "-" {
         return Ok(None);
     }
@@ -574,9 +444,9 @@ fn parse_builtin_api_key(value: &str) -> Result<Option<String>, Error> {
         let name = reference
             .strip_suffix('}')
             .ok_or_else(|| Error::Config("unterminated environment variable reference".into()))?;
-        ensure_environment_name(name)?;
+        validate_environment_name(name)?;
     } else if let Some(name) = value.strip_prefix('$') {
-        ensure_environment_name(name)?;
+        validate_environment_name(name)?;
     } else if value.starts_with('!') {
         return Err(Error::Config(
             "API keys beginning with '!' are not supported; use an environment variable reference"
@@ -586,7 +456,17 @@ fn parse_builtin_api_key(value: &str) -> Result<Option<String>, Error> {
     Ok(Some(value.to_string()))
 }
 
-fn ensure_environment_name(name: &str) -> Result<(), Error> {
+fn validate_stored_api_key(value: &str) -> Result<(), Error> {
+    if parse_builtin_api_key(value)?.is_some() {
+        Ok(())
+    } else {
+        Err(Error::Config(
+            "use an empty API-key change to remove the stored key".into(),
+        ))
+    }
+}
+
+pub(crate) fn validate_environment_name(name: &str) -> Result<(), Error> {
     let mut bytes = name.bytes();
     let valid_start = bytes
         .next()
@@ -606,7 +486,7 @@ fn api_key_is_effective(provider: &ProviderConfig, requested: Option<&str>) -> b
     }
 }
 
-fn parse_on_off(value: &str) -> Result<bool, Error> {
+pub(crate) fn parse_on_off(value: &str) -> Result<bool, Error> {
     match value {
         "on" | "true" => Ok(true),
         "off" | "false" => Ok(false),
@@ -614,7 +494,7 @@ fn parse_on_off(value: &str) -> Result<bool, Error> {
     }
 }
 
-fn parse_threshold(value: &str) -> Result<f64, Error> {
+pub(crate) fn parse_threshold(value: &str) -> Result<f64, Error> {
     let threshold = if let Some(percent) = value.strip_suffix('%') {
         percent
             .parse::<f64>()
@@ -697,7 +577,7 @@ mod tests {
         let config = dirs.config();
 
         let outcome = config
-            .change_global(ConfigChange::MaxTokens("2048".into()))
+            .change_global(ConfigChange::MaxTokens(2048))
             .expect("valid change should apply");
 
         assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
@@ -719,7 +599,7 @@ mod tests {
         let config = dirs.config();
 
         let outcome = config
-            .change_global(ConfigChange::MaxTokens("2048".into()))
+            .change_global(ConfigChange::MaxTokens(2048))
             .expect("global value should still be saved");
 
         assert_eq!(outcome.effect, ConfigChangeEffect::Overridden);
@@ -738,7 +618,7 @@ mod tests {
         let config = dirs.config();
 
         let error = config
-            .change_global(ConfigChange::CompactThreshold("5%".into()))
+            .change_global(ConfigChange::CompactThreshold(0.05))
             .err()
             .expect("invalid threshold should fail");
 
@@ -756,8 +636,8 @@ mod tests {
         let config = dirs.config();
 
         let result = config.change_global_batch(vec![
-            ConfigChange::MaxTokens("2048".into()),
-            ConfigChange::CompactThreshold("5%".into()),
+            ConfigChange::MaxTokens(2048),
+            ConfigChange::CompactThreshold(0.05),
         ]);
 
         assert!(result.is_err());
@@ -832,7 +712,9 @@ mod tests {
         let config = dirs.config();
 
         let outcome = config
-            .change_global(ConfigChange::AccentColor("#123abc".into()))
+            .change_global(ConfigChange::AccentColor(
+                UiColor::parse("#123abc").expect("test color should parse"),
+            ))
             .expect("valid RGB color should apply");
 
         assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
@@ -846,12 +728,7 @@ mod tests {
         assert!(saved.get("status_bar_color").is_none());
         assert!(saved.get("text_box_color").is_none());
 
-        assert!(
-            outcome
-                .config
-                .change_global(ConfigChange::AccentColor("transparent".into()))
-                .is_err()
-        );
+        assert!(UiColor::parse("transparent").is_err());
     }
 
     #[test]
@@ -861,7 +738,9 @@ mod tests {
         assert_eq!(config.selection_color, None);
 
         let outcome = config
-            .change_global(ConfigChange::SelectionColor("blue".into()))
+            .change_global(ConfigChange::SelectionColor(
+                UiColor::parse_selection("blue").expect("test selection should parse"),
+            ))
             .expect("a palette color should apply");
         assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
         assert_eq!(
@@ -881,7 +760,7 @@ mod tests {
 
         let outcome = outcome
             .config
-            .change_global(ConfigChange::SelectionColor("accent".into()))
+            .change_global(ConfigChange::SelectionColor(None))
             .expect("'accent' should restore following the accent color");
         assert_eq!(outcome.config.selection_color, None);
         assert_eq!(
@@ -889,12 +768,7 @@ mod tests {
             outcome.config.accent_color
         );
 
-        assert!(
-            outcome
-                .config
-                .change_global(ConfigChange::SelectionColor("transparent".into()))
-                .is_err()
-        );
+        assert!(UiColor::parse_selection("transparent").is_err());
     }
 
     #[test]
@@ -904,7 +778,7 @@ mod tests {
         assert!(config.scroll_bar);
 
         let outcome = config
-            .change_global(ConfigChange::ScrollBar("off".into()))
+            .change_global(ConfigChange::ScrollBar(false))
             .expect("a valid on/off value should apply");
 
         assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
@@ -916,11 +790,7 @@ mod tests {
         .expect("saved config should remain JSON");
         assert_eq!(saved["scroll_bar"], false);
 
-        let error = outcome
-            .config
-            .change_global(ConfigChange::ScrollBar("maybe".into()))
-            .err()
-            .expect("non-boolean values should fail validation");
+        let error = parse_on_off("maybe").expect_err("non-boolean values should fail parsing");
         assert!(error.to_string().contains("on or off"));
     }
 
@@ -931,7 +801,7 @@ mod tests {
         assert!(config.scroll_bar_auto_hide);
 
         let outcome = config
-            .change_global(ConfigChange::ScrollBarAutoHide("off".into()))
+            .change_global(ConfigChange::ScrollBarAutoHide(false))
             .expect("a valid on/off value should apply");
 
         assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
@@ -943,11 +813,7 @@ mod tests {
         .expect("saved config should remain JSON");
         assert_eq!(saved["scroll_bar_auto_hide"], false);
 
-        let error = outcome
-            .config
-            .change_global(ConfigChange::ScrollBarAutoHide("maybe".into()))
-            .err()
-            .expect("non-boolean values should fail validation");
+        let error = parse_on_off("maybe").expect_err("non-boolean values should fail parsing");
         assert!(error.to_string().contains("on or off"));
     }
 
@@ -958,7 +824,7 @@ mod tests {
         assert!(!config.enter_steers);
 
         let outcome = config
-            .change_global(ConfigChange::EnterSteers("on".into()))
+            .change_global(ConfigChange::EnterSteers(true))
             .expect("a valid on/off value should apply");
 
         assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
@@ -970,12 +836,7 @@ mod tests {
         .expect("saved config should remain JSON");
         assert_eq!(saved["enter_steers"], true);
 
-        assert!(
-            outcome
-                .config
-                .change_global(ConfigChange::EnterSteers("maybe".into()))
-                .is_err()
-        );
+        assert!(parse_on_off("maybe").is_err());
     }
 
     #[test]
@@ -984,11 +845,14 @@ mod tests {
         let config = dirs.config();
         let missing = dirs.root.join("missing-skills");
 
+        let change = ConfigChange::skill_directory(
+            &config,
+            SkillDirectoryAction::Remove,
+            &missing.display().to_string(),
+        )
+        .expect("skill-directory request should parse");
         let outcome = config
-            .change_global(ConfigChange::SkillDirectory {
-                action: SkillDirectoryAction::Remove,
-                path: missing.display().to_string(),
-            })
+            .change_global(change)
             .expect("missing directory should be reported without failing");
 
         assert_eq!(
@@ -1004,7 +868,7 @@ mod tests {
         let config = dirs.config();
 
         let stored = config
-            .change_global(ConfigChange::AnthropicApiKey("sk-ant-test".into()))
+            .change_global(ConfigChange::AnthropicApiKey(Some("sk-ant-test".into())))
             .expect("a literal anthropic key should apply");
         assert_eq!(stored.effect, ConfigChangeEffect::Applied);
         assert_eq!(
@@ -1014,7 +878,7 @@ mod tests {
 
         let reference = stored
             .config
-            .change_global(ConfigChange::OpenAiApiKey("$OPENAI_TEST_KEY".into()))
+            .change_global(ConfigChange::OpenAiApiKey(Some("$OPENAI_TEST_KEY".into())))
             .expect("an environment reference should apply");
         assert_eq!(
             reference.config.openai_api_key.as_deref(),
@@ -1023,20 +887,22 @@ mod tests {
 
         let removed = reference
             .config
-            .change_global(ConfigChange::OpenAiApiKey("-".into()))
+            .change_global(ConfigChange::OpenAiApiKey(None))
             .expect("removing the stored key should apply");
         assert_eq!(removed.config.openai_api_key, None);
 
+        assert!(parse_builtin_api_key("").is_err());
+        assert!(parse_builtin_api_key("$2BAD").is_err());
         assert!(
             removed
                 .config
-                .change_global(ConfigChange::AnthropicApiKey("".into()))
+                .change_global(ConfigChange::AnthropicApiKey(Some("!invalid".into())))
                 .is_err()
         );
         assert!(
             removed
                 .config
-                .change_global(ConfigChange::OpenAiApiKey("$2BAD".into()))
+                .change_global(ConfigChange::OpenAiApiKey(Some("${BROKEN".into())))
                 .is_err()
         );
         let saved: Value = serde_json::from_str(
@@ -1053,19 +919,23 @@ mod tests {
         let dirs = TestDirs::new("web");
         let config = dirs.config();
         let enabled = config
-            .change_global(ConfigChange::WebBrowsing("on".into()))
+            .change_global(ConfigChange::WebBrowsing(true))
             .expect("web browsing should enable");
         let provider = enabled
             .config
-            .change_global(ConfigChange::WebSearchProvider("firecrawl".into()))
+            .change_global(ConfigChange::WebSearchProvider(
+                WebSearchProvider::Firecrawl,
+            ))
             .expect("provider should apply");
         let limited = provider
             .config
-            .change_global(ConfigChange::WebFetchMaxChars("12345".into()))
+            .change_global(ConfigChange::WebFetchMaxChars(12_345))
             .expect("limit should apply");
         let keyed = limited
             .config
-            .change_global(ConfigChange::FirecrawlApiKey("$FIRECRAWL_TEST_KEY".into()))
+            .change_global(ConfigChange::FirecrawlApiKey(Some(
+                "$FIRECRAWL_TEST_KEY".into(),
+            )))
             .expect("key reference should apply");
         assert!(keyed.config.web_browsing);
         assert_eq!(
@@ -1080,21 +950,16 @@ mod tests {
 
         let removed = keyed
             .config
-            .change_global(ConfigChange::FirecrawlApiKey("-".into()))
+            .change_global(ConfigChange::FirecrawlApiKey(None))
             .expect("key removal should apply");
         assert_eq!(removed.config.firecrawl_api_key, None);
         assert!(
             removed
                 .config
-                .change_global(ConfigChange::WebFetchMaxChars("0".into()))
+                .change_global(ConfigChange::WebFetchMaxChars(0))
                 .is_err()
         );
-        assert!(
-            removed
-                .config
-                .change_global(ConfigChange::WebSearchProvider("other".into()))
-                .is_err()
-        );
+        assert!("other".parse::<WebSearchProvider>().is_err());
     }
 
     #[test]
@@ -1127,11 +992,11 @@ mod tests {
         let dirs = TestDirs::new("subagents");
         let config = dirs.config();
         let enabled = config
-            .change_global(ConfigChange::Subagents("on".into()))
+            .change_global(ConfigChange::Subagents(true))
             .expect("subagents should enable");
         let limited = enabled
             .config
-            .change_global(ConfigChange::MaxSubagents("16".into()))
+            .change_global(ConfigChange::MaxSubagents(16))
             .expect("maximum valid subagent limit should apply");
         let modeled = limited
             .config
@@ -1139,11 +1004,11 @@ mod tests {
             .expect("inherit should be persisted");
         let budgeted = modeled
             .config
-            .change_global(ConfigChange::SubagentRequestBudget("50".into()))
+            .change_global(ConfigChange::SubagentRequestBudget(50))
             .expect("valid request budget should apply");
         let timed = budgeted
             .config
-            .change_global(ConfigChange::SubagentTimeoutSecs("300".into()))
+            .change_global(ConfigChange::SubagentTimeoutSecs(300))
             .expect("valid timeout should apply");
 
         assert!(timed.config.subagents);
@@ -1154,19 +1019,19 @@ mod tests {
         assert!(
             timed
                 .config
-                .change_global(ConfigChange::MaxSubagents("17".into()))
+                .change_global(ConfigChange::MaxSubagents(17))
                 .is_err()
         );
         assert!(
             timed
                 .config
-                .change_global(ConfigChange::SubagentRequestBudget("1001".into()))
+                .change_global(ConfigChange::SubagentRequestBudget(1001))
                 .is_err()
         );
         assert!(
             timed
                 .config
-                .change_global(ConfigChange::SubagentTimeoutSecs("86401".into()))
+                .change_global(ConfigChange::SubagentTimeoutSecs(86_401))
                 .is_err()
         );
         let saved: Value = serde_json::from_str(

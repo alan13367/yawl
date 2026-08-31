@@ -135,16 +135,12 @@ fn tool_allowlist_filters_child_tool_scans() {
 fn print_mode_pump_delivers_deferred_results_in_a_follow_up_turn() {
     let mut test = TestAgent::new("subagent-pump");
     test.agent.config.subagents = true;
-    test.agent
-        .subagents
-        .as_ref()
-        .expect("persistent conversations own a manager")
-        .push_test_deferred(
-            1,
-            "scout",
-            crate::subagent::RunOutcome::Completed,
-            "found it",
-        );
+    test.agent.subagent_manager().push_test_deferred(
+        1,
+        "scout",
+        crate::subagent::RunOutcome::Completed,
+        "found it",
+    );
     let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
         text: "delivered summary",
         tool_calls: Vec::new(),
@@ -170,14 +166,7 @@ fn print_mode_pump_delivers_deferred_results_in_a_follow_up_turn() {
         .expect("pump should complete");
 
     assert!(pumped);
-    assert!(
-        !test
-            .agent
-            .subagents
-            .as_ref()
-            .expect("manager survives the pump")
-            .has_deferred()
-    );
+    assert!(!test.agent.subagent_manager().has_deferred());
     let messages = &test.agent.messages;
     assert_eq!(
         messages
@@ -265,7 +254,7 @@ fn conversation_transaction_persists_tool_loop_in_order() {
             vec![Role::User, Role::Assistant, Role::Tool]
         ]
     );
-    let (_, replayed) = Session::open(&test.sessions_dir, test.agent.session.id())
+    let (_, replayed) = Session::open(&test.sessions_dir, test.agent.session_id())
         .expect("persisted session should replay");
     assert_eq!(
         replayed
@@ -472,8 +461,7 @@ fn undo_keeps_working_after_compaction_during_a_goal() {
     let start = range.start;
     let replaced = range.len();
     test.agent
-        .session
-        .append_compaction_range("compacted goal progress", start, replaced)
+        .persist_compaction("compacted goal progress", start, replaced)
         .expect("compaction should persist");
     compaction::apply_summary_range(&mut test.agent.messages, "compacted goal progress", range);
 
@@ -491,15 +479,13 @@ fn undo_last_turn_drops_the_prompt_and_restores_files() {
     let file = test.root.join("cwd").join("note.txt");
     std::fs::write(&file, "before").expect("write");
     test.agent
+        .persistent_mut()
         .checkpoints
-        .as_mut()
-        .expect("persistent")
         .snapshot()
         .expect("snapshot");
     test.agent
+        .persistent_mut()
         .checkpoints
-        .as_mut()
-        .expect("persistent")
         .remember_path(&file)
         .expect("pre-image");
     test.agent

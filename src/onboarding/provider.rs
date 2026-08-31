@@ -5,6 +5,8 @@ use crate::config::{
 };
 use crate::error::Error;
 
+pub(crate) use crate::config::validate_environment_name;
+
 use super::discovery;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,18 +171,6 @@ pub(crate) fn validate_provider_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) fn validate_environment_name(name: &str) -> Result<(), Error> {
-    let mut bytes = name.bytes();
-    let valid_start = bytes
-        .next()
-        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
-    if valid_start && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
-        Ok(())
-    } else {
-        Err(Error::Config("invalid environment variable name".into()))
-    }
-}
-
 pub(crate) fn credential_environment_name(provider: &ProviderId) -> Option<String> {
     match provider {
         ProviderId::Anthropic => Some("ANTHROPIC_API_KEY".into()),
@@ -241,7 +231,12 @@ pub(crate) fn credential_change(
     provider: &ProviderId,
     credential: &CredentialChoice,
 ) -> Option<ConfigChange> {
-    let value = credential_config_value(credential)?;
+    let value = match credential {
+        CredentialChoice::Keep => return None,
+        CredentialChoice::Environment(name) => Some(format!("${name}")),
+        CredentialChoice::Literal(value) => Some(value.clone()),
+        CredentialChoice::None => None,
+    };
     match provider {
         ProviderId::Anthropic => Some(ConfigChange::AnthropicApiKey(value)),
         ProviderId::OpenAi => Some(ConfigChange::OpenAiApiKey(value)),

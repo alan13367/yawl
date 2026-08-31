@@ -4,7 +4,6 @@
 
 mod conversation;
 mod events;
-mod journal;
 
 use crate::background::BackgroundProcessManager;
 use crate::cancellation::CancellationToken;
@@ -62,15 +61,11 @@ impl Agent {
     }
 
     pub(crate) fn subagents(&self) -> SubagentManager {
-        self.conversation
-            .subagent_manager()
-            .expect("persistent agents always own a subagent manager")
+        self.conversation.subagent_manager()
     }
 
     pub(crate) fn background_processes(&self) -> BackgroundProcessManager {
-        self.conversation
-            .background_manager()
-            .expect("persistent agents always own a background process manager")
+        self.conversation.background_manager()
     }
 
     pub(crate) fn cancellation_token(&self) -> CancellationToken {

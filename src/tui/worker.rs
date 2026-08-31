@@ -35,53 +35,21 @@ pub(super) fn turn_interactive<R: Read>(
     terminal: &mut Terminal,
     events: &mut EventReader<R>,
 ) -> Result<bool, Error> {
-    let mut active_pickers = ActivePickers::from_agent(agent);
-    let mut active_config = agent.config().clone();
-    let active_cancellation = agent.cancellation_token();
-    let steers = agent.steer_inbox();
-    let background = agent.background_processes();
-    agent.clear_cancellation();
-    let active_agent = &mut *agent;
-    let result = std::thread::scope(|scope| {
-        let (updates_tx, updates_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let (thread_tx, thread_rx) = mpsc::channel();
-        scope.spawn(move || {
-            let _ = thread_tx.send(native_thread_id());
-            let result = if goal_mode {
-                active_agent.run_goal_preserving_cancellation(&mut |event| {
-                    let _ = updates_tx.send(Update::from_event(event));
-                })
+    let result = run_agent_job_interactive(
+        agent,
+        state,
+        editor,
+        terminal,
+        events,
+        move |agent, sink| {
+            if goal_mode {
+                agent.run_goal_preserving_cancellation(sink)
             } else {
-                active_agent.run_turn_input_preserving_cancellation(input, &mut |event| {
-                    let _ = updates_tx.send(Update::from_event(event));
-                })
-            };
-            let _ = done_tx.send(result);
-        });
-        let worker_thread = thread_rx
-            .recv()
-            .map_err(|_| Error::Protocol("agent worker did not start".into()))?;
-        pump_events(
-            WorkerChannels {
-                updates: updates_rx,
-                done: done_rx,
-                thread: worker_thread,
-                cancellation: active_cancellation,
-                steers,
-                background,
-            },
-            state,
-            editor,
-            terminal,
-            events,
-            &mut active_pickers,
-            &mut active_config,
-        )
-    });
-    recover_unaccepted_steers(agent, state);
+                agent.run_turn_input_preserving_cancellation(input, sink)
+            }
+        },
+    );
     state.active_goal = agent.active_goal().map(str::to_string);
-    agent.sync_display_config(&active_config);
     result
 }
 
@@ -92,47 +60,9 @@ pub(super) fn compact_interactive<R: Read>(
     terminal: &mut Terminal,
     events: &mut EventReader<R>,
 ) -> Result<(), Error> {
-    let mut active_pickers = ActivePickers::from_agent(agent);
-    let mut active_config = agent.config().clone();
-    let active_cancellation = agent.cancellation_token();
-    let steers = agent.steer_inbox();
-    let background = agent.background_processes();
-    agent.clear_cancellation();
-    let active_agent = &mut *agent;
-    let result = std::thread::scope(|scope| {
-        let (updates_tx, updates_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let (thread_tx, thread_rx) = mpsc::channel();
-        scope.spawn(move || {
-            let _ = thread_tx.send(native_thread_id());
-            let result = active_agent.compact_now_preserving_cancellation(&mut |event| {
-                let _ = updates_tx.send(Update::from_event(event));
-            });
-            let _ = done_tx.send(result);
-        });
-        let worker_thread = thread_rx
-            .recv()
-            .map_err(|_| Error::Protocol("agent worker did not start".into()))?;
-        pump_events(
-            WorkerChannels {
-                updates: updates_rx,
-                done: done_rx,
-                thread: worker_thread,
-                cancellation: active_cancellation,
-                steers,
-                background,
-            },
-            state,
-            editor,
-            terminal,
-            events,
-            &mut active_pickers,
-            &mut active_config,
-        )
-    });
-    recover_unaccepted_steers(agent, state);
-    agent.sync_display_config(&active_config);
-    result
+    run_agent_job_interactive(agent, state, editor, terminal, events, |agent, sink| {
+        agent.compact_now_preserving_cancellation(sink)
+    })
 }
 
 pub(super) fn deferred_subagents_interactive<R: Read>(
@@ -142,6 +72,24 @@ pub(super) fn deferred_subagents_interactive<R: Read>(
     terminal: &mut Terminal,
     events: &mut EventReader<R>,
 ) -> Result<Option<bool>, Error> {
+    run_agent_job_interactive(agent, state, editor, terminal, events, |agent, sink| {
+        agent.run_deferred_subagent_results(sink)
+    })
+}
+
+fn run_agent_job_interactive<R, T, F>(
+    agent: &mut Agent,
+    state: &mut ViewState,
+    editor: &mut Editor,
+    terminal: &mut Terminal,
+    events: &mut EventReader<R>,
+    job: F,
+) -> Result<T, Error>
+where
+    R: Read,
+    T: Send,
+    F: FnOnce(&mut Agent, &mut dyn FnMut(crate::agent::TurnEvent<'_>)) -> Result<T, Error> + Send,
+{
     let mut active_pickers = ActivePickers::from_agent(agent);
     let mut active_config = agent.config().clone();
     let active_cancellation = agent.cancellation_token();
@@ -155,7 +103,7 @@ pub(super) fn deferred_subagents_interactive<R: Read>(
         let (thread_tx, thread_rx) = mpsc::channel();
         scope.spawn(move || {
             let _ = thread_tx.send(native_thread_id());
-            let result = active_agent.run_deferred_subagent_results(&mut |event| {
+            let result = job(active_agent, &mut |event| {
                 let _ = updates_tx.send(Update::from_event(event));
             });
             let _ = done_tx.send(result);
@@ -542,9 +490,16 @@ pub(super) fn activate_picker_action_while_busy(
     let Some(action) = super::connection::handle_action(state, action) else {
         return;
     };
-    if let Some((change, selected)) = display_config_change(&action) {
-        apply_display_config_while_busy(active_config, state, active_pickers, change, selected);
-        return;
+    match display_config_change(&action) {
+        Ok(Some((change, selected))) => {
+            apply_display_config_while_busy(active_config, state, active_pickers, change, selected);
+            return;
+        }
+        Err(error) => {
+            state.notice(format!("Could not change setting: {error}"));
+            return;
+        }
+        Ok(None) => {}
     }
     match action {
         PickerAction::OpenModels { save: true } => {
@@ -600,7 +555,7 @@ pub(super) fn activate_picker_action_while_busy(
 
 pub(super) fn display_config_change(
     action: &PickerAction,
-) -> Option<(ConfigChange, SettingsLocation)> {
+) -> Result<Option<(ConfigChange, SettingsLocation)>, Error> {
     let interface = |item| SettingsLocation {
         category: SettingsCategory::Interface,
         item,
@@ -610,44 +565,45 @@ pub(super) fn display_config_change(
         item,
     };
     match action {
-        PickerAction::SetHideReasoning(enabled) => Some((
-            ConfigChange::HideReasoning(if *enabled { "on" } else { "off" }.into()),
+        PickerAction::SetHideReasoning(enabled) => Ok(Some((
+            ConfigChange::HideReasoning(*enabled),
             interface(SettingsItem::ReasoningDisplay),
-        )),
-        PickerAction::SetAccentColor(color) => Some((
-            ConfigChange::AccentColor(color.config_value()),
+        ))),
+        PickerAction::SetAccentColor(color) => Ok(Some((
+            ConfigChange::AccentColor(*color),
             interface(SettingsItem::AccentColor),
-        )),
-        PickerAction::SetSelectionColor(selection) => Some((
-            ConfigChange::SelectionColor(crate::config::UiColor::selection_config_value(
-                *selection,
-            )),
+        ))),
+        PickerAction::SetSelectionColor(selection) => Ok(Some((
+            ConfigChange::SelectionColor(*selection),
             interface(SettingsItem::SelectionColor),
-        )),
-        PickerAction::SetScrollBar(enabled) => Some((
-            ConfigChange::ScrollBar(if *enabled { "on" } else { "off" }.into()),
+        ))),
+        PickerAction::SetScrollBar(enabled) => Ok(Some((
+            ConfigChange::ScrollBar(*enabled),
             interface(SettingsItem::ScrollBar),
-        )),
-        PickerAction::SetScrollBarAutoHide(enabled) => Some((
-            ConfigChange::ScrollBarAutoHide(if *enabled { "on" } else { "off" }.into()),
+        ))),
+        PickerAction::SetScrollBarAutoHide(enabled) => Ok(Some((
+            ConfigChange::ScrollBarAutoHide(*enabled),
             interface(SettingsItem::ScrollBarAutoHide),
-        )),
-        PickerAction::SetEnterSteers(enabled) => Some((
-            ConfigChange::EnterSteers(if *enabled { "on" } else { "off" }.into()),
+        ))),
+        PickerAction::SetEnterSteers(enabled) => Ok(Some((
+            ConfigChange::EnterSteers(*enabled),
             input(SettingsItem::EnterSteers),
-        )),
-        PickerAction::ApplySetting { argument, location } => argument
-            .strip_prefix("accent_color ")
-            .and_then(|value| {
-                location.map(|location| (ConfigChange::AccentColor(value.to_string()), location))
-            })
-            .or_else(|| {
-                argument.strip_prefix("selection_color ").and_then(|value| {
-                    location
-                        .map(|location| (ConfigChange::SelectionColor(value.to_string()), location))
-                })
-            }),
-        _ => None,
+        ))),
+        PickerAction::ApplySetting { argument, location } => {
+            let change = if let Some(value) = argument.strip_prefix("accent_color ") {
+                Some(ConfigChange::AccentColor(
+                    crate::config::UiColor::parse(value).map_err(Error::Config)?,
+                ))
+            } else if let Some(value) = argument.strip_prefix("selection_color ") {
+                Some(ConfigChange::SelectionColor(
+                    crate::config::UiColor::parse_selection(value).map_err(Error::Config)?,
+                ))
+            } else {
+                None
+            };
+            Ok(change.and_then(|change| location.map(|location| (change, location))))
+        }
+        _ => Ok(None),
     }
 }
 

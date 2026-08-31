@@ -1,7 +1,11 @@
 //! Slash commands, settings mutation, queue actions, skills, and session selection.
 
 use crate::agent::Agent;
-use crate::config::{Config, ConfigChange, ConfigChangeEffect, SkillDirectoryAction};
+use crate::config::{
+    Config, ConfigChange, ConfigChangeEffect, MAX_SUBAGENT_REQUEST_BUDGET,
+    MAX_SUBAGENT_TIMEOUT_SECS, MAX_WEB_FETCH_MAX_CHARS, SkillDirectoryAction, UiColor,
+    parse_bounded, parse_builtin_api_key, parse_on_off, parse_threshold,
+};
 use crate::error::Error;
 use crate::provider::{Message, Role};
 
@@ -378,11 +382,7 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::SetHideReasoning(enabled) => {
-            if settings(
-                agent,
-                &format!("hide_reasoning {}", if enabled { "on" } else { "off" }),
-                state,
-            ) {
+            if apply_config_change(agent, ConfigChange::HideReasoning(enabled), state) {
                 open_settings_location(
                     agent,
                     state,
@@ -402,14 +402,7 @@ pub(super) fn activate_picker_action(
             ));
         }
         PickerAction::SetSelectionColor(selection) => {
-            if settings(
-                agent,
-                &format!(
-                    "selection_color {}",
-                    crate::config::UiColor::selection_config_value(selection)
-                ),
-                state,
-            ) {
+            if apply_config_change(agent, ConfigChange::SelectionColor(selection), state) {
                 open_settings_location(
                     agent,
                     state,
@@ -418,23 +411,12 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::SetScrollBar(enabled) => {
-            if settings(
-                agent,
-                &format!("scroll_bar {}", if enabled { "on" } else { "off" }),
-                state,
-            ) {
+            if apply_config_change(agent, ConfigChange::ScrollBar(enabled), state) {
                 open_settings_location(agent, state, interface_location(SettingsItem::ScrollBar));
             }
         }
         PickerAction::SetScrollBarAutoHide(enabled) => {
-            if settings(
-                agent,
-                &format!(
-                    "scroll_bar_auto_hide {}",
-                    if enabled { "on" } else { "off" }
-                ),
-                state,
-            ) {
+            if apply_config_change(agent, ConfigChange::ScrollBarAutoHide(enabled), state) {
                 open_settings_location(
                     agent,
                     state,
@@ -443,11 +425,7 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::SetEnterSteers(enabled) => {
-            if settings(
-                agent,
-                &format!("enter_steers {}", if enabled { "on" } else { "off" }),
-                state,
-            ) {
+            if apply_config_change(agent, ConfigChange::EnterSteers(enabled), state) {
                 open_settings_location(
                     agent,
                     state,
@@ -459,11 +437,7 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::SetAccentColor(color) => {
-            if settings(
-                agent,
-                &format!("accent_color {}", color.config_value()),
-                state,
-            ) {
+            if apply_config_change(agent, ConfigChange::AccentColor(color), state) {
                 open_settings_location(agent, state, interface_location(SettingsItem::AccentColor));
             }
         }
@@ -506,11 +480,7 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::SetAutoCompact(enabled) => {
-            if settings(
-                agent,
-                &format!("auto_compact {}", if enabled { "on" } else { "off" }),
-                state,
-            ) {
+            if apply_config_change(agent, ConfigChange::AutoCompact(enabled), state) {
                 open_settings_location(
                     agent,
                     state,
@@ -522,11 +492,7 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::SetWebBrowsing(enabled) => {
-            if settings(
-                agent,
-                &format!("web_browsing {}", if enabled { "on" } else { "off" }),
-                state,
-            ) {
+            if apply_config_change(agent, ConfigChange::WebBrowsing(enabled), state) {
                 open_settings_location(
                     agent,
                     state,
@@ -538,11 +504,7 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::SetWebSearchProvider(provider) => {
-            if settings(
-                agent,
-                &format!("web_search_provider {}", provider.as_str()),
-                state,
-            ) {
+            if apply_config_change(agent, ConfigChange::WebSearchProvider(provider), state) {
                 open_settings_location(
                     agent,
                     state,
@@ -554,11 +516,7 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::SetSubagents(enabled) => {
-            if settings(
-                agent,
-                &format!("subagents {}", if enabled { "on" } else { "off" }),
-                state,
-            ) {
+            if apply_config_change(agent, ConfigChange::Subagents(enabled), state) {
                 open_settings_location(
                     agent,
                     state,
@@ -570,7 +528,7 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::Reload => {
-            if settings(agent, "reload", state) {
+            if apply_config_change(agent, ConfigChange::Reload, state) {
                 open_settings_location(
                     agent,
                     state,
@@ -640,78 +598,114 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
         }
         "model" => one_value(&mut parts, "usage: /settings model MODEL")
             .map(|model| ConfigChange::Model(model.to_string())),
-        "max_tokens" => one_value(&mut parts, "usage: /settings max_tokens NUMBER")
-            .map(|value| ConfigChange::MaxTokens(value.to_string())),
+        "max_tokens" => {
+            one_value(&mut parts, "usage: /settings max_tokens NUMBER").and_then(|value| {
+                value
+                    .parse::<u32>()
+                    .map(ConfigChange::MaxTokens)
+                    .map_err(|_| Error::Config("max_tokens must be a positive integer".into()))
+            })
+        }
         "reasoning_effort" => one_value(
             &mut parts,
             "usage: /settings reasoning_effort default|minimal|low|medium|high|xhigh|max",
         )
-        .map(|value| ConfigChange::ReasoningEffort(value.to_string())),
+        .and_then(reasoning_effort_change),
         "hide_reasoning" => one_value(&mut parts, "usage: /settings hide_reasoning on|off")
-            .map(|value| ConfigChange::HideReasoning(value.to_string())),
+            .and_then(parse_on_off)
+            .map(ConfigChange::HideReasoning),
         "accent_color" | "status_bar_color" | "text_box_color" => {
             one_value(&mut parts, "usage: /settings accent_color NAME|#RRGGBB")
-                .map(|value| ConfigChange::AccentColor(value.to_string()))
+                .and_then(|value| UiColor::parse(value).map_err(Error::Config))
+                .map(ConfigChange::AccentColor)
         }
         "selection_color" => one_value(
             &mut parts,
             "usage: /settings selection_color accent|NAME|#RRGGBB",
         )
-        .map(|value| ConfigChange::SelectionColor(value.to_string())),
+        .and_then(|value| UiColor::parse_selection(value).map_err(Error::Config))
+        .map(ConfigChange::SelectionColor),
         "scroll_bar" => one_value(&mut parts, "usage: /settings scroll_bar on|off")
-            .map(|value| ConfigChange::ScrollBar(value.to_string())),
+            .and_then(parse_on_off)
+            .map(ConfigChange::ScrollBar),
         "scroll_bar_auto_hide" => {
             one_value(&mut parts, "usage: /settings scroll_bar_auto_hide on|off")
-                .map(|value| ConfigChange::ScrollBarAutoHide(value.to_string()))
+                .and_then(parse_on_off)
+                .map(ConfigChange::ScrollBarAutoHide)
         }
         "enter_steers" => one_value(&mut parts, "usage: /settings enter_steers on|off")
-            .map(|value| ConfigChange::EnterSteers(value.to_string())),
+            .and_then(parse_on_off)
+            .map(ConfigChange::EnterSteers),
         "auto_compact" => one_value(&mut parts, "usage: /settings auto_compact on|off")
-            .map(|value| ConfigChange::AutoCompact(value.to_string())),
+            .and_then(parse_on_off)
+            .map(ConfigChange::AutoCompact),
         "compact_threshold" => one_value(
             &mut parts,
             "usage: /settings compact_threshold FRACTION|PERCENT%",
         )
-        .map(|value| ConfigChange::CompactThreshold(value.to_string())),
+        .and_then(parse_threshold)
+        .map(ConfigChange::CompactThreshold),
         "web_browsing" => one_value(&mut parts, "usage: /settings web_browsing on|off")
-            .map(|value| ConfigChange::WebBrowsing(value.to_string())),
+            .and_then(parse_on_off)
+            .map(ConfigChange::WebBrowsing),
         "web_search_provider" => one_value(
             &mut parts,
             "usage: /settings web_search_provider duckduckgo|brave|firecrawl",
         )
-        .map(|value| ConfigChange::WebSearchProvider(value.to_string())),
+        .and_then(|value| value.parse().map_err(Error::Config))
+        .map(ConfigChange::WebSearchProvider),
         "web_fetch_max_chars" => {
             one_value(&mut parts, "usage: /settings web_fetch_max_chars NUMBER")
-                .map(|value| ConfigChange::WebFetchMaxChars(value.to_string()))
+                .and_then(|value| {
+                    parse_bounded(value, 1, MAX_WEB_FETCH_MAX_CHARS, "web_fetch_max_chars")
+                })
+                .map(ConfigChange::WebFetchMaxChars)
         }
         "brave_api_key" => one_value(&mut parts, "usage: /settings brave_api_key KEY|-")
-            .map(|value| ConfigChange::BraveApiKey(value.to_string())),
+            .and_then(parse_builtin_api_key)
+            .map(ConfigChange::BraveApiKey),
         "firecrawl_api_key" => one_value(&mut parts, "usage: /settings firecrawl_api_key KEY|-")
-            .map(|value| ConfigChange::FirecrawlApiKey(value.to_string())),
+            .and_then(parse_builtin_api_key)
+            .map(ConfigChange::FirecrawlApiKey),
         "subagents" => one_value(&mut parts, "usage: /settings subagents on|off")
-            .map(|value| ConfigChange::Subagents(value.to_string())),
+            .and_then(parse_on_off)
+            .map(ConfigChange::Subagents),
         "max_subagents" => one_value(&mut parts, "usage: /settings max_subagents NUMBER")
-            .map(|value| ConfigChange::MaxSubagents(value.to_string())),
+            .and_then(|value| parse_bounded(value, 1, 16, "max_subagents"))
+            .map(ConfigChange::MaxSubagents),
         "subagent_model" => one_value(&mut parts, "usage: /settings subagent_model inherit|MODEL")
             .map(|value| ConfigChange::SubagentModel(value.to_string())),
         "subagent_request_budget" => one_value(
             &mut parts,
             "usage: /settings subagent_request_budget NUMBER|0-for-unlimited",
         )
-        .map(|value| ConfigChange::SubagentRequestBudget(value.to_string())),
+        .and_then(|value| {
+            parse_bounded(
+                value,
+                0,
+                MAX_SUBAGENT_REQUEST_BUDGET,
+                "subagent_request_budget",
+            )
+        })
+        .map(ConfigChange::SubagentRequestBudget),
         "subagent_timeout_secs" => one_value(
             &mut parts,
             "usage: /settings subagent_timeout_secs SECONDS|0-for-unlimited",
         )
-        .map(|value| ConfigChange::SubagentTimeoutSecs(value.to_string())),
-        "context_window" => {
-            one_value(&mut parts, "usage: /settings context_window TOKENS").map(|value| {
-                ConfigChange::ContextWindow {
+        .and_then(|value| {
+            parse_bounded(value, 0, MAX_SUBAGENT_TIMEOUT_SECS, "subagent_timeout_secs")
+        })
+        .map(ConfigChange::SubagentTimeoutSecs),
+        "context_window" => one_value(&mut parts, "usage: /settings context_window TOKENS")
+            .and_then(|value| {
+                let window = value.parse::<u64>().map_err(|_| {
+                    Error::Config("context_window must be a positive integer".into())
+                })?;
+                Ok(ConfigChange::ContextWindow {
                     model: agent.model().to_string(),
-                    value: value.to_string(),
-                }
-            })
-        }
+                    window,
+                })
+            }),
         "skills" => {
             let action = parts.next();
             let path = parts.next();
@@ -721,14 +715,15 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
                     "usage: /settings skills add|remove DIRECTORY".into(),
                 ))
             } else {
-                Ok(ConfigChange::SkillDirectory {
-                    action: if action == Some("add") {
+                ConfigChange::skill_directory(
+                    agent.config(),
+                    if action == Some("add") {
                         SkillDirectoryAction::Add
                     } else {
                         SkillDirectoryAction::Remove
                     },
-                    path: path.unwrap_or_default().to_string(),
-                })
+                    path.unwrap_or_default(),
+                )
             }
         }
         "anthropic_base_url" | "openai_base_url" => {
@@ -741,11 +736,11 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
             })
         }
         "anthropic_api_key" | "openai_api_key" => {
-            one_value(&mut parts, "usage: /settings anthropic_api_key KEY|-").map(|value| {
+            one_value(&mut parts, "usage: /settings anthropic_api_key KEY|-").and_then(|value| {
                 if key == "anthropic_api_key" {
-                    ConfigChange::AnthropicApiKey(value.to_string())
+                    parse_builtin_api_key(value).map(ConfigChange::AnthropicApiKey)
                 } else {
-                    ConfigChange::OpenAiApiKey(value.to_string())
+                    parse_builtin_api_key(value).map(ConfigChange::OpenAiApiKey)
                 }
             })
         }
@@ -770,9 +765,17 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
         ))),
     };
 
-    let result = change.and_then(|change| agent.change_global_config(change));
+    match change {
+        Ok(change) => apply_config_change(agent, change, state),
+        Err(error) => {
+            state.notice(format!("Could not change setting: {error}"));
+            false
+        }
+    }
+}
 
-    match result {
+fn apply_config_change(agent: &mut Agent, change: ConfigChange, state: &mut ViewState) -> bool {
+    match agent.change_global_config(change) {
         Ok(effect) => {
             state.model = agent.model().to_string();
             state.reasoning_effort = agent.config().reasoning_effort.clone();
@@ -799,10 +802,7 @@ pub(super) fn notice_config_effect(
     state: &mut ViewState,
 ) {
     match effect {
-        ConfigChangeEffect::Applied => state.notice(format!(
-            "Saved to `{}` and applied.",
-            config.global_config_path().display()
-        )),
+        ConfigChangeEffect::Applied => {}
         ConfigChangeEffect::Overridden => state.notice(format!(
             "Saved to `{}`, but project settings in `{}` remain effective.",
             config.global_config_path().display(),
@@ -813,6 +813,18 @@ pub(super) fn notice_config_effect(
             path.display()
         )),
     }
+}
+
+fn reasoning_effort_change(value: &str) -> Result<ConfigChange, Error> {
+    let effective = match value {
+        "default" | "off" => None,
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(value.to_string()),
+        _ => return Err(Error::Config("unsupported reasoning effort".into())),
+    };
+    Ok(ConfigChange::ReasoningEffort {
+        stored: value.to_string(),
+        effective,
+    })
 }
 
 pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {

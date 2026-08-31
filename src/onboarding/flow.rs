@@ -200,7 +200,7 @@ struct BuiltinSpec {
     key_config_name: &'static str,
     provider: ProviderId,
     url_change: fn(String) -> ConfigChange,
-    key_change: fn(String) -> ConfigChange,
+    key_change: fn(Option<String>) -> ConfigChange,
 }
 
 const ANTHROPIC: BuiltinSpec = BuiltinSpec {
@@ -330,12 +330,12 @@ fn configure_builtin(
                 }
                 println!("The API key must not be empty.");
             };
-            changes.push((spec.key_change)(key.clone()));
+            changes.push((spec.key_change)(Some(key.clone())));
             summary.push(format!("key: stored as {}", spec.key_config_name));
             request_key = key;
         }
         Some(3) => {
-            changes.push((spec.key_change)("-".into()));
+            changes.push((spec.key_change)(None));
             summary.push("key: no API key".into());
             request_key.clear();
         }

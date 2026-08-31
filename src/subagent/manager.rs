@@ -57,7 +57,6 @@ struct State {
 
 struct Entry {
     snapshot: SubagentSnapshot,
-    conversation: Option<Conversation>,
     cancellation: CancellationToken,
     work: VecDeque<WorkItem>,
     next_run_number: u64,
@@ -204,7 +203,6 @@ impl SubagentManager {
             state.active = state.active.saturating_add(1);
             state.entries.push(Entry {
                 snapshot,
-                conversation: None,
                 cancellation,
                 work: VecDeque::new(),
                 next_run_number: 2,
@@ -262,7 +260,7 @@ impl SubagentManager {
         origin: RunOrigin,
     ) -> Result<String, String> {
         let message = validate_message(message, "message")?;
-        let (id, conversation, work, old_handle) = {
+        let id = {
             let mut state = self.lock();
             let index = find_index(&state, id)?;
             let is_active = state.entries[index].snapshot.status.is_active();
@@ -297,31 +295,26 @@ impl SubagentManager {
                 ));
             }
             let entry = &mut state.entries[index];
-            let conversation = entry
-                .conversation
-                .take()
-                .ok_or_else(|| format!("{id} has no retained conversation"))?;
+            if entry.thread_id.is_none() {
+                return Err(format!("{id} has no live worker"));
+            }
             let run_number = entry.next_run_number;
             entry.next_run_number = entry.next_run_number.saturating_add(1);
-            let work = WorkItem {
+            entry.work.push_back(WorkItem {
                 message,
                 origin,
                 run_number,
-            };
+            });
             entry.snapshot.status = SubagentStatus::Starting;
             entry.snapshot.current_activity = "starting".into();
             entry.snapshot.settled_at = None;
             entry.cancellation.clear();
             entry.suppress_delivery = false;
-            let old_handle = entry.handle.take();
             let id = entry.snapshot.id.clone();
             state.active = state.active.saturating_add(1);
-            (id, conversation, work, old_handle)
+            self.shared.changed.notify_all();
+            id
         };
-        if let Some(handle) = old_handle {
-            let _ = handle.join();
-        }
-        self.start_worker(id.clone(), conversation, work)?;
         Ok(format!("restarted {id}"))
     }
 
@@ -653,6 +646,7 @@ impl SubagentManager {
         for thread in threads {
             crate::cancellation::wake_thread(thread);
         }
+        self.shared.changed.notify_all();
         for handle in handles {
             let _ = handle.join();
         }
@@ -691,24 +685,22 @@ impl SubagentManager {
     fn start_worker(
         &self,
         id: SubagentId,
-        conversation: Conversation,
+        mut conversation: Conversation,
         first_work: WorkItem,
     ) -> Result<(), String> {
-        let holder = Arc::new(Mutex::new(Some(conversation)));
-        let worker_holder = Arc::clone(&holder);
         let manager = self.clone();
         let worker_id = id.clone();
         let spawn = std::thread::Builder::new()
             .name(format!("yawl-{id}"))
             .spawn(move || {
-                let mut conversation = lock_mutex(&worker_holder)
-                    .take()
-                    .expect("subagent conversation is installed before spawning");
                 manager.worker_started(&worker_id);
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     manager.worker_loop(&worker_id, &mut conversation, first_work)
                 }));
-                manager.worker_finished(worker_id, conversation, result);
+                match result {
+                    Ok(()) => manager.worker_stopped(&worker_id),
+                    Err(_) => manager.worker_panicked(&worker_id),
+                }
             });
         match spawn {
             Ok(handle) => {
@@ -723,7 +715,6 @@ impl SubagentManager {
                 Ok(())
             }
             Err(error) => {
-                let conversation = lock_mutex(&holder).take();
                 let mut state = self.lock();
                 if let Some(index) = state
                     .entries
@@ -737,7 +728,6 @@ impl SubagentManager {
                         super::types::MAX_ERROR_BYTES,
                     );
                     entry.snapshot.settled_at = Some(Instant::now());
-                    entry.conversation = conversation;
                     state.active = state.active.saturating_sub(1);
                 }
                 self.shared.changed.notify_all();
@@ -759,29 +749,14 @@ impl SubagentManager {
         self.shared.changed.notify_all();
     }
 
-    fn worker_loop(
-        &self,
-        id: &SubagentId,
-        conversation: &mut Conversation,
-        mut work: WorkItem,
-    ) -> RunOutcome {
+    fn worker_loop(&self, id: &SubagentId, conversation: &mut Conversation, first_work: WorkItem) {
+        let mut next_work = Some(first_work);
         loop {
-            {
-                let mut state = self.lock();
-                let Some(entry) = state
-                    .entries
-                    .iter_mut()
-                    .find(|entry| entry.snapshot.id == *id)
-                else {
-                    return RunOutcome::Interrupted;
-                };
-                if entry.snapshot.status == SubagentStatus::Canceling {
-                    entry.snapshot.latest_outcome = Some(RunOutcome::Interrupted);
-                    return RunOutcome::Interrupted;
-                }
-                entry
-                    .snapshot
-                    .begin_turn(&work.message, work.origin, work.run_number);
+            let Some(work) = next_work.take().or_else(|| self.wait_for_work(id)) else {
+                return;
+            };
+            if !self.begin_work(id, &work) {
+                return;
             }
             let run_model = conversation.model().to_string();
             let result = conversation.run_turn_preserving_cancellation(
@@ -806,16 +781,22 @@ impl SubagentManager {
                 // model actually errored, so the label rides the error text.
                 Err(error) => (RunOutcome::Failed, Some(format!("[{run_model}] {error}"))),
             };
-            let leftovers = conversation.take_unaccepted_steers();
+            let mut leftovers = conversation.take_unaccepted_steers();
             let final_result = conversation.latest_turn_result();
             let mut state = self.lock();
-            let Some(entry) = state
+            // Steering also takes the manager lock before pushing into the
+            // inbox. Draining again while holding it closes the boundary
+            // race between a turn ending and the settled state becoming
+            // visible.
+            leftovers.extend(conversation.take_unaccepted_steers());
+            let Some(index) = state
                 .entries
-                .iter_mut()
-                .find(|entry| entry.snapshot.id == *id)
+                .iter()
+                .position(|entry| entry.snapshot.id == *id)
             else {
-                return outcome;
+                return;
             };
+            let entry = &mut state.entries[index];
             entry
                 .snapshot
                 .finish_turn(outcome, &final_result, error.as_deref());
@@ -865,137 +846,122 @@ impl SubagentManager {
             entry.cancellation.clear();
             // The entry borrow ends here; the session total outlives entries.
             state.total_child_tokens = state.total_child_tokens.saturating_add(run_tokens);
-            self.shared.changed.notify_all();
-            if canceling {
-                return RunOutcome::Interrupted;
+            if !canceling && let Some(next) = next {
+                next_work = Some(next);
+                self.shared.changed.notify_all();
+                continue;
             }
-            let Some(next) = next else {
-                return outcome;
-            };
-            work = next;
+            settle_entry(&mut state, index, outcome, self.shared.as_ref());
         }
     }
 
-    fn worker_finished(
-        &self,
-        id: SubagentId,
-        conversation: Conversation,
-        worker_result: std::thread::Result<RunOutcome>,
-    ) {
-        let can_restart = worker_result.is_ok();
+    fn wait_for_work(&self, id: &SubagentId) -> Option<WorkItem> {
         let mut state = self.lock();
-        // Steering and queue submission also hold this lock. Draining only
-        // after acquiring it closes the boundary race between a turn ending
-        // and the worker publishing its settled state.
-        let late_steers = conversation.take_unaccepted_steers();
+        loop {
+            if state.shutting_down {
+                return None;
+            }
+            let index = state
+                .entries
+                .iter()
+                .position(|entry| entry.snapshot.id == *id)?;
+            if state.entries[index].snapshot.status == SubagentStatus::Canceling {
+                state.entries[index].snapshot.latest_outcome = Some(RunOutcome::Interrupted);
+                settle_entry(
+                    &mut state,
+                    index,
+                    RunOutcome::Interrupted,
+                    self.shared.as_ref(),
+                );
+                return None;
+            }
+            let entry = &mut state.entries[index];
+            if let Some(work) = entry.work.pop_front() {
+                if !entry.snapshot.queued_messages.is_empty() {
+                    entry.snapshot.queued_messages.remove(0);
+                }
+                return Some(work);
+            }
+            state = match self.shared.changed.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+
+    fn begin_work(&self, id: &SubagentId, work: &WorkItem) -> bool {
+        let mut state = self.lock();
         let Some(index) = state
             .entries
             .iter()
-            .position(|entry| entry.snapshot.id == id)
+            .position(|entry| entry.snapshot.id == *id)
+        else {
+            return false;
+        };
+        if state.entries[index].snapshot.status == SubagentStatus::Canceling {
+            state.entries[index].snapshot.latest_outcome = Some(RunOutcome::Interrupted);
+            settle_entry(
+                &mut state,
+                index,
+                RunOutcome::Interrupted,
+                self.shared.as_ref(),
+            );
+            return false;
+        }
+        state.entries[index]
+            .snapshot
+            .begin_turn(&work.message, work.origin, work.run_number);
+        true
+    }
+
+    fn worker_stopped(&self, id: &SubagentId) {
+        let mut state = self.lock();
+        if let Some(entry) = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.snapshot.id == *id)
+        {
+            entry.thread_id = None;
+        }
+        self.shared.changed.notify_all();
+    }
+
+    fn worker_panicked(&self, id: &SubagentId) {
+        let mut state = self.lock();
+        let Some(index) = state
+            .entries
+            .iter()
+            .position(|entry| entry.snapshot.id == *id)
         else {
             return;
         };
-        let now = Instant::now();
-        let shutting_down = state.shutting_down;
-        let mut pending = Vec::new();
-        let mut restart = None;
+        let was_active = state.entries[index].snapshot.status.is_active();
+        let entry = &mut state.entries[index];
+        entry.thread_id = None;
+        entry.snapshot.status = SubagentStatus::Failed;
+        entry.snapshot.error = "subagent worker panicked".into();
+        entry.snapshot.latest_outcome = Some(RunOutcome::Failed);
+        entry.snapshot.settled_at = Some(Instant::now());
+        if was_active
+            && entry.snapshot.origin == RunOrigin::Model
+            && !entry.suppress_delivery
+            && !entry
+                .pending_delivery
+                .iter()
+                .any(|delivery| delivery.run_number == entry.snapshot.run_number)
         {
-            let entry = &mut state.entries[index];
-            entry.thread_id = None;
-            entry.conversation = Some(conversation);
-            entry.snapshot.settled_at = Some(now);
-            entry.snapshot.current_tool = None;
-            entry.snapshot.live_assistant.clear();
-            entry.snapshot.live_reasoning.clear();
-            entry.snapshot.current_activity.clear();
-            match worker_result {
-                Ok(RunOutcome::Failed) => entry.snapshot.status = SubagentStatus::Failed,
-                Ok(outcome) => {
-                    entry.snapshot.status = SubagentStatus::Done;
-                    entry.snapshot.latest_outcome.get_or_insert(outcome);
-                }
-                Err(_) => {
-                    entry.snapshot.status = SubagentStatus::Failed;
-                    entry.snapshot.error = "subagent worker panicked".into();
-                    entry.snapshot.latest_outcome = Some(RunOutcome::Failed);
-                    if entry.snapshot.origin == RunOrigin::Model
-                        && !entry.suppress_delivery
-                        && !entry
-                            .pending_delivery
-                            .iter()
-                            .any(|delivery| delivery.run_number == entry.snapshot.run_number)
-                    {
-                        entry.pending_delivery.push(PendingDelivery {
-                            run_number: entry.snapshot.run_number,
-                            outcome: RunOutcome::Failed,
-                            result: String::new(),
-                            error: "subagent worker panicked".into(),
-                        });
-                    }
-                }
-            }
-            entry.snapshot.pending_steers.clear();
-            for steer in late_steers {
-                if entry.work.len() >= MAX_QUEUE_MESSAGES {
-                    break;
-                }
-                let run_number = entry.next_run_number;
-                entry.next_run_number = entry.next_run_number.saturating_add(1);
-                entry.work.push_back(WorkItem {
-                    message: steer.text.clone(),
-                    origin: RunOrigin::PrivateUser,
-                    run_number,
-                });
-                entry.snapshot.queued_messages.push(QueuedSubagentMessage {
-                    text: steer.text,
-                    origin: RunOrigin::PrivateUser,
-                });
-            }
-            // Completed runs always defer their full results; a concurrent
-            // wait drains them, and otherwise they arrive as background
-            // follow-up delivery.
-            if shutting_down {
-                entry.pending_delivery.clear();
-            } else {
-                pending = std::mem::take(&mut entry.pending_delivery);
-            }
+            entry.pending_delivery.push(PendingDelivery {
+                run_number: entry.snapshot.run_number,
+                outcome: RunOutcome::Failed,
+                result: String::new(),
+                error: "subagent worker panicked".into(),
+            });
         }
-        state.active = state.active.saturating_sub(1);
-        for delivery in pending {
-            state.settlement_sequence = state.settlement_sequence.saturating_add(1);
-            let snapshot = &state.entries[index].snapshot;
-            let deferred = DeferredResult {
-                id: snapshot.id.clone(),
-                name: snapshot.name.clone(),
-                run_number: delivery.run_number,
-                outcome: delivery.outcome,
-                result: delivery.result,
-                error: delivery.error,
-                sequence: state.settlement_sequence,
-            };
-            state.deferred.push_back(deferred);
+        if was_active {
+            state.active = state.active.saturating_sub(1);
         }
-        if !shutting_down
-            && can_restart
-            && let Some(work) = state.entries[index].work.pop_front()
-        {
-            let entry = &mut state.entries[index];
-            if !entry.snapshot.queued_messages.is_empty() {
-                entry.snapshot.queued_messages.remove(0);
-            }
-            if let Some(conversation) = entry.conversation.take() {
-                entry.snapshot.status = SubagentStatus::Starting;
-                entry.snapshot.settled_at = None;
-                entry.cancellation.clear();
-                state.active = state.active.saturating_add(1);
-                restart = Some((conversation, work));
-            }
-        }
+        flush_pending_deliveries(&mut state, index);
         self.shared.changed.notify_all();
-        drop(state);
-        if let Some((conversation, work)) = restart {
-            let _ = self.start_worker(id, conversation, work);
-        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -1006,10 +972,46 @@ impl SubagentManager {
     }
 }
 
-fn lock_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(value) => value,
-        Err(poisoned) => poisoned.into_inner(),
+fn settle_entry(state: &mut State, index: usize, outcome: RunOutcome, shared: &Shared) {
+    let shutting_down = state.shutting_down;
+    let entry = &mut state.entries[index];
+    entry.snapshot.status = if outcome == RunOutcome::Failed {
+        SubagentStatus::Failed
+    } else {
+        SubagentStatus::Done
+    };
+    entry.snapshot.latest_outcome.get_or_insert(outcome);
+    entry.snapshot.settled_at = Some(Instant::now());
+    entry.snapshot.current_tool = None;
+    entry.snapshot.live_assistant.clear();
+    entry.snapshot.live_reasoning.clear();
+    entry.snapshot.current_activity.clear();
+    entry.snapshot.pending_steers.clear();
+    if shutting_down {
+        entry.pending_delivery.clear();
+    }
+    state.active = state.active.saturating_sub(1);
+    if !shutting_down {
+        flush_pending_deliveries(state, index);
+    }
+    shared.changed.notify_all();
+}
+
+fn flush_pending_deliveries(state: &mut State, index: usize) {
+    let pending = std::mem::take(&mut state.entries[index].pending_delivery);
+    let id = state.entries[index].snapshot.id.clone();
+    let name = state.entries[index].snapshot.name.clone();
+    for delivery in pending {
+        state.settlement_sequence = state.settlement_sequence.saturating_add(1);
+        state.deferred.push_back(DeferredResult {
+            id: id.clone(),
+            name: name.clone(),
+            run_number: delivery.run_number,
+            outcome: delivery.outcome,
+            result: delivery.result,
+            error: delivery.error,
+            sequence: state.settlement_sequence,
+        });
     }
 }
 
@@ -1314,6 +1316,32 @@ mod tests {
             },
         );
         config
+    }
+
+    fn test_entry(status: SubagentStatus) -> Entry {
+        let conversation = Conversation::memory(config(), "parent".into(), "session-sa-1".into());
+        let cancellation = conversation.cancellation_token();
+        let mut snapshot = SubagentSnapshot::new(
+            SubagentId::new(1),
+            "agent".into(),
+            "default".into(),
+            "task".into(),
+            "parent".into(),
+            100,
+        );
+        snapshot.status = status;
+        Entry {
+            snapshot,
+            cancellation,
+            work: VecDeque::new(),
+            next_run_number: 2,
+            thread_id: None,
+            handle: None,
+            wait_interest: 0,
+            pending_delivery: Vec::new(),
+            suppress_delivery: false,
+            steers: crate::agent::SteerInbox::default(),
+        }
     }
 
     fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
@@ -1919,6 +1947,67 @@ mod tests {
     }
 
     #[test]
+    fn canceling_an_idle_restart_releases_its_capacity() {
+        let manager = SubagentManager::new("session".into(), 1);
+        {
+            let mut state = manager.lock();
+            state.active = 1;
+            state.entries.push(test_entry(SubagentStatus::Canceling));
+        }
+        let id = SubagentId::new(1);
+        let worker_manager = manager.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = worker_manager.wait_for_work(&id);
+            done_tx.send(()).expect("worker completion receiver");
+        });
+
+        let returned_promptly = done_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+        if !returned_promptly {
+            manager.lock().shutting_down = true;
+            manager.shared.changed.notify_all();
+        }
+        worker.join().expect("idle worker should stop");
+        let state = manager.lock();
+        let active = state.active;
+        let status = state.entries[0].snapshot.status;
+        let outcome = state.entries[0].snapshot.latest_outcome;
+        drop(state);
+        manager.shutdown_and_discard();
+
+        assert!(
+            returned_promptly,
+            "canceling idle workers must not wait for new work"
+        );
+        assert_eq!(active, 0);
+        assert_eq!(status, SubagentStatus::Done);
+        assert_eq!(outcome, Some(RunOutcome::Interrupted));
+    }
+
+    #[test]
+    fn work_canceled_after_dequeue_does_not_enter_the_transcript() {
+        let manager = SubagentManager::new("session".into(), 1);
+        manager
+            .lock()
+            .entries
+            .push(test_entry(SubagentStatus::Canceling));
+        let work = WorkItem {
+            message: "canceled follow-up".into(),
+            origin: RunOrigin::PrivateUser,
+            run_number: 2,
+        };
+
+        let started = manager.begin_work(&SubagentId::new(1), &work);
+        let state = manager.lock();
+        let snapshot = &state.entries[0].snapshot;
+
+        assert!(!started);
+        assert_eq!(snapshot.status, SubagentStatus::Done);
+        assert_eq!(snapshot.latest_outcome, Some(RunOutcome::Interrupted));
+        assert!(snapshot.transcript.is_empty());
+    }
+
+    #[test]
     fn settled_agents_reuse_their_conversation_on_restart() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
         let base_url = format!(
@@ -1940,6 +2029,13 @@ mod tests {
         manager
             .wait(&[id.to_string()], Some(5))
             .expect("initial subagent run should settle");
+        let first_thread = manager
+            .lock()
+            .entries
+            .iter()
+            .find(|entry| entry.snapshot.id == id)
+            .and_then(|entry| entry.thread_id)
+            .expect("settled subagent should retain its worker");
         manager
             .send(id.as_str(), "follow-up", RunOrigin::PrivateUser)
             .expect("settled subagent should restart");
@@ -1952,6 +2048,14 @@ mod tests {
             .into_iter()
             .find(|snapshot| snapshot.id == id)
             .expect("retained subagent snapshot");
+        let second_thread = manager
+            .lock()
+            .entries
+            .iter()
+            .find(|entry| entry.snapshot.id == id)
+            .and_then(|entry| entry.thread_id)
+            .expect("restarted subagent should retain its worker");
+        assert_eq!(first_thread, second_thread);
         assert_eq!(snapshot.completed_turns, 2);
         assert!(snapshot.transcript.iter().any(|item| {
             matches!(item, super::super::types::SubagentTranscriptItem::Assistant(text) if text == "first")
@@ -2051,7 +2155,6 @@ mod tests {
             );
             state.entries.push(Entry {
                 snapshot,
-                conversation: Some(conversation),
                 cancellation,
                 work: VecDeque::new(),
                 next_run_number: 2,

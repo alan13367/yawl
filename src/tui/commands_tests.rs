@@ -68,6 +68,10 @@ fn direct_web_settings_apply_and_validate() {
     );
     assert_eq!(agent.config().web_fetch_max_chars, 12_345);
     assert_eq!(agent.config().brave_api_key.as_deref(), Some("test-secret"));
+    assert!(
+        state.transcript.entries().is_empty(),
+        "successful configuration changes should not add system notices"
+    );
     assert!(!settings(
         &mut agent,
         "web_fetch_max_chars 50001",

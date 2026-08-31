@@ -2,14 +2,16 @@
 
 ## Project
 
-Yawl is one Cargo package with a Rust 2024 library target and binary target for macOS and Linux. It uses blocking I/O and targets Rust 1.98.0 or newer. Keep the binary small and the direct dependency count low.
+Yawl is one Cargo package with a Rust 2024 library target and binary target for macOS and Linux. It uses blocking I/O and targets Rust 1.98.0 or newer. Keep the binary small and the direct dependency count low and avoid over-engineering the codebase.
+
+Never spawn subagents if not explicitly requested by the user.
 
 ## Layout
 
 - `src/main.rs`: binary bootstrap, session selection, and TUI/print-mode dispatch
 - `src/cli.rs`, `src/print_mode.rs`, `src/project_trust.rs`: binary-local argument parsing, streamed text presentation, and project skill trust prompts
 - `src/agent.rs`: stable `Agent` facade and public turn events
-- `src/agent/conversation.rs`, `conversation/turn.rs`, `conversation/goal.rs`, `conversation/steer.rs`, `events.rs`, `journal.rs`: conversation lifecycle, model/tool turns, goal mode, live steering, streamed event translation, and optional session persistence
+- `src/agent/conversation.rs`, `conversation/turn.rs`, `conversation/goal.rs`, `conversation/steer.rs`, `events.rs`: conversation lifecycle, model/tool turns, goal mode, live steering, streamed event translation, and optional session persistence
 - `src/prompt.rs`: compact system prompt, skill catalog, and `AGENTS.md` instruction injection
 - `src/provider/mod.rs`: stable provider facade and re-exports
 - `src/provider/types.rs`, `streaming.rs`, `resolution.rs`, `http.rs`: provider-neutral protocol, retries, provider selection, and SSE/HTTP support
@@ -27,6 +29,7 @@ Yawl is one Cargo package with a Rust 2024 library target and binary target for 
 - `src/tools/`: builtin registry and executable-tool discovery
 - `src/tools/exec.rs`, `src/tools/web.rs`: exec-tool contract, plus isolated web search/fetch adapters and HTML cleanup
 - `src/background.rs`, `src/subagent/`, `src/cancellation.rs`: session-bound shell processes, parallel subagents, and interrupt tokens
+- `src/terminal_mode.rs`: shared raw-terminal lifecycle for the TUI and onboarding selector
 - `src/skills.rs`, `src/trust.rs`, `src/image.rs`: skill discovery, project skill trust, and image input
 - `src/session.rs`, `src/compaction.rs`, `src/checkpoint.rs`: append-only sessions, context compaction, and `/undo` working-tree snapshots
 - `README.md`: user-facing behavior, contracts, and a concise architecture map

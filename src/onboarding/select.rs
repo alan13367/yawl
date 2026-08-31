@@ -50,7 +50,7 @@ pub(super) fn select(title: &str, choices: &[Choice]) -> Result<Option<usize>, E
 
 fn select_interactive(title: &str, choices: &[Choice]) -> Result<Option<usize>, Error> {
     let mut out = io::stdout();
-    let _raw = RawGuard::enter()?;
+    let _raw = crate::terminal_mode::RawMode::enter()?;
     let visible = choices.len().min(MAX_VISIBLE);
     let mut cursor = 0usize;
     draw_initial(&mut out, title, choices, cursor, visible)?;
@@ -229,49 +229,6 @@ fn decode(byte: u8) -> Result<Key, Error> {
 fn read_byte() -> io::Result<Option<u8>> {
     let mut buffer = [0u8; 1];
     Ok((io::stdin().read(&mut buffer)? == 1).then_some(buffer[0]))
-}
-
-/// Cooked-to-raw terminal guard. Ctrl+C stays enabled so the process-wide
-/// interrupt handler can abort a blocked read.
-struct RawGuard(libc::termios);
-
-impl RawGuard {
-    fn enter() -> Result<Self, Error> {
-        // SAFETY: The zeroed termios is initialized by `tcgetattr` before
-        // any field is read.
-        let mut original: libc::termios = unsafe { std::mem::zeroed() };
-        // SAFETY: STDIN_FILENO is valid for this process and `original`
-        // points to writable termios storage.
-        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
-        let mut raw = original;
-        // SAFETY: `raw` is an initialized termios value.
-        unsafe { libc::cfmakeraw(&mut raw) };
-        raw.c_lflag |= libc::ISIG;
-        raw.c_cc[libc::VQUIT] = 0;
-        raw.c_cc[libc::VSUSP] = 0;
-        // Blocking-ish reads: the first byte waits up to 100 ms so escape
-        // sequences can be told apart from a lone Esc.
-        raw.c_cc[libc::VMIN] = 0;
-        raw.c_cc[libc::VTIME] = 1;
-        // SAFETY: STDIN_FILENO is valid and `raw` points to initialized
-        // termios storage for this terminal.
-        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw) } != 0 {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
-        Ok(Self(original))
-    }
-}
-
-impl Drop for RawGuard {
-    fn drop(&mut self) {
-        // SAFETY: The stored termios came from a successful `tcgetattr`
-        // call for stdin and remains initialized until this drop.
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0);
-        }
-    }
 }
 
 fn select_numbered(title: &str, choices: &[Choice]) -> Result<Option<usize>, Error> {

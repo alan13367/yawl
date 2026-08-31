@@ -7,7 +7,7 @@ use crate::provider::{
 use crate::tools::Registry;
 
 use super::goal;
-use super::{Conversation, last_undoable_user_index};
+use super::{Conversation, ConversationKind, last_undoable_user_index};
 use crate::agent::events::{TurnEvent, forward};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,7 +62,7 @@ impl Conversation {
     ) -> Result<bool, Error> {
         let cancellation = self.cancellation.clone();
         crate::cancellation::scope(&cancellation, || {
-            let Some(timeout) = self.run_limits.and_then(|limits| limits.timeout) else {
+            let Some(timeout) = self.run_limits().and_then(|limits| limits.timeout) else {
                 return self.run_turn_input_with_mode(
                     user_input,
                     sink,
@@ -121,7 +121,7 @@ impl Conversation {
             if crate::cancellation::interrupted() {
                 return Ok(false);
             }
-            let Some(manager) = self.subagents.clone() else {
+            let Some(manager) = self.persistent_subagents() else {
                 return Ok(true);
             };
             if manager.has_deferred() {
@@ -163,8 +163,7 @@ impl Conversation {
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
     {
         let manager = self
-            .subagents
-            .clone()
+            .persistent_subagents()
             .expect("deferred results require a subagent manager");
         let deliveries = manager.drain_deferred();
         if deliveries.is_empty() {
@@ -250,7 +249,7 @@ impl Conversation {
     where
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
     {
-        if mode == TurnMode::Goal && self.active_goal.is_none() {
+        if mode == TurnMode::Goal && self.active_goal().is_none() {
             return Err(Error::Config("no active goal to resume".into()));
         }
         self.latest_turn_result.clear();
@@ -262,9 +261,7 @@ impl Conversation {
                     self.model
                 )));
             }
-            if let Some(checkpoints) = &mut self.checkpoints
-                && let Err(error) = checkpoints.snapshot()
-            {
+            if let Some(Err(error)) = self.checkpoint_snapshot() {
                 sink(TurnEvent::Warning(format!(
                     "Could not checkpoint for /undo: {error}"
                 )));
@@ -272,7 +269,7 @@ impl Conversation {
             self.append_input_message(Message::user_input(input))?;
         }
         // Per-run guard rails: only subagent conversations carry limits.
-        let limits = self.run_limits;
+        let limits = self.run_limits();
         let max_requests = limits.map_or(0, |limits| limits.max_requests);
         let hard_requests = max_requests.saturating_add((max_requests / 2).max(1));
         let mut requests_made: u64 = 0;
@@ -312,24 +309,23 @@ impl Conversation {
                 registry.advertise_goal_complete();
             }
             let specs = registry.specs();
-            let system = if self.subagents.is_some() {
-                crate::prompt::build_system_prompt(
+            let system = match &self.kind {
+                ConversationKind::Persistent(state) => crate::prompt::build_system_prompt(
                     &self.config.home_dir,
                     self.config.subagents,
                     self.print_mode,
                     registry.has_web_tools(),
                     registry.skills(),
                     (mode == TurnMode::Goal)
-                        .then_some(self.active_goal.as_deref())
+                        .then_some(state.active_goal.as_deref())
                         .flatten(),
-                )
-            } else {
-                crate::prompt::build_subagent_system_prompt(
+                ),
+                ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(
                     &self.config.home_dir,
-                    self.role_fragment.as_deref(),
+                    self.role_fragment(),
                     registry.has_web_tools(),
                     registry.skills(),
-                )
+                ),
             };
 
             self.maybe_compact(sink, resolve_provider)?;
@@ -367,7 +363,7 @@ impl Conversation {
             assistant.provider_data = out.provider_data;
 
             if self.steers.has_pending() {
-                self.session.append_message(&assistant)?;
+                self.persist_message(&assistant)?;
                 self.messages.push(assistant);
                 sink(TurnEvent::AssistantDone);
                 self.skip_tool_calls(&out.tool_calls, goal::STEER_SKIPPED)?;
@@ -525,8 +521,7 @@ impl Conversation {
                 });
                 if let Some(path) =
                     crate::checkpoint::mutating_tool_path(&call.name, &call.arguments)
-                    && let Some(checkpoints) = &mut self.checkpoints
-                    && let Err(error) = checkpoints.remember_path(&path)
+                    && let Some(Err(error)) = self.checkpoint_path(&path)
                 {
                     sink(TurnEvent::Warning(format!(
                         "Could not record {} for /undo: {error}",
@@ -536,7 +531,7 @@ impl Conversation {
                 let outcome = registry.execute_with_capabilities(
                     &call.name,
                     &call.arguments,
-                    self.session.id(),
+                    self.session_id(),
                     crate::model::supports_images(&self.config, &self.model),
                 );
                 sink(TurnEvent::ToolEnd {
@@ -558,7 +553,7 @@ impl Conversation {
                     outcome.is_error,
                 )
             };
-            self.session.append_message(&result)?;
+            self.persist_message(&result)?;
             self.messages.push(result);
         }
         Ok(aborted)
@@ -569,7 +564,7 @@ impl Conversation {
         assistant: Message,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<(), Error> {
-        self.session.append_message(&assistant)?;
+        self.persist_message(&assistant)?;
         self.messages.push(assistant);
         sink(TurnEvent::AssistantDone);
         Ok(())
@@ -579,7 +574,7 @@ impl Conversation {
         for call in calls {
             let result = Message::tool_result(&call.id, &call.name, reason.to_string(), true)
                 .with_control(MessageControl::ToolSkipped);
-            self.session.append_message(&result)?;
+            self.persist_message(&result)?;
             self.messages.push(result);
         }
         Ok(())
@@ -587,7 +582,7 @@ impl Conversation {
 
     fn reject_goal_complete(&mut self, call: &ToolCall, error: &str) -> Result<(), Error> {
         let result = Message::tool_result(&call.id, &call.name, error.to_string(), true);
-        self.session.append_message(&result)?;
+        self.persist_message(&result)?;
         self.messages.push(result);
         Ok(())
     }
@@ -642,16 +637,18 @@ impl Conversation {
         }
         assistant.content.clone_from(&result);
         assistant.tool_calls.clear();
-        self.session.append_goal_complete(&assistant)?;
+        self.persistent_mut()
+            .session
+            .append_goal_complete(&assistant)?;
         self.messages.push(assistant);
         self.latest_turn_result.clone_from(&result);
-        self.active_goal = None;
+        self.persistent_mut().active_goal = None;
         sink(TurnEvent::AssistantDone);
         Ok(())
     }
 
     fn drain_deferred_subagent_results_into_history(&mut self) -> Result<(), Error> {
-        let Some(manager) = self.subagents.clone() else {
+        let Some(manager) = self.persistent_subagents() else {
             return Ok(());
         };
         if !manager.has_deferred() {
@@ -763,8 +760,7 @@ impl Conversation {
         )?;
         let start = range.start;
         let replaced = range.len();
-        self.session
-            .append_compaction_range(&summary, start, replaced)?;
+        self.persist_compaction(&summary, start, replaced)?;
         compaction::apply_summary_range(&mut self.messages, &summary, range);
         // Old usage estimate is stale after compaction; a fresh number
         // arrives with the next response.
