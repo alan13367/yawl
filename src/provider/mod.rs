@@ -13,8 +13,9 @@ mod types;
 pub use resolution::resolve;
 pub use streaming::{StreamNotice, TurnOutput, stream_turn};
 pub use types::{
-    Event, ImageContent, Message, MessageControl, Provider, Reasoning, ReasoningKind, Request,
-    Role, SubagentResult, TokenUsage, ToolCall, ToolSpec, TurnInput, UsageSummary,
+    CompactionOutput, Event, ImageContent, Message, MessageControl, Provider, Reasoning,
+    ReasoningKind, Request, Role, SubagentResult, TokenUsage, ToolCall, ToolSpec, TurnInput,
+    UsageSummary,
 };
 
 pub(crate) use http::{SseEvent, SseReader, error_body, http_agent};

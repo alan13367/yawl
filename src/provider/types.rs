@@ -116,10 +116,14 @@ pub struct Message {
     pub tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
-    /// Provider-specific replay data. Codex stores encrypted reasoning items
-    /// here so `store: false` tool loops remain valid.
+    /// Provider-specific replay data. Codex stores encrypted reasoning and
+    /// remote compaction items here so `store: false` requests remain valid.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_data: Vec<Value>,
+    /// Model that produced `provider_data`. Older sessions omit this field;
+    /// providers may replay those legacy items for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_data_model: Option<String>,
     /// Synthetic model-originated subagent results batched into this user
     /// message. Older session files omit the field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -141,6 +145,7 @@ impl Message {
             tool_name: None,
             is_error: false,
             provider_data: Vec::new(),
+            provider_data_model: None,
             subagent_results: Vec::new(),
             control: None,
         }
@@ -157,6 +162,7 @@ impl Message {
             tool_name: None,
             is_error: false,
             provider_data: Vec::new(),
+            provider_data_model: None,
             subagent_results: Vec::new(),
             control: None,
         }
@@ -173,6 +179,7 @@ impl Message {
             tool_name: None,
             is_error: false,
             provider_data: Vec::new(),
+            provider_data_model: None,
             subagent_results: Vec::new(),
             control: None,
         }
@@ -204,6 +211,7 @@ impl Message {
             tool_name: Some(name.into()),
             is_error,
             provider_data: Vec::new(),
+            provider_data_model: None,
             subagent_results: Vec::new(),
             control: None,
         }
@@ -248,6 +256,7 @@ impl Message {
             tool_name: None,
             is_error: false,
             provider_data: Vec::new(),
+            provider_data_model: None,
             subagent_results: results,
             control: None,
         }
@@ -368,6 +377,14 @@ pub struct Request<'a> {
     pub prompt_cache_key: Option<&'a str>,
 }
 
+/// Provider-native replacement history returned by remote compaction.
+#[derive(Debug, Default)]
+pub struct CompactionOutput {
+    /// Opaque Responses items to replay instead of the portable text summary.
+    pub replacement_history: Vec<Value>,
+    pub usage: TokenUsage,
+}
+
 /// Events surfaced by a provider while streaming one assistant response.
 #[derive(Debug)]
 pub enum Event {
@@ -390,6 +407,12 @@ pub trait Provider {
     /// A single streaming attempt; retries are layered on by
     /// [`crate::provider::stream_turn`].
     fn stream_once(&self, req: &Request<'_>, on_event: &mut dyn FnMut(Event)) -> Result<(), Error>;
+
+    /// Requests provider-native replacement history for `req.messages`.
+    /// Providers without a remote compaction protocol return `None`.
+    fn compact(&self, _req: &Request<'_>) -> Result<Option<CompactionOutput>, Error> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

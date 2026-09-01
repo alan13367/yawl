@@ -2,6 +2,7 @@
 //! SSE endpoint. The OAuth and wire behavior follow OpenAI's Codex CLI flow.
 
 mod auth;
+mod compaction;
 mod responses;
 
 pub use auth::{CodexLoginStatus, credential_status, login};

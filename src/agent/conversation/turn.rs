@@ -366,6 +366,9 @@ impl Conversation {
             let mut assistant = Message::assistant(out.text, out.tool_calls.clone());
             assistant.reasoning = out.reasoning;
             assistant.provider_data = out.provider_data;
+            if !assistant.provider_data.is_empty() {
+                assistant.provider_data_model = Some(bare_model.clone());
+            }
 
             if self.steers.has_pending() {
                 self.persist_message(&assistant)?;
@@ -744,7 +747,7 @@ impl Conversation {
         })
     }
 
-    fn compact_now_with<F>(
+    pub(super) fn compact_now_with<F>(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent<'_>),
         resolve_provider: &mut F,
@@ -753,8 +756,26 @@ impl Conversation {
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
     {
         sink(TurnEvent::Compacting);
+        let registry = self.scan_tools();
+        let specs = registry.specs();
+        let system = match &self.kind {
+            ConversationKind::Persistent(state) => crate::prompt::build_system_prompt(
+                &self.config.home_dir,
+                self.config.subagents,
+                self.print_mode,
+                registry.has_web_tools(),
+                registry.skills(),
+                state.active_goal.as_deref(),
+            ),
+            ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(
+                &self.config.home_dir,
+                self.role_fragment(),
+                registry.has_web_tools(),
+                registry.skills(),
+            ),
+        };
         let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;
-        let (summary, range, usage) = compaction::summarize(
+        let (summary, range, summary_usage) = compaction::summarize(
             provider.as_ref(),
             &bare_model,
             crate::model::max_tokens(&self.config, &self.model),
@@ -763,11 +784,53 @@ impl Conversation {
             // Summarizer output is not user-facing; swallow its deltas.
             &mut |_| {},
         )?;
-        self.record_usage(usage)?;
+        self.record_usage(summary_usage)?;
+
+        let remote_request = provider::Request {
+            model: &bare_model,
+            system: &system,
+            messages: &self.messages[range.clone()],
+            tools: &specs,
+            max_tokens: crate::model::max_tokens(&self.config, &self.model),
+            supports_images: crate::model::supports_images(&self.config, &self.model),
+            prompt_cache_control: true,
+            prompt_cache_key: Some(self.prompt_cache_key()),
+        };
+        let remote = match provider.compact(&remote_request) {
+            Ok(output) => output,
+            Err(_) if crate::cancellation::interrupted() => return Err(Error::Interrupted),
+            Err(error) => {
+                sink(TurnEvent::Warning(format!(
+                    "Codex remote compaction failed; using the portable summary: {error}"
+                )));
+                None
+            }
+        };
+        let mut request_usage = summary_usage;
+        let (provider_data, provider_data_model) = if let Some(remote) = remote {
+            self.record_usage(remote.usage)?;
+            request_usage = request_usage.saturating_add(remote.usage);
+            (remote.replacement_history, Some(bare_model.clone()))
+        } else {
+            (Vec::new(), None)
+        };
+
         let start = range.start;
         let replaced = range.len();
-        self.persist_compaction(&summary, start, replaced)?;
-        compaction::apply_summary_range(&mut self.messages, &summary, range);
+        self.persist_compaction(
+            &summary,
+            start,
+            replaced,
+            &provider_data,
+            provider_data_model.as_deref(),
+        )?;
+        compaction::apply_summary_range_with_provider_data(
+            &mut self.messages,
+            &summary,
+            range,
+            provider_data,
+            provider_data_model,
+        );
         self.record_cache_reset()?;
         // Old usage estimate is stale after compaction; a fresh number
         // arrives with the next response.
@@ -775,7 +838,7 @@ impl Conversation {
         sink(TurnEvent::Usage {
             context_tokens: 0,
             context_window: self.context_window(),
-            request_usage: usage,
+            request_usage,
             session_usage: self.usage(),
         });
         sink(TurnEvent::Compacted { replaced });

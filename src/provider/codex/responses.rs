@@ -21,9 +21,22 @@ fn codex_image_block(image: &crate::provider::ImageContent) -> Value {
     })
 }
 
-fn build_input(messages: &[Message], supports_images: bool) -> Vec<Value> {
+pub(super) fn build_input(messages: &[Message], supports_images: bool, model: &str) -> Vec<Value> {
     let mut input = Vec::new();
     for (message_index, message) in messages.iter().enumerate() {
+        let provider_data_matches = message
+            .provider_data_model
+            .as_deref()
+            .is_none_or(|data_model| data_model == model);
+        let has_compaction = provider_data_matches
+            && message
+                .provider_data
+                .iter()
+                .any(|item| item["type"] == "compaction");
+        if has_compaction {
+            input.extend(message.provider_data.iter().cloned());
+            continue;
+        }
         match message.role {
             Role::User => {
                 let mut content = vec![json!({"type": "input_text", "text": message.content})];
@@ -33,7 +46,9 @@ fn build_input(messages: &[Message], supports_images: bool) -> Vec<Value> {
                 input.push(json!({"role": "user", "content": content}));
             }
             Role::Assistant => {
-                input.extend(message.provider_data.iter().cloned());
+                if provider_data_matches {
+                    input.extend(message.provider_data.iter().cloned());
+                }
                 if !message.content.is_empty() {
                     input.push(json!({
                         "type": "message",
@@ -98,7 +113,7 @@ fn build_body(request: &Request<'_>, reasoning_effort: Option<&str>) -> Value {
         "store": false,
         "stream": true,
         "instructions": if request.system.is_empty() { "You are a helpful assistant." } else { request.system },
-        "input": build_input(request.messages, request.supports_images),
+        "input": build_input(request.messages, request.supports_images, request.model),
         "text": {"verbosity": "low"},
         "include": ["reasoning.encrypted_content"],
         "tool_choice": "auto",
@@ -297,6 +312,13 @@ impl Provider for Codex {
             "Codex stream ended before completion",
         )))
     }
+
+    fn compact(
+        &self,
+        req: &Request<'_>,
+    ) -> Result<Option<crate::provider::CompactionOutput>, Error> {
+        super::compaction::compact(self, req).map(Some)
+    }
 }
 
 fn emit_reasoning_summary(item: &Value, emitted: &mut bool, on_event: &mut dyn FnMut(Event)) {
@@ -364,11 +386,30 @@ mod tests {
             assistant,
             Message::tool_result("call_1|fc_1", "shell", "/tmp".into(), false),
         ];
-        let input = build_input(&messages, false);
+        let input = build_input(&messages, false, "gpt-5.6-sol");
         assert_eq!(input[1]["type"], "reasoning");
         assert_eq!(input[2]["call_id"], "call_1");
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(input[3]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn remote_compaction_replays_only_for_the_model_that_created_it() {
+        let mut summary = Message::user("portable summary");
+        summary.provider_data = vec![json!({
+            "type": "compaction",
+            "encrypted_content": "opaque"
+        })];
+        summary.provider_data_model = Some("gpt-5.6-sol".into());
+
+        let matching = build_input(std::slice::from_ref(&summary), false, "gpt-5.6-sol");
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0]["type"], "compaction");
+
+        let switched = build_input(&[summary], false, "gpt-5.4");
+        assert_eq!(switched.len(), 1);
+        assert_eq!(switched[0]["role"], "user");
+        assert_eq!(switched[0]["content"][0]["text"], "portable summary");
     }
 
     #[test]
@@ -386,7 +427,7 @@ mod tests {
             vec![image],
             false,
         );
-        let input = build_input(&[user, tool], true);
+        let input = build_input(&[user, tool], true, "gpt-5.6-sol");
 
         assert_eq!(input[0]["content"][1]["type"], "input_image");
         assert_eq!(input[1]["output"][1]["type"], "input_image");

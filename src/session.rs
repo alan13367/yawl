@@ -38,6 +38,11 @@ enum SessionEvent {
         #[serde(default)]
         start: usize,
         replaced: usize,
+        /// Provider-native replacement history for compatible resumed turns.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        provider_data: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_data_model: Option<String>,
     },
     /// The last `dropped` messages were removed by `/undo`.
     Undo {
@@ -180,10 +185,23 @@ impl Session {
         start: usize,
         replaced: usize,
     ) -> Result<(), Error> {
+        self.append_compaction_range_with_provider_data(summary, start, replaced, &[], None)
+    }
+
+    pub(crate) fn append_compaction_range_with_provider_data(
+        &mut self,
+        summary: &str,
+        start: usize,
+        replaced: usize,
+        provider_data: &[serde_json::Value],
+        provider_data_model: Option<&str>,
+    ) -> Result<(), Error> {
         self.append(&SessionEvent::Compaction {
             summary: summary.to_string(),
             start,
             replaced,
+            provider_data: provider_data.to_vec(),
+            provider_data_model: provider_data_model.map(str::to_string),
         })?;
         self.usage.record_cache_reset();
         Ok(())
@@ -312,12 +330,18 @@ fn replay(path: &Path) -> Result<(Vec<Message>, Option<String>, UsageSummary), E
                 summary,
                 start,
                 replaced,
+                provider_data,
+                provider_data_model,
             } => {
                 let start = start.min(messages.len());
                 let end = start.saturating_add(replaced).min(messages.len());
                 drop(messages.splice(
                     start..end,
-                    std::iter::once(crate::compaction::summary_message(&summary)),
+                    std::iter::once(crate::compaction::summary_message_with_provider_data(
+                        &summary,
+                        provider_data,
+                        provider_data_model,
+                    )),
                 ));
                 usage.record_cache_reset();
             }
@@ -564,6 +588,34 @@ mod tests {
         assert_eq!(messages[1].content, "goal");
         assert!(messages[2].content.contains("progress summary"));
         assert_eq!(messages[3].content, "tail");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn session_roundtrip_preserves_remote_compaction_history() -> Result<(), Error> {
+        let dir = temp_root("remote-compaction");
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "gpt-test")?;
+        let id = session.id.clone();
+        session.append_message(&Message::user("one"))?;
+        let provider_data = [serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": "opaque"
+        })];
+        session.append_compaction_range_with_provider_data(
+            "portable summary",
+            0,
+            1,
+            &provider_data,
+            Some("gpt-test"),
+        )?;
+        drop(session);
+
+        let (_, messages) = Session::open(&dir, &id)?;
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("portable summary"));
+        assert_eq!(messages[0].provider_data, provider_data);
+        assert_eq!(messages[0].provider_data_model.as_deref(), Some("gpt-test"));
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

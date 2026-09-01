@@ -541,11 +541,19 @@ impl Conversation {
         summary: &str,
         start: usize,
         replaced: usize,
+        provider_data: &[serde_json::Value],
+        provider_data_model: Option<&str>,
     ) -> Result<(), Error> {
         match &mut self.kind {
-            ConversationKind::Persistent(state) => state
-                .session
-                .append_compaction_range(summary, start, replaced),
+            ConversationKind::Persistent(state) => {
+                state.session.append_compaction_range_with_provider_data(
+                    summary,
+                    start,
+                    replaced,
+                    provider_data,
+                    provider_data_model,
+                )
+            }
             ConversationKind::Child(_) => Ok(()),
         }
     }

@@ -16,7 +16,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/provider/mod.rs`: stable provider facade and re-exports
 - `src/provider/types.rs`, `streaming.rs`, `resolution.rs`, `http.rs`: provider-neutral protocol, retries, provider selection, and SSE/HTTP support
 - `src/provider/anthropic.rs`, `openai.rs`: provider-specific wire translation
-- `src/provider/codex/`: Codex facade with separate OAuth and Responses modules
+- `src/provider/codex/`: Codex facade with separate OAuth, Responses, and remote compaction modules
 - `src/config.rs`: effective `Config` facade and stable re-exports
 - `src/config/types.rs`, `schema.rs`, `loading.rs`, `storage.rs`, `change.rs`: runtime types, on-disk schema, merge logic, JSON storage, and validated mutations
 - `src/tui/mod.rs`: `tui::run` facade and top-level event/submission coordination

@@ -995,6 +995,7 @@ pub(super) fn render_loading_state(state: &ViewState, width: usize) -> Option<St
     if has_visible_in_flight_content(state)
         && !state.activity.starts_with("preparing ")
         && state.activity != "loading skill"
+        && state.activity != "compacting conversation"
     {
         return None;
     }

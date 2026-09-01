@@ -10,7 +10,8 @@ use crate::compaction;
 use crate::config::Config;
 use crate::error::Error;
 use crate::provider::{
-    Event as ProviderEvent, Message, Provider, Request, Role, TokenUsage, ToolCall,
+    CompactionOutput, Event as ProviderEvent, Message, Provider, Request, Role, TokenUsage,
+    ToolCall,
 };
 use crate::session::Session;
 
@@ -70,6 +71,40 @@ impl Provider for ScriptedProvider {
             }
             ProviderStep::Fail => Err(Error::Protocol("scripted failure".into())),
         }
+    }
+}
+
+struct RemoteCompactionProvider;
+
+impl Provider for RemoteCompactionProvider {
+    fn stream_once(
+        &self,
+        _request: &Request<'_>,
+        on_event: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), Error> {
+        on_event(ProviderEvent::TextDelta("portable summary".into()));
+        on_event(ProviderEvent::Usage(TokenUsage {
+            input_tokens: 20,
+            output_tokens: 5,
+            ..TokenUsage::default()
+        }));
+        on_event(ProviderEvent::Done);
+        Ok(())
+    }
+
+    fn compact(&self, request: &Request<'_>) -> Result<Option<CompactionOutput>, Error> {
+        assert_eq!(request.messages.len(), 2);
+        Ok(Some(CompactionOutput {
+            replacement_history: vec![serde_json::json!({
+                "type": "compaction",
+                "encrypted_content": "opaque"
+            })],
+            usage: TokenUsage {
+                input_tokens: 30,
+                output_tokens: 10,
+                ..TokenUsage::default()
+            },
+        }))
     }
 }
 
@@ -324,6 +359,42 @@ fn provider_usage_saturates_instead_of_wrapping() {
 }
 
 #[test]
+fn compaction_persists_and_replays_provider_native_history() {
+    let mut test = TestAgent::new("remote-compaction");
+    for index in 0..12 {
+        test.agent
+            .append_input_message(Message::user(format!("history {index}")))
+            .expect("history should persist");
+    }
+    let mut resolve = |_: &str, _: &Config| {
+        Ok::<(Box<dyn Provider>, String), Error>((
+            Box::new(RemoteCompactionProvider),
+            "codex-test".into(),
+        ))
+    };
+
+    test.agent
+        .compact_now_with(&mut |_| {}, &mut resolve)
+        .expect("remote compaction should succeed");
+
+    assert_eq!(test.agent.messages.len(), 11);
+    assert_eq!(
+        test.agent.messages[0].provider_data[0]["type"],
+        "compaction"
+    );
+    assert_eq!(
+        test.agent.messages[0].provider_data_model.as_deref(),
+        Some("codex-test")
+    );
+    assert_eq!(test.agent.usage().requests, 2);
+    let (session, replayed) = Session::open(&test.sessions_dir, test.agent.session_id())
+        .expect("compacted session should replay");
+    assert_eq!(replayed[0].provider_data[0]["encrypted_content"], "opaque");
+    assert_eq!(session.usage().requests, 2);
+    assert_eq!(session.usage().cache_resets, 1);
+}
+
+#[test]
 fn failed_auto_compaction_warns_and_the_turn_continues() {
     let mut test = TestAgent::new("compact-warning");
     test.agent.config.auto_compact = true;
@@ -466,7 +537,7 @@ fn undo_keeps_working_after_compaction_during_a_goal() {
     let start = range.start;
     let replaced = range.len();
     test.agent
-        .persist_compaction("compacted goal progress", start, replaced)
+        .persist_compaction("compacted goal progress", start, replaced, &[], None)
         .expect("compaction should persist");
     compaction::apply_summary_range(&mut test.agent.messages, "compacted goal progress", range);
 

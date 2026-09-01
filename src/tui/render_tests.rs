@@ -141,6 +141,45 @@ fn frame_keeps_input_and_status_pinned() {
 }
 
 #[test]
+fn input_box_moves_complete_words_to_the_next_row() {
+    let mut state = empty_session_state();
+    let mut editor = Editor::default();
+    editor.paste("123456789012 palabra");
+
+    let (frame, _) = build_frame(&mut state, &editor, 20, 12);
+    let input = frame
+        .iter()
+        .map(|line| markdown::strip_ansi(line))
+        .filter(|line| line.starts_with('│'))
+        .collect::<Vec<_>>();
+
+    assert!(
+        input.iter().any(|line| line.contains("  palabra")),
+        "{input:?}"
+    );
+}
+
+#[test]
+fn wide_input_glyphs_are_not_clipped_at_the_text_box_edge() {
+    let mut state = empty_session_state();
+    let mut editor = Editor::default();
+    editor.paste("abcdefghijklmno界def");
+
+    let (frame, _) = build_frame(&mut state, &editor, 20, 12);
+    let input = frame
+        .iter()
+        .map(|line| markdown::strip_ansi(line))
+        .filter(|line| line.starts_with('│'))
+        .collect::<Vec<_>>();
+
+    assert!(input.iter().any(|line| line.contains("界def")), "{input:?}");
+    assert!(
+        frame.iter().all(|line| markdown::visible_width(line) == 20),
+        "{frame:?}"
+    );
+}
+
+#[test]
 fn active_background_terminal_gets_its_own_row_above_status() {
     let mut state = empty_session_state();
     state.transcript = Transcript::from_messages(&[crate::provider::Message::assistant(
@@ -505,6 +544,16 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
     assert_eq!(state.activity, "sending");
     let loading = render_loading_state(&state, 80).expect("waiting after tools");
     assert!(markdown::strip_ansi(&loading).contains("Waiting…"));
+}
+
+#[test]
+fn compacting_state_stays_visible_after_assistant_text() {
+    let mut state = overflow_state();
+    state.apply(Update::Compacting);
+
+    let loading = render_loading_state(&state, 80)
+        .expect("compaction should remain visible after assistant text");
+    assert!(markdown::strip_ansi(&loading).contains("Compacting conversation…"));
 }
 
 #[test]

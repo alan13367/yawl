@@ -55,7 +55,7 @@ use self::picker::{
     open_model_picker, open_reasoning_picker, open_settings_picker, picker_is_editing,
     take_picker_action,
 };
-use self::state::{ViewState, advance_ticks, scroll, toggle_tool_expansion};
+use self::state::{Update, ViewState, advance_ticks, scroll, toggle_tool_expansion};
 use self::subagents::open_dashboard as open_subagent_dashboard;
 use self::terminal::Terminal;
 use self::transcript::Transcript;
@@ -82,8 +82,6 @@ use self::render::{
     HIDDEN_CURSOR, RenderCache, WELCOME_ANIMATION_TICKS, build_frame, render_entries,
     render_loading_state, render_queued_panel, selected_row, selection_style,
 };
-#[cfg(test)]
-use self::state::Update;
 #[cfg(test)]
 use self::terminal::{
     ScreenPoint, TextSelection, cursor_control, highlighted_selection, selected_text,
@@ -391,8 +389,11 @@ fn handle_submission<R: Read>(
                 Err(error) => state.notice(format!("Could not start a session: {error}")),
             },
             "compact" => {
+                state.apply(Update::Compacting);
                 terminal.draw(state, editor)?;
-                match compact_interactive(agent, state, editor, terminal, events) {
+                let result = compact_interactive(agent, state, editor, terminal, events);
+                state.activity.clear();
+                match result {
                     Ok(()) => {}
                     Err(Error::Interrupted) => state.notice("Compaction interrupted."),
                     Err(error) => state.notice(format!("Compaction failed: {error}")),

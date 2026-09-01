@@ -16,9 +16,20 @@ pub const KEEP_TAIL: usize = 10;
 const SUMMARY_MARKER: &str = "[conversation summary]";
 
 pub fn summary_message(summary: &str) -> Message {
-    Message::user(format!(
+    summary_message_with_provider_data(summary, Vec::new(), None)
+}
+
+pub(crate) fn summary_message_with_provider_data(
+    summary: &str,
+    provider_data: Vec<serde_json::Value>,
+    provider_data_model: Option<String>,
+) -> Message {
+    let mut message = Message::user(format!(
         "{SUMMARY_MARKER}\nEarlier conversation, summarized to free context:\n\n{summary}"
-    ))
+    ));
+    message.provider_data = provider_data;
+    message.provider_data_model = provider_data_model;
+    message
 }
 
 pub(crate) fn is_summary_message(message: &Message) -> bool {
@@ -167,7 +178,24 @@ pub(crate) fn apply_summary(messages: &mut Vec<Message>, summary: &str, split: u
 }
 
 pub(crate) fn apply_summary_range(messages: &mut Vec<Message>, summary: &str, range: Range<usize>) {
-    drop(messages.splice(range, std::iter::once(summary_message(summary))));
+    apply_summary_range_with_provider_data(messages, summary, range, Vec::new(), None);
+}
+
+pub(crate) fn apply_summary_range_with_provider_data(
+    messages: &mut Vec<Message>,
+    summary: &str,
+    range: Range<usize>,
+    provider_data: Vec<serde_json::Value>,
+    provider_data_model: Option<String>,
+) {
+    drop(messages.splice(
+        range,
+        std::iter::once(summary_message_with_provider_data(
+            summary,
+            provider_data,
+            provider_data_model,
+        )),
+    ));
 }
 
 #[cfg(test)]

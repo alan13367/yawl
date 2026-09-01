@@ -1,6 +1,10 @@
 //! Multiline input editor with cursor movement, kill keys, paste, and
 //! command history.
 
+use std::cell::Cell;
+
+use unicode_width::UnicodeWidthChar;
+
 use super::clipboard::{ClipboardStore, StagedImage};
 use super::events::Key;
 
@@ -94,10 +98,23 @@ pub struct InputLayout {
     pub cursor_col: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CursorPosition {
+    row: usize,
+    column: usize,
+}
+
+struct BufferLayout {
+    lines: Vec<String>,
+    positions: Vec<CursorPosition>,
+}
+
 #[derive(Default)]
 pub struct Editor {
     buffer: Vec<char>,
     cursor: usize,
+    layout_width: Cell<usize>,
+    preferred_column: Option<usize>,
     history: Vec<Submission>,
     history_index: Option<usize>,
     history_draft: Option<Submission>,
@@ -162,6 +179,7 @@ impl Editor {
     pub(super) fn restore_submission(&mut self, submission: Submission) {
         self.buffer = submission.text.chars().collect();
         self.cursor = self.buffer.len();
+        self.preferred_column = None;
         self.images = submission.images;
         self.history_index = None;
         self.history_draft = None;
@@ -320,6 +338,7 @@ impl Editor {
     pub fn clear(&mut self) {
         self.buffer.clear();
         self.cursor = 0;
+        self.preferred_column = None;
         self.history_index = None;
         self.history_draft = None;
         self.images.clear();
@@ -338,6 +357,9 @@ impl Editor {
     }
 
     pub fn handle_key(&mut self, key: Key) -> EditAction {
+        if !matches!(key, Key::Up | Key::Down) {
+            self.preferred_column = None;
+        }
         match key {
             Key::Char(character) => self.insert(character),
             Key::Newline => self.insert('\n'),
@@ -349,8 +371,18 @@ impl Editor {
             Key::Right => self.cursor = (self.cursor + 1).min(self.buffer.len()),
             Key::Home | Key::Ctrl('a') => self.cursor = self.line_start(),
             Key::End | Key::Ctrl('e') => self.cursor = self.line_end(),
-            Key::Up => self.history_previous(),
-            Key::Down => self.history_next(),
+            Key::Up => {
+                if !self.move_vertical(true) {
+                    self.preferred_column = None;
+                    self.history_previous();
+                }
+            }
+            Key::Down => {
+                if !self.move_vertical(false) {
+                    self.preferred_column = None;
+                    self.history_next();
+                }
+            }
             Key::Ctrl('u') => self.kill_to_line_start(),
             Key::Ctrl('k') => self.kill_to_line_end(),
             Key::Ctrl('w') => self.kill_previous_word(),
@@ -375,49 +407,46 @@ impl Editor {
 
     fn layout_with_buffer(&self, width: usize, buffer: &[char]) -> InputLayout {
         let width = width.max(3);
-        let mut lines = Vec::new();
-        let mut line = String::from("> ");
-        let mut column = 2usize;
-        let mut cursor_row = 0usize;
-        let mut cursor_col = 2usize;
-
-        for (index, character) in buffer.iter().copied().enumerate() {
-            if index == self.cursor {
-                cursor_row = lines.len();
-                cursor_col = column;
-            }
-            if character == '\n' {
-                lines.push(line);
-                line = String::from("  ");
-                column = 2;
-                continue;
-            }
-            if column >= width {
-                lines.push(line);
-                line = String::from("  ");
-                column = 2;
-                if index == self.cursor {
-                    cursor_row = lines.len();
-                    cursor_col = column;
-                }
-            }
-            line.push(if character.is_control() {
-                '�'
-            } else {
-                character
-            });
-            column += 1;
-        }
-        if self.cursor == buffer.len() {
-            cursor_row = lines.len();
-            cursor_col = column;
-        }
-        lines.push(line);
+        self.layout_width.set(width);
+        let layout = buffer_layout(buffer, width);
+        let cursor = layout.positions[self.cursor];
         InputLayout {
-            lines,
-            cursor_row,
-            cursor_col,
+            lines: layout.lines,
+            cursor_row: cursor.row,
+            cursor_col: cursor.column,
         }
+    }
+
+    fn move_vertical(&mut self, upward: bool) -> bool {
+        let width = self.layout_width.get();
+        if width < 3 {
+            return false;
+        }
+        let positions = buffer_layout(&self.buffer, width).positions;
+        let current = positions[self.cursor];
+        let target_row = if upward {
+            current.row.checked_sub(1)
+        } else {
+            current.row.checked_add(1).filter(|row| {
+                positions
+                    .last()
+                    .is_some_and(|position| *row <= position.row)
+            })
+        };
+        let Some(target_row) = target_row else {
+            return false;
+        };
+        let preferred_column = *self.preferred_column.get_or_insert(current.column);
+        let Some((target, _)) = positions
+            .iter()
+            .enumerate()
+            .filter(|(_, position)| position.row == target_row)
+            .min_by_key(|(_, position)| position.column.abs_diff(preferred_column))
+        else {
+            return false;
+        };
+        self.cursor = target;
+        true
     }
 
     fn insert(&mut self, character: char) {
@@ -551,9 +580,96 @@ impl Editor {
     }
 
     fn leave_history(&mut self) {
+        self.preferred_column = None;
         self.history_index = None;
         self.history_draft = None;
     }
+}
+
+fn displayed_character(character: char) -> char {
+    if character.is_control() {
+        '�'
+    } else {
+        character
+    }
+}
+
+fn wraps_before(column: usize, character_width: usize, width: usize) -> bool {
+    column > 2 && column.saturating_add(character_width) > width
+}
+
+fn word_width(buffer: &[char], start: usize) -> usize {
+    buffer[start..]
+        .iter()
+        .copied()
+        .take_while(|character| !character.is_whitespace())
+        .map(displayed_character)
+        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .sum()
+}
+
+fn should_wrap_word(buffer: &[char], index: usize, column: usize, width: usize) -> bool {
+    let character = buffer[index];
+    if character.is_whitespace()
+        || index
+            .checked_sub(1)
+            .is_some_and(|previous| !buffer[previous].is_whitespace())
+    {
+        return false;
+    }
+    let word_width = word_width(buffer, index);
+    column > 2 && word_width <= width.saturating_sub(2) && column.saturating_add(word_width) > width
+}
+
+fn buffer_layout(buffer: &[char], width: usize) -> BufferLayout {
+    let mut lines = Vec::new();
+    let mut positions = Vec::with_capacity(buffer.len().saturating_add(1));
+    let mut line = String::from("> ");
+    let mut column = 2usize;
+
+    for (index, character) in buffer.iter().copied().enumerate() {
+        if character == '\n' {
+            positions.push(CursorPosition {
+                row: lines.len(),
+                column,
+            });
+            lines.push(line);
+            line = String::from("  ");
+            column = 2;
+            continue;
+        }
+        let displayed = displayed_character(character);
+        let character_width = UnicodeWidthChar::width(displayed).unwrap_or(0);
+        if character.is_whitespace() && wraps_before(column, character_width, width) {
+            lines.push(line);
+            line = String::from("  ");
+            column = 2;
+            positions.push(CursorPosition {
+                row: lines.len(),
+                column,
+            });
+            continue;
+        }
+        if should_wrap_word(buffer, index, column, width)
+            || wraps_before(column, character_width, width)
+        {
+            lines.push(line);
+            line = String::from("  ");
+            column = 2;
+        }
+        positions.push(CursorPosition {
+            row: lines.len(),
+            column,
+        });
+        line.push(displayed);
+        column = column.saturating_add(character_width);
+    }
+    positions.push(CursorPosition {
+        row: lines.len(),
+        column,
+    });
+    lines.push(line);
+    BufferLayout { lines, positions }
 }
 
 fn normalize_paste(text: &str) -> String {
@@ -750,6 +866,88 @@ mod tests {
         let layout = editor.layout(5);
         assert_eq!(layout.lines, ["> abc", "  def"]);
         assert_eq!((layout.cursor_row, layout.cursor_col), (1, 5));
+    }
+
+    #[test]
+    fn layout_moves_a_complete_word_to_the_next_row() {
+        let mut editor = Editor::default();
+        editor.paste("hi palabra");
+
+        let layout = editor.layout(10);
+
+        assert_eq!(layout.lines, ["> hi ", "  palabra"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 9));
+    }
+
+    #[test]
+    fn layout_absorbs_whitespace_at_a_wrap_boundary() {
+        let mut editor = Editor::default();
+        editor.paste("abcdefgh ijklmnop");
+
+        let layout = editor.layout(10);
+
+        assert_eq!(layout.lines, ["> abcdefgh", "  ijklmnop"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 10));
+    }
+
+    #[test]
+    fn layout_wraps_wide_characters_before_the_right_edge() {
+        let mut editor = Editor::default();
+        editor.paste("abc界def");
+
+        let layout = editor.layout(6);
+
+        assert_eq!(layout.lines, ["> abc", "  界de", "  f"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (2, 3));
+    }
+
+    #[test]
+    fn up_and_down_move_between_wrapped_input_rows() {
+        let mut editor = Editor::default();
+        editor.paste("abcdefghijkl");
+        assert_eq!(
+            (editor.layout(7).cursor_row, editor.layout(7).cursor_col),
+            (2, 4)
+        );
+
+        editor.handle_key(Key::Up);
+        assert_eq!(
+            (editor.layout(7).cursor_row, editor.layout(7).cursor_col),
+            (1, 4)
+        );
+
+        editor.handle_key(Key::Up);
+        assert_eq!(
+            (editor.layout(7).cursor_row, editor.layout(7).cursor_col),
+            (0, 4)
+        );
+
+        editor.handle_key(Key::Down);
+        assert_eq!(
+            (editor.layout(7).cursor_row, editor.layout(7).cursor_col),
+            (1, 4)
+        );
+    }
+
+    #[test]
+    fn vertical_movement_crosses_newlines_and_preserves_the_target_column() {
+        let mut editor = Editor::default();
+        editor.paste("abcdef\nx\nuvwxyz");
+        editor.layout(20);
+
+        editor.handle_key(Key::Up);
+        assert_eq!(
+            (editor.layout(20).cursor_row, editor.layout(20).cursor_col),
+            (1, 3)
+        );
+        editor.handle_key(Key::Up);
+        assert_eq!(
+            (editor.layout(20).cursor_row, editor.layout(20).cursor_col),
+            (0, 8)
+        );
+
+        editor.handle_key(Key::Char('!'));
+        assert_eq!(editor.text(), "abcdef!\nx\nuvwxyz");
     }
 
     #[test]
