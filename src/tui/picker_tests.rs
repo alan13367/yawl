@@ -2,7 +2,7 @@
 
 use super::picker::{
     SettingsCategory, SettingsItem, settings_category_picker, settings_picker,
-    web_search_provider_picker,
+    status_bar_add_picker, status_bar_editor_picker, web_search_provider_picker,
 };
 use super::*;
 
@@ -120,6 +120,95 @@ fn selection_picker_defaults_to_following_the_accent() {
 }
 
 #[test]
+fn interface_settings_open_the_status_bar_editor() {
+    let config = Config::test_default();
+    let picker = super::picker::settings_category_picker_from(
+        &config,
+        "test",
+        100,
+        SettingsCategory::Interface,
+        0,
+    );
+
+    let item = picker
+        .items
+        .iter()
+        .find(|item| item.label == "Status bar")
+        .expect("interface settings should list the status bar");
+    assert!(matches!(
+        item.action,
+        PickerAction::OpenStatusBarEditor { .. }
+    ));
+}
+
+#[test]
+fn status_bar_editor_lists_unique_items_and_returns_move_and_remove_actions() {
+    let mut state = test_picker_state(Picker {
+        title: String::new(),
+        hint: String::new(),
+        items: Vec::new(),
+        selected: 0,
+        editing: None,
+        parent: None,
+    });
+    state.status_bar_draft = Some(crate::config::StatusBarConfig {
+        items: vec![crate::config::StatusBarItemConfig::new(
+            crate::config::StatusBarKind::Model,
+        )],
+        ..Default::default()
+    });
+    state.picker = Some(status_bar_editor_picker(&state, 0));
+
+    let move_action = take_picker_action(&mut state, &mut Editor::default(), Key::Char('J'));
+    assert!(matches!(
+        move_action,
+        Some(PickerAction::MoveStatusBarItem {
+            index: 0,
+            direction: 1
+        })
+    ));
+
+    state.picker = Some(status_bar_editor_picker(&state, 0));
+    let remove_action = take_picker_action(&mut state, &mut Editor::default(), Key::Delete);
+    assert!(matches!(
+        remove_action,
+        Some(PickerAction::RemoveStatusBarItem(0))
+    ));
+
+    let add = status_bar_add_picker(&state);
+    assert!(!add.items.iter().any(|item| item.label == "Model"));
+    assert!(add.items.iter().any(|item| item.label == "Prompt cache"));
+}
+
+#[test]
+fn status_bar_label_editor_can_submit_an_empty_label() {
+    let mut state = test_picker_state(Picker {
+        title: "Model".into(),
+        hint: String::new(),
+        items: vec![PickerItem {
+            label: "Custom label…".into(),
+            description: String::new(),
+            action: PickerAction::EditStatusBarLabel {
+                index: 0,
+                initial: String::new(),
+            },
+        }],
+        selected: 0,
+        editing: None,
+        parent: None,
+    });
+    let mut editor = Editor::default();
+
+    assert!(take_picker_action(&mut state, &mut editor, Key::Enter).is_none());
+    let action = take_picker_action(&mut state, &mut editor, Key::Enter);
+
+    assert!(matches!(
+        action,
+        Some(PickerAction::ApplyStatusBarLabel { index: 0, label }) if label.is_empty()
+    ));
+}
+
+#[test]
 fn escape_returns_the_typed_parent_action() {
     let parent = PickerAction::OpenSettingsRoot { selected: 3 };
     let mut state = test_picker_state(Picker {
@@ -212,6 +301,8 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -230,7 +321,6 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -292,6 +382,8 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -310,7 +402,6 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -384,7 +475,7 @@ fn settings_picker_categories_and_items_keep_their_action_contracts() {
     let agent = Agent::new(config, "test".into(), session, Vec::new());
 
     let picker = settings_picker(&agent);
-    assert_eq!(picker.items.len(), 9);
+    assert_eq!(picker.items.len(), 8);
     assert_eq!(
         picker.items[SettingsCategory::Providers.index()].label,
         "Providers"
@@ -415,15 +506,6 @@ fn settings_picker_categories_and_items_keep_their_action_contracts() {
         interface.items[auto_hide].action,
         PickerAction::SetScrollBarAutoHide(false)
     ));
-    let input = settings_category_picker(&agent, SettingsCategory::Input, 0);
-    let enter_steers =
-        super::picker::settings_item_index(SettingsCategory::Input, SettingsItem::EnterSteers);
-    assert_eq!(input.items[enter_steers].label, "Enter while busy");
-    assert!(matches!(
-        input.items[enter_steers].action,
-        PickerAction::SetEnterSteers(true)
-    ));
-
     let context = settings_category_picker(&agent, SettingsCategory::Context, 0);
     assert_eq!(context.items[0].label, "Automatic compaction");
     let web = settings_category_picker(&agent, SettingsCategory::Web, 0);

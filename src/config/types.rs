@@ -2,10 +2,226 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{Deserialize, Deserializer, de};
+use serde::{Deserialize, Deserializer, Serialize, de};
+use unicode_width::UnicodeWidthStr;
 
 use super::OPENAI_COMPLETIONS_API;
 use super::schema::ProviderFile;
+
+/// Ordered status-bar layout persisted in `config.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct StatusBarConfig {
+    pub(crate) style: StatusBarStyle,
+    pub(crate) separator: String,
+    pub(crate) items: Vec<StatusBarItemConfig>,
+}
+
+impl Default for StatusBarConfig {
+    fn default() -> Self {
+        Self {
+            style: StatusBarStyle::Mixed,
+            separator: "  ·  ".into(),
+            items: StatusBarKind::ALL
+                .into_iter()
+                .map(StatusBarItemConfig::new)
+                .collect(),
+        }
+    }
+}
+
+impl StatusBarConfig {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        validate_status_text(&self.separator, 8, "status_bar.separator")?;
+        let mut seen = std::collections::HashSet::new();
+        for item in &self.items {
+            if !seen.insert(item.kind) {
+                return Err(format!(
+                    "status_bar.items contains duplicate '{}' entries",
+                    item.kind.as_str()
+                ));
+            }
+            if let Some(label) = &item.label {
+                validate_status_text(label, 32, "status_bar item label")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_status_text(value: &str, max_width: usize, field: &str) -> Result<(), String> {
+    if value.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    if UnicodeWidthStr::width(value) > max_width {
+        return Err(format!("{field} must be at most {max_width} columns wide"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StatusBarStyle {
+    #[default]
+    Mixed,
+    Accent,
+    Muted,
+    Plain,
+}
+
+impl StatusBarStyle {
+    pub(crate) const ALL: [Self; 4] = [Self::Mixed, Self::Accent, Self::Muted, Self::Plain];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mixed => "mixed",
+            Self::Accent => "accent",
+            Self::Muted => "muted",
+            Self::Plain => "plain",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StatusBarItemConfig {
+    pub(crate) kind: StatusBarKind,
+    #[serde(default)]
+    pub(crate) format: StatusBarFormat,
+    /// `None` uses the built-in label, `Some("")` removes it.
+    #[serde(default)]
+    pub(crate) label: Option<String>,
+    #[serde(default)]
+    pub(crate) visibility: StatusBarVisibility,
+}
+
+impl StatusBarItemConfig {
+    pub(crate) const fn new(kind: StatusBarKind) -> Self {
+        Self {
+            kind,
+            format: StatusBarFormat::Current,
+            label: None,
+            visibility: StatusBarVisibility::Auto,
+        }
+    }
+}
+
+impl Default for StatusBarItemConfig {
+    fn default() -> Self {
+        Self::new(StatusBarKind::Model)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StatusBarKind {
+    #[default]
+    Model,
+    Reasoning,
+    Context,
+    Cache,
+    Elapsed,
+    Queued,
+    Steering,
+    Goal,
+    Pending,
+    ActiveSubagents,
+    FailedSubagents,
+    ChildTokens,
+}
+
+impl StatusBarKind {
+    pub(crate) const ALL: [Self; 12] = [
+        Self::Model,
+        Self::Reasoning,
+        Self::Context,
+        Self::Cache,
+        Self::Elapsed,
+        Self::Queued,
+        Self::Steering,
+        Self::Goal,
+        Self::Pending,
+        Self::ActiveSubagents,
+        Self::FailedSubagents,
+        Self::ChildTokens,
+    ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Reasoning => "reasoning",
+            Self::Context => "context",
+            Self::Cache => "cache",
+            Self::Elapsed => "elapsed",
+            Self::Queued => "queued",
+            Self::Steering => "steering",
+            Self::Goal => "goal",
+            Self::Pending => "pending",
+            Self::ActiveSubagents => "active_subagents",
+            Self::FailedSubagents => "failed_subagents",
+            Self::ChildTokens => "child_tokens",
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Model => "Model",
+            Self::Reasoning => "Reasoning effort",
+            Self::Context => "Context usage",
+            Self::Cache => "Prompt cache",
+            Self::Elapsed => "Turn elapsed",
+            Self::Queued => "Queued messages",
+            Self::Steering => "Pending steering",
+            Self::Goal => "Goal state",
+            Self::Pending => "Pending settings",
+            Self::ActiveSubagents => "Active subagents",
+            Self::FailedSubagents => "Failed subagents",
+            Self::ChildTokens => "Child token usage",
+        }
+    }
+
+    pub(crate) const fn is_dynamic(self) -> bool {
+        !matches!(self, Self::Model | Self::Context)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StatusBarFormat {
+    #[default]
+    Current,
+    Compact,
+    Detailed,
+}
+
+impl StatusBarFormat {
+    pub(crate) const ALL: [Self; 3] = [Self::Current, Self::Compact, Self::Detailed];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Compact => "compact",
+            Self::Detailed => "detailed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StatusBarVisibility {
+    #[default]
+    Auto,
+    Always,
+}
+
+impl StatusBarVisibility {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+        }
+    }
+}
 
 /// Search service used by the built-in `web_search` tool.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -281,5 +497,85 @@ impl ProviderConfig {
         if let Some(compat) = file.compat {
             self.compat.apply(compat);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn status_bar_defaults_match_the_original_item_order() {
+        let layout = StatusBarConfig::default();
+
+        assert_eq!(layout.style, StatusBarStyle::Mixed);
+        assert_eq!(layout.separator, "  ·  ");
+        assert_eq!(
+            layout
+                .items
+                .iter()
+                .map(|item| item.kind)
+                .collect::<Vec<_>>(),
+            StatusBarKind::ALL
+        );
+        assert!(layout.validate().is_ok());
+    }
+
+    #[test]
+    fn status_bar_round_trips_label_states_and_empty_layouts() {
+        let layout: StatusBarConfig = serde_json::from_value(json!({
+            "style": "plain",
+            "separator": "",
+            "items": [
+                {"kind": "model", "format": "compact", "label": null},
+                {"kind": "cache", "format": "detailed", "label": "", "visibility": "always"}
+            ]
+        }))
+        .expect("valid layout should deserialize");
+
+        assert_eq!(layout.items[0].label, None);
+        assert_eq!(layout.items[1].label.as_deref(), Some(""));
+        assert_eq!(layout.items[1].visibility, StatusBarVisibility::Always);
+        assert_eq!(
+            serde_json::to_value(&layout).expect("layout should serialize")["items"][1]["label"],
+            ""
+        );
+        assert!(serde_json::from_value::<StatusBarConfig>(json!({"items": []})).is_ok());
+    }
+
+    #[test]
+    fn status_bar_rejects_duplicates_controls_and_overwide_text() {
+        let mut duplicate = StatusBarConfig {
+            items: vec![
+                StatusBarItemConfig::new(StatusBarKind::Model),
+                StatusBarItemConfig::new(StatusBarKind::Model),
+            ],
+            ..StatusBarConfig::default()
+        };
+        assert!(duplicate.validate().unwrap_err().contains("duplicate"));
+
+        duplicate.items.truncate(1);
+        duplicate.separator = "\x1b[31m".into();
+        assert!(duplicate.validate().unwrap_err().contains("control"));
+
+        duplicate.separator = " ".into();
+        duplicate.items[0].label = Some("界".repeat(17));
+        assert!(duplicate.validate().unwrap_err().contains("32 columns"));
+
+        assert!(
+            serde_json::from_value::<StatusBarConfig>(json!({
+                "style": "neon",
+                "items": []
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<StatusBarConfig>(json!({
+                "items": [{"format": "compact"}]
+            }))
+            .is_err()
+        );
     }
 }

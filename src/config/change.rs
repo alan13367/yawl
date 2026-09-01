@@ -4,8 +4,8 @@ use serde_json::{Map, Value, json};
 
 use super::{
     Config, MAX_SUBAGENT_REQUEST_BUDGET, MAX_SUBAGENT_TIMEOUT_SECS, MAX_WEB_FETCH_MAX_CHARS,
-    OPENAI_COMPLETIONS_API, ProviderConfig, UiColor, WebSearchProvider, expand_home_path,
-    object_field, validate_bounded, validate_provider_name,
+    OPENAI_COMPLETIONS_API, ProviderConfig, StatusBarConfig, UiColor, WebSearchProvider,
+    expand_home_path, object_field, validate_bounded, validate_provider_name,
 };
 use crate::error::Error;
 
@@ -22,9 +22,9 @@ pub(crate) enum ConfigChange {
     HideReasoning(bool),
     AccentColor(UiColor),
     SelectionColor(Option<UiColor>),
+    StatusBar(StatusBarConfig),
     ScrollBar(bool),
     ScrollBarAutoHide(bool),
-    EnterSteers(bool),
     AutoCompact(bool),
     CompactThreshold(f64),
     WebBrowsing(bool),
@@ -142,6 +142,7 @@ impl ConfigChange {
             Self::CompactThreshold(value) => {
                 validate_bounded(*value, 0.1, 0.99, "compact_threshold").map(|_| ())
             }
+            Self::StatusBar(layout) => layout.validate().map_err(Error::Config),
             Self::WebFetchMaxChars(value) => {
                 validate_bounded(*value, 1, MAX_WEB_FETCH_MAX_CHARS, "web_fetch_max_chars")
                     .map(|_| ())
@@ -244,11 +245,14 @@ impl ConfigChange {
                 "selection_color",
                 json!(UiColor::selection_config_value(*selection)),
             ),
+            Self::StatusBar(layout) if layout == &StatusBarConfig::default() => {
+                remove_root(root, "status_bar")
+            }
+            Self::StatusBar(layout) => insert_root(root, "status_bar", json!(layout)),
             Self::ScrollBar(enabled) => insert_root(root, "scroll_bar", json!(enabled)),
             Self::ScrollBarAutoHide(enabled) => {
                 insert_root(root, "scroll_bar_auto_hide", json!(enabled))
             }
-            Self::EnterSteers(enabled) => insert_root(root, "enter_steers", json!(enabled)),
             Self::AutoCompact(enabled) => insert_root(root, "auto_compact", json!(enabled)),
             Self::CompactThreshold(threshold) => {
                 insert_root(root, "compact_threshold", json!(threshold))
@@ -379,9 +383,9 @@ impl ConfigChange {
             Self::HideReasoning(hidden) => config.hide_reasoning == *hidden,
             Self::AccentColor(color) => config.accent_color == *color,
             Self::SelectionColor(selection) => config.selection_color == *selection,
+            Self::StatusBar(layout) => config.status_bar == *layout,
             Self::ScrollBar(enabled) => config.scroll_bar == *enabled,
             Self::ScrollBarAutoHide(enabled) => config.scroll_bar_auto_hide == *enabled,
-            Self::EnterSteers(enabled) => config.enter_steers == *enabled,
             Self::AutoCompact(enabled) => config.auto_compact == *enabled,
             Self::CompactThreshold(threshold) => config.compact_threshold == *threshold,
             Self::WebBrowsing(enabled) => config.web_browsing == *enabled,
@@ -613,6 +617,67 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_change_persists_and_default_removes_the_key() {
+        let dirs = TestDirs::new("status-bar");
+        let config = dirs.config();
+        let layout = StatusBarConfig {
+            style: crate::config::StatusBarStyle::Plain,
+            items: StatusBarConfig::default()
+                .items
+                .into_iter()
+                .filter(|item| item.kind != crate::config::StatusBarKind::Reasoning)
+                .collect(),
+            ..StatusBarConfig::default()
+        };
+
+        let outcome = config
+            .change_global(ConfigChange::StatusBar(layout.clone()))
+            .expect("valid status bar should save");
+        assert_eq!(outcome.config.status_bar, layout);
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(dirs.home.join("config.json"))
+                .expect("saved config should be readable"),
+        )
+        .expect("saved config should remain JSON");
+        assert_eq!(saved["status_bar"]["style"], "plain");
+
+        let reset = outcome
+            .config
+            .change_global(ConfigChange::StatusBar(StatusBarConfig::default()))
+            .expect("default status bar should reset");
+        assert_eq!(reset.config.status_bar, StatusBarConfig::default());
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(dirs.home.join("config.json"))
+                .expect("reset config should be readable"),
+        )
+        .expect("reset config should remain JSON");
+        assert!(saved.get("status_bar").is_none());
+    }
+
+    #[test]
+    fn project_status_bar_replaces_the_saved_global_layout() {
+        let dirs = TestDirs::new("status-bar-override");
+        fs::create_dir_all(&dirs.project).expect("project config directory should be created");
+        fs::write(
+            dirs.project.join("config.json"),
+            r#"{"status_bar":{"style":"plain","separator":"","items":[]}}"#,
+        )
+        .expect("project config should be written");
+        let config = dirs.config();
+
+        let outcome = config
+            .change_global(ConfigChange::StatusBar(StatusBarConfig::default()))
+            .expect("global status bar should still save");
+
+        assert_eq!(outcome.effect, ConfigChangeEffect::Overridden);
+        assert!(outcome.config.status_bar.items.is_empty());
+        assert_eq!(
+            outcome.config.status_bar.style,
+            crate::config::StatusBarStyle::Plain
+        );
+    }
+
+    #[test]
     fn invalid_change_does_not_create_global_config() {
         let dirs = TestDirs::new("invalid");
         let config = dirs.config();
@@ -815,28 +880,6 @@ mod tests {
 
         let error = parse_on_off("maybe").expect_err("non-boolean values should fail parsing");
         assert!(error.to_string().contains("on or off"));
-    }
-
-    #[test]
-    fn enter_steers_change_is_validated_persisted_and_reloaded() {
-        let dirs = TestDirs::new("enter-steers");
-        let config = dirs.config();
-        assert!(!config.enter_steers);
-
-        let outcome = config
-            .change_global(ConfigChange::EnterSteers(true))
-            .expect("a valid on/off value should apply");
-
-        assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
-        assert!(outcome.config.enter_steers);
-        let saved: Value = serde_json::from_str(
-            &fs::read_to_string(dirs.home.join("config.json"))
-                .expect("saved config should be readable"),
-        )
-        .expect("saved config should remain JSON");
-        assert_eq!(saved["enter_steers"], true);
-
-        assert!(parse_on_off("maybe").is_err());
     }
 
     #[test]

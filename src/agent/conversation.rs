@@ -284,9 +284,9 @@ impl Conversation {
     pub(crate) fn sync_display_config(&mut self, config: &Config) {
         self.config.hide_reasoning = config.hide_reasoning;
         self.config.accent_color = config.accent_color;
+        self.config.status_bar.clone_from(&config.status_bar);
         self.config.scroll_bar = config.scroll_bar;
         self.config.scroll_bar_auto_hide = config.scroll_bar_auto_hide;
-        self.config.enter_steers = config.enter_steers;
     }
 
     /// Starts a fresh session (used by `/new` and `/clear`).

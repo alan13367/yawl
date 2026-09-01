@@ -22,7 +22,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tui/mod.rs`: `tui::run` facade and top-level event/submission coordination
 - `src/tui/commands.rs`, `completion.rs`, `files.rs`, `picker.rs`, `state.rs`, `worker.rs`: TUI behavior and state
 - `src/tui/render.rs`, `terminal.rs`, `events.rs`, `input.rs`, `transcript.rs`: frame composition, terminal lifecycle, input decoding/editing, and transcript reduction
-- `src/tui/markdown.rs`, `highlight.rs`, `tool_view.rs`: sanitized Markdown, syntax highlighting, and tool presentation
+- `src/tui/markdown.rs`, `highlight.rs`, `tool_view.rs`, `status_bar.rs`: sanitized Markdown, syntax highlighting, tool presentation, and configurable status rendering
 - `src/tui/processes.rs`, `subagents.rs`, `connection.rs`, `dashboard.rs`: background-process and subagent dashboards, provider setup, and shared dashboard layout
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering

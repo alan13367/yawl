@@ -18,8 +18,11 @@ pub(crate) use loading::{
 };
 pub(crate) use schema::validate_file_shape;
 pub(crate) use storage::{read_json_object, resolve_config_value, write_json_object};
-pub(crate) use types::UiColor;
 pub use types::{ModelConfig, OpenAiCompatibility, ProviderConfig, WebSearchProvider};
+pub(crate) use types::{
+    StatusBarConfig, StatusBarFormat, StatusBarItemConfig, StatusBarKind, StatusBarStyle,
+    StatusBarVisibility, UiColor,
+};
 
 use storage::{object_field, validate_provider_name};
 
@@ -53,12 +56,12 @@ pub struct Config {
     /// Highlight color for the selected row in menus and pickers. `None`
     /// follows the accent color.
     pub(crate) selection_color: Option<UiColor>,
+    /// Ordered status items and their presentation.
+    pub(crate) status_bar: StatusBarConfig,
     /// Whether the TUI draws a transcript scroll bar.
     pub scroll_bar: bool,
     /// Whether an idle transcript scroll bar hides itself after a pause.
     pub scroll_bar_auto_hide: bool,
-    /// Whether Enter steers instead of queues while a TUI turn is active.
-    pub enter_steers: bool,
     pub context_windows: HashMap<String, u64>,
     pub auto_compact: bool,
     pub compact_threshold: f64,
@@ -263,9 +266,9 @@ impl Config {
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
             selection_color: None,
+            status_bar: StatusBarConfig::default(),
             scroll_bar: true,
             scroll_bar_auto_hide: true,
-            enter_steers: false,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,

@@ -290,8 +290,12 @@ pub(super) fn handle_event(state: &mut ViewState, editor: &mut Editor, event: Ev
                         })
                     }
                     Event::Key(key) => {
-                        match editor.handle_key(key) {
-                            EditAction::Steer(message) => {
+                        match if key == Key::Tab {
+                            editor.queue()
+                        } else {
+                            editor.handle_key(key)
+                        } {
+                            EditAction::Submit(message) | EditAction::Steer(message) => {
                                 let message = editor.expand_submission(&message.text);
                                 match state.subagent_manager.steer(&id, &message) {
                                     Ok(_) => scroll.follow(),
@@ -299,24 +303,16 @@ pub(super) fn handle_event(state: &mut ViewState, editor: &mut Editor, event: Ev
                                         .notice(format!("Could not steer the subagent: {error}")),
                                 }
                             }
-                            EditAction::Submit(message) => {
+                            EditAction::Queue(message) => {
                                 let message = editor.expand_submission(&message.text);
-                                let (action, result) = if state.enter_steers {
-                                    ("steer", state.subagent_manager.steer(&id, &message))
-                                } else {
-                                    (
-                                        "send a private message to",
-                                        state.subagent_manager.send(
-                                            &id,
-                                            &message,
-                                            RunOrigin::PrivateUser,
-                                        ),
-                                    )
-                                };
-                                match result {
+                                match state.subagent_manager.send(
+                                    &id,
+                                    &message,
+                                    RunOrigin::PrivateUser,
+                                ) {
                                     Ok(_) => scroll.follow(),
                                     Err(error) => state.notice(format!(
-                                        "Could not {action} the subagent: {error}"
+                                        "Could not send a private message to the subagent: {error}"
                                     )),
                                 }
                             }
@@ -388,7 +384,6 @@ pub(super) fn render(
                 snapshots: &state.subagent_snapshots,
                 hide_reasoning: state.hide_reasoning,
                 accent_color: state.accent_color,
-                enter_steers: state.enter_steers,
             },
             editor,
             id,
@@ -634,7 +629,6 @@ struct TakeoverContext<'a> {
     snapshots: &'a [SubagentSnapshot],
     hide_reasoning: bool,
     accent_color: crate::config::UiColor,
-    enter_steers: bool,
 }
 
 fn render_takeover(
@@ -729,10 +723,8 @@ fn render_takeover(
     frame.push(format!("{accent}└{}┘\x1b[0m", "─".repeat(inner_width)));
     let hint = if confirm_cancel {
         "Cancel this run? Enter confirms, Esc keeps it running"
-    } else if context.enter_steers {
-        "Enter steers  Ctrl+G steers  ↑/↓ or PgUp/PgDn scroll  Ctrl+C cancel  Esc dashboard"
     } else {
-        "Enter queues  Ctrl+G steers  ↑/↓ or PgUp/PgDn scroll  Ctrl+C cancel  Esc dashboard"
+        "Enter steers  Tab queues  ↑/↓ or PgUp/PgDn scroll  Ctrl+C cancel  Esc dashboard"
     };
     frame.push(format!(
         "{}{}\x1b[0m",
@@ -863,6 +855,8 @@ mod tests {
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
             selection_color: UiColor::WHITE,
+            status_bar: Default::default(),
+            status_bar_draft: None,
             show_scroll_bar: true,
             scroll_bar_enabled: true,
             scroll_bar_auto_hide: false,
@@ -881,7 +875,6 @@ mod tests {
             pending_steers: VecDeque::new(),
             active_goal: None,
             goal_running: false,
-            enter_steers: false,
             pending_actions: VecDeque::new(),
             completions: Vec::new(),
             completion_index: 0,

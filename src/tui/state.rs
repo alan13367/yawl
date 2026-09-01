@@ -2,7 +2,7 @@
 
 use crate::agent::{Agent, TurnEvent};
 use crate::background::BackgroundProcessManager;
-use crate::config::{Config, UiColor};
+use crate::config::{Config, StatusBarConfig, UiColor};
 use crate::provider::UsageSummary;
 use crate::subagent::{SubagentManager, SubagentSnapshot};
 
@@ -40,6 +40,9 @@ pub(super) struct ViewState {
     /// Effective selection highlight color: `selection_color` from the
     /// config when set, otherwise the accent color.
     pub(super) selection_color: UiColor,
+    pub(super) status_bar: StatusBarConfig,
+    /// Unsaved layout shown while the status-bar editor is open.
+    pub(super) status_bar_draft: Option<StatusBarConfig>,
     pub(super) show_scroll_bar: bool,
     /// Whether the config enables the scroll bar at all. Kept beside the
     /// effective `show_scroll_bar` so auto-hide can re-show it on activity.
@@ -61,7 +64,6 @@ pub(super) struct ViewState {
     pub(super) pending_steers: std::collections::VecDeque<super::input::Submission>,
     pub(super) active_goal: Option<String>,
     pub(super) goal_running: bool,
-    pub(super) enter_steers: bool,
     pub(super) pending_actions: std::collections::VecDeque<PickerAction>,
     pub(super) completions: Vec<Completion>,
     pub(super) completion_index: usize,
@@ -96,6 +98,8 @@ impl ViewState {
             hide_reasoning: agent.config().hide_reasoning,
             accent_color: agent.config().accent_color,
             selection_color: agent.config().effective_selection_color(),
+            status_bar: agent.config().status_bar.clone(),
+            status_bar_draft: None,
             scroll_bar_enabled: agent.config().scroll_bar,
             scroll_bar_auto_hide: agent.config().scroll_bar_auto_hide,
             show_scroll_bar: agent.config().scroll_bar,
@@ -114,7 +118,6 @@ impl ViewState {
             pending_steers: std::collections::VecDeque::new(),
             active_goal: agent.active_goal().map(str::to_string),
             goal_running: false,
-            enter_steers: agent.config().enter_steers,
             pending_actions: std::collections::VecDeque::new(),
             completions: command_completions(agent),
             completion_index: 0,

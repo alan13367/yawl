@@ -24,6 +24,7 @@ const KNOWN_KEYS: &[&str] = &[
     "hide_reasoning",
     "accent_color",
     "selection_color",
+    "status_bar",
     "status_bar_color",
     "text_box_color",
     "scroll_bar",
@@ -1000,6 +1001,26 @@ mod tests {
 
         match &finding.fix {
             Some(Fix::RemoveKey { keys, .. }) => assert_eq!(keys, &["max_tokens".to_string()]),
+            other => panic!("expected RemoveKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_status_bar_layout_is_attributed_to_items() {
+        let dirs = TestDirs::new("status-bar");
+        dirs.write_global(r#"{"status_bar":{"items":[{"kind":"model"},{"kind":"model"}]}}"#);
+
+        let findings = run(&dirs.paths());
+        let error_findings = errors(&findings);
+        let finding = error_findings
+            .iter()
+            .find(|finding| finding.message.contains("duplicate 'model'"))
+            .expect("the invalid status bar should be flagged");
+
+        match &finding.fix {
+            Some(Fix::RemoveKey { keys, .. }) => {
+                assert_eq!(keys, &["status_bar".to_string(), "items".to_string()]);
+            }
             other => panic!("expected RemoveKey, got {other:?}"),
         }
     }

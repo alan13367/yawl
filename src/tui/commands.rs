@@ -13,7 +13,7 @@ use super::picker::{
     Picker, PickerAction, PickerItem, SettingsCategory, SettingsItem, SettingsLocation,
     color_picker, open_model_picker, open_reasoning_picker, select_picker_item,
     selection_color_picker, settings_category_picker, settings_item_index, settings_picker,
-    web_search_provider_picker,
+    status_bar_editor_picker, web_search_provider_picker,
 };
 use super::state::ViewState;
 
@@ -41,17 +41,20 @@ Commands
   /quit                leave Yawl
 
 Input
-  Enter submits. Shift+Enter, Alt+Enter, or Ctrl+J inserts a newline.
+  Enter submits while idle and steers during an active response. Tab queues a
+    non-empty message while a response runs. Shift+Enter, Alt+Enter, or Ctrl+J
+    inserts a newline.
     Type / for commands; Up/Down select, Tab completes, and Enter runs the selected
     command or an exact name such as /copy.
   Model, settings, and provider setup remain available during an active response.
-  Messages submitted during a response appear below it as queued. Ctrl+G steers
-    the running turn at the next safe boundary; Ctrl+Enter also works in terminals
-    that report modified Enter. /unqueue opens an editor: K/J
-    reorder, e edits, d deletes, and Enter stops the turn to send.
+  Queued messages appear below the response. Ctrl+G steers the running turn at the
+    next safe boundary; Ctrl+Enter also works in terminals that report modified
+    Enter. /unqueue opens an editor: K/J reorder, e edits, d deletes, and Enter
+    stops the turn to send.
   Outside the menu, Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
   Ctrl+V pastes a clipboard image as [Image #N] when the model accepts images.
-  Tab focuses transcript blocks. Up/Down move, Left/Right fold, Enter opens,
+  Otherwise, Tab focuses transcript blocks when no completion is open. Up/Down
+    move, Left/Right fold, Enter opens,
     y copies, and Esc returns to the editor. Ctrl+F searches the transcript.
   Ctrl+O expands or collapses tool output. Esc or Ctrl+C aborts the active turn.
    Mouse wheel and PageUp/PageDown scroll. Click or drag the right-edge
@@ -329,6 +332,9 @@ pub(super) fn activate_picker_action(
     let Some(action) = super::connection::handle_action(state, action) else {
         return;
     };
+    let Some(action) = super::status_bar::handle_editor_action(state, action) else {
+        return;
+    };
     match action {
         PickerAction::SwitchModel(model) => {
             agent.switch_model(model);
@@ -411,6 +417,23 @@ pub(super) fn activate_picker_action(
                 );
             }
         }
+        PickerAction::CancelStatusBarEditor => {
+            state.status_bar_draft = None;
+            open_settings_location(agent, state, interface_location(SettingsItem::StatusBar));
+        }
+        PickerAction::SaveStatusBar => {
+            let Some(layout) = state.status_bar_draft.take() else {
+                open_settings_location(agent, state, interface_location(SettingsItem::StatusBar));
+                state.refresh_completions(agent);
+                return;
+            };
+            if apply_config_change(agent, ConfigChange::StatusBar(layout.clone()), state) {
+                open_settings_location(agent, state, interface_location(SettingsItem::StatusBar));
+            } else {
+                state.status_bar_draft = Some(layout);
+                state.picker = Some(status_bar_editor_picker(state, 0));
+            }
+        }
         PickerAction::SetScrollBar(enabled) => {
             if apply_config_change(agent, ConfigChange::ScrollBar(enabled), state) {
                 open_settings_location(agent, state, interface_location(SettingsItem::ScrollBar));
@@ -422,18 +445,6 @@ pub(super) fn activate_picker_action(
                     agent,
                     state,
                     interface_location(SettingsItem::ScrollBarAutoHide),
-                );
-            }
-        }
-        PickerAction::SetEnterSteers(enabled) => {
-            if apply_config_change(agent, ConfigChange::EnterSteers(enabled), state) {
-                open_settings_location(
-                    agent,
-                    state,
-                    SettingsLocation {
-                        category: SettingsCategory::Input,
-                        item: SettingsItem::EnterSteers,
-                    },
                 );
             }
         }
@@ -541,6 +552,27 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::ShowSettings => show_settings(agent, state),
+        PickerAction::OpenStatusBarEditor { .. }
+        | PickerAction::OpenStatusBarItem { .. }
+        | PickerAction::OpenStatusBarFormats(_)
+        | PickerAction::SetStatusBarFormat { .. }
+        | PickerAction::SetStatusBarVisibility { .. }
+        | PickerAction::EditStatusBarLabel { .. }
+        | PickerAction::ApplyStatusBarLabel { .. }
+        | PickerAction::ResetStatusBarLabel(_)
+        | PickerAction::OpenStatusBarAdd
+        | PickerAction::AddStatusBarItem(_)
+        | PickerAction::MoveStatusBarItem { .. }
+        | PickerAction::RemoveStatusBarItem(_)
+        | PickerAction::OpenStatusBarStyles
+        | PickerAction::SetStatusBarStyle(_)
+        | PickerAction::OpenStatusBarSeparators
+        | PickerAction::SetStatusBarSeparator(_)
+        | PickerAction::EditStatusBarSeparator(_)
+        | PickerAction::ApplyStatusBarSeparator(_)
+        | PickerAction::ResetStatusBar => {
+            unreachable!("status-bar editor action should be consumed before dispatch")
+        }
         PickerAction::EditSetting { .. }
         | PickerAction::EditSecretSetting { .. }
         | PickerAction::EditModel { .. }
@@ -634,9 +666,6 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
                 .and_then(parse_on_off)
                 .map(ConfigChange::ScrollBarAutoHide)
         }
-        "enter_steers" => one_value(&mut parts, "usage: /settings enter_steers on|off")
-            .and_then(parse_on_off)
-            .map(ConfigChange::EnterSteers),
         "auto_compact" => one_value(&mut parts, "usage: /settings auto_compact on|off")
             .and_then(parse_on_off)
             .map(ConfigChange::AutoCompact),
@@ -783,7 +812,7 @@ fn apply_config_change(agent: &mut Agent, change: ConfigChange, state: &mut View
             state.hide_reasoning = agent.config().hide_reasoning;
             state.accent_color = agent.config().accent_color;
             state.selection_color = agent.config().effective_selection_color();
-            state.enter_steers = agent.config().enter_steers;
+            state.status_bar = agent.config().status_bar.clone();
             state.subagents_enabled = agent.config().subagents;
             state.sync_scroll_bar_config(agent.config());
             state.context_window = agent.context_window();
@@ -832,7 +861,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- enter_steers: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- web_browsing: `{}`\n- web_search_provider: `{}`\n- web_fetch_max_chars: `{}`\n- brave_api_key: `{}`\n- firecrawl_api_key: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- status_bar: `{} items, {} style`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- web_browsing: `{}`\n- web_search_provider: `{}`\n- web_fetch_max_chars: `{}`\n- brave_api_key: `{}`\n- firecrawl_api_key: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -843,17 +872,14 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         agent.config().hide_reasoning,
         agent.config().accent_color.config_value(),
         crate::config::UiColor::selection_config_value(agent.config().selection_color),
+        agent.config().status_bar.items.len(),
+        agent.config().status_bar.style.as_str(),
         if agent.config().scroll_bar {
             "on"
         } else {
             "off"
         },
         if agent.config().scroll_bar_auto_hide {
-            "on"
-        } else {
-            "off"
-        },
-        if agent.config().enter_steers {
             "on"
         } else {
             "off"
@@ -924,7 +950,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings enter_steers on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);

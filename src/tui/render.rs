@@ -1068,8 +1068,10 @@ pub(super) fn build_frame_with_images(
     let background_count = state.background_processes.active_count();
     state.background_active_count = background_count;
     let background_notice_height = usize::from(background_count > 0);
-    let menu_capacity =
-        COMPLETION_MENU_ROWS.min(rows.saturating_sub(input_height + background_notice_height + 1));
+    let status_line = super::status_bar::render(state, columns);
+    let status_height = usize::from(status_line.is_some());
+    let menu_capacity = COMPLETION_MENU_ROWS
+        .min(rows.saturating_sub(input_height + background_notice_height + status_height));
     let menu_entries = if state.picker.is_none() {
         sync_completion_filter(state, editor);
         menu_rows(state, editor)
@@ -1128,8 +1130,9 @@ pub(super) fn build_frame_with_images(
     }
     let menu_height = menu.len();
     let search_height = usize::from(state.transcript.search_active());
-    let transcript_height = rows
-        .saturating_sub(input_height + menu_height + search_height + background_notice_height + 1);
+    let transcript_height = rows.saturating_sub(
+        input_height + menu_height + search_height + background_notice_height + status_height,
+    );
     let transcript = render_transcript_window(state, columns, transcript_height, image_support);
     let transcript_width = columns;
     let visible = &transcript.lines;
@@ -1204,10 +1207,18 @@ pub(super) fn build_frame_with_images(
             markdown::fit_width(line, inner_width)
         ));
     }
-    frame.push(format!(
-        "{text_box_color}└{}┘\x1b[0m",
+    let show_queue_hint = state.turn_started.is_some() && !editor.is_empty() && menu.is_empty();
+    let bottom_border = if show_queue_hint {
+        const HINT: &str = " Tab queues ";
+        format!(
+            "{}{}",
+            "─".repeat(inner_width.saturating_sub(HINT.len())),
+            HINT
+        )
+    } else {
         "─".repeat(inner_width)
-    ));
+    };
+    frame.push(format!("{text_box_color}└{bottom_border}┘\x1b[0m"));
     frame.extend(menu);
 
     if background_count > 0 {
@@ -1218,62 +1229,9 @@ pub(super) fn build_frame_with_images(
         ));
     }
 
-    let percentage = state
-        .context_tokens
-        .saturating_mul(100)
-        .checked_div(state.context_window)
-        .unwrap_or(0);
-    let mut parts = Vec::new();
-    if let Some(effort) = state
-        .reasoning_effort
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        parts.push(effort.to_string());
+    if let Some(status_line) = status_line {
+        frame.push(status_line);
     }
-    parts.push(format!(
-        "{}% / {}",
-        percentage,
-        format_token_count(state.context_window)
-    ));
-    if state.usage.tokens.cache_details_reported {
-        parts.push(format!("cache {}%", state.usage.cache_hit_percent()));
-    }
-    if let Some(started) = state.turn_started {
-        parts.push(tool_view::format_elapsed(started.elapsed()));
-    }
-    if !state.queued_inputs.is_empty() {
-        parts.push(format!("{} queued", state.queued_inputs.len()));
-    }
-    if !state.pending_steers.is_empty() {
-        parts.push(format!("{} steering", state.pending_steers.len()));
-    }
-    if let Some(goal) = state.active_goal.as_deref() {
-        let preview = crate::error::truncate(goal, 32);
-        if state.goal_running {
-            parts.push(format!("goal: {preview}"));
-        } else {
-            parts.push(format!("goal paused: {preview}"));
-        }
-    }
-    if !state.pending_actions.is_empty() {
-        parts.push(format!("{} pending", state.pending_actions.len()));
-    }
-    parts.extend(agent_status_parts(state));
-    let status = if parts.is_empty() {
-        String::new()
-    } else {
-        format!("  ·  {}", parts.join("  ·  "))
-    };
-    frame.push(markdown::fit_width(
-        &format!(
-            " {}\x1b[1m{}\x1b[22m{}{status}\x1b[0m",
-            foreground_color(state.accent_color),
-            state.model,
-            status_style(state.accent_color),
-        ),
-        columns,
-    ));
 
     if state.copy_toast_ticks > 0 {
         render_copy_toast(&mut frame, columns, state.accent_color);
@@ -1413,57 +1371,4 @@ fn render_block_viewer(
     (frame, (rows, 1))
 }
 
-fn agent_status_parts(state: &ViewState) -> Vec<String> {
-    if state.subagent_snapshots.is_empty() && state.subagent_tokens == 0 {
-        return Vec::new();
-    }
-    let running = state
-        .subagent_snapshots
-        .iter()
-        .filter(|snapshot| snapshot.status.is_active())
-        .collect::<Vec<_>>();
-    let failed = state
-        .subagent_snapshots
-        .iter()
-        .filter(|snapshot| snapshot.status == crate::subagent::SubagentStatus::Failed)
-        .count();
-    let mut parts = Vec::new();
-    match running.as_slice() {
-        [] => {}
-        [snapshot] => parts.push(snapshot.name.clone()),
-        many => parts.push(format!("{} agents", many.len())),
-    }
-    if failed > 0 {
-        parts.push(format!("{failed} failed"));
-    }
-    if state.subagent_tokens > 0 {
-        parts.push(format!(
-            "{} child",
-            format_token_count(state.subagent_tokens)
-        ));
-    }
-    parts
-}
-
-/// Compact token counts for the status bar: raw below 10,000, then 12.3k
-/// and 1.2M steps so the line stays short. Whole thousands drop the
-/// trailing `.0` (`400k`, `1M`).
-pub(super) fn format_token_count(tokens: u64) -> String {
-    if tokens < 10_000 {
-        return tokens.to_string();
-    }
-    if tokens < 1_000_000 {
-        let whole = tokens / 1_000;
-        let tenths = tokens % 1_000 / 100;
-        if tenths == 0 {
-            return format!("{whole}k");
-        }
-        return format!("{whole}.{tenths}k");
-    }
-    let whole = tokens / 1_000_000;
-    let tenths = tokens % 1_000_000 / 100_000;
-    if tenths == 0 {
-        return format!("{whole}M");
-    }
-    format!("{whole}.{tenths}M")
-}
+pub(super) use super::status_bar::format_token_count;

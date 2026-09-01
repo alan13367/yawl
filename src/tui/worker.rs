@@ -17,8 +17,8 @@ use super::events::{Event, EventReader, Key, MouseEvent};
 use super::input::{EditAction, Editor, Submission};
 use super::picker::{
     ActivePickers, PickerAction, SettingsCategory, SettingsItem, SettingsLocation,
-    picker_is_editing, select_picker_item, settings_item_index, take_picker_action,
-    web_search_provider_picker,
+    picker_is_editing, select_picker_item, settings_item_index, status_bar_editor_picker,
+    take_picker_action, web_search_provider_picker,
 };
 use super::state::{
     COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, scroll,
@@ -279,8 +279,14 @@ pub(super) fn pump_events<R: Read, T>(
                             _ if handle_completion_key(state, editor, key) => {
                                 // Keep accepting and completing input while the agent runs.
                             }
-                            Key::Tab => super::navigation::focus_transcript(state),
-                            _ => match editor.handle_key(key) {
+                            Key::Tab if editor.is_empty() => {
+                                super::navigation::focus_transcript(state)
+                            }
+                            _ => match if key == Key::Tab {
+                                editor.queue()
+                            } else {
+                                editor.handle_key(key)
+                            } {
                                 EditAction::Steer(input) => {
                                     handle_steering_while_busy(
                                         input,
@@ -290,19 +296,18 @@ pub(super) fn pump_events<R: Read, T>(
                                         active_config,
                                     )?;
                                 }
-                                EditAction::Submit(input) => {
-                                    if active_config.enter_steers
-                                        && !input.text.trim().starts_with('/')
-                                    {
-                                        handle_steering_while_busy(
-                                            input,
-                                            state,
-                                            editor,
-                                            &worker.steers,
-                                            active_config,
-                                        )?;
-                                        continue;
-                                    }
+                                EditAction::Submit(input)
+                                    if !input.text.trim().starts_with('/') =>
+                                {
+                                    handle_steering_while_busy(
+                                        input,
+                                        state,
+                                        editor,
+                                        &worker.steers,
+                                        active_config,
+                                    )?;
+                                }
+                                EditAction::Submit(input) | EditAction::Queue(input) => {
                                     if input.has_images() && busy_command(&input.text).is_some() {
                                         state.notice("Images cannot accompany commands while a turn is running.");
                                         editor.restore_submission(input);
@@ -493,6 +498,14 @@ pub(super) fn activate_picker_action_while_busy(
     let Some(action) = super::connection::handle_action(state, action) else {
         return;
     };
+    let Some(action) = super::status_bar::handle_editor_action(state, action) else {
+        return;
+    };
+    let Some(action) =
+        handle_status_bar_action_while_busy(state, action, active_pickers, active_config)
+    else {
+        return;
+    };
     match display_config_change(&action) {
         Ok(Some((change, selected))) => {
             apply_display_config_while_busy(active_config, state, active_pickers, change, selected);
@@ -543,7 +556,10 @@ pub(super) fn activate_picker_action_while_busy(
                     picker
                 });
         }
-        PickerAction::EditSetting { .. } | PickerAction::EditModel { .. } => {}
+        PickerAction::EditSetting { .. }
+        | PickerAction::EditModel { .. }
+        | PickerAction::EditStatusBarLabel { .. }
+        | PickerAction::EditStatusBarSeparator(_) => {}
         PickerAction::SendQueued(_)
         | PickerAction::ApplyQueued { .. }
         | PickerAction::MoveQueued { .. }
@@ -556,15 +572,59 @@ pub(super) fn activate_picker_action_while_busy(
     }
 }
 
+fn handle_status_bar_action_while_busy(
+    state: &mut ViewState,
+    action: PickerAction,
+    active_pickers: &mut ActivePickers,
+    active_config: &mut Config,
+) -> Option<PickerAction> {
+    let interface_picker = |state: &mut ViewState, active_pickers: &ActivePickers| {
+        state.picker = active_pickers
+            .settings_categories
+            .iter()
+            .find(|(category, _)| *category == SettingsCategory::Interface)
+            .map(|(_, picker)| {
+                let mut picker = picker.clone();
+                picker.selected =
+                    settings_item_index(SettingsCategory::Interface, SettingsItem::StatusBar);
+                picker
+            });
+    };
+    match action {
+        PickerAction::CancelStatusBarEditor => {
+            state.status_bar_draft = None;
+            interface_picker(state, active_pickers);
+        }
+        PickerAction::SaveStatusBar => {
+            let Some(layout) = state.status_bar_draft.take() else {
+                interface_picker(state, active_pickers);
+                return None;
+            };
+            match active_config.change_global(ConfigChange::StatusBar(layout.clone())) {
+                Ok(outcome) => {
+                    *active_config = outcome.config;
+                    state.status_bar = active_config.status_bar.clone();
+                    notice_config_effect(active_config, outcome.effect, state);
+                    active_pickers.refresh_display_settings(active_config);
+                    interface_picker(state, active_pickers);
+                }
+                Err(error) => {
+                    state.notice(format!("Could not change setting: {error}"));
+                    state.status_bar_draft = Some(layout);
+                    state.picker = Some(status_bar_editor_picker(state, 0));
+                }
+            }
+        }
+        action => return Some(action),
+    }
+    None
+}
+
 pub(super) fn display_config_change(
     action: &PickerAction,
 ) -> Result<Option<(ConfigChange, SettingsLocation)>, Error> {
     let interface = |item| SettingsLocation {
         category: SettingsCategory::Interface,
-        item,
-    };
-    let input = |item| SettingsLocation {
-        category: SettingsCategory::Input,
         item,
     };
     match action {
@@ -587,10 +647,6 @@ pub(super) fn display_config_change(
         PickerAction::SetScrollBarAutoHide(enabled) => Ok(Some((
             ConfigChange::ScrollBarAutoHide(*enabled),
             interface(SettingsItem::ScrollBarAutoHide),
-        ))),
-        PickerAction::SetEnterSteers(enabled) => Ok(Some((
-            ConfigChange::EnterSteers(*enabled),
-            input(SettingsItem::EnterSteers),
         ))),
         PickerAction::ApplySetting { argument, location } => {
             let change = if let Some(value) = argument.strip_prefix("accent_color ") {
@@ -623,7 +679,6 @@ pub(super) fn apply_display_config_while_busy(
             state.hide_reasoning = config.hide_reasoning;
             state.accent_color = config.accent_color;
             state.selection_color = config.effective_selection_color();
-            state.enter_steers = config.enter_steers;
             state.sync_scroll_bar_config(config);
             state.subagents_enabled = config.subagents;
             notice_config_effect(config, outcome.effect, state);

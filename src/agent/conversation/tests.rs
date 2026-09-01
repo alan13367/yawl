@@ -151,6 +151,19 @@ impl Drop for TestAgent {
 }
 
 #[test]
+fn active_display_config_sync_keeps_the_status_bar_layout() {
+    let mut conversation =
+        Conversation::memory(Config::test_default(), "test".into(), "child".into());
+    let mut active_config = conversation.config().clone();
+    active_config.status_bar.items.clear();
+    active_config.status_bar.style = crate::config::StatusBarStyle::Plain;
+
+    conversation.sync_display_config(&active_config);
+
+    assert_eq!(conversation.config().status_bar, active_config.status_bar);
+}
+
+#[test]
 fn tool_allowlist_filters_child_tool_scans() {
     let test = TestAgent::new("allowlist");
     let mut child =

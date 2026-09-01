@@ -50,9 +50,9 @@ impl Config {
             hide_reasoning: false,
             accent_color: UiColor::WHITE,
             selection_color: None,
+            status_bar: Default::default(),
             scroll_bar: true,
             scroll_bar_auto_hide: true,
-            enter_steers: false,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
@@ -128,14 +128,15 @@ impl Config {
         if let Some(value) = file.selection_color {
             self.selection_color = UiColor::parse_selection(&value).map_err(Error::Config)?;
         }
+        if let Some(value) = file.status_bar {
+            value.validate().map_err(Error::Config)?;
+            self.status_bar = value;
+        }
         if let Some(value) = file.scroll_bar {
             self.scroll_bar = value;
         }
         if let Some(value) = file.scroll_bar_auto_hide {
             self.scroll_bar_auto_hide = value;
-        }
-        if let Some(value) = file.enter_steers {
-            self.enter_steers = value;
         }
         if let Some(map) = file.context_windows {
             for (model, window) in &map {
@@ -471,16 +472,6 @@ mod tests {
             json!({"scroll_bar_auto_hide": false}),
         )?)?;
         assert!(!cfg.scroll_bar_auto_hide);
-        Ok(())
-    }
-
-    #[test]
-    fn enter_queues_unless_steering_is_enabled() -> Result<(), Error> {
-        let mut cfg = test_config();
-        assert!(!cfg.enter_steers);
-
-        cfg.apply(serde_json::from_value(json!({"enter_steers": true}))?)?;
-        assert!(cfg.enter_steers);
         Ok(())
     }
 

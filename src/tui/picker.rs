@@ -1,7 +1,10 @@
 //! Picker model, catalogs, and keyboard reducer.
 
 use crate::agent::Agent;
-use crate::config::{Config, UiColor, WebSearchProvider};
+use crate::config::{
+    Config, StatusBarFormat, StatusBarKind, StatusBarStyle, StatusBarVisibility, UiColor,
+    WebSearchProvider,
+};
 
 use super::ViewState;
 use super::connection::{ConnectEditField, ConnectStep};
@@ -16,7 +19,6 @@ use crate::onboarding::provider::{
 pub(super) enum SettingsCategory {
     Model,
     Interface,
-    Input,
     Context,
     Providers,
     Web,
@@ -26,10 +28,9 @@ pub(super) enum SettingsCategory {
 }
 
 impl SettingsCategory {
-    pub(super) const ALL: [Self; 9] = [
+    pub(super) const ALL: [Self; 8] = [
         Self::Model,
         Self::Interface,
-        Self::Input,
         Self::Context,
         Self::Providers,
         Self::Web,
@@ -42,7 +43,6 @@ impl SettingsCategory {
         match self {
             Self::Model => "Model",
             Self::Interface => "Interface",
-            Self::Input => "Input",
             Self::Context => "Context",
             Self::Providers => "Providers",
             Self::Web => "Web",
@@ -56,7 +56,6 @@ impl SettingsCategory {
         match self {
             Self::Model => "Default model, output, and reasoning",
             Self::Interface => "Colors, reasoning display, and scroll bar",
-            Self::Input => "Submission and steering behavior",
             Self::Context => "Compaction and context windows",
             Self::Providers => "Add or update model providers",
             Self::Web => "Browsing, search source, fetch limit, and keys",
@@ -82,9 +81,9 @@ pub(super) enum SettingsItem {
     ReasoningDisplay,
     AccentColor,
     SelectionColor,
+    StatusBar,
     ScrollBar,
     ScrollBarAutoHide,
-    EnterSteers,
     AutoCompact,
     CompactThreshold,
     ContextWindow,
@@ -155,11 +154,51 @@ pub(super) enum PickerAction {
     OpenSelectionColor,
     /// `None` follows the accent color.
     SetSelectionColor(Option<UiColor>),
+    OpenStatusBarEditor {
+        selected: usize,
+    },
+    CancelStatusBarEditor,
+    OpenStatusBarItem {
+        index: usize,
+        selected: usize,
+    },
+    OpenStatusBarFormats(usize),
+    SetStatusBarFormat {
+        index: usize,
+        format: StatusBarFormat,
+    },
+    SetStatusBarVisibility {
+        index: usize,
+        visibility: StatusBarVisibility,
+    },
+    EditStatusBarLabel {
+        index: usize,
+        initial: String,
+    },
+    ApplyStatusBarLabel {
+        index: usize,
+        label: String,
+    },
+    ResetStatusBarLabel(usize),
+    OpenStatusBarAdd,
+    AddStatusBarItem(StatusBarKind),
+    MoveStatusBarItem {
+        index: usize,
+        direction: isize,
+    },
+    RemoveStatusBarItem(usize),
+    OpenStatusBarStyles,
+    SetStatusBarStyle(StatusBarStyle),
+    OpenStatusBarSeparators,
+    SetStatusBarSeparator(String),
+    EditStatusBarSeparator(String),
+    ApplyStatusBarSeparator(String),
+    ResetStatusBar,
+    SaveStatusBar,
     OpenWebSearchProviders,
     SetWebSearchProvider(WebSearchProvider),
     SetScrollBar(bool),
     SetScrollBarAutoHide(bool),
-    SetEnterSteers(bool),
     ResumeSession(String),
     DeleteSession(String),
     /// Reopen the resume picker, restoring `selected` after a canceled delete.
@@ -255,6 +294,8 @@ pub(super) enum PickerEdit {
         save: bool,
     },
     Queued(usize),
+    StatusBarLabel(usize),
+    StatusBarSeparator,
     Connect {
         field: ConnectEditField,
         secret: bool,
@@ -290,14 +331,18 @@ impl ActivePickers {
     }
 
     pub(super) fn refresh_display_settings(&mut self, config: &Config) {
-        for category in [SettingsCategory::Interface, SettingsCategory::Input] {
-            if let Some((_, picker)) = self
-                .settings_categories
-                .iter_mut()
-                .find(|(candidate, _)| *candidate == category)
-            {
-                *picker = settings_category_picker_from(config, "", 0, category, picker.selected);
-            }
+        if let Some((_, picker)) = self
+            .settings_categories
+            .iter_mut()
+            .find(|(category, _)| *category == SettingsCategory::Interface)
+        {
+            *picker = settings_category_picker_from(
+                config,
+                "",
+                0,
+                SettingsCategory::Interface,
+                picker.selected,
+            );
         }
         self.accent_color = color_picker(config.accent_color);
         self.selection_color = selection_color_picker(config.selection_color);
@@ -481,6 +526,14 @@ pub(super) fn settings_category_picker_from(
                 action: PickerAction::OpenSelectionColor,
             },
             PickerItem {
+                label: "Status bar".into(),
+                description: format!(
+                    "{} items · Enter to customize",
+                    config.status_bar.items.len()
+                ),
+                action: PickerAction::OpenStatusBarEditor { selected: 0 },
+            },
+            PickerItem {
                 label: "Scroll bar".into(),
                 description: format!(
                     "{} · Enter to toggle",
@@ -498,18 +551,6 @@ pub(super) fn settings_category_picker_from(
                 action: PickerAction::SetScrollBarAutoHide(!config.scroll_bar_auto_hide),
             },
         ],
-        SettingsCategory::Input => vec![PickerItem {
-            label: "Enter while busy".into(),
-            description: format!(
-                "{} · Enter to toggle",
-                if config.enter_steers {
-                    "Steer"
-                } else {
-                    "Queue"
-                }
-            ),
-            action: PickerAction::SetEnterSteers(!config.enter_steers),
-        }],
         SettingsCategory::Context => vec![
             PickerItem {
                 label: "Automatic compaction".into(),
@@ -833,6 +874,265 @@ pub(super) fn selection_color_picker(current: Option<UiColor>) -> Picker {
     }
 }
 
+pub(super) fn status_bar_editor_picker(state: &ViewState, selected: usize) -> Picker {
+    let layout = state.status_bar_draft.as_ref().unwrap_or(&state.status_bar);
+    let mut items = layout
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let label = match item.label.as_deref() {
+                None => "default label".to_string(),
+                Some("") => "no label".to_string(),
+                Some(label) => format!("label {label:?}"),
+            };
+            PickerItem {
+                label: item.kind.label().into(),
+                description: format!(
+                    "{} · {} · {label}",
+                    item.format.as_str(),
+                    item.visibility.as_str()
+                ),
+                action: PickerAction::OpenStatusBarItem { index, selected: 0 },
+            }
+        })
+        .collect::<Vec<_>>();
+    items.extend([
+        PickerItem {
+            label: "Add item…".into(),
+            description: format!(
+                "{} available",
+                StatusBarKind::ALL.len().saturating_sub(layout.items.len())
+            ),
+            action: PickerAction::OpenStatusBarAdd,
+        },
+        PickerItem {
+            label: "Color style".into(),
+            description: layout.style.as_str().into(),
+            action: PickerAction::OpenStatusBarStyles,
+        },
+        PickerItem {
+            label: "Separator".into(),
+            description: separator_description(&layout.separator),
+            action: PickerAction::OpenStatusBarSeparators,
+        },
+        PickerItem {
+            label: "Reset to default".into(),
+            description: "Restore the built-in items and appearance".into(),
+            action: PickerAction::ResetStatusBar,
+        },
+        PickerItem {
+            label: "Save".into(),
+            description: "Write this layout to global settings".into(),
+            action: PickerAction::SaveStatusBar,
+        },
+    ]);
+    Picker {
+        title: "Status bar".into(),
+        hint: "K/J reorder  d remove  Enter edit  Esc discard".into(),
+        selected: selected.min(items.len().saturating_sub(1)),
+        items,
+        editing: None,
+        parent: Some(PickerAction::CancelStatusBarEditor),
+    }
+}
+
+pub(super) fn status_bar_item_picker(state: &ViewState, index: usize, selected: usize) -> Picker {
+    let item = &state
+        .status_bar_draft
+        .as_ref()
+        .unwrap_or(&state.status_bar)
+        .items[index];
+    let label_description = match item.label.as_deref() {
+        None => "Built-in label".into(),
+        Some("") => "Hidden".into(),
+        Some(label) => label.into(),
+    };
+    let mut items = vec![
+        PickerItem {
+            label: "Format".into(),
+            description: item.format.as_str().into(),
+            action: PickerAction::OpenStatusBarFormats(index),
+        },
+        PickerItem {
+            label: "Custom label…".into(),
+            description: label_description,
+            action: PickerAction::EditStatusBarLabel {
+                index,
+                initial: item.label.clone().unwrap_or_default(),
+            },
+        },
+        PickerItem {
+            label: "Use built-in label".into(),
+            description: "Clear the label override".into(),
+            action: PickerAction::ResetStatusBarLabel(index),
+        },
+    ];
+    if item.kind.is_dynamic() {
+        items.push(PickerItem {
+            label: "Visibility".into(),
+            description: item.visibility.as_str().into(),
+            action: PickerAction::SetStatusBarVisibility {
+                index,
+                visibility: if item.visibility == StatusBarVisibility::Auto {
+                    StatusBarVisibility::Always
+                } else {
+                    StatusBarVisibility::Auto
+                },
+            },
+        });
+    }
+    Picker {
+        title: item.kind.label().into(),
+        hint: "Enter change  Esc back".into(),
+        selected: selected.min(items.len().saturating_sub(1)),
+        items,
+        editing: None,
+        parent: Some(PickerAction::OpenStatusBarEditor { selected: index }),
+    }
+}
+
+pub(super) fn status_bar_format_picker(state: &ViewState, index: usize) -> Picker {
+    let item = &state
+        .status_bar_draft
+        .as_ref()
+        .unwrap_or(&state.status_bar)
+        .items[index];
+    let items = StatusBarFormat::ALL
+        .into_iter()
+        .map(|format| PickerItem {
+            label: format.as_str().into(),
+            description: match format {
+                StatusBarFormat::Current => "Match the original status bar",
+                StatusBarFormat::Compact => "Show the shortest useful value",
+                StatusBarFormat::Detailed => "Add a descriptive label and detail",
+            }
+            .into(),
+            action: PickerAction::SetStatusBarFormat { index, format },
+        })
+        .collect::<Vec<_>>();
+    let selected = StatusBarFormat::ALL
+        .iter()
+        .position(|format| *format == item.format)
+        .unwrap_or(0);
+    Picker {
+        title: format!("{} format", item.kind.label()),
+        hint: "Enter select  Esc back".into(),
+        selected,
+        items,
+        editing: None,
+        parent: Some(PickerAction::OpenStatusBarItem { index, selected: 0 }),
+    }
+}
+
+pub(super) fn status_bar_add_picker(state: &ViewState) -> Picker {
+    let layout = state.status_bar_draft.as_ref().unwrap_or(&state.status_bar);
+    let items = StatusBarKind::ALL
+        .into_iter()
+        .filter(|kind| !layout.items.iter().any(|item| item.kind == *kind))
+        .map(|kind| PickerItem {
+            label: kind.label().into(),
+            description: kind.as_str().into(),
+            action: PickerAction::AddStatusBarItem(kind),
+        })
+        .collect::<Vec<_>>();
+    Picker {
+        title: "Add status item".into(),
+        hint: "Enter add  Esc back".into(),
+        selected: 0,
+        items,
+        editing: None,
+        parent: Some(PickerAction::OpenStatusBarEditor {
+            selected: layout.items.len(),
+        }),
+    }
+}
+
+pub(super) fn status_bar_style_picker(state: &ViewState) -> Picker {
+    let layout = state.status_bar_draft.as_ref().unwrap_or(&state.status_bar);
+    let items = StatusBarStyle::ALL
+        .into_iter()
+        .map(|style| PickerItem {
+            label: style.as_str().into(),
+            description: match style {
+                StatusBarStyle::Mixed => "Accent model, mute other items",
+                StatusBarStyle::Accent => "Use the accent color for every item",
+                StatusBarStyle::Muted => "Use the muted accent for every item",
+                StatusBarStyle::Plain => "Use the terminal's default foreground",
+            }
+            .into(),
+            action: PickerAction::SetStatusBarStyle(style),
+        })
+        .collect::<Vec<_>>();
+    let selected = StatusBarStyle::ALL
+        .iter()
+        .position(|style| *style == layout.style)
+        .unwrap_or(0);
+    Picker {
+        title: "Status-bar color style".into(),
+        hint: "Enter select  Esc back".into(),
+        selected,
+        items,
+        editing: None,
+        parent: Some(PickerAction::OpenStatusBarEditor {
+            selected: layout.items.len() + 1,
+        }),
+    }
+}
+
+pub(super) fn status_bar_separator_picker(state: &ViewState) -> Picker {
+    let layout = state.status_bar_draft.as_ref().unwrap_or(&state.status_bar);
+    let presets = [
+        ("Dot", "  ·  "),
+        ("Pipe", " | "),
+        ("Slash", " / "),
+        ("Space", " "),
+        ("None", ""),
+    ];
+    let mut items = presets
+        .into_iter()
+        .map(|(label, separator)| PickerItem {
+            label: label.into(),
+            description: separator_description(separator),
+            action: PickerAction::SetStatusBarSeparator(separator.into()),
+        })
+        .collect::<Vec<_>>();
+    items.push(PickerItem {
+        label: "Custom…".into(),
+        description: separator_description(&layout.separator),
+        action: PickerAction::EditStatusBarSeparator(layout.separator.clone()),
+    });
+    let selected = items
+        .iter()
+        .position(|item| {
+            matches!(&item.action, PickerAction::SetStatusBarSeparator(separator) if separator == &layout.separator)
+        })
+        .unwrap_or(items.len() - 1);
+    Picker {
+        title: "Status-bar separator".into(),
+        hint: "Enter select  Esc back".into(),
+        selected,
+        items,
+        editing: None,
+        parent: Some(PickerAction::OpenStatusBarEditor {
+            selected: layout.items.len() + 2,
+        }),
+    }
+}
+
+fn separator_description(separator: &str) -> String {
+    if separator.is_empty() {
+        "No separator".into()
+    } else if separator.chars().all(char::is_whitespace) {
+        format!(
+            "{} space columns",
+            unicode_width::UnicodeWidthStr::width(separator)
+        )
+    } else {
+        format!("{separator:?}")
+    }
+}
+
 pub(super) fn open_reasoning_picker(agent: &Agent, state: &mut ViewState, save: bool) {
     state.picker = Some(reasoning_picker(agent, save));
 }
@@ -931,6 +1231,24 @@ pub(super) fn take_picker_action(
                 picker.editing = None;
             }
             Key::Enter => {
+                match editing {
+                    PickerEdit::StatusBarLabel(index) => {
+                        let value = editor.text();
+                        editor.clear();
+                        state.picker = None;
+                        return Some(PickerAction::ApplyStatusBarLabel {
+                            index,
+                            label: value,
+                        });
+                    }
+                    PickerEdit::StatusBarSeparator => {
+                        let value = editor.text();
+                        editor.clear();
+                        state.picker = None;
+                        return Some(PickerAction::ApplyStatusBarSeparator(value));
+                    }
+                    _ => {}
+                }
                 if let Some(value) = editor.take_text() {
                     let location =
                         picker
@@ -959,6 +1277,9 @@ pub(super) fn take_picker_action(
                             }
                         }
                         PickerEdit::Queued(index) => PickerAction::ApplyQueued { index, value },
+                        PickerEdit::StatusBarLabel(_) | PickerEdit::StatusBarSeparator => {
+                            unreachable!("status-bar edits return before non-empty edit handling")
+                        }
                         PickerEdit::Connect { field, .. } => PickerAction::ApplyConnect {
                             field,
                             value: value.trim().to_string(),
@@ -1017,6 +1338,16 @@ pub(super) fn take_picker_action(
                     editor.paste(&initial);
                     picker.editing = Some(PickerEdit::Connect { field, secret });
                 }
+                Some(PickerAction::EditStatusBarLabel { index, initial }) => {
+                    editor.clear();
+                    editor.paste(&initial);
+                    picker.editing = Some(PickerEdit::StatusBarLabel(index));
+                }
+                Some(PickerAction::EditStatusBarSeparator(initial)) => {
+                    editor.clear();
+                    editor.paste(&initial);
+                    picker.editing = Some(PickerEdit::StatusBarSeparator);
+                }
                 Some(action) => {
                     state.picker = None;
                     return Some(action);
@@ -1037,16 +1368,26 @@ pub(super) fn take_picker_action(
             }
         }
         Key::Char('K') | Key::Char('J') => {
-            if let Some(PickerAction::SendQueued(index)) = picker
+            let action = picker
                 .items
                 .get(picker.selected)
-                .map(|item| item.action.clone())
-            {
-                state.picker = None;
-                return Some(PickerAction::MoveQueued {
-                    index,
-                    direction: if key == Key::Char('K') { -1 } else { 1 },
-                });
+                .map(|item| item.action.clone());
+            match action {
+                Some(PickerAction::SendQueued(index)) => {
+                    state.picker = None;
+                    return Some(PickerAction::MoveQueued {
+                        index,
+                        direction: if key == Key::Char('K') { -1 } else { 1 },
+                    });
+                }
+                Some(PickerAction::OpenStatusBarItem { index, .. }) => {
+                    state.picker = None;
+                    return Some(PickerAction::MoveStatusBarItem {
+                        index,
+                        direction: if key == Key::Char('K') { -1 } else { 1 },
+                    });
+                }
+                _ => {}
             }
         }
         Key::Delete | Key::Char('d') => {
@@ -1060,6 +1401,9 @@ pub(super) fn take_picker_action(
                 }
                 Some(PickerAction::SendQueued(index)) => {
                     return Some(PickerAction::RemoveQueued(index));
+                }
+                Some(PickerAction::OpenStatusBarItem { index, .. }) => {
+                    return Some(PickerAction::RemoveStatusBarItem(index));
                 }
                 _ => {}
             }
@@ -1122,10 +1466,10 @@ fn settings_items(category: SettingsCategory) -> &'static [SettingsItem] {
             SettingsItem::ReasoningDisplay,
             SettingsItem::AccentColor,
             SettingsItem::SelectionColor,
+            SettingsItem::StatusBar,
             SettingsItem::ScrollBar,
             SettingsItem::ScrollBarAutoHide,
         ],
-        SettingsCategory::Input => &[SettingsItem::EnterSteers],
         SettingsCategory::Context => &[
             SettingsItem::AutoCompact,
             SettingsItem::CompactThreshold,

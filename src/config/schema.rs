@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{ModelConfig, OpenAiCompatibility, UiColor};
+use super::{ModelConfig, OpenAiCompatibility, StatusBarConfig, UiColor};
 
 /// On-disk shape of `config.json`. All fields are optional so the project
 /// file can override only the keys it cares about.
@@ -21,12 +21,11 @@ pub(super) struct ConfigFile {
     /// Menu selection highlight: `"accent"` follows the accent color,
     /// otherwise a palette name or `#RRGGBB`.
     pub(super) selection_color: Option<String>,
+    pub(super) status_bar: Option<StatusBarConfig>,
     /// Whether the transcript scroll bar is drawn in the TUI.
     pub(super) scroll_bar: Option<bool>,
     /// Whether an idle transcript scroll bar hides itself after a pause.
     pub(super) scroll_bar_auto_hide: Option<bool>,
-    /// Whether Enter steers instead of queues during an active TUI turn.
-    pub(super) enter_steers: Option<bool>,
     /// Compatibility with the brief two-color settings format.
     pub(super) status_bar_color: Option<UiColor>,
     /// Compatibility with the brief two-color settings format.
@@ -74,7 +73,10 @@ pub(super) struct ProviderFile {
 /// Checks one raw config file against the on-disk schema. Used by the
 /// doctor so its findings match what `Config::load` would reject.
 pub(crate) fn validate_file_shape(value: &Value) -> Result<(), String> {
-    serde_json::from_value::<ConfigFile>(value.clone())
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    let file =
+        serde_json::from_value::<ConfigFile>(value.clone()).map_err(|error| error.to_string())?;
+    if let Some(status_bar) = file.status_bar {
+        status_bar.validate()?;
+    }
+    Ok(())
 }

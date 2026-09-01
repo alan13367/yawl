@@ -60,6 +60,8 @@ fn display_settings_apply_during_an_active_turn() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -78,7 +80,6 @@ fn display_settings_apply_during_an_active_turn() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -110,7 +111,7 @@ fn display_settings_apply_during_an_active_turn() {
         project_dir: root.join("project/.yawl"),
         ..Config::test_default()
     };
-    active_pickers.settings_categories = [SettingsCategory::Interface, SettingsCategory::Input]
+    active_pickers.settings_categories = [SettingsCategory::Interface]
         .into_iter()
         .map(|category| {
             (
@@ -168,26 +169,6 @@ fn display_settings_apply_during_an_active_turn() {
     assert!(matches!(
         active_pickers.accent_color.items[active_pickers.accent_color.selected].action,
         PickerAction::SetAccentColor(color) if color == blue
-    ));
-
-    activate_picker_action_while_busy(
-        &mut state,
-        PickerAction::SetEnterSteers(true),
-        &mut active_pickers,
-        &mut config,
-    );
-
-    assert!(config.enter_steers);
-    assert!(state.enter_steers);
-    let settings = state
-        .picker
-        .as_ref()
-        .expect("settings picker should reopen");
-    let enter_steers = settings_item_index(SettingsCategory::Input, SettingsItem::EnterSteers);
-    assert_eq!(settings.selected, enter_steers);
-    assert!(matches!(
-        settings.items[enter_steers].action,
-        PickerAction::SetEnterSteers(false)
     ));
 
     activate_picker_action_while_busy(
@@ -250,6 +231,43 @@ fn display_settings_apply_during_an_active_turn() {
         .expect("search provider picker should open");
     assert_eq!(provider_picker.items.len(), 3);
     assert_eq!(provider_picker.selected, 0);
+    assert!(state.pending_actions.is_empty());
+
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::OpenStatusBarEditor { selected: 0 },
+        &mut active_pickers,
+        &mut config,
+    );
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::RemoveStatusBarItem(0),
+        &mut active_pickers,
+        &mut config,
+    );
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::SetStatusBarStyle(crate::config::StatusBarStyle::Plain),
+        &mut active_pickers,
+        &mut config,
+    );
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::SaveStatusBar,
+        &mut active_pickers,
+        &mut config,
+    );
+
+    assert_eq!(
+        config.status_bar.items.len(),
+        crate::config::StatusBarKind::ALL.len() - 1
+    );
+    assert_eq!(
+        config.status_bar.style,
+        crate::config::StatusBarStyle::Plain
+    );
+    assert_eq!(state.status_bar, config.status_bar);
+    assert!(state.status_bar_draft.is_none());
     assert!(state.pending_actions.is_empty());
 
     activate_picker_action_while_busy(

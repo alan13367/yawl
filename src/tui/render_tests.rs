@@ -55,6 +55,8 @@ fn frame_keeps_input_and_status_pinned() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -73,7 +75,6 @@ fn frame_keeps_input_and_status_pinned() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -99,6 +100,7 @@ fn frame_keeps_input_and_status_pinned() {
         .expect("the frame length was asserted immediately above");
     let status_plain = markdown::strip_ansi(status);
     assert!(status_plain.contains("test"));
+    assert!(status_plain.starts_with(" test  ·  12% / 100"));
     assert!(!status_plain.contains("cache"));
     assert_eq!(cursor.0, 10);
     assert!(
@@ -157,6 +159,19 @@ fn input_box_moves_complete_words_to_the_next_row() {
         input.iter().any(|line| line.contains("  palabra")),
         "{input:?}"
     );
+}
+
+#[test]
+fn busy_input_box_hints_that_tab_queues_the_message() {
+    let mut state = empty_session_state();
+    state.turn_started = Some(std::time::Instant::now());
+    let mut editor = Editor::default();
+    editor.paste("follow up");
+
+    let (frame, _) = build_frame(&mut state, &editor, 40, 12);
+    let plain = markdown::strip_ansi(&frame.join("\n"));
+
+    assert!(plain.contains("Tab queues"), "{plain}");
 }
 
 #[test]
@@ -422,6 +437,8 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -440,7 +457,6 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -483,6 +499,8 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         hide_reasoning: true,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -501,7 +519,6 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -601,6 +618,8 @@ fn loading_state_ignores_status_activity() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -619,7 +638,6 @@ fn loading_state_ignores_status_activity() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -667,6 +685,8 @@ fn overflow_state() -> ViewState {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -685,7 +705,6 @@ fn overflow_state() -> ViewState {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -968,6 +987,8 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -986,7 +1007,6 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -1150,6 +1170,8 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: false,
         scroll_bar_enabled: false,
         scroll_bar_auto_hide: false,
@@ -1168,7 +1190,6 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: (1..=12)
             .map(|n| Completion {
@@ -1303,6 +1324,8 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: false,
         scroll_bar_enabled: false,
         scroll_bar_auto_hide: false,
@@ -1321,7 +1344,6 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -1441,6 +1463,185 @@ fn status_bar_names_a_running_subagent_instead_of_zero_counts() {
 }
 
 #[test]
+fn status_bar_respects_order_formats_labels_and_separator() {
+    let mut state = empty_session_state();
+    state.model = "omlx:local-model".into();
+    state.status_bar = crate::config::StatusBarConfig {
+        style: crate::config::StatusBarStyle::Plain,
+        separator: " | ".into(),
+        items: vec![
+            crate::config::StatusBarItemConfig {
+                kind: crate::config::StatusBarKind::Context,
+                format: crate::config::StatusBarFormat::Compact,
+                label: Some("ctx".into()),
+                visibility: crate::config::StatusBarVisibility::Auto,
+            },
+            crate::config::StatusBarItemConfig {
+                kind: crate::config::StatusBarKind::Model,
+                format: crate::config::StatusBarFormat::Compact,
+                label: Some(String::new()),
+                visibility: crate::config::StatusBarVisibility::Auto,
+            },
+            crate::config::StatusBarItemConfig {
+                kind: crate::config::StatusBarKind::Cache,
+                format: crate::config::StatusBarFormat::Detailed,
+                label: Some("hit".into()),
+                visibility: crate::config::StatusBarVisibility::Always,
+            },
+        ],
+    };
+    state.context_tokens = 15;
+    state.context_window = 100;
+
+    let status = super::status_bar::render(&state, 80).expect("items should produce a row");
+    let plain = markdown::strip_ansi(&status);
+
+    assert!(
+        plain.starts_with(" ctx 15% | local-model | hit n/a"),
+        "{plain:?}"
+    );
+    assert!(
+        !status.contains("38;2;"),
+        "plain style must not set a color"
+    );
+}
+
+#[test]
+fn status_bar_formats_context_and_uses_always_fallbacks() {
+    let mut state = empty_session_state();
+    state.context_tokens = 42_679;
+    state.context_window = 272_000;
+    let context = |format| crate::config::StatusBarItemConfig {
+        kind: crate::config::StatusBarKind::Context,
+        format,
+        label: None,
+        visibility: crate::config::StatusBarVisibility::Auto,
+    };
+    state.status_bar.items = vec![context(crate::config::StatusBarFormat::Current)];
+    let current = markdown::strip_ansi(
+        &super::status_bar::render(&state, 80).expect("context should render"),
+    );
+    assert!(current.contains("15% / 272k"));
+
+    state.status_bar.items = vec![context(crate::config::StatusBarFormat::Detailed)];
+    let detailed = markdown::strip_ansi(
+        &super::status_bar::render(&state, 80).expect("context should render"),
+    );
+    assert!(detailed.contains("context 42.6k / 272k (15%)"));
+
+    state.status_bar.items = [
+        crate::config::StatusBarKind::Reasoning,
+        crate::config::StatusBarKind::Cache,
+        crate::config::StatusBarKind::Elapsed,
+        crate::config::StatusBarKind::Queued,
+        crate::config::StatusBarKind::Steering,
+        crate::config::StatusBarKind::Goal,
+        crate::config::StatusBarKind::Pending,
+        crate::config::StatusBarKind::ActiveSubagents,
+        crate::config::StatusBarKind::FailedSubagents,
+        crate::config::StatusBarKind::ChildTokens,
+    ]
+    .into_iter()
+    .map(|kind| crate::config::StatusBarItemConfig {
+        visibility: crate::config::StatusBarVisibility::Always,
+        ..crate::config::StatusBarItemConfig::new(kind)
+    })
+    .collect();
+    let idle = markdown::strip_ansi(
+        &super::status_bar::render(&state, 240).expect("always items should render"),
+    );
+    for expected in [
+        "provider default",
+        "cache n/a",
+        "idle",
+        "0 queued",
+        "0 steering",
+        "no goal",
+        "0 pending",
+        "0 agents",
+        "0 failed",
+        "0 child",
+    ] {
+        assert!(idle.contains(expected), "missing {expected:?} in {idle:?}");
+    }
+}
+
+#[test]
+fn status_bar_goal_formats_and_custom_labels_keep_runtime_state() {
+    let mut state = empty_session_state();
+    state.active_goal = Some("finish the status bar".into());
+    state.goal_running = false;
+    state.status_bar.items = vec![crate::config::StatusBarItemConfig {
+        kind: crate::config::StatusBarKind::Goal,
+        format: crate::config::StatusBarFormat::Compact,
+        label: Some("mission".into()),
+        visibility: crate::config::StatusBarVisibility::Auto,
+    }];
+    let compact = markdown::strip_ansi(
+        &super::status_bar::render(&state, 80).expect("active goal should render"),
+    );
+    assert!(compact.contains("mission paused"), "{compact:?}");
+
+    state.status_bar.items[0].format = crate::config::StatusBarFormat::Detailed;
+    let detailed = markdown::strip_ansi(
+        &super::status_bar::render(&state, 80).expect("active goal should render"),
+    );
+    assert!(
+        detailed.contains("mission paused: finish the status bar"),
+        "{detailed:?}"
+    );
+}
+
+#[test]
+fn status_bar_clips_unicode_at_the_right_edge_without_splitting_columns() {
+    use unicode_width::UnicodeWidthStr;
+
+    let mut state = empty_session_state();
+    state.model = "provider:模型模型模型".into();
+    state.status_bar = crate::config::StatusBarConfig {
+        style: crate::config::StatusBarStyle::Plain,
+        separator: "界".into(),
+        items: vec![
+            crate::config::StatusBarItemConfig {
+                kind: crate::config::StatusBarKind::Model,
+                format: crate::config::StatusBarFormat::Compact,
+                label: None,
+                visibility: crate::config::StatusBarVisibility::Auto,
+            },
+            crate::config::StatusBarItemConfig::new(crate::config::StatusBarKind::Context),
+        ],
+    };
+
+    let rendered = super::status_bar::render(&state, 10).expect("model should render");
+    let plain = markdown::strip_ansi(&rendered);
+    assert_eq!(UnicodeWidthStr::width(plain.as_str()), 10, "{plain:?}");
+    assert!(plain.starts_with(" 模型模型"), "{plain:?}");
+}
+
+#[test]
+fn status_bar_auto_only_layout_disappears_and_draft_previews_live() {
+    let mut state = empty_session_state();
+    state.status_bar.items = vec![crate::config::StatusBarItemConfig::new(
+        crate::config::StatusBarKind::Cache,
+    )];
+    assert!(super::status_bar::render(&state, 80).is_none());
+
+    let editor = Editor::default();
+    let (without_status, cursor_without) = build_frame(&mut state, &editor, 80, 20);
+    assert!(markdown::strip_ansi(without_status.last().expect("frame row")).starts_with('└'));
+
+    state.status_bar_draft = Some(crate::config::StatusBarConfig {
+        items: vec![crate::config::StatusBarItemConfig::new(
+            crate::config::StatusBarKind::Model,
+        )],
+        ..Default::default()
+    });
+    let (with_preview, cursor_with) = build_frame(&mut state, &editor, 80, 20);
+    assert!(markdown::strip_ansi(with_preview.last().expect("status row")).contains("test"));
+    assert_eq!(cursor_without.0, cursor_with.0 + 1);
+}
+
+#[test]
 fn running_tool_entries_show_their_elapsed_time() {
     let mut transcript = Transcript::from_messages(&[]);
     transcript.apply(TranscriptEvent::ToolStart {
@@ -1474,6 +1675,8 @@ fn empty_session_state() -> ViewState {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: false,
         scroll_bar_enabled: false,
         scroll_bar_auto_hide: false,
@@ -1492,7 +1695,6 @@ fn empty_session_state() -> ViewState {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,

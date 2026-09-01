@@ -28,6 +28,7 @@ mod search;
 mod state;
 #[cfg(test)]
 mod state_tests;
+mod status_bar;
 mod subagents;
 mod terminal;
 #[cfg(test)]
@@ -243,7 +244,9 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                             }
                             Key::Tab => navigation::focus_transcript(&mut state),
                             _ => match editor.handle_key(key) {
-                                EditAction::Submit(input) | EditAction::Steer(input) => {
+                                EditAction::Submit(input)
+                                | EditAction::Queue(input)
+                                | EditAction::Steer(input) => {
                                     if handle_submission(
                                         agent,
                                         input,

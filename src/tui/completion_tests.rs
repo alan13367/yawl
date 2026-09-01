@@ -11,6 +11,8 @@ fn completion_state(commands: &[&str]) -> ViewState {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -29,7 +31,6 @@ fn completion_state(commands: &[&str]) -> ViewState {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: commands
             .iter()

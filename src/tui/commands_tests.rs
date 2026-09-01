@@ -98,6 +98,74 @@ fn direct_web_settings_apply_and_validate() {
 }
 
 #[test]
+fn status_bar_editor_discards_drafts_and_saves_once() {
+    let root = std::env::temp_dir().join(format!(
+        "yawl-tui-status-settings-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let config = Config {
+        model: Some("test".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
+    };
+    let cwd = root.join("project");
+    let dirs = config.session_dirs(&cwd);
+    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
+        .expect("session should be created");
+    let mut agent = Agent::new(config, "test".into(), session, Vec::new());
+    let mut state = ViewState::from_agent(&agent);
+
+    activate_picker_action(
+        &mut agent,
+        &mut state,
+        PickerAction::OpenStatusBarEditor { selected: 0 },
+    );
+    state
+        .status_bar_draft
+        .as_mut()
+        .expect("editor should create a draft")
+        .items
+        .clear();
+    activate_picker_action(&mut agent, &mut state, PickerAction::CancelStatusBarEditor);
+    assert!(state.status_bar_draft.is_none());
+    assert_eq!(
+        agent.config().status_bar,
+        crate::config::StatusBarConfig::default()
+    );
+    assert!(!agent.config().global_config_path().exists());
+
+    activate_picker_action(
+        &mut agent,
+        &mut state,
+        PickerAction::OpenStatusBarEditor { selected: 0 },
+    );
+    let draft = state
+        .status_bar_draft
+        .as_mut()
+        .expect("editor should create a second draft");
+    draft.items.clear();
+    draft.style = crate::config::StatusBarStyle::Plain;
+    activate_picker_action(&mut agent, &mut state, PickerAction::SaveStatusBar);
+
+    assert!(agent.config().status_bar.items.is_empty());
+    assert!(state.status_bar.items.is_empty());
+    assert!(state.status_bar_draft.is_none());
+    let saved: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(agent.config().global_config_path())
+            .expect("saved config should be readable"),
+    )
+    .expect("saved config should be JSON");
+    assert_eq!(saved["status_bar"]["style"], "plain");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
     let mut state = ViewState {
         transcript: Transcript::from_messages(&[]),
@@ -107,6 +175,8 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         hide_reasoning: false,
         accent_color: UiColor::WHITE,
         selection_color: UiColor::WHITE,
+        status_bar: Default::default(),
+        status_bar_draft: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -125,7 +195,6 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
-        enter_steers: false,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,

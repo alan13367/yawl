@@ -88,6 +88,7 @@ impl From<&str> for Submission {
 pub enum EditAction {
     None,
     Submit(Submission),
+    Queue(Submission),
     Steer(Submission),
 }
 
@@ -522,6 +523,11 @@ impl Editor {
             .map_or(EditAction::None, EditAction::Submit)
     }
 
+    pub(super) fn queue(&mut self) -> EditAction {
+        self.take_submission()
+            .map_or(EditAction::None, EditAction::Queue)
+    }
+
     fn steer(&mut self) -> EditAction {
         self.take_submission()
             .map_or(EditAction::None, EditAction::Steer)
@@ -772,6 +778,13 @@ mod tests {
             editor.handle_key(Key::Enter),
             EditAction::Submit("a\nb".into())
         );
+    }
+
+    #[test]
+    fn tab_returns_a_queued_submission() {
+        let mut editor = Editor::default();
+        editor.paste("follow up");
+        assert_eq!(editor.queue(), EditAction::Queue("follow up".into()));
     }
 
     #[test]
