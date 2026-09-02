@@ -10,7 +10,7 @@ use crate::cancellation::CancellationToken;
 use crate::config::{Config, ConfigChange, ConfigChangeEffect};
 use crate::error::Error;
 use crate::provider::{Message, TurnInput, UsageSummary};
-use crate::session::Session;
+use crate::session::{PlanState, Session};
 use crate::subagent::SubagentManager;
 use crate::tools::Registry;
 
@@ -80,8 +80,28 @@ impl Agent {
         self.conversation.steer_inbox()
     }
 
+    pub(crate) fn question_broker(&self) -> crate::tools::QuestionBroker {
+        self.conversation.question_broker()
+    }
+
+    pub(crate) fn enable_interactive_questions(&self) {
+        self.conversation.enable_interactive_questions();
+    }
+
     pub(crate) fn active_goal(&self) -> Option<&str> {
         self.conversation.active_goal()
+    }
+
+    pub(crate) fn plan_state(&self) -> Option<&PlanState> {
+        self.conversation.plan_state()
+    }
+
+    pub(crate) fn active_plan(&self) -> Option<&str> {
+        self.conversation.active_plan()
+    }
+
+    pub(crate) fn plan_ready_this_turn(&self) -> bool {
+        self.conversation.plan_ready_this_turn()
     }
 
     pub(crate) fn take_unaccepted_steers(&self) -> Vec<TurnInput> {
@@ -94,6 +114,14 @@ impl Agent {
 
     pub(crate) fn cancel_goal(&mut self) -> Result<bool, Error> {
         self.conversation.cancel_goal()
+    }
+
+    pub(crate) fn start_plan(&mut self, input: TurnInput) -> Result<Option<String>, Error> {
+        self.conversation.start_plan(input)
+    }
+
+    pub(crate) fn cancel_plan(&mut self) -> Result<bool, Error> {
+        self.conversation.cancel_plan()
     }
 
     pub(crate) fn clear_cancellation(&self) {
@@ -192,6 +220,31 @@ impl Agent {
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
         self.conversation.run_goal_preserving_cancellation(sink)
+    }
+
+    pub(crate) fn run_plan_preserving_cancellation(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.conversation.run_plan_preserving_cancellation(sink)
+    }
+
+    pub(crate) fn run_plan_follow_up_preserving_cancellation(
+        &mut self,
+        input: TurnInput,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.conversation
+            .run_plan_follow_up_preserving_cancellation(input, sink)
+    }
+
+    pub(crate) fn run_plan_implementation_preserving_cancellation(
+        &mut self,
+        input: Option<TurnInput>,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.conversation
+            .run_plan_implementation_preserving_cancellation(input, sink)
     }
 
     pub(crate) fn has_deferred_subagent_results(&self) -> bool {

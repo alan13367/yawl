@@ -19,6 +19,7 @@ pub(super) struct Completion {
 pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
     let mut completions = [
         ("/model", "List or switch models"),
+        ("/reasoning", "Show or set the reasoning effort"),
         ("/connect", "Configure a model provider"),
         ("/settings", "Show or change settings"),
         ("/subagents", "Open the subagent dashboard"),
@@ -35,6 +36,7 @@ pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
         ("/resume", "List or resume sessions"),
         ("/unqueue", "Cancel queued messages"),
         ("/goal", "Start, resume, or cancel a persistent goal"),
+        ("/plan", "Start, resume, or cancel a planning workflow"),
         ("/help", "Show help"),
         ("/quit", "Exit Yawl"),
     ]

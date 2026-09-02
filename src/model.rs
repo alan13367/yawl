@@ -207,6 +207,13 @@ pub(crate) fn reasoning_efforts(config: &Config, spec: &str) -> &'static [&'stat
     ModelTarget::parse(spec, config).reasoning_efforts()
 }
 
+pub(crate) fn effective_reasoning_effort<'a>(config: &'a Config, spec: &str) -> Option<&'a str> {
+    let effort = config.reasoning_effort.as_deref()?;
+    reasoning_efforts(config, spec)
+        .contains(&effort)
+        .then_some(effort)
+}
+
 pub(crate) fn supports_images(config: &Config, spec: &str) -> bool {
     ModelTarget::parse(spec, config).supports_images()
 }
@@ -291,6 +298,31 @@ mod tests {
         assert!(reasoning_efforts(&config, "openai-codex:gpt-5.4").contains(&"xhigh"));
         assert!(!reasoning_efforts(&config, "openai-codex:gpt-5.4").contains(&"max"));
         assert!(reasoning_efforts(&config, "openai-codex:gpt-5.6-sol").contains(&"max"));
+    }
+
+    #[test]
+    fn effective_reasoning_is_limited_to_the_active_model() {
+        let mut config = config();
+        config.reasoning_effort = Some("high".into());
+
+        assert_eq!(
+            effective_reasoning_effort(&config, "openai-codex:gpt-5.4"),
+            Some("high")
+        );
+        assert_eq!(
+            effective_reasoning_effort(&config, "local:family:model"),
+            None
+        );
+
+        config.reasoning_effort = Some("max".into());
+        assert_eq!(
+            effective_reasoning_effort(&config, "openai-codex:gpt-5.4"),
+            None
+        );
+        assert_eq!(
+            effective_reasoning_effort(&config, "openai-codex:gpt-5.6-sol"),
+            Some("max")
+        );
     }
 
     #[test]

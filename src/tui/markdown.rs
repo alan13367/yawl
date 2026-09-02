@@ -760,6 +760,29 @@ pub(crate) fn plain_lines(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+pub(crate) fn wrapped_plain_lines(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in terminal_lines(text) {
+        lines.extend(wrap_ansi(&line, width.max(1)));
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+pub(crate) fn wrapped_plain_prefixed_lines(
+    prefix: &str,
+    continuation: &str,
+    text: &str,
+    width: usize,
+) -> Vec<String> {
+    let text = terminal_lines(text).join(" ");
+    let mut lines = Vec::new();
+    push_wrapped(prefix, continuation, &text, width.max(1), &mut lines);
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

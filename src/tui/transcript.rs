@@ -112,7 +112,7 @@ impl Transcript {
                         entries.push(Entry::Assistant(message.content.clone()));
                     }
                     for call in &message.tool_calls {
-                        if call.name == crate::tools::GOAL_COMPLETE_TOOL_NAME
+                        if crate::tools::is_private_tool_name(&call.name)
                             || skipped_tool_ids.contains(call.id.as_str())
                         {
                             continue;
@@ -130,8 +130,10 @@ impl Transcript {
                     }
                 }
                 Role::Tool
-                    if message.tool_name.as_deref()
-                        == Some(crate::tools::GOAL_COMPLETE_TOOL_NAME)
+                    if message
+                        .tool_name
+                        .as_deref()
+                        .is_some_and(crate::tools::is_private_tool_name)
                         || message.is_skipped_tool() => {}
                 Role::Tool => {
                     let pending_position = message.tool_call_id.as_deref().and_then(|id| {

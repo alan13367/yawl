@@ -13,6 +13,32 @@ use super::processes::ProcessView;
 use super::subagents::SubagentView;
 use super::transcript::{Transcript, TranscriptEvent};
 
+pub(super) enum QuestionInput {
+    Choices,
+    Custom(Box<super::input::Editor>),
+}
+
+pub(super) struct ActiveQuestion {
+    pub(super) snapshot: crate::tools::QuestionSnapshot,
+    pub(super) selected: usize,
+    pub(super) input: QuestionInput,
+}
+
+impl ActiveQuestion {
+    pub(super) fn new(snapshot: crate::tools::QuestionSnapshot) -> Self {
+        let selected = snapshot.question.recommended;
+        Self {
+            snapshot,
+            selected,
+            input: QuestionInput::Choices,
+        }
+    }
+
+    pub(super) fn is_custom(&self) -> bool {
+        matches!(self.input, QuestionInput::Custom(_))
+    }
+}
+
 pub(super) const COPY_TOAST_TICKS: u8 = 15;
 
 /// Ticks an idle transcript scroll bar stays visible before auto-hide
@@ -64,6 +90,10 @@ pub(super) struct ViewState {
     pub(super) pending_steers: std::collections::VecDeque<super::input::Submission>,
     pub(super) active_goal: Option<String>,
     pub(super) goal_running: bool,
+    pub(super) active_plan: Option<String>,
+    pub(super) plan_draft: bool,
+    pub(super) pending_plan_implementation: bool,
+    pub(super) question: Option<ActiveQuestion>,
     pub(super) pending_actions: std::collections::VecDeque<PickerAction>,
     pub(super) completions: Vec<Completion>,
     pub(super) completion_index: usize,
@@ -94,7 +124,11 @@ impl ViewState {
             transcript: Transcript::from_messages(agent.messages()),
             tools_expanded: false,
             model: agent.model().to_string(),
-            reasoning_effort: agent.config().reasoning_effort.clone(),
+            reasoning_effort: crate::model::effective_reasoning_effort(
+                agent.config(),
+                agent.model(),
+            )
+            .map(str::to_string),
             hide_reasoning: agent.config().hide_reasoning,
             accent_color: agent.config().accent_color,
             selection_color: agent.config().effective_selection_color(),
@@ -118,6 +152,13 @@ impl ViewState {
             pending_steers: std::collections::VecDeque::new(),
             active_goal: agent.active_goal().map(str::to_string),
             goal_running: false,
+            active_plan: agent.active_plan().map(str::to_string),
+            plan_draft: matches!(
+                agent.plan_state(),
+                Some(crate::session::PlanState::Draft { .. })
+            ),
+            pending_plan_implementation: false,
+            question: None,
             pending_actions: std::collections::VecDeque::new(),
             completions: command_completions(agent),
             completion_index: 0,
@@ -168,14 +209,14 @@ impl ViewState {
         let follow_bottom = self.scroll_offset == 0;
         match update {
             Update::Transcript(event) => {
-                let hide_goal_complete = match &event {
+                let hide_private_tool = match &event {
                     TranscriptEvent::ToolStart { name, .. }
                     | TranscriptEvent::ToolEnd { name, .. } => {
-                        name == crate::tools::GOAL_COMPLETE_TOOL_NAME
+                        crate::tools::is_private_tool_name(name)
                     }
                     _ => false,
                 };
-                if hide_goal_complete {
+                if hide_private_tool {
                     // Keep history valid without showing the internal tool.
                 } else {
                     self.activity = match &event {
@@ -201,7 +242,7 @@ impl ViewState {
                 self.transcript.push_steer(text);
             }
             Update::ToolPreparing { name } => {
-                if name != crate::tools::GOAL_COMPLETE_TOOL_NAME {
+                if !crate::tools::is_private_tool_name(&name) {
                     self.activity = match name.as_str() {
                         "write_file" => "preparing write".into(),
                         "edit_file" => "preparing edit".into(),

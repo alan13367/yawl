@@ -56,6 +56,8 @@ pub struct ToolCall {
 pub enum MessageControl {
     GoalStart,
     GoalContinuation,
+    PlanContinuation,
+    PlanImplementationStart,
     Steering,
     ToolSkipped,
 }
@@ -223,7 +225,14 @@ impl Message {
     }
 
     pub fn is_hidden_control(&self) -> bool {
-        matches!(self.control, Some(MessageControl::GoalContinuation))
+        matches!(
+            self.control,
+            Some(
+                MessageControl::GoalContinuation
+                    | MessageControl::PlanContinuation
+                    | MessageControl::PlanImplementationStart
+            )
+        )
     }
 
     pub fn is_steering(&self) -> bool {
@@ -232,6 +241,10 @@ impl Message {
 
     pub fn is_goal_start(&self) -> bool {
         matches!(self.control, Some(MessageControl::GoalStart))
+    }
+
+    pub fn is_plan_implementation_start(&self) -> bool {
+        matches!(self.control, Some(MessageControl::PlanImplementationStart))
     }
 
     pub fn is_skipped_tool(&self) -> bool {

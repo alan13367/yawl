@@ -11,7 +11,7 @@ use super::completion::{
     COMPLETION_MENU_ROWS, completion_window, menu_rows, sync_completion_filter,
 };
 use super::input::Editor;
-use super::picker::render_picker;
+use super::picker::{Picker, PickerAction, picker_is_plan_handoff, render_picker};
 use super::state::{ScrollGeometry, scroll_bar_position, scroll_bar_span};
 use super::transcript::Entry;
 use super::{USER_BACKGROUND, USER_TEXT, ViewState, markdown, tool_view};
@@ -838,7 +838,10 @@ pub(super) fn apply_scroll_bar(
 ) {
     let height = region.len();
     if !state.show_scroll_bar
-        || state.picker.is_some()
+        || state
+            .picker
+            .as_ref()
+            .is_some_and(|picker| !picker_is_plan_handoff(picker))
         || max_scroll == 0
         || height == 0
         || total_lines <= height
@@ -1050,29 +1053,56 @@ pub(super) fn build_frame_with_images(
         };
     }
     let inner_width = columns.saturating_sub(2);
+    let plan_handoff = state.picker.as_ref().is_some_and(picker_is_plan_handoff);
     let layout = if super::picker::picker_is_secret(state) {
         editor.masked_layout(inner_width)
     } else {
         editor.layout(inner_width)
     };
-    let max_input_lines = (rows / 3).max(1);
-    let input_start = layout
-        .cursor_row
-        .saturating_add(1)
-        .saturating_sub(max_input_lines)
-        .min(layout.lines.len().saturating_sub(max_input_lines));
-    let input_end = (input_start + max_input_lines).min(layout.lines.len());
-    let input_lines = &layout.lines[input_start..input_end];
-    let cursor_input_row = layout.cursor_row.saturating_sub(input_start);
-    let input_height = input_lines.len() + 2;
     let background_count = state.background_processes.active_count();
     state.background_active_count = background_count;
     let background_notice_height = usize::from(background_count > 0);
     let status_line = super::status_bar::render(state, columns);
     let status_height = usize::from(status_line.is_some());
+    let search_height = usize::from(state.transcript.search_active());
+    let max_input_lines = (rows / 3).max(1);
+    let max_question_lines = rows
+        .saturating_sub(2 + background_notice_height + status_height + search_height)
+        .max(1);
+    let (input_lines, cursor_input_row, cursor_input_col, hide_input_cursor) =
+        if let Some(question) = &state.question {
+            let (lines, cursor, focus_row) =
+                render_question_input(question, inner_width, state.selection_color, rows <= 10);
+            let (lines, cursor) = bounded_input_view(lines, cursor, focus_row, max_question_lines);
+            let (cursor_row, cursor_col) = cursor.unwrap_or((0, 0));
+            (lines, cursor_row, cursor_col, cursor.is_none())
+        } else if let Some(picker) = state
+            .picker
+            .as_ref()
+            .filter(|picker| picker_is_plan_handoff(picker))
+        {
+            let (lines, focus_row) =
+                render_plan_handoff_input(picker, inner_width, state.selection_color, rows <= 10);
+            let (lines, _) = bounded_input_view(lines, None, focus_row, max_input_lines);
+            (lines, 0, 0, true)
+        } else {
+            let input_start = layout
+                .cursor_row
+                .saturating_add(1)
+                .saturating_sub(max_input_lines)
+                .min(layout.lines.len().saturating_sub(max_input_lines));
+            let input_end = (input_start + max_input_lines).min(layout.lines.len());
+            (
+                layout.lines[input_start..input_end].to_vec(),
+                layout.cursor_row.saturating_sub(input_start),
+                layout.cursor_col,
+                false,
+            )
+        };
+    let input_height = input_lines.len() + 2;
     let menu_capacity = COMPLETION_MENU_ROWS
         .min(rows.saturating_sub(input_height + background_notice_height + status_height));
-    let menu_entries = if state.picker.is_none() {
+    let menu_entries = if state.picker.is_none() && state.question.is_none() {
         sync_completion_filter(state, editor);
         menu_rows(state, editor)
     } else {
@@ -1129,7 +1159,6 @@ pub(super) fn build_frame_with_images(
         ));
     }
     let menu_height = menu.len();
-    let search_height = usize::from(state.transcript.search_active());
     let transcript_height = rows.saturating_sub(
         input_height + menu_height + search_height + background_notice_height + status_height,
     );
@@ -1138,7 +1167,11 @@ pub(super) fn build_frame_with_images(
     let visible = &transcript.lines;
 
     let mut region = Vec::with_capacity(transcript_height);
-    if let Some(picker) = &state.picker {
+    if let Some(picker) = state
+        .picker
+        .as_ref()
+        .filter(|picker| !picker_is_plan_handoff(picker))
+    {
         let outline = foreground_color(state.accent_color);
         region.extend(render_picker(
             picker,
@@ -1197,17 +1230,27 @@ pub(super) fn build_frame_with_images(
         ));
     }
     let text_box_color = foreground_color(state.accent_color);
-    frame.push(format!(
-        "{text_box_color}┌{}┐\x1b[0m",
-        "─".repeat(inner_width)
-    ));
-    for line in input_lines {
+    let composer_label = if plan_handoff {
+        Some("Plan ready")
+    } else if state.turn_started.is_some() && !state.goal_running && state.plan_draft {
+        Some("Planning")
+    } else if state.turn_started.is_some() && !state.goal_running && state.active_plan.is_some() {
+        Some("Plan turn")
+    } else {
+        None
+    };
+    let top_border = composer_top_border(inner_width, composer_label);
+    frame.push(format!("{text_box_color}┌{}┐\x1b[0m", top_border));
+    for line in &input_lines {
         frame.push(format!(
             "{text_box_color}│\x1b[0m{}{text_box_color}│\x1b[0m",
             markdown::fit_width(line, inner_width)
         ));
     }
-    let show_queue_hint = state.turn_started.is_some() && !editor.is_empty() && menu.is_empty();
+    let show_queue_hint = state.question.is_none()
+        && state.turn_started.is_some()
+        && !editor.is_empty()
+        && menu.is_empty();
     let bottom_border = if show_queue_hint {
         const HINT: &str = " Tab queues ";
         format!(
@@ -1237,7 +1280,9 @@ pub(super) fn build_frame_with_images(
         render_copy_toast(&mut frame, columns, state.accent_color);
     }
 
-    let (cursor_row, cursor_col) = if let Some(query) = state.transcript.search_query() {
+    let (cursor_row, cursor_col) = if hide_input_cursor || plan_handoff {
+        HIDDEN_CURSOR
+    } else if let Some(query) = state.transcript.search_query() {
         (
             transcript_height + 1,
             (8 + markdown::visible_width(query)).min(columns.saturating_sub(1)),
@@ -1245,10 +1290,14 @@ pub(super) fn build_frame_with_images(
     } else {
         (
             transcript_height + search_height + 2 + cursor_input_row,
-            (2 + layout.cursor_col).min(columns.saturating_sub(1)),
+            (2 + cursor_input_col).min(columns.saturating_sub(1)),
         )
     };
-    let images = if state.picker.is_some() {
+    let images = if state
+        .picker
+        .as_ref()
+        .is_some_and(|picker| !picker_is_plan_handoff(picker))
+    {
         Vec::new()
     } else {
         transcript.images
@@ -1258,6 +1307,203 @@ pub(super) fn build_frame_with_images(
         cursor: (cursor_row, cursor_col),
         images,
     }
+}
+
+fn composer_top_border(width: usize, label: Option<&str>) -> String {
+    let Some(label) = label else {
+        return "─".repeat(width);
+    };
+    let label = format!(" {label} ");
+    if label.len().saturating_add(1) > width {
+        return "─".repeat(width);
+    }
+    format!(
+        "─{label}{}",
+        "─".repeat(width.saturating_sub(label.len() + 1))
+    )
+}
+
+fn render_plan_handoff_input(
+    picker: &Picker,
+    width: usize,
+    selection_color: UiColor,
+    compact: bool,
+) -> (Vec<String>, usize) {
+    let mut lines = Vec::with_capacity(picker.items.len() + 2);
+    let mut focus_row = 0;
+    if !compact {
+        lines.push(markdown::fit_width("Choose what happens next", width));
+    }
+    for (index, item) in picker.items.iter().enumerate() {
+        if index == picker.selected {
+            focus_row = lines.len();
+        }
+        lines.extend(render_choice_lines(
+            index,
+            &item.label,
+            &item.description,
+            matches!(item.action, PickerAction::ImplementPlan),
+            index == picker.selected,
+            width,
+            selection_color,
+        ));
+    }
+    if !compact {
+        lines.push(markdown::fit_width(
+            " ↑/↓ choose · 1–2 select · Enter confirm · Esc return",
+            width,
+        ));
+    }
+    (lines, focus_row)
+}
+
+fn render_question_input(
+    active: &super::state::ActiveQuestion,
+    width: usize,
+    selection_color: UiColor,
+    compact: bool,
+) -> (Vec<String>, Option<(usize, usize)>, usize) {
+    let snapshot = &active.snapshot;
+    let countdown = snapshot
+        .remaining
+        .map(|remaining| format!(" · {}s", remaining.as_secs().saturating_add(1)))
+        .unwrap_or_default();
+    let heading = if compact {
+        format!(
+            "{}/{}{countdown} · {}",
+            snapshot.question_index + 1,
+            snapshot.question_count,
+            snapshot.question.question
+        )
+    } else {
+        format!(
+            "Question {}/{}{countdown}",
+            snapshot.question_index + 1,
+            snapshot.question_count
+        )
+    };
+    let mut lines = markdown::wrapped_plain_lines(&heading, width);
+    if !compact {
+        lines.extend(markdown::wrapped_plain_lines(
+            &snapshot.question.question,
+            width,
+        ));
+    }
+
+    if let super::state::QuestionInput::Custom(editor) = &active.input {
+        if !compact {
+            lines.push(String::new());
+            lines.push(markdown::fit_width(" Your answer", width));
+        }
+        let layout = editor.layout(width);
+        let answer_start = lines.len();
+        let cursor = (answer_start + layout.cursor_row, layout.cursor_col);
+        lines.extend(
+            layout
+                .lines
+                .into_iter()
+                .map(|line| markdown::fit_width(&line, width)),
+        );
+        if !compact {
+            lines.push(markdown::fit_width(
+                " Enter submit · Shift+Enter newline · Esc choices · Ctrl+C cancel",
+                width,
+            ));
+            lines.push(String::new());
+        }
+        return (lines, Some(cursor), cursor.0);
+    }
+
+    let mut focus_row = lines.len();
+    for (index, option) in snapshot.question.options.iter().enumerate() {
+        if index == active.selected {
+            focus_row = lines.len();
+        }
+        lines.extend(render_choice_lines(
+            index,
+            &option.label,
+            if compact { "" } else { &option.description },
+            index == snapshot.question.recommended,
+            index == active.selected,
+            width,
+            selection_color,
+        ));
+    }
+    let other_index = snapshot.question.options.len();
+    if other_index == active.selected {
+        focus_row = lines.len();
+    }
+    lines.extend(render_choice_lines(
+        other_index,
+        "Other…",
+        if compact { "" } else { "Write your own answer" },
+        false,
+        other_index == active.selected,
+        width,
+        selection_color,
+    ));
+    if !compact {
+        let option_count = snapshot.question.options.len() + 1;
+        lines.push(markdown::fit_width(
+            &format!(" ↑/↓ choose · 1–{option_count} select · Enter confirm · Esc cancel"),
+            width,
+        ));
+        lines.push(String::new());
+    }
+    (lines, None, focus_row)
+}
+
+fn bounded_input_view(
+    lines: Vec<String>,
+    cursor: Option<(usize, usize)>,
+    focus_row: usize,
+    max_lines: usize,
+) -> (Vec<String>, Option<(usize, usize)>) {
+    let max_lines = max_lines.max(1);
+    if lines.len() <= max_lines {
+        return (lines, cursor);
+    }
+    let focus_row = cursor
+        .map_or(focus_row, |(row, _)| row)
+        .min(lines.len().saturating_sub(1));
+    let start = focus_row
+        .saturating_sub(max_lines / 2)
+        .min(lines.len() - max_lines);
+    let end = start + max_lines;
+    let cursor = cursor
+        .and_then(|(row, column)| (start..end).contains(&row).then_some((row - start, column)));
+    (lines[start..end].to_vec(), cursor)
+}
+
+fn render_choice_lines(
+    index: usize,
+    label: &str,
+    description: &str,
+    recommended: bool,
+    selected: bool,
+    width: usize,
+    selection_color: UiColor,
+) -> Vec<String> {
+    let prefix = format!(" {}. ", index + 1);
+    let continuation = " ".repeat(markdown::visible_width(&prefix));
+    let recommended = if recommended { " (Recommended)" } else { "" };
+    let content = if description.is_empty() {
+        format!("{label}{recommended}")
+    } else {
+        format!("{label}{recommended} · {description}")
+    };
+    let style = selection_style(selection_color);
+    markdown::wrapped_plain_prefixed_lines(&prefix, &continuation, &content, width)
+        .into_iter()
+        .map(|line| {
+            let line = markdown::fit_width(&line, width);
+            if selected {
+                selected_row(&line, &style)
+            } else {
+                line
+            }
+        })
+        .collect()
 }
 
 pub(super) fn render_background_process_notice(

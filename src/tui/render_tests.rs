@@ -75,6 +75,10 @@ fn frame_keeps_input_and_status_pinned() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -457,6 +461,10 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -519,6 +527,10 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -638,6 +650,10 @@ fn loading_state_ignores_status_activity() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -705,6 +721,10 @@ fn overflow_state() -> ViewState {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -1007,6 +1027,10 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -1190,6 +1214,10 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: (1..=12)
             .map(|n| Completion {
@@ -1344,6 +1372,10 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -1666,6 +1698,207 @@ fn running_tool_entries_show_their_elapsed_time() {
     assert!(!plain.contains("[running"));
 }
 
+#[test]
+fn active_question_replaces_the_composer_and_preserves_its_draft() {
+    let mut state = empty_session_state();
+    let mut editor = Editor::default();
+    editor.paste("keep this draft");
+    state.question = Some(super::state::ActiveQuestion::new(
+        crate::tools::QuestionSnapshot {
+            request_id: 7,
+            question_index: 0,
+            question_count: 3,
+            question: crate::tools::UserQuestion {
+                id: "scope".into(),
+                question: "Which scope should we use?".into(),
+                options: vec![
+                    crate::tools::QuestionOption {
+                        label: "Focused".into(),
+                        description: "small change".into(),
+                    },
+                    crate::tools::QuestionOption {
+                        label: "Broad".into(),
+                        description: "large change".into(),
+                    },
+                ],
+                recommended: 0,
+            },
+            remaining: Some(std::time::Duration::from_secs(29)),
+        },
+    ));
+
+    let (question_frame, cursor) = build_frame(&mut state, &editor, 32, 14);
+    let question = markdown::strip_ansi(&question_frame.join("\n"));
+    assert!(question.contains("Question 1/3"));
+    assert!(question.contains("(Recommended)"));
+    assert!(question.contains("Other…"));
+    assert!(!question.contains("keep this draft"));
+    assert_eq!(cursor, HIDDEN_CURSOR);
+    let bottom_border = question_frame
+        .iter()
+        .position(|line| markdown::strip_ansi(line).starts_with('└'))
+        .expect("question bottom border");
+    let spacer = markdown::strip_ansi(&question_frame[bottom_border - 1]);
+    assert!(spacer.trim_matches(['│', ' ']).is_empty());
+    assert!(
+        question_frame
+            .iter()
+            .all(|line| markdown::visible_width(line) <= 32)
+    );
+    let active = state.question.as_mut().expect("active question");
+    active.snapshot.question.question = "A deliberately long question ".repeat(20);
+    active.selected = active.snapshot.question.options.len();
+    let (short_frame, _) = build_frame(&mut state, &editor, 32, 8);
+    assert!(short_frame.len() <= 8);
+    assert!(markdown::strip_ansi(&short_frame.join("\n")).contains("Other…"));
+
+    state.question = None;
+    let (editor_frame, _) = build_frame(&mut state, &editor, 32, 14);
+    assert!(markdown::strip_ansi(&editor_frame.join("\n")).contains("keep this draft"));
+}
+
+#[test]
+fn question_options_wrap_without_losing_their_descriptions() {
+    let mut state = empty_session_state();
+    let mut active = super::state::ActiveQuestion::new(crate::tools::QuestionSnapshot {
+            request_id: 8,
+            question_index: 0,
+            question_count: 3,
+            question: crate::tools::UserQuestion {
+                id: "scope".into(),
+                question: "What should the improvement prioritize?".into(),
+                options: vec![
+                    crate::tools::QuestionOption {
+                        label: "UI polish and accessibility".into(),
+                        description: "Improve hierarchy, spacing, responsive behavior, keyboard support, and visual states while preserving the current interaction model.".into(),
+                    },
+                    crate::tools::QuestionOption {
+                        label: "Chat reliability".into(),
+                        description: "Focus on streaming and retry behavior.".into(),
+                    },
+                    crate::tools::QuestionOption {
+                        label: "Both".into(),
+                        description: "Make a balanced pass.".into(),
+                    },
+                ],
+                recommended: 2,
+            },
+        remaining: Some(std::time::Duration::from_secs(17)),
+    });
+    active.selected = 0;
+    state.question = Some(active);
+
+    let (frame, _) = build_frame(&mut state, &Editor::default(), 64, 20);
+    let plain = markdown::strip_ansi(&frame.join("\n"));
+    assert!(plain.contains("keyboard support"));
+    assert!(plain.contains("current interaction model"));
+    assert!(frame.iter().all(|line| markdown::visible_width(line) <= 64));
+}
+
+#[test]
+fn custom_question_answer_uses_its_own_visible_editor() {
+    let mut state = empty_session_state();
+    let mut outer_editor = Editor::default();
+    outer_editor.paste("preserve this main draft");
+    let mut active = super::state::ActiveQuestion::new(crate::tools::QuestionSnapshot {
+        request_id: 9,
+        question_index: 0,
+        question_count: 1,
+        question: crate::tools::UserQuestion {
+            id: "details".into(),
+            question: "What should happen instead?".into(),
+            options: vec![
+                crate::tools::QuestionOption {
+                    label: "First".into(),
+                    description: "first choice".into(),
+                },
+                crate::tools::QuestionOption {
+                    label: "Second".into(),
+                    description: "second choice".into(),
+                },
+            ],
+            recommended: 0,
+        },
+        remaining: None,
+    });
+    let mut answer_editor = Editor::default();
+    answer_editor.paste("Keep the current API and change the layout");
+    active.input = super::state::QuestionInput::Custom(Box::new(answer_editor));
+    state.question = Some(active);
+
+    let (frame, cursor) = build_frame(&mut state, &outer_editor, 64, 18);
+    let plain = markdown::strip_ansi(&frame.join("\n"));
+    assert!(plain.contains("Question 1/1"));
+    assert!(!plain.contains("Question 1/1 ·"));
+    assert!(plain.contains("Your answer"));
+    assert!(plain.contains("Keep the current API and change the layout"));
+    assert!(!plain.contains("preserve this main draft"));
+    assert_ne!(cursor, HIDDEN_CURSOR);
+
+    let super::state::QuestionInput::Custom(answer) =
+        &mut state.question.as_mut().expect("active question").input
+    else {
+        panic!("custom answer editor");
+    };
+    answer.paste(&"\nmore detail".repeat(20));
+    let (short_frame, short_cursor) = build_frame(&mut state, &outer_editor, 32, 8);
+    assert!(short_frame.len() <= 8);
+    assert_ne!(short_cursor, HIDDEN_CURSOR);
+    assert!(short_cursor.0 < 8);
+}
+
+#[test]
+fn ready_plan_actions_replace_the_composer_without_covering_the_plan() {
+    let mut state = empty_session_state();
+    let mut editor = Editor::default();
+    editor.paste("keep this editor draft");
+    state.transcript = Transcript::from_messages(&[crate::provider::Message::assistant(
+        "## Ready plan\n\n1. Keep this plan visible.".into(),
+        Vec::new(),
+    )]);
+    state.active_plan = Some("## Ready plan".into());
+    state.picker = Some(super::commands::plan_handoff_picker());
+
+    let (handoff_frame, cursor) = build_frame(&mut state, &editor, 64, 16);
+    let handoff = markdown::strip_ansi(&handoff_frame.join("\n"));
+    assert!(handoff.contains("Ready plan"));
+    assert!(handoff.contains("Keep this plan visible"));
+    assert!(handoff.contains("Plan ready"));
+    assert!(handoff.contains("Implement (Recommended)"));
+    assert!(handoff.contains("Return to editor"));
+    assert!(!handoff.contains("keep this editor draft"));
+    assert_eq!(cursor, HIDDEN_CURSOR);
+
+    let picker = state.picker.as_mut().expect("plan handoff");
+    picker.selected = 1;
+    picker.items[0].description = "A long implementation description ".repeat(20);
+    picker.items[1].description = "A long editor description ".repeat(20);
+    let (short_frame, _) = build_frame(&mut state, &editor, 32, 12);
+    assert!(short_frame.len() <= 12);
+    assert!(markdown::strip_ansi(&short_frame.join("\n")).contains("Return to editor"));
+
+    state.picker = None;
+    let (editor_frame, _) = build_frame(&mut state, &editor, 64, 16);
+    assert!(markdown::strip_ansi(&editor_frame.join("\n")).contains("keep this editor draft"));
+}
+
+#[test]
+fn planning_turn_labels_the_composer_border() {
+    let mut state = empty_session_state();
+    state.plan_draft = true;
+    state.turn_started = Some(std::time::Instant::now());
+
+    let (planning_frame, _) = build_frame(&mut state, &Editor::default(), 40, 10);
+    let planning = markdown::strip_ansi(&planning_frame.join("\n"));
+    assert!(planning.contains("Planning"));
+
+    state.plan_draft = false;
+    state.active_plan = Some("ready".into());
+    let (follow_up_frame, _) = build_frame(&mut state, &Editor::default(), 40, 10);
+    let follow_up = markdown::strip_ansi(&follow_up_frame.join("\n"));
+    assert!(follow_up.contains("Plan turn"));
+}
+
 fn empty_session_state() -> ViewState {
     ViewState {
         transcript: Transcript::from_messages(&[]),
@@ -1695,6 +1928,10 @@ fn empty_session_state() -> ViewState {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,

@@ -31,6 +31,10 @@ fn completion_state(commands: &[&str]) -> ViewState {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: commands
             .iter()

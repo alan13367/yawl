@@ -7,6 +7,7 @@ use crate::provider::{
 use crate::tools::Registry;
 
 use super::goal;
+use super::plan::{self, FollowUpAction};
 use super::{Conversation, ConversationKind, last_undoable_user_index};
 use crate::agent::events::{TurnEvent, forward};
 
@@ -14,6 +15,42 @@ use crate::agent::events::{TurnEvent, forward};
 enum TurnMode {
     Normal,
     Goal,
+    Plan,
+    PlanFollowUp,
+    PlanRevise,
+    PlanImplement,
+}
+
+fn plan_prompt(
+    state: Option<&crate::session::PlanState>,
+    mode: TurnMode,
+) -> Option<crate::prompt::PlanPrompt<'_>> {
+    use crate::prompt::PlanPrompt;
+    use crate::session::PlanState;
+    match (mode, state) {
+        (TurnMode::Plan, Some(PlanState::Draft { objective, .. })) => {
+            Some(PlanPrompt::Draft(objective))
+        }
+        (TurnMode::PlanRevise, Some(PlanState::Ready { plan })) => Some(PlanPrompt::Revise(plan)),
+        (TurnMode::PlanFollowUp, Some(PlanState::Ready { plan })) => {
+            Some(PlanPrompt::FollowUp(plan))
+        }
+        (TurnMode::PlanImplement, Some(PlanState::Ready { plan })) => {
+            Some(PlanPrompt::Implement(plan))
+        }
+        (_, Some(PlanState::Ready { plan })) => Some(PlanPrompt::Active(plan)),
+        _ => None,
+    }
+}
+
+fn plan_continuation(mode: TurnMode) -> Option<&'static str> {
+    match mode {
+        TurnMode::Plan | TurnMode::PlanRevise => Some(plan::PLAN_CONTINUATION),
+        TurnMode::PlanImplement => Some(plan::PLAN_IMPLEMENT_CONTINUATION),
+        // Follow-up turns end on a text reply so the model can answer
+        // requests unrelated to the plan without being forced to classify.
+        TurnMode::Normal | TurnMode::Goal | TurnMode::PlanFollowUp => None,
+    }
 }
 
 impl Conversation {
@@ -93,6 +130,48 @@ impl Conversation {
         let cancellation = self.cancellation.clone();
         crate::cancellation::scope(&cancellation, || {
             self.run_turn_input_with_mode(None, sink, &mut provider::resolve, TurnMode::Goal)
+        })
+    }
+
+    pub(crate) fn run_plan_preserving_cancellation(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        let cancellation = self.cancellation.clone();
+        crate::cancellation::scope(&cancellation, || {
+            self.run_turn_input_with_mode(None, sink, &mut provider::resolve, TurnMode::Plan)
+        })
+    }
+
+    pub(crate) fn run_plan_follow_up_preserving_cancellation(
+        &mut self,
+        input: TurnInput,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        let cancellation = self.cancellation.clone();
+        crate::cancellation::scope(&cancellation, || {
+            self.run_turn_input_with_mode(
+                Some(input),
+                sink,
+                &mut provider::resolve,
+                TurnMode::PlanFollowUp,
+            )
+        })
+    }
+
+    pub(crate) fn run_plan_implementation_preserving_cancellation(
+        &mut self,
+        input: Option<TurnInput>,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        let cancellation = self.cancellation.clone();
+        crate::cancellation::scope(&cancellation, || {
+            self.run_turn_input_with_mode(
+                input,
+                sink,
+                &mut provider::resolve,
+                TurnMode::PlanImplement,
+            )
         })
     }
 
@@ -239,12 +318,50 @@ impl Conversation {
         self.run_turn_input_with_mode(None, sink, resolve_provider, TurnMode::Goal)
     }
 
+    #[cfg(test)]
+    pub(super) fn run_plan_with<F>(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        self.run_turn_input_with_mode(None, sink, resolve_provider, TurnMode::Plan)
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_plan_follow_up_with<F>(
+        &mut self,
+        input: TurnInput,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        self.run_turn_input_with_mode(Some(input), sink, resolve_provider, TurnMode::PlanFollowUp)
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_plan_implementation_with<F>(
+        &mut self,
+        input: Option<TurnInput>,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        self.run_turn_input_with_mode(input, sink, resolve_provider, TurnMode::PlanImplement)
+    }
+
     fn run_turn_input_with_mode<F>(
         &mut self,
         user_input: Option<TurnInput>,
         sink: &mut dyn FnMut(TurnEvent<'_>),
         resolve_provider: &mut F,
-        mode: TurnMode,
+        mut mode: TurnMode,
     ) -> Result<bool, Error>
     where
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
@@ -252,7 +369,34 @@ impl Conversation {
         if mode == TurnMode::Goal && self.active_goal().is_none() {
             return Err(Error::Config("no active goal to resume".into()));
         }
+        match mode {
+            TurnMode::Plan
+                if !matches!(
+                    self.plan_state(),
+                    Some(crate::session::PlanState::Draft { .. })
+                ) =>
+            {
+                return Err(Error::Config("no draft plan to resume".into()));
+            }
+            TurnMode::PlanFollowUp | TurnMode::PlanImplement if self.active_plan().is_none() => {
+                return Err(Error::Config("no completed plan is active".into()));
+            }
+            _ => {}
+        }
+        self.questions.begin_turn();
+        self.plan_ready_this_turn = false;
         self.latest_turn_result.clear();
+        if mode == TurnMode::PlanImplement && user_input.is_none() {
+            if let Some(Err(error)) = self.checkpoint_snapshot() {
+                sink(TurnEvent::Warning(format!(
+                    "Could not checkpoint for /undo: {error}"
+                )));
+            }
+            self.append_input_message(
+                Message::user("Implement the active plan now.")
+                    .with_control(MessageControl::PlanImplementationStart),
+            )?;
+        }
         if let Some(input) = user_input {
             if !input.images.is_empty() && !crate::model::supports_images(&self.config, &self.model)
             {
@@ -274,6 +418,10 @@ impl Conversation {
         let hard_requests = max_requests.saturating_add((max_requests / 2).max(1));
         let mut requests_made: u64 = 0;
         let mut steer_sent = false;
+        let mut asked_plan_questions = mode == TurnMode::Plan
+            && self
+                .plan_state()
+                .is_some_and(crate::session::PlanState::questions_asked);
 
         // Uncapped: the loop ends when the model stops calling tools, or
         // when a goal completes through goal_complete.
@@ -281,7 +429,7 @@ impl Conversation {
             if crate::cancellation::interrupted() {
                 return Ok(false);
             }
-            if mode == TurnMode::Goal {
+            if matches!(mode, TurnMode::Goal | TurnMode::PlanImplement) {
                 self.drain_deferred_subagent_results_into_history()?;
             }
             if max_requests > 0 {
@@ -305,8 +453,18 @@ impl Conversation {
             // Rescan every iteration so a tool the model just wrote is
             // available on its very next step.
             let mut registry = self.scan_tools();
-            if mode == TurnMode::Goal {
-                registry.advertise_goal_complete();
+            match mode {
+                TurnMode::Goal => registry.advertise_goal_complete(),
+                TurnMode::Plan | TurnMode::PlanRevise => {
+                    registry.retain_for_planning();
+                    registry.advertise_plan_complete();
+                }
+                TurnMode::PlanFollowUp => {
+                    registry.retain_for_planning();
+                    registry.advertise_plan_action();
+                }
+                TurnMode::PlanImplement => registry.advertise_plan_implemented(),
+                TurnMode::Normal => {}
             }
             let specs = registry.specs();
             let system = match &self.kind {
@@ -316,9 +474,13 @@ impl Conversation {
                     self.print_mode,
                     registry.has_web_tools(),
                     registry.skills(),
-                    (mode == TurnMode::Goal)
-                        .then_some(state.active_goal.as_deref())
-                        .flatten(),
+                    crate::prompt::MainPromptState {
+                        goal: (mode == TurnMode::Goal)
+                            .then_some(state.active_goal.as_deref())
+                            .flatten(),
+                        plan: plan_prompt(state.session.active_plan(), mode),
+                        interactive_questions: self.questions.is_enabled(),
+                    },
                 ),
                 ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(
                     &self.config.home_dir,
@@ -382,7 +544,126 @@ impl Conversation {
                     self.append_goal_continuation()?;
                     continue;
                 }
+                if let Some(continuation) = plan_continuation(mode) {
+                    self.append_plan_continuation(continuation)?;
+                    continue;
+                }
                 return Ok(true);
+            }
+
+            if out.tool_calls.iter().any(plan::is_user_input) {
+                self.persist_assistant(assistant, sink)?;
+                let question_validation = crate::tools::validate_user_input(
+                    out.tool_calls
+                        .first()
+                        .map_or("{}", |call| call.arguments.as_str()),
+                );
+                let valid_batch = out.tool_calls.len() == 1
+                    && (!matches!(mode, TurnMode::Plan | TurnMode::PlanRevise)
+                        || question_validation == Ok(3));
+                if !valid_batch {
+                    let error = if out.tool_calls.len() != 1 {
+                        "request_user_input must be the only tool call in its model step"
+                    } else if let Err(error) = &question_validation {
+                        error
+                    } else {
+                        "planning and revision require exactly three questions per request_user_input call"
+                    };
+                    self.reject_tool_calls(&out.tool_calls, error)?;
+                    continue;
+                }
+                let aborted = self.run_tools(&registry, &out.tool_calls, sink)?;
+                if aborted {
+                    return Ok(false);
+                }
+                if matches!(mode, TurnMode::Plan | TurnMode::PlanRevise) {
+                    asked_plan_questions = true;
+                    if mode == TurnMode::Plan {
+                        self.persistent_mut()
+                            .session
+                            .append_plan_questions_asked()?;
+                    }
+                }
+                continue;
+            }
+
+            let has_private_plan_call = out.tool_calls.iter().any(|call| {
+                plan::is_plan_complete(call)
+                    || plan::is_plan_action(call)
+                    || plan::is_plan_implemented(call)
+            });
+            if has_private_plan_call {
+                if out.tool_calls.len() != 1 {
+                    self.persist_assistant(assistant, sink)?;
+                    self.reject_tool_calls(
+                        &out.tool_calls,
+                        "private planning tools must be the only tool call in their model step",
+                    )?;
+                    continue;
+                }
+                let call = &out.tool_calls[0];
+                match mode {
+                    TurnMode::Plan | TurnMode::PlanRevise if plan::is_plan_complete(call) => {
+                        if !asked_plan_questions {
+                            self.persist_assistant(assistant, sink)?;
+                            self.reject_tool_calls(&out.tool_calls, plan::PLAN_QUESTION_REQUIRED)?;
+                            continue;
+                        }
+                        match plan::parse_plan(&call.arguments) {
+                            Ok(result) => {
+                                self.finish_plan_complete(assistant, result, sink)?;
+                                return Ok(true);
+                            }
+                            Err(error) => {
+                                self.persist_assistant(assistant, sink)?;
+                                self.reject_tool_calls(&out.tool_calls, &error)?;
+                            }
+                        }
+                        continue;
+                    }
+                    TurnMode::PlanFollowUp if plan::is_plan_action(call) => {
+                        match plan::parse_action(&call.arguments) {
+                            Ok(action) => {
+                                self.persist_assistant(assistant, sink)?;
+                                if self.run_tools(&registry, &out.tool_calls, sink)? {
+                                    return Ok(false);
+                                }
+                                mode = match action {
+                                    FollowUpAction::Revise => TurnMode::PlanRevise,
+                                    FollowUpAction::Implement => TurnMode::PlanImplement,
+                                    FollowUpAction::Unrelated => TurnMode::Normal,
+                                };
+                                asked_plan_questions = false;
+                            }
+                            Err(error) => {
+                                self.persist_assistant(assistant, sink)?;
+                                self.reject_tool_calls(&out.tool_calls, &error)?;
+                            }
+                        }
+                        continue;
+                    }
+                    TurnMode::PlanImplement if plan::is_plan_implemented(call) => {
+                        match plan::parse_implemented(&call.arguments) {
+                            Ok(result) => {
+                                self.finish_plan_implemented(assistant, result, sink)?;
+                                return Ok(true);
+                            }
+                            Err(error) => {
+                                self.persist_assistant(assistant, sink)?;
+                                self.reject_tool_calls(&out.tool_calls, &error)?;
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {
+                        self.persist_assistant(assistant, sink)?;
+                        self.reject_tool_calls(
+                            &out.tool_calls,
+                            "that planning tool is unavailable in the current phase",
+                        )?;
+                        continue;
+                    }
+                }
             }
 
             let (completes, ordinary) = if mode == TurnMode::Goal {
@@ -427,6 +708,10 @@ impl Conversation {
                 }
                 if mode == TurnMode::Goal {
                     self.append_goal_continuation()?;
+                    continue;
+                }
+                if let Some(continuation) = plan_continuation(mode) {
+                    self.append_plan_continuation(continuation)?;
                     continue;
                 }
                 return Ok(true);
@@ -595,6 +880,15 @@ impl Conversation {
         Ok(())
     }
 
+    fn reject_tool_calls(&mut self, calls: &[ToolCall], error: &str) -> Result<(), Error> {
+        for call in calls {
+            let result = Message::tool_result(&call.id, &call.name, error.to_string(), true);
+            self.persist_message(&result)?;
+            self.messages.push(result);
+        }
+        Ok(())
+    }
+
     fn inject_pending_steers(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent<'_>),
@@ -632,6 +926,12 @@ impl Conversation {
         )
     }
 
+    fn append_plan_continuation(&mut self, text: &str) -> Result<(), Error> {
+        self.append_input_message(
+            Message::user(text).with_control(MessageControl::PlanContinuation),
+        )
+    }
+
     fn finish_goal_complete(
         &mut self,
         mut assistant: Message,
@@ -651,6 +951,51 @@ impl Conversation {
         self.messages.push(assistant);
         self.latest_turn_result.clone_from(&result);
         self.persistent_mut().active_goal = None;
+        sink(TurnEvent::AssistantDone);
+        Ok(())
+    }
+
+    fn finish_plan_complete(
+        &mut self,
+        mut assistant: Message,
+        plan: String,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<(), Error> {
+        if assistant.content.is_empty() {
+            sink(TurnEvent::TextDelta(&plan));
+        } else if assistant.content != plan {
+            sink(TurnEvent::AssistantReplace(&plan));
+        }
+        assistant.content.clone_from(&plan);
+        assistant.tool_calls.clear();
+        self.persistent_mut()
+            .session
+            .append_plan_ready(&plan, &assistant)?;
+        self.messages.push(assistant);
+        self.latest_turn_result.clone_from(&plan);
+        self.plan_ready_this_turn = true;
+        sink(TurnEvent::AssistantDone);
+        Ok(())
+    }
+
+    fn finish_plan_implemented(
+        &mut self,
+        mut assistant: Message,
+        result: String,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<(), Error> {
+        if assistant.content.is_empty() {
+            sink(TurnEvent::TextDelta(&result));
+        } else if assistant.content != result {
+            sink(TurnEvent::AssistantReplace(&result));
+        }
+        assistant.content.clone_from(&result);
+        assistant.tool_calls.clear();
+        self.persistent_mut()
+            .session
+            .append_plan_implemented(&assistant)?;
+        self.messages.push(assistant);
+        self.latest_turn_result.clone_from(&result);
         sink(TurnEvent::AssistantDone);
         Ok(())
     }
@@ -765,7 +1110,15 @@ impl Conversation {
                 self.print_mode,
                 registry.has_web_tools(),
                 registry.skills(),
-                state.active_goal.as_deref(),
+                crate::prompt::MainPromptState {
+                    goal: state.active_goal.as_deref(),
+                    plan: state
+                        .session
+                        .active_plan()
+                        .and_then(crate::session::PlanState::ready)
+                        .map(crate::prompt::PlanPrompt::Active),
+                    interactive_questions: self.questions.is_enabled(),
+                },
             ),
             ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(
                 &self.config.home_dir,

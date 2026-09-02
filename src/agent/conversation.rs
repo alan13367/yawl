@@ -1,6 +1,7 @@
 //! Provider-neutral conversation state and turn execution.
 
 mod goal;
+mod plan;
 mod steer;
 mod turn;
 
@@ -13,9 +14,9 @@ use crate::compaction;
 use crate::config::{Config, ConfigChange, ConfigChangeEffect};
 use crate::error::Error;
 use crate::provider::{Message, MessageControl, TokenUsage, TurnInput, UsageSummary};
-use crate::session::Session;
+use crate::session::{PlanState, Session};
 use crate::subagent::SubagentManager;
-use crate::tools::{DescribeCache, Registry};
+use crate::tools::{DescribeCache, QuestionBroker, Registry};
 
 pub(crate) use steer::SteerInbox;
 
@@ -42,7 +43,7 @@ pub(crate) fn is_undoable_user_prompt(message: &Message) -> bool {
     message.role == crate::provider::Role::User
         && message.subagent_results.is_empty()
         && !compaction::is_summary_message(message)
-        && !message.is_hidden_control()
+        && (!message.is_hidden_control() || message.is_plan_implementation_start())
         && !message.is_steering()
 }
 
@@ -85,10 +86,14 @@ pub(crate) struct Conversation {
     /// estimate of current context usage.
     context_tokens: u64,
     latest_turn_result: String,
+    /// Set when a turn ends through plan_complete so the TUI can offer the
+    /// implement/revise handoff only for freshly finished plans.
+    plan_ready_this_turn: bool,
     describe_cache: DescribeCache,
     cancellation: CancellationToken,
     print_mode: bool,
     steers: SteerInbox,
+    questions: QuestionBroker,
 }
 
 impl Conversation {
@@ -115,10 +120,12 @@ impl Conversation {
             }),
             context_tokens: 0,
             latest_turn_result: String::new(),
+            plan_ready_this_turn: false,
             describe_cache: DescribeCache::default(),
             cancellation: CancellationToken::default(),
             print_mode: false,
             steers: SteerInbox::default(),
+            questions: QuestionBroker::default(),
         }
     }
 
@@ -137,10 +144,12 @@ impl Conversation {
             }),
             context_tokens: 0,
             latest_turn_result: String::new(),
+            plan_ready_this_turn: false,
             describe_cache: DescribeCache::default(),
             cancellation: CancellationToken::default(),
             print_mode: false,
             steers: SteerInbox::default(),
+            questions: QuestionBroker::default(),
         }
     }
 
@@ -209,8 +218,28 @@ impl Conversation {
         self.steers.clone()
     }
 
+    pub(crate) fn question_broker(&self) -> QuestionBroker {
+        self.questions.clone()
+    }
+
+    pub(crate) fn enable_interactive_questions(&self) {
+        self.questions.enable();
+    }
+
     pub(crate) fn active_goal(&self) -> Option<&str> {
         self.persistent_state().active_goal.as_deref()
+    }
+
+    pub(crate) fn plan_state(&self) -> Option<&PlanState> {
+        self.persistent_state().session.active_plan()
+    }
+
+    pub(crate) fn active_plan(&self) -> Option<&str> {
+        self.plan_state().and_then(PlanState::ready)
+    }
+
+    pub(crate) fn plan_ready_this_turn(&self) -> bool {
+        self.plan_ready_this_turn
     }
 
     pub(crate) fn take_unaccepted_steers(&self) -> Vec<TurnInput> {
@@ -244,6 +273,33 @@ impl Conversation {
         let state = self.persistent_mut();
         state.session.append_goal_cancel()?;
         state.active_goal = None;
+        Ok(true)
+    }
+
+    pub(crate) fn start_plan(&mut self, input: TurnInput) -> Result<Option<String>, Error> {
+        let objective = input.text.clone();
+        if objective.trim().is_empty() {
+            return Err(Error::Config("plan objective is empty".into()));
+        }
+        let warning = self
+            .persistent_mut()
+            .checkpoints
+            .snapshot()
+            .err()
+            .map(|error| format!("Could not checkpoint for /undo: {error}"));
+        let message = Message::user_input(input);
+        self.persistent_mut()
+            .session
+            .append_plan_start(&objective, &message)?;
+        self.messages.push(message);
+        Ok(warning)
+    }
+
+    pub(crate) fn cancel_plan(&mut self) -> Result<bool, Error> {
+        if self.plan_state().is_none() {
+            return Ok(false);
+        }
+        self.persistent_mut().session.append_plan_cancel()?;
         Ok(true)
     }
 
@@ -395,6 +451,9 @@ impl Conversation {
         {
             registry.retain_names(allowed);
         }
+        if matches!(&self.kind, ConversationKind::Persistent(_)) && self.questions.is_enabled() {
+            registry.advertise_user_input(self.questions.clone());
+        }
         registry
     }
 
@@ -455,10 +514,11 @@ impl Conversation {
         };
         let dropped = self.messages.len() - start;
         let clear_goal = self.messages[start..].iter().any(Message::is_goal_start);
+        let plan_state = self.persistent_state().session.plan_before_turn().cloned();
         let restore = self.persistent_mut().checkpoints.restore_last()?;
         self.persistent_mut()
             .session
-            .append_undo_event(dropped, clear_goal)?;
+            .append_undo_event_with_plan(dropped, clear_goal, plan_state)?;
         self.messages.truncate(start);
         if clear_goal {
             self.persistent_mut().active_goal = None;

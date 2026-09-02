@@ -784,6 +784,410 @@ fn goal_mode_rejects_mixed_goal_complete_batches() {
 }
 
 #[test]
+fn planning_requires_three_questions_then_persists_the_completed_plan() {
+    let mut test = TestAgent::new("plan-complete");
+    test.agent.enable_interactive_questions();
+    test.agent
+        .start_plan("add planning mode".to_string().into())
+        .expect("start plan");
+    let question_arguments = serde_json::json!({
+        "questions": (1..=3).map(|index| serde_json::json!({
+            "id": format!("q{index}"),
+            "question": format!("Choice {index}?"),
+            "options": [
+                {"label": "Recommended", "description": "use the default"},
+                {"label": "Alternative", "description": "use another approach"}
+            ],
+            "recommended": 0
+        })).collect::<Vec<_>>()
+    })
+    .to_string();
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "questions-invalid".into(),
+                name: crate::tools::USER_INPUT_TOOL_NAME.into(),
+                arguments: serde_json::json!({
+                    "questions": [
+                        {"id":"one","question":"One?","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}],"recommended":0},
+                        {"id":"two","question":"Two?","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}],"recommended":0}
+                    ]
+                })
+                .to_string(),
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "questions-1".into(),
+                name: crate::tools::USER_INPUT_TOOL_NAME.into(),
+                arguments: question_arguments,
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "plan-1".into(),
+                name: crate::tools::PLAN_COMPLETE_TOOL_NAME.into(),
+                arguments: r##"{"plan":"# Plan\n\n1. Build it."}"##.into(),
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+    ])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
+    let broker = test.agent.question_broker();
+    let responder = std::thread::spawn(move || {
+        let mut answered = 0;
+        while answered < 3 {
+            if let Some(snapshot) = broker.snapshot() {
+                broker
+                    .answer(snapshot.request_id, snapshot.question.recommended)
+                    .expect("answer question");
+                answered += 1;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    });
+
+    let completed = test
+        .agent
+        .run_plan_with(&mut |_| {}, &mut resolve)
+        .expect("planning should complete");
+    responder.join().expect("question responder");
+
+    assert!(completed);
+    assert!(test.agent.messages.iter().any(|message| {
+        message.tool_call_id.as_deref() == Some("questions-invalid")
+            && message.is_error
+            && message.content.contains("exactly three")
+    }));
+    assert_eq!(test.agent.active_plan(), Some("# Plan\n\n1. Build it."));
+    assert!(matches!(
+        test.agent.plan_state(),
+        Some(crate::session::PlanState::Ready { .. })
+    ));
+
+    let failed_steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Fail])));
+    let mut failed_resolve = scripted_resolve(failed_steps, Rc::new(RefCell::new(Vec::new())));
+    assert!(
+        test.agent
+            .run_plan_implementation_with(
+                Some("implement it".to_string().into()),
+                &mut |_| {},
+                &mut failed_resolve,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        test.agent.active_plan(),
+        Some("# Plan\n\n1. Build it."),
+        "implementation errors must retain the active plan"
+    );
+}
+
+#[test]
+fn unrelated_follow_up_replies_normally_and_leaves_the_plan_active() {
+    let mut test = TestAgent::new("plan-followup");
+    test.agent.enable_interactive_questions();
+    test.agent
+        .start_plan("add planning mode".to_string().into())
+        .expect("start plan");
+    let question_arguments = serde_json::json!({
+        "questions": (1..=3).map(|index| serde_json::json!({
+            "id": format!("q{index}"),
+            "question": format!("Choice {index}?"),
+            "options": [
+                {"label": "Recommended", "description": "use the default"},
+                {"label": "Alternative", "description": "use another approach"}
+            ],
+            "recommended": 0
+        })).collect::<Vec<_>>()
+    })
+    .to_string();
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "questions-1".into(),
+                name: crate::tools::USER_INPUT_TOOL_NAME.into(),
+                arguments: question_arguments,
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "plan-1".into(),
+                name: crate::tools::PLAN_COMPLETE_TOOL_NAME.into(),
+                arguments: r##"{"plan":"# Plan\n\n1. Build it."}"##.into(),
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+    ])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
+    let broker = test.agent.question_broker();
+    let responder = std::thread::spawn(move || {
+        let mut answered = 0;
+        while answered < 3 {
+            if let Some(snapshot) = broker.snapshot() {
+                broker
+                    .answer(snapshot.request_id, snapshot.question.recommended)
+                    .expect("answer question");
+                answered += 1;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    });
+
+    let completed = test
+        .agent
+        .run_plan_with(&mut |_| {}, &mut resolve)
+        .expect("planning should complete");
+    responder.join().expect("question responder");
+
+    assert!(completed);
+    assert!(test.agent.plan_ready_this_turn());
+    assert_eq!(test.agent.active_plan(), Some("# Plan\n\n1. Build it."));
+
+    let reply_steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
+        text: "This plan adds a planning mode before implementation starts.",
+        tool_calls: Vec::new(),
+        input_tokens: 10,
+        output_tokens: 2,
+    }])));
+    let mut reply_resolve = scripted_resolve(reply_steps, Rc::new(RefCell::new(Vec::new())));
+
+    let completed = test
+        .agent
+        .run_plan_follow_up_with(
+            "what is this plan about?".to_string().into(),
+            &mut |_| {},
+            &mut reply_resolve,
+        )
+        .expect("unrelated follow-up should complete");
+
+    assert!(completed);
+    assert!(
+        !test.agent.plan_ready_this_turn(),
+        "a text reply must not offer the plan handoff picker"
+    );
+    assert_eq!(test.agent.active_plan(), Some("# Plan\n\n1. Build it."));
+    assert_eq!(
+        test.agent
+            .messages
+            .last()
+            .map(|message| message.content.as_str()),
+        Some("This plan adds a planning mode before implementation starts."),
+        "a text reply ends the turn without a plan continuation"
+    );
+}
+
+#[test]
+fn resumed_plan_remembers_that_requirements_were_answered() {
+    let mut test = TestAgent::new("plan-question-resume");
+    test.agent.enable_interactive_questions();
+    test.agent
+        .start_plan("add planning mode".to_string().into())
+        .expect("start plan");
+    let question_arguments = serde_json::json!({
+        "questions": (1..=3).map(|index| serde_json::json!({
+            "id": format!("q{index}"),
+            "question": format!("Choice {index}?"),
+            "options": [
+                {"label": "Recommended", "description": "use the default"},
+                {"label": "Alternative", "description": "use another approach"}
+            ],
+            "recommended": 0
+        })).collect::<Vec<_>>()
+    })
+    .to_string();
+    let first_steps = Rc::new(RefCell::new(VecDeque::from([
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "questions-1".into(),
+                name: crate::tools::USER_INPUT_TOOL_NAME.into(),
+                arguments: question_arguments,
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+        ProviderStep::Fail,
+    ])));
+    let mut first_resolve = scripted_resolve(first_steps, Rc::new(RefCell::new(Vec::new())));
+    let broker = test.agent.question_broker();
+    let responder = std::thread::spawn(move || {
+        let mut answered = 0;
+        while answered < 3 {
+            if let Some(snapshot) = broker.snapshot() {
+                broker
+                    .answer(snapshot.request_id, snapshot.question.recommended)
+                    .expect("answer question");
+                answered += 1;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    });
+
+    assert!(
+        test.agent
+            .run_plan_with(&mut |_| {}, &mut first_resolve)
+            .is_err()
+    );
+    responder.join().expect("question responder");
+    assert!(
+        test.agent
+            .plan_state()
+            .is_some_and(crate::session::PlanState::questions_asked)
+    );
+
+    let resumed_steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
+        text: "",
+        tool_calls: vec![ToolCall {
+            id: "plan-1".into(),
+            name: crate::tools::PLAN_COMPLETE_TOOL_NAME.into(),
+            arguments: r##"{"plan":"# Plan\n\n1. Build it."}"##.into(),
+        }],
+        input_tokens: 10,
+        output_tokens: 2,
+    }])));
+    let mut resumed_resolve = scripted_resolve(resumed_steps, Rc::new(RefCell::new(Vec::new())));
+    assert!(
+        test.agent
+            .run_plan_with(&mut |_| {}, &mut resumed_resolve)
+            .expect("resumed plan should complete without another question batch")
+    );
+    assert_eq!(test.agent.active_plan(), Some("# Plan\n\n1. Build it."));
+}
+
+#[test]
+fn unrelated_plan_follow_up_transitions_to_the_full_tool_registry() {
+    let mut test = TestAgent::new("plan-unrelated-tools");
+    test.agent
+        .start_plan("add planning mode".to_string().into())
+        .expect("start plan");
+    let ready = Message::assistant("# Plan".into(), vec![]);
+    test.agent
+        .persistent_mut()
+        .session
+        .append_plan_ready("# Plan", &ready)
+        .expect("ready plan");
+    test.agent.messages.push(ready);
+    let output_path = test.root.join("unrelated.txt");
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "classify-1".into(),
+                name: crate::tools::PLAN_ACTION_TOOL_NAME.into(),
+                arguments: r#"{"action":"unrelated"}"#.into(),
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "write-1".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({
+                    "path": output_path,
+                    "content": "done"
+                })
+                .to_string(),
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+        ProviderStep::Output {
+            text: "Completed the unrelated request.",
+            tool_calls: Vec::new(),
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+    ])));
+    let mut resolve = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
+
+    assert!(
+        test.agent
+            .run_plan_follow_up_with(
+                "write an unrelated file".to_string().into(),
+                &mut |_| {},
+                &mut resolve,
+            )
+            .expect("unrelated request should run normally")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&output_path).expect("unrelated write should run"),
+        "done"
+    );
+    assert_eq!(test.agent.active_plan(), Some("# Plan"));
+}
+
+#[test]
+fn plan_implementation_receives_deferred_subagent_results() {
+    let mut test = TestAgent::new("plan-subagent-results");
+    test.agent.config.subagents = true;
+    test.agent
+        .start_plan("add planning mode".to_string().into())
+        .expect("start plan");
+    let ready = Message::assistant("# Plan".into(), vec![]);
+    test.agent
+        .persistent_mut()
+        .session
+        .append_plan_ready("# Plan", &ready)
+        .expect("ready plan");
+    test.agent.messages.push(ready);
+    test.agent.subagent_manager().push_test_deferred(
+        1,
+        "worker",
+        crate::subagent::RunOutcome::Completed,
+        "child result",
+    );
+    let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
+        text: "",
+        tool_calls: vec![ToolCall {
+            id: "implemented-1".into(),
+            name: crate::tools::PLAN_IMPLEMENTED_TOOL_NAME.into(),
+            arguments: r#"{"result":"Implemented the plan."}"#.into(),
+        }],
+        input_tokens: 10,
+        output_tokens: 2,
+    }])));
+    let mut resolve = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
+
+    assert!(
+        test.agent
+            .run_plan_implementation_with(
+                Some("implement it".to_string().into()),
+                &mut |_| {},
+                &mut resolve,
+            )
+            .expect("implementation should complete")
+    );
+    assert!(test.agent.messages.iter().any(|message| {
+        message
+            .subagent_results
+            .iter()
+            .any(|result| result.content == "child result")
+    }));
+    assert_eq!(test.agent.active_plan(), None);
+}
+
+#[test]
 fn steering_skips_pending_tools_and_injects_the_steer_message() {
     let mut test = TestAgent::new("steer-tools");
     test.agent.steer_inbox().push(crate::provider::TurnInput {

@@ -25,6 +25,7 @@ enum Tone {
 struct ToolLine {
     text: String,
     tone: Tone,
+    wrap: bool,
 }
 
 struct BackgroundStartDetails {
@@ -44,7 +45,13 @@ impl ToolLine {
         Self {
             text: text.into(),
             tone,
+            wrap: false,
         }
+    }
+
+    fn wrapping(mut self) -> Self {
+        self.wrap = true;
+        self
     }
 }
 
@@ -104,18 +111,35 @@ pub(super) fn render_labeled(
     } else {
         None
     };
-    let mut lines = render_call(
-        name,
-        parsed.as_ref(),
-        args,
-        background_start,
-        background_details.as_ref(),
-        running,
-        elapsed,
-        is_error,
-        labels,
-        expanded,
-    );
+    let mut lines = if name == crate::tools::USER_INPUT_TOOL_NAME && !running && !is_error {
+        render_question_answers(parsed.as_ref(), output).unwrap_or_else(|| {
+            render_call(
+                name,
+                parsed.as_ref(),
+                args,
+                background_start,
+                background_details.as_ref(),
+                running,
+                elapsed,
+                is_error,
+                labels,
+                expanded,
+            )
+        })
+    } else {
+        render_call(
+            name,
+            parsed.as_ref(),
+            args,
+            background_start,
+            background_details.as_ref(),
+            running,
+            elapsed,
+            is_error,
+            labels,
+            expanded,
+        )
+    };
 
     if let Some(details) = background_details {
         lines.push(ToolLine::new("", Tone::Output));
@@ -228,11 +252,14 @@ fn render_call(
     match name {
         "shell" => {
             let command = string_arg(args, "command").unwrap_or(raw_args);
-            let mut call = prefixed_lines(command, "$ ", "  ", Tone::Header);
-            if let Some(first) = call.first_mut() {
-                first.text.push_str(status);
+            let mut call = prefixed_lines(command, "$ ", "  ", Tone::Header)
+                .into_iter()
+                .map(ToolLine::wrapping)
+                .collect::<Vec<_>>();
+            if let Some(last) = call.last_mut() {
+                last.text.push_str(status);
             }
-            preview_lines(call, CALL_PREVIEW_LINES, expanded, false)
+            call
         }
         "shell_output" => vec![ToolLine::new(
             format!(
@@ -381,7 +408,54 @@ fn should_show_output(name: &str, output: &str, is_error: bool) -> bool {
     if output.is_empty() || output == "(no output; command succeeded)" {
         return false;
     }
-    is_error || !matches!(name, "write_file" | "edit_file")
+    is_error
+        || !matches!(
+            name,
+            "write_file" | "edit_file" | crate::tools::USER_INPUT_TOOL_NAME
+        )
+}
+
+fn render_question_answers(args: Option<&Value>, output: &str) -> Option<Vec<ToolLine>> {
+    let questions = args?.get("questions")?.as_array()?;
+    let result: Value = serde_json::from_str(output).ok()?;
+    let answers = result.get("answers")?.as_array()?;
+    let timed_out = result
+        .get("timed_out")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut lines = vec![ToolLine::new(
+        if timed_out {
+            "Questions answered · timed out"
+        } else {
+            "Questions answered"
+        },
+        Tone::Header,
+    )];
+    for question in questions {
+        let id = question.get("id").and_then(Value::as_str).unwrap_or("?");
+        let prompt = question
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or(id);
+        let answer = answers
+            .iter()
+            .find(|answer| answer.get("id").and_then(Value::as_str) == Some(id));
+        let label = answer
+            .and_then(|answer| answer.get("answer").or_else(|| answer.get("label")))
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
+        let timeout = answer
+            .and_then(|answer| answer.get("source"))
+            .and_then(Value::as_str)
+            .filter(|source| *source == "timeout")
+            .map_or("", |_| " [timeout]");
+        lines.push(ToolLine::new(
+            format!("{prompt} → {label}{timeout}"),
+            Tone::Output,
+        ));
+    }
+    Some(lines)
 }
 
 fn string_arg<'a>(args: Option<&'a Value>, key: &str) -> Option<&'a str> {
@@ -706,7 +780,7 @@ fn render_line(
     background: &str,
 ) -> Vec<String> {
     let sanitized = sanitize_line(&line.text);
-    let chunks = if expanded {
+    let chunks = if expanded || line.wrap {
         wrap_chars(&sanitized, content_width)
     } else {
         vec![truncate_chars(&sanitized, content_width)]
@@ -774,6 +848,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn question_batch_renders_compact_answers_and_timeout_markers() {
+        let args = r#"{"questions":[{"id":"scope","question":"Which scope?","options":[{"label":"Focused","description":"small"},{"label":"Broad","description":"large"}],"recommended":0},{"id":"tests","question":"Which tests?","options":[{"label":"Focused","description":"small"},{"label":"All","description":"large"}],"recommended":1}]}"#;
+        let output = r#"{"answers":[{"id":"scope","option_index":0,"label":"Focused","source":"user"},{"id":"tests","option_index":1,"label":"All","source":"timeout"}],"timed_out":true}"#;
+
+        let rendered = render(
+            crate::tools::USER_INPUT_TOOL_NAME,
+            args,
+            output,
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&rendered.join("\n"));
+        assert!(plain.contains("Which scope? → Focused"));
+        assert!(plain.contains("Which tests? → All [timeout]"));
+        assert!(!plain.contains("option_index"));
+    }
+
+    #[test]
+    fn question_batch_renders_custom_answer_text() {
+        let args = r#"{"questions":[{"id":"scope","question":"Which scope?","options":[{"label":"Focused","description":"small"},{"label":"Broad","description":"large"}],"recommended":0}]}"#;
+        let output = r#"{"answers":[{"id":"scope","option_index":null,"label":"Other","answer":"Only update keyboard navigation","source":"user"}],"timed_out":false}"#;
+
+        let rendered = render(
+            crate::tools::USER_INPUT_TOOL_NAME,
+            args,
+            output,
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&rendered.join("\n"));
+        assert!(plain.contains("Which scope? → Only update keyboard navigation"));
+        assert!(!plain.contains("→ Other"));
+    }
+
+    #[test]
     fn compact_shell_preview_keeps_the_tail() {
         let output = (1..=20)
             .map(|line| format!("line {line}"))
@@ -793,6 +908,59 @@ mod tests {
         assert!(plain.contains("10 earlier lines"));
         assert!(!plain.contains("line 1 "));
         assert!(plain.contains("line 20"));
+    }
+
+    #[test]
+    fn shell_command_wraps_fully_while_expansion_only_changes_output() {
+        let args = serde_json::json!({
+            "command": "command -v chromium || command -v chromium-browser && final-marker"
+        })
+        .to_string();
+        let output = (1..=20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let compact = render(
+            "shell",
+            &args,
+            &output,
+            false,
+            true,
+            Some(Duration::from_secs(7)),
+            36,
+            false,
+        );
+        let expanded = render(
+            "shell",
+            &args,
+            &output,
+            false,
+            true,
+            Some(Duration::from_secs(7)),
+            36,
+            true,
+        );
+        let compact = markdown::strip_ansi(&compact.join("\n"));
+        let expanded = markdown::strip_ansi(&expanded.join("\n"));
+
+        for rendered in [&compact, &expanded] {
+            assert!(rendered.contains("final-marker"), "{rendered}");
+            assert!(rendered.contains("[running 7s]"), "{rendered}");
+        }
+        let compact_call = compact
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        let expanded_call = expanded
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(compact_call, expanded_call);
+        assert!(!compact.contains("line 1 "));
+        assert!(expanded.contains("line 1 "));
     }
 
     #[test]

@@ -5,6 +5,8 @@
 //! wins (builtins < `~/.yawl/tools` < `./.yawl/tools`).
 
 pub mod exec;
+mod planning_shell;
+mod user_input;
 mod web;
 
 use std::io::Read;
@@ -21,6 +23,9 @@ use crate::subagent::presets::discover as discover_presets;
 use crate::subagent::{AgentPreset, RunOrigin, SubagentManager};
 
 pub use exec::DescribeCache;
+pub(crate) use user_input::{QuestionBroker, QuestionSnapshot};
+#[cfg(test)]
+pub(crate) use user_input::{QuestionOption, UserQuestion};
 
 /// Cap on tool result size fed back to the model.
 const MAX_RESULT_CHARS: usize = 60_000;
@@ -41,6 +46,11 @@ enum ToolImpl {
     WebSearch,
     WebFetch,
     GoalComplete,
+    PlanningShell,
+    UserInput(QuestionBroker),
+    PlanComplete,
+    PlanAction,
+    PlanImplemented,
     Exec(exec::ExecTool),
     Subagent(SubagentTool),
 }
@@ -121,7 +131,7 @@ impl Registry {
         if let Some(shell) = registry
             .entries
             .iter_mut()
-            .find(|entry| entry.spec.name == "shell" && matches!(entry.imp, ToolImpl::Shell))
+            .find(|entry| entry.spec.name == "shell" && matches!(&entry.imp, ToolImpl::Shell))
         {
             *shell = shell_entry(true);
         }
@@ -255,6 +265,40 @@ impl Registry {
         self.insert(goal_complete_entry());
     }
 
+    pub(crate) fn advertise_user_input(&mut self, broker: QuestionBroker) {
+        self.insert(user_input_entry(broker));
+    }
+
+    pub(crate) fn advertise_plan_complete(&mut self) {
+        self.insert(plan_complete_entry());
+    }
+
+    pub(crate) fn advertise_plan_action(&mut self) {
+        self.insert(plan_action_entry());
+    }
+
+    pub(crate) fn advertise_plan_implemented(&mut self) {
+        self.insert(plan_implemented_entry());
+    }
+
+    /// Keeps only read tools and replaces the unrestricted shell with its
+    /// planning-only inspection gate.
+    pub(crate) fn retain_for_planning(&mut self) {
+        self.entries.retain(|entry| {
+            matches!(
+                &entry.imp,
+                ToolImpl::Shell
+                    | ToolImpl::ReadFile
+                    | ToolImpl::ReadSkill
+                    | ToolImpl::WebSearch
+                    | ToolImpl::WebFetch
+                    | ToolImpl::UserInput(_)
+                    | ToolImpl::PlanComplete
+            )
+        });
+        self.insert(planning_shell_entry());
+    }
+
     pub(crate) fn skills(&self) -> &[Skill] {
         &self.skills
     }
@@ -262,20 +306,24 @@ impl Registry {
     pub(crate) fn has_web_tools(&self) -> bool {
         self.entries
             .iter()
-            .any(|entry| matches!(entry.imp, ToolImpl::WebSearch | ToolImpl::WebFetch))
+            .any(|entry| matches!(&entry.imp, ToolImpl::WebSearch | ToolImpl::WebFetch))
     }
 
     /// Name, description, and origin for `/tools` and `--list-tools`.
     pub fn describe_all(&self) -> Vec<(String, String, String)> {
         self.entries
             .iter()
-            .filter(|entry| !matches!(entry.imp, ToolImpl::GoalComplete))
+            .filter(|entry| !is_private_tool(&entry.imp))
             .map(|e| {
                 let origin = match &e.imp {
                     ToolImpl::Exec(t) => t.path.display().to_string(),
                     ToolImpl::Subagent(_) => "orchestration".to_string(),
                     ToolImpl::ReadSkill => "skills".to_string(),
                     ToolImpl::GoalComplete => "internal".to_string(),
+                    ToolImpl::PlanComplete | ToolImpl::PlanAction | ToolImpl::PlanImplemented => {
+                        "internal".to_string()
+                    }
+                    ToolImpl::UserInput(_) => "interactive".to_string(),
                     ToolImpl::ShellList | ToolImpl::ShellOutput | ToolImpl::ShellStop => {
                         "builtin".to_string()
                     }
@@ -323,6 +371,21 @@ impl Registry {
             ToolImpl::WebSearch => self.execute_web(&args, true),
             ToolImpl::WebFetch => self.execute_web(&args, false),
             ToolImpl::GoalComplete => goal_complete_outcome(&args),
+            ToolImpl::PlanningShell => match planning_shell::prepare(&args) {
+                Ok(args) => {
+                    shell_with_path(&args, None, planning_shell::inspection_path().as_deref())
+                }
+                Err(error) => ToolOutcome::error(error),
+            },
+            ToolImpl::UserInput(broker) => match user_input::parse_questions(&args)
+                .and_then(|questions| broker.ask(questions))
+            {
+                Ok(content) => ToolOutcome::ok(content),
+                Err(error) => ToolOutcome::error(error),
+            },
+            ToolImpl::PlanComplete => plan_complete_outcome(&args),
+            ToolImpl::PlanAction => plan_action_outcome(&args),
+            ToolImpl::PlanImplemented => plan_implemented_outcome(&args),
             ToolImpl::Exec(tool) => {
                 let (content, is_error) = exec::invoke(tool, args_json, session_id);
                 ToolOutcome {
@@ -472,9 +535,43 @@ const RESERVED_TOOL_NAMES: &[&str] = &[
     "subagent_cancel",
     "subagent_list",
     "goal_complete",
+    "request_user_input",
+    "plan_complete",
+    "plan_action",
+    "plan_implemented",
 ];
 const WEB_TOOL_NAMES: &[&str] = &["web_search", "web_fetch"];
 pub(crate) const GOAL_COMPLETE_TOOL_NAME: &str = "goal_complete";
+pub(crate) const USER_INPUT_TOOL_NAME: &str = user_input::TOOL_NAME;
+pub(crate) const PLAN_COMPLETE_TOOL_NAME: &str = "plan_complete";
+pub(crate) const PLAN_ACTION_TOOL_NAME: &str = "plan_action";
+pub(crate) const PLAN_IMPLEMENTED_TOOL_NAME: &str = "plan_implemented";
+
+pub(crate) fn validate_user_input(arguments: &str) -> Result<usize, String> {
+    let value: Value = serde_json::from_str(arguments)
+        .map_err(|error| format!("invalid tool arguments json: {error}"))?;
+    user_input::parse_questions(&value).map(|questions| questions.len())
+}
+
+fn is_private_tool(tool: &ToolImpl) -> bool {
+    matches!(
+        tool,
+        ToolImpl::GoalComplete
+            | ToolImpl::PlanComplete
+            | ToolImpl::PlanAction
+            | ToolImpl::PlanImplemented
+    )
+}
+
+pub(crate) fn is_private_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        GOAL_COMPLETE_TOOL_NAME
+            | PLAN_COMPLETE_TOOL_NAME
+            | PLAN_ACTION_TOOL_NAME
+            | PLAN_IMPLEMENTED_TOOL_NAME
+    )
+}
 
 fn reserved_tool_name(config: &Config, name: &str) -> bool {
     RESERVED_TOOL_NAMES.contains(&name) || (config.web_browsing && WEB_TOOL_NAMES.contains(&name))
@@ -517,10 +614,148 @@ fn goal_complete_entry() -> ToolEntry {
     }
 }
 
+fn planning_shell_entry() -> ToolEntry {
+    ToolEntry {
+        spec: ToolSpec {
+            name: "shell".into(),
+            description: "Run a read-only repository inspection command. Pipelines are allowed between: basename, cat, cut, dirname, du, git, grep, head, ls, pwd, readlink, realpath, rg, sed, stat, tail, tr, and wc. Git is limited to read-only subcommands, sed to print-only ranges, and rg cannot use preprocessors. Redirection, chaining, expansion, background execution, and other commands are rejected."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Seconds; defaults to 120."
+                    }
+                },
+                "required": ["command"]
+            }),
+        },
+        imp: ToolImpl::PlanningShell,
+    }
+}
+
 fn goal_complete_outcome(args: &Value) -> ToolOutcome {
     match args.get("result").and_then(Value::as_str).map(str::trim) {
         Some(result) if !result.is_empty() => ToolOutcome::ok(result.to_string()),
         _ => ToolOutcome::error("goal_complete requires a non-empty string 'result'"),
+    }
+}
+
+fn user_input_entry(broker: QuestionBroker) -> ToolEntry {
+    ToolEntry {
+        spec: ToolSpec {
+            name: USER_INPUT_TOOL_NAME.into(),
+            description: "Ask the user one to three multiple-choice questions. Each question needs 2 or 3 options and one recommended option. Yawl adds an open-answer choice automatically; custom replies have a null option_index and their text in answer. Set the recommendation with the recommended index; do not add '(Recommended)' to an option label. This must be the only tool call in its step. If the result says timed_out, do not ask again in this turn.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "question": {"type": "string"},
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 3,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {
+                                                "type": "string",
+                                                "description": "Short answer label without a recommendation marker"
+                                            },
+                                            "description": {"type": "string"}
+                                        },
+                                        "required": ["label", "description"]
+                                    }
+                                },
+                                "recommended": {"type": "integer", "minimum": 0, "maximum": 2}
+                            },
+                            "required": ["id", "question", "options", "recommended"]
+                        }
+                    }
+                },
+                "required": ["questions"]
+            }),
+        },
+        imp: ToolImpl::UserInput(broker),
+    }
+}
+
+fn plan_complete_entry() -> ToolEntry {
+    ToolEntry {
+        spec: ToolSpec {
+            name: PLAN_COMPLETE_TOOL_NAME.into(),
+            description: "Finish planning with the complete Markdown plan. This must be the only tool call in its step.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"plan": {"type": "string"}},
+                "required": ["plan"]
+            }),
+        },
+        imp: ToolImpl::PlanComplete,
+    }
+}
+
+fn plan_action_entry() -> ToolEntry {
+    ToolEntry {
+        spec: ToolSpec {
+            name: PLAN_ACTION_TOOL_NAME.into(),
+            description: "Classify the user's latest request against the active plan. Use unrelated to continue the request as a normal turn with the full tool set. This must be the only tool call in its step.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"action": {"type": "string", "enum": ["revise", "implement", "unrelated"]}},
+                "required": ["action"]
+            }),
+        },
+        imp: ToolImpl::PlanAction,
+    }
+}
+
+fn plan_implemented_entry() -> ToolEntry {
+    ToolEntry {
+        spec: ToolSpec {
+            name: PLAN_IMPLEMENTED_TOOL_NAME.into(),
+            description: "Finish implementation of the active plan with the final user-facing result. This must be the only tool call in its step.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"result": {"type": "string"}},
+                "required": ["result"]
+            }),
+        },
+        imp: ToolImpl::PlanImplemented,
+    }
+}
+
+fn plan_complete_outcome(args: &Value) -> ToolOutcome {
+    non_empty_arg(args, "plan", PLAN_COMPLETE_TOOL_NAME)
+}
+
+fn plan_action_outcome(args: &Value) -> ToolOutcome {
+    match args.get("action").and_then(Value::as_str) {
+        Some(action @ ("revise" | "implement" | "unrelated")) => ToolOutcome::ok(action.into()),
+        _ => {
+            ToolOutcome::error("plan_action requires action 'revise', 'implement', or 'unrelated'")
+        }
+    }
+}
+
+fn plan_implemented_outcome(args: &Value) -> ToolOutcome {
+    non_empty_arg(args, "result", PLAN_IMPLEMENTED_TOOL_NAME)
+}
+
+fn non_empty_arg(args: &Value, key: &str, tool: &str) -> ToolOutcome {
+    match args.get(key).and_then(Value::as_str).map(str::trim) {
+        Some(value) if !value.is_empty() => ToolOutcome::ok(value.to_string()),
+        _ => ToolOutcome::error(format!("{tool} requires a non-empty string '{key}'")),
     }
 }
 
@@ -825,6 +1060,14 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolOutcome> {
 }
 
 fn shell(args: &Value, background: Option<&BackgroundProcessManager>) -> ToolOutcome {
+    shell_with_path(args, background, None)
+}
+
+fn shell_with_path(
+    args: &Value,
+    background: Option<&BackgroundProcessManager>,
+    path: Option<&std::ffi::OsStr>,
+) -> ToolOutcome {
     let command = match str_arg(args, "command") {
         Ok(c) => c,
         Err(e) => return e,
@@ -882,6 +1125,9 @@ fn shell(args: &Value, background: Option<&BackgroundProcessManager>) -> ToolOut
     let timeout = Duration::from_secs(timeout_secs);
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c").arg(command);
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
     match exec::run_with_timeout(cmd, None, timeout) {
         Ok(result) => {
             let (content, is_error) = exec::render_result(&result, timeout);
@@ -1638,6 +1884,76 @@ fi
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, ["read_file", "shell"]);
+    }
+
+    #[test]
+    fn planning_registry_gates_shell_to_read_only_inspection() {
+        let root = temp_path("planning-registry");
+        let mut config = registry_config(root.join("home"), root.join("project"));
+        config.web_browsing = true;
+        let manager = SubagentManager::new("session".into(), config.max_subagents);
+        let mut registry = Registry::scan_with_subagents_and_background(
+            &config,
+            &mut DescribeCache::default(),
+            manager.clone(),
+            "test",
+            BackgroundProcessManager::default(),
+        );
+        let broker = QuestionBroker::default();
+        broker.enable();
+        registry.advertise_user_input(broker);
+
+        registry.retain_for_planning();
+        registry.advertise_plan_complete();
+
+        let names = registry
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<std::collections::HashSet<_>>();
+        for required in [
+            "shell",
+            "read_file",
+            "web_search",
+            "web_fetch",
+            USER_INPUT_TOOL_NAME,
+            PLAN_COMPLETE_TOOL_NAME,
+        ] {
+            assert!(names.contains(required), "missing planning tool {required}");
+        }
+        for forbidden in [
+            "write_file",
+            "edit_file",
+            "shell_list",
+            "shell_output",
+            "shell_stop",
+            "subagent_spawn",
+            "subagent_wait",
+        ] {
+            assert!(
+                !names.contains(forbidden),
+                "planning exposed forbidden tool {forbidden}"
+            );
+        }
+        let inspection = registry.execute(
+            "shell",
+            r#"{"command":"rg --files | head -n 1"}"#,
+            "session",
+        );
+        assert!(!inspection.is_error, "{}", inspection.content);
+        let git = registry.execute("shell", r#"{"command":"git status --short"}"#, "session");
+        assert!(!git.is_error, "{}", git.content);
+        let mutation = registry.execute(
+            "shell",
+            r#"{"command":"printf nope > changed.txt"}"#,
+            "session",
+        );
+        assert!(mutation.is_error);
+        let git_mutation =
+            registry.execute("shell", r#"{"command":"git reset --hard"}"#, "session");
+        assert!(git_mutation.is_error);
+        assert!(!root.join("project/changed.txt").exists());
+        manager.shutdown_and_discard();
     }
 
     #[test]

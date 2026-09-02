@@ -45,23 +45,24 @@ use crate::agent::Agent;
 use crate::error::Error;
 
 use self::commands::{
-    GoalAction, HELP, activate_picker_action, copy_all_messages, copy_last_reply, goal,
-    is_new_session_command, notice_undo, open_resume_picker, resume, settings, show_skills,
-    unqueue,
+    GoalAction, HELP, PlanAction, activate_picker_action, copy_all_messages, copy_last_reply, goal,
+    is_new_session_command, notice_undo, open_resume_picker, plan, plan_handoff_picker, reasoning,
+    refresh_model_selection, resume, settings, show_skills, unqueue,
 };
 use self::completion::handle_completion_key;
 use self::events::{Event, EventReader, Key};
 use self::input::{EditAction, Editor, Submission};
 use self::picker::{
     open_model_picker, open_reasoning_picker, open_settings_picker, picker_is_editing,
-    take_picker_action,
+    picker_is_plan_handoff, take_picker_action,
 };
 use self::state::{Update, ViewState, advance_ticks, scroll, toggle_tool_expansion};
 use self::subagents::open_dashboard as open_subagent_dashboard;
 use self::terminal::Terminal;
 use self::transcript::Transcript;
 use self::worker::{
-    compact_interactive, deferred_subagents_interactive, handle_mouse_selection, turn_interactive,
+    TurnKind, compact_interactive, deferred_subagents_interactive, handle_mouse_selection,
+    turn_interactive,
 };
 
 #[cfg(test)]
@@ -106,6 +107,7 @@ const USER_TEXT: &str = "\x1b[38;2;208;208;214m";
 /// Returns terminal setup, rendering, session, or input errors.
 pub fn run(agent: &mut Agent) -> Result<(), Error> {
     crate::install_interrupt_handler()?;
+    agent.enable_interactive_questions();
     let mut terminal = Terminal::enter()?;
     let stdin = io::stdin();
     let mut events = EventReader::new(stdin.lock());
@@ -114,6 +116,19 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
     terminal.draw(&mut state, &editor)?;
 
     loop {
+        if state.pending_plan_implementation {
+            state.pending_plan_implementation = false;
+            run_agent_turn(
+                agent,
+                None,
+                TurnDispatch::PlanImplement(None),
+                &mut state,
+                &mut editor,
+                &mut terminal,
+                &mut events,
+            )?;
+            continue;
+        }
         if agent.has_deferred_subagent_results() {
             state.activity = "delivering subagent results".into();
             state.turn_started = Some(std::time::Instant::now());
@@ -184,14 +199,18 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                 break;
             }
             if state.picker.is_some() {
+                let plan_handoff = state.picker.as_ref().is_some_and(picker_is_plan_handoff);
                 match event {
                     Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
+                    Event::Key(Key::PageUp) if plan_handoff => scroll(&mut state, 10),
+                    Event::Key(Key::PageDown) if plan_handoff => scroll(&mut state, -10),
                     Event::Key(key) => {
                         if let Some(action) = take_picker_action(&mut state, &mut editor, key) {
                             activate_picker_action(agent, &mut state, action);
                         }
                     }
                     Event::Paste(text) if picker_is_editing(&state) => editor.paste(&text),
+                    Event::MouseScroll(amount) if plan_handoff => scroll(&mut state, amount),
                     Event::Mouse(mouse) => {
                         handle_mouse_selection(&mut terminal, &mut state, mouse)?
                     }
@@ -363,15 +382,14 @@ fn handle_submission<R: Read>(
             "model" if argument.is_empty() => open_model_picker(agent, state, false),
             "model" => {
                 agent.switch_model(argument.to_string());
-                state.model = agent.model().to_string();
-                state.context_window = agent.context_window();
-                state.context_tokens = 0;
+                refresh_model_selection(agent, state);
                 if crate::model::is_codex(agent.config(), agent.model()) {
                     open_reasoning_picker(agent, state, false);
                 } else {
                     state.notice(format!("Switched to {}.", agent.model()));
                 }
             }
+            "reasoning" => reasoning(agent, argument, state),
             "settings" if argument.is_empty() => open_settings_picker(agent, state),
             "settings" => {
                 let _ = settings(agent, argument, state);
@@ -453,12 +471,45 @@ fn handle_submission<R: Read>(
                     }
                 }
             }
+            "plan" => {
+                let (agent_argument, displayed) = prepare_goal_submission(editor, argument);
+                match plan(agent, &agent_argument, state) {
+                    PlanAction::None => {}
+                    PlanAction::Start => {
+                        run_agent_turn(
+                            agent,
+                            Some(displayed),
+                            TurnDispatch::Plan,
+                            state,
+                            editor,
+                            terminal,
+                            events,
+                        )?;
+                    }
+                    PlanAction::Resume => {
+                        run_agent_turn(
+                            agent,
+                            None,
+                            TurnDispatch::Plan,
+                            state,
+                            editor,
+                            terminal,
+                            events,
+                        )?;
+                    }
+                }
+            }
             "undo" => match agent.undo_last_turn() {
                 Ok(report) => {
                     state.transcript = Transcript::from_messages(agent.messages());
                     state.render_cache.invalidate();
                     state.context_tokens = agent.context_tokens();
                     state.active_goal = agent.active_goal().map(str::to_string);
+                    state.active_plan = agent.active_plan().map(str::to_string);
+                    state.plan_draft = matches!(
+                        agent.plan_state(),
+                        Some(crate::session::PlanState::Draft { .. })
+                    );
                     notice_undo(state, report);
                 }
                 Err(error) => state.notice(format!("Could not undo: {error}")),
@@ -481,10 +532,15 @@ fn handle_submission<R: Read>(
             return Ok(false);
         }
     };
+    let dispatch = if agent.active_plan().is_some() {
+        TurnDispatch::PlanFollowUp(agent_input)
+    } else {
+        TurnDispatch::Normal(Some(agent_input))
+    };
     run_agent_turn(
         agent,
         Some(displayed_input),
-        TurnDispatch::Normal(Some(agent_input)),
+        dispatch,
         state,
         editor,
         terminal,
@@ -502,6 +558,9 @@ enum GoalDispatch {
 enum TurnDispatch {
     Normal(Option<crate::provider::TurnInput>),
     Goal,
+    Plan,
+    PlanFollowUp(crate::provider::TurnInput),
+    PlanImplement(Option<crate::provider::TurnInput>),
 }
 
 fn prepare_goal_submission(editor: &Editor, argument: &str) -> (String, String) {
@@ -534,36 +593,60 @@ fn run_agent_turn<R: Read>(
     events: &mut EventReader<R>,
 ) -> Result<(), Error> {
     let goal_mode = matches!(&turn, TurnDispatch::Goal);
+    let kind = match &turn {
+        TurnDispatch::Normal(_) => TurnKind::Normal,
+        TurnDispatch::Goal => TurnKind::Goal,
+        TurnDispatch::Plan => TurnKind::Plan,
+        TurnDispatch::PlanFollowUp(_) => TurnKind::PlanFollowUp,
+        TurnDispatch::PlanImplement(_) => TurnKind::PlanImplement,
+    };
     if let Some(displayed_input) = displayed_input {
         state.transcript.push_user(displayed_input);
     }
     state.activity = "sending".into();
     state.turn_started = Some(std::time::Instant::now());
     state.active_goal = agent.active_goal().map(str::to_string);
+    state.active_plan = agent.active_plan().map(str::to_string);
+    state.plan_draft = matches!(
+        agent.plan_state(),
+        Some(crate::session::PlanState::Draft { .. })
+    );
     state.goal_running = goal_mode;
     state.scroll_offset = 0;
     terminal.draw(state, editor)?;
     let agent_input = match turn {
         TurnDispatch::Normal(input) => input,
         TurnDispatch::Goal => None,
+        TurnDispatch::Plan => None,
+        TurnDispatch::PlanFollowUp(input) => Some(input),
+        TurnDispatch::PlanImplement(input) => input,
     };
-    match turn_interactive(
-        agent,
-        agent_input,
-        goal_mode,
-        state,
-        editor,
-        terminal,
-        events,
-    ) {
-        Ok(true) => {}
-        Ok(false) | Err(Error::Interrupted) => state.notice("Turn interrupted."),
-        Err(error) => state.notice(format!("Request failed: {error}")),
-    }
+    let completed =
+        match turn_interactive(agent, agent_input, kind, state, editor, terminal, events) {
+            Ok(true) => true,
+            Ok(false) | Err(Error::Interrupted) => {
+                state.notice("Turn interrupted.");
+                false
+            }
+            Err(error) => {
+                state.notice(format!("Request failed: {error}"));
+                false
+            }
+        };
     crate::set_interrupted(false);
     state.activity.clear();
     state.turn_started = None;
     state.active_goal = agent.active_goal().map(str::to_string);
+    state.active_plan = agent.active_plan().map(str::to_string);
+    state.plan_draft = matches!(
+        agent.plan_state(),
+        Some(crate::session::PlanState::Draft { .. })
+    );
     state.goal_running = false;
+    // Only a turn that ended through plan_complete offers the handoff;
+    // follow-up turns replying to unrelated requests must not.
+    if completed && agent.plan_ready_this_turn() {
+        state.picker = Some(plan_handoff_picker());
+    }
     Ok(())
 }

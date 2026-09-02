@@ -16,6 +16,39 @@ use serde::{Deserialize, Serialize};
 use crate::error::Error;
 use crate::provider::{Message, Role, TokenUsage, UsageSummary};
 
+/// Planning state retained with a session, outside the working tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum PlanState {
+    Draft {
+        objective: String,
+        #[serde(default)]
+        questions_asked: bool,
+    },
+    Ready {
+        plan: String,
+    },
+}
+
+impl PlanState {
+    pub(crate) fn ready(&self) -> Option<&str> {
+        match self {
+            Self::Ready { plan } => Some(plan),
+            Self::Draft { .. } => None,
+        }
+    }
+
+    pub(crate) fn questions_asked(&self) -> bool {
+        matches!(
+            self,
+            Self::Draft {
+                questions_asked: true,
+                ..
+            }
+        )
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SessionEvent {
@@ -50,6 +83,10 @@ enum SessionEvent {
         /// Set when the dropped range includes a goal's starting message.
         #[serde(default)]
         clear_goal: bool,
+        /// Planning state to restore after dropping the turn. Older logs
+        /// predate planning and therefore default to no active plan.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_state: Option<PlanState>,
     },
     GoalStart {
         goal: String,
@@ -59,6 +96,21 @@ enum SessionEvent {
         message: Message,
     },
     GoalCancel,
+    PlanStart {
+        objective: String,
+        message: Message,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous: Option<PlanState>,
+    },
+    PlanReady {
+        plan: String,
+        message: Message,
+    },
+    PlanQuestionsAsked,
+    PlanImplemented {
+        message: Message,
+    },
+    PlanCancel,
     /// Provider-reported usage for one successful model request.
     Usage {
         usage: TokenUsage,
@@ -70,6 +122,16 @@ pub struct Session {
     pub id: String,
     file: File,
     active_goal: Option<String>,
+    active_plan: Option<PlanState>,
+    plan_before_turn: Option<PlanState>,
+    usage: UsageSummary,
+}
+
+struct ReplayedSession {
+    messages: Vec<Message>,
+    active_goal: Option<String>,
+    active_plan: Option<PlanState>,
+    plan_before_turn: Option<PlanState>,
     usage: UsageSummary,
 }
 
@@ -106,6 +168,8 @@ impl Session {
             id: id.clone(),
             file,
             active_goal: None,
+            active_plan: None,
+            plan_before_turn: None,
             usage: UsageSummary::default(),
         };
         session.append(&SessionEvent::Meta {
@@ -121,16 +185,18 @@ impl Session {
     pub fn open(dir: &Path, id: &str) -> Result<(Session, Vec<Message>), Error> {
         validate_id(id)?;
         let path = dir.join(format!("{id}.jsonl"));
-        let (messages, active_goal, usage) = replay(&path)?;
+        let replayed = replay(&path)?;
         let file = OpenOptions::new().append(true).open(&path)?;
         Ok((
             Session {
                 id: id.to_string(),
                 file,
-                active_goal,
-                usage,
+                active_goal: replayed.active_goal,
+                active_plan: replayed.active_plan,
+                plan_before_turn: replayed.plan_before_turn,
+                usage: replayed.usage,
             },
-            messages,
+            replayed.messages,
         ))
     }
 
@@ -170,6 +236,12 @@ impl Session {
     }
 
     pub fn append_message(&mut self, message: &Message) -> Result<(), Error> {
+        if message.role == Role::User
+            && (!message.is_hidden_control() || message.is_plan_implementation_start())
+            && !message.is_steering()
+        {
+            self.plan_before_turn.clone_from(&self.active_plan);
+        }
         self.append(&SessionEvent::Message {
             message: message.clone(),
         })
@@ -216,13 +288,25 @@ impl Session {
         dropped: usize,
         clear_goal: bool,
     ) -> Result<(), Error> {
+        self.append_undo_event_with_plan(dropped, clear_goal, None)
+    }
+
+    pub(crate) fn append_undo_event_with_plan(
+        &mut self,
+        dropped: usize,
+        clear_goal: bool,
+        plan_state: Option<PlanState>,
+    ) -> Result<(), Error> {
         self.append(&SessionEvent::Undo {
             dropped,
             clear_goal,
+            plan_state: plan_state.clone(),
         })?;
         if clear_goal {
             self.active_goal = None;
         }
+        self.active_plan = plan_state;
+        self.plan_before_turn = None;
         Ok(())
     }
 
@@ -251,6 +335,81 @@ impl Session {
 
     pub(crate) fn active_goal(&self) -> Option<&str> {
         self.active_goal.as_deref()
+    }
+
+    pub(crate) fn append_plan_start(
+        &mut self,
+        objective: &str,
+        message: &Message,
+    ) -> Result<(), Error> {
+        let previous = self.active_plan.clone();
+        self.append(&SessionEvent::PlanStart {
+            objective: objective.to_string(),
+            message: message.clone(),
+            previous: previous.clone(),
+        })?;
+        self.plan_before_turn = previous;
+        self.active_plan = Some(PlanState::Draft {
+            objective: objective.to_string(),
+            questions_asked: false,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn append_plan_questions_asked(&mut self) -> Result<(), Error> {
+        let Some(PlanState::Draft {
+            questions_asked, ..
+        }) = self.active_plan.as_ref()
+        else {
+            return Err(Error::Protocol(
+                "cannot record planning questions without a draft plan".into(),
+            ));
+        };
+        if *questions_asked {
+            return Ok(());
+        }
+        self.append(&SessionEvent::PlanQuestionsAsked)?;
+        if let Some(PlanState::Draft {
+            questions_asked, ..
+        }) = self.active_plan.as_mut()
+        {
+            *questions_asked = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_plan_ready(&mut self, plan: &str, message: &Message) -> Result<(), Error> {
+        self.append(&SessionEvent::PlanReady {
+            plan: plan.to_string(),
+            message: message.clone(),
+        })?;
+        self.active_plan = Some(PlanState::Ready {
+            plan: plan.to_string(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn append_plan_implemented(&mut self, message: &Message) -> Result<(), Error> {
+        self.append(&SessionEvent::PlanImplemented {
+            message: message.clone(),
+        })?;
+        self.active_plan = None;
+        Ok(())
+    }
+
+    pub(crate) fn append_plan_cancel(&mut self) -> Result<(), Error> {
+        self.append(&SessionEvent::PlanCancel)?;
+        self.active_plan = None;
+        self.plan_before_turn = None;
+        Ok(())
+    }
+
+    pub(crate) fn active_plan(&self) -> Option<&PlanState> {
+        self.active_plan.as_ref()
+    }
+
+    pub(crate) fn plan_before_turn(&self) -> Option<&PlanState> {
+        self.plan_before_turn.as_ref()
     }
 
     pub(crate) fn usage(&self) -> UsageSummary {
@@ -294,10 +453,12 @@ fn validate_id(id: &str) -> Result<(), Error> {
 }
 
 /// Rebuilds the effective conversation from a session log.
-fn replay(path: &Path) -> Result<(Vec<Message>, Option<String>, UsageSummary), Error> {
+fn replay(path: &Path) -> Result<ReplayedSession, Error> {
     let file = File::open(path)?;
     let mut messages: Vec<Message> = Vec::new();
     let mut active_goal = None;
+    let mut active_plan = None;
+    let mut plan_before_turn = None;
     let mut usage = UsageSummary::default();
     let mut has_meta = false;
     for line in BufReader::new(file).lines() {
@@ -325,7 +486,15 @@ fn replay(path: &Path) -> Result<(Vec<Message>, Option<String>, UsageSummary), E
         };
         match event {
             SessionEvent::Meta { .. } => {}
-            SessionEvent::Message { message } => messages.push(message),
+            SessionEvent::Message { message } => {
+                if message.role == Role::User
+                    && (!message.is_hidden_control() || message.is_plan_implementation_start())
+                    && !message.is_steering()
+                {
+                    plan_before_turn.clone_from(&active_plan);
+                }
+                messages.push(message);
+            }
             SessionEvent::Compaction {
                 summary,
                 start,
@@ -348,12 +517,15 @@ fn replay(path: &Path) -> Result<(Vec<Message>, Option<String>, UsageSummary), E
             SessionEvent::Undo {
                 dropped,
                 clear_goal,
+                plan_state,
             } => {
                 let keep = messages.len().saturating_sub(dropped);
                 messages.truncate(keep);
                 if clear_goal {
                     active_goal = None;
                 }
+                active_plan = plan_state;
+                plan_before_turn = None;
             }
             SessionEvent::GoalStart { goal, message } => {
                 active_goal = Some(goal);
@@ -366,6 +538,38 @@ fn replay(path: &Path) -> Result<(Vec<Message>, Option<String>, UsageSummary), E
             SessionEvent::GoalCancel => {
                 active_goal = None;
             }
+            SessionEvent::PlanStart {
+                objective,
+                message,
+                previous,
+            } => {
+                plan_before_turn = previous;
+                active_plan = Some(PlanState::Draft {
+                    objective,
+                    questions_asked: false,
+                });
+                messages.push(message);
+            }
+            SessionEvent::PlanReady { plan, message } => {
+                active_plan = Some(PlanState::Ready { plan });
+                messages.push(message);
+            }
+            SessionEvent::PlanQuestionsAsked => {
+                if let Some(PlanState::Draft {
+                    questions_asked, ..
+                }) = active_plan.as_mut()
+                {
+                    *questions_asked = true;
+                }
+            }
+            SessionEvent::PlanImplemented { message } => {
+                active_plan = None;
+                messages.push(message);
+            }
+            SessionEvent::PlanCancel => {
+                active_plan = None;
+                plan_before_turn = None;
+            }
             SessionEvent::Usage {
                 usage: request_usage,
             } => usage.record(request_usage),
@@ -374,7 +578,13 @@ fn replay(path: &Path) -> Result<(Vec<Message>, Option<String>, UsageSummary), E
     if !has_meta {
         return Err(Error::Protocol("session log is missing metadata".into()));
     }
-    Ok((messages, active_goal, usage))
+    Ok(ReplayedSession {
+        messages,
+        active_goal,
+        active_plan,
+        plan_before_turn,
+        usage,
+    })
 }
 
 pub struct SessionInfo {
@@ -465,7 +675,9 @@ fn read_header(path: &Path) -> SessionHeader {
                     return header;
                 }
             }
-            Ok(SessionEvent::GoalStart { message, .. }) => {
+            Ok(
+                SessionEvent::GoalStart { message, .. } | SessionEvent::PlanStart { message, .. },
+            ) => {
                 header.has_message = true;
                 if message.role == Role::User && header.preview.is_empty() {
                     let first = message.content.lines().next().unwrap_or("");
@@ -695,6 +907,65 @@ mod tests {
         let (session, messages) = Session::open(&dir, &canceled_id)?;
         assert_eq!(session.active_goal(), None);
         assert_eq!(messages.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn session_replays_and_undoes_plan_transitions() -> Result<(), Error> {
+        let dir = temp_root("plan-state");
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
+        let id = session.id.clone();
+        let start = Message::user("add planning mode");
+        session.append_plan_start("add planning mode", &start)?;
+        let ready = Message::assistant("# Plan".into(), vec![]);
+        session.append_plan_ready("# Plan", &ready)?;
+        session.append_message(&Message::user("implement it"))?;
+        let before_implementation = session.plan_before_turn().cloned();
+        session.append_plan_implemented(&Message::assistant("done".into(), vec![]))?;
+        assert_eq!(session.active_plan(), None);
+        session.append_undo_event_with_plan(2, false, before_implementation)?;
+        drop(session);
+
+        let (mut session, messages) = Session::open(&dir, &id)?;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            session.active_plan(),
+            Some(&PlanState::Ready {
+                plan: "# Plan".into()
+            })
+        );
+        session.append_plan_cancel()?;
+        drop(session);
+        let (session, _) = Session::open(&dir, &id)?;
+        assert_eq!(session.active_plan(), None);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_start_is_resumable_and_question_state_replays() -> Result<(), Error> {
+        let dir = temp_root("plan-resume");
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
+        let id = session.id.clone();
+        let start = Message::user("add planning mode");
+        session.append_plan_start("add planning mode", &start)?;
+
+        let listed = list(&dir)?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].preview, "add planning mode");
+
+        session.append_plan_questions_asked()?;
+        drop(session);
+        let (session, messages) = Session::open(&dir, &id)?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, start.content);
+        assert!(
+            session
+                .active_plan()
+                .is_some_and(PlanState::questions_asked)
+        );
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

@@ -20,6 +20,7 @@ use super::state::ViewState;
 pub(super) const HELP: &str = "\
 Commands
   /model [MODEL]       open the model picker or switch directly
+  /reasoning [LEVEL]   show supported reasoning levels or set one
   /connect             configure a model provider interactively
   /settings [KEY ...]  open the settings picker or change directly
   /new                 start a new session without changing directories
@@ -37,6 +38,7 @@ Commands
   /resume [ID|NUMBER]  open the session picker or resume directly
   /unqueue [N|all]     cancel queued messages
   /goal [TEXT]         start, resume, cancel, or show the persistent goal
+  /plan [TEXT]         start, resume, cancel, or show a planning workflow
   /help                show this help
   /quit                leave Yawl
 
@@ -69,6 +71,94 @@ pub(super) enum GoalAction {
     None,
     Start,
     Resume,
+}
+
+pub(super) enum PlanAction {
+    None,
+    Start,
+    Resume,
+}
+
+pub(super) fn plan(agent: &mut Agent, argument: &str, state: &mut ViewState) -> PlanAction {
+    match argument {
+        "" => {
+            notice_plan_status(agent, state);
+            PlanAction::None
+        }
+        "cancel" => {
+            match agent.cancel_plan() {
+                Ok(true) => {
+                    state.active_plan = None;
+                    state.plan_draft = false;
+                    state.notice("Plan canceled.");
+                }
+                Ok(false) => state.notice("No active plan."),
+                Err(error) => state.notice(format!("Could not cancel the plan: {error}")),
+            }
+            PlanAction::None
+        }
+        "resume" => match agent.plan_state() {
+            Some(crate::session::PlanState::Draft { .. }) => PlanAction::Resume,
+            Some(crate::session::PlanState::Ready { .. }) => {
+                state.notice(
+                    "The plan is already complete. Enter a prompt to revise or implement it.",
+                );
+                PlanAction::None
+            }
+            None => {
+                state.notice("No interrupted plan to resume.");
+                PlanAction::None
+            }
+        },
+        objective => match agent.start_plan(objective.to_string().into()) {
+            Ok(warning) => {
+                state.active_plan = None;
+                state.plan_draft = true;
+                if let Some(warning) = warning {
+                    state.notice(warning);
+                }
+                PlanAction::Start
+            }
+            Err(error) => {
+                state.notice(format!("Could not start the plan: {error}"));
+                PlanAction::None
+            }
+        },
+    }
+}
+
+fn notice_plan_status(agent: &Agent, state: &mut ViewState) {
+    match agent.plan_state() {
+        Some(crate::session::PlanState::Draft { objective, .. }) => state.notice(format!(
+            "Draft plan for:\n{objective}\n\n/plan resume continues it. /plan cancel clears it."
+        )),
+        Some(crate::session::PlanState::Ready { plan }) => state.notice(format!(
+            "Active plan:\n\n{plan}\n\nEnter a prompt to revise or implement it. /plan cancel clears it."
+        )),
+        None => state.notice("No active plan. Start one with /plan TEXT."),
+    }
+}
+
+pub(super) fn plan_handoff_picker() -> Picker {
+    Picker {
+        title: "Plan ready".into(),
+        hint: "Enter select · Esc return to editor".into(),
+        selected: 0,
+        items: vec![
+            PickerItem {
+                label: "Implement".into(),
+                description: "Start implementing this plan now".into(),
+                action: PickerAction::ImplementPlan,
+            },
+            PickerItem {
+                label: "Return to editor".into(),
+                description: "Write a change request or implementation prompt".into(),
+                action: PickerAction::ReturnFromPlan,
+            },
+        ],
+        editing: None,
+        parent: Some(PickerAction::ReturnFromPlan),
+    }
 }
 
 pub(super) fn goal(agent: &mut Agent, argument: &str, state: &mut ViewState) -> GoalAction {
@@ -131,6 +221,71 @@ pub(super) fn goal_while_busy(argument: &str, state: &mut ViewState) {
         "resume" => state.notice("Wait for the current turn to settle, then run /goal resume."),
         _ => state.notice("Wait for the current turn to settle before replacing the goal."),
     }
+}
+
+pub(super) fn plan_while_busy(argument: &str, state: &mut ViewState) {
+    match argument {
+        "" => {
+            if state.plan_draft {
+                state.notice("A planning workflow is currently running.");
+            } else if let Some(plan) = state.active_plan.as_deref() {
+                state.notice(format!("Active plan:\n\n{plan}"));
+            } else {
+                state.notice("No active plan.");
+            }
+        }
+        _ => state.notice("Wait for the current turn to settle before changing the plan."),
+    }
+}
+
+pub(super) fn reasoning(agent: &mut Agent, argument: &str, state: &mut ViewState) {
+    let supported = crate::model::reasoning_efforts(agent.config(), agent.model());
+    if argument.is_empty() {
+        if supported.is_empty() {
+            state.notice(format!(
+                "{} does not expose reasoning levels.",
+                agent.model()
+            ));
+        } else {
+            open_reasoning_picker(agent, state, false);
+        }
+        return;
+    }
+    let effort = argument.to_ascii_lowercase();
+    if effort == "default" {
+        apply_reasoning_effort(agent, None, state);
+    } else if supported.iter().any(|level| *level == effort) {
+        apply_reasoning_effort(agent, Some(effort), state);
+    } else if supported.is_empty() {
+        state.notice(format!(
+            "{} does not expose reasoning levels.",
+            agent.model()
+        ));
+    } else {
+        state.notice(format!(
+            "{} supports default, {}.",
+            agent.model(),
+            supported.join(", ")
+        ));
+    }
+}
+
+fn apply_reasoning_effort(agent: &mut Agent, effort: Option<String>, state: &mut ViewState) {
+    agent.set_reasoning_effort(effort.clone());
+    state.reasoning_effort = effort;
+    let label = state
+        .reasoning_effort
+        .as_deref()
+        .unwrap_or("provider default");
+    state.notice(format!("Using {} with {label} reasoning.", agent.model()));
+}
+
+pub(super) fn refresh_model_selection(agent: &Agent, state: &mut ViewState) {
+    state.model = agent.model().to_string();
+    state.reasoning_effort =
+        crate::model::effective_reasoning_effort(agent.config(), agent.model()).map(str::to_string);
+    state.context_window = agent.context_window();
+    state.context_tokens = 0;
 }
 
 fn notice_goal_status(agent: &Agent, state: &mut ViewState, running: bool) {
@@ -338,9 +493,7 @@ pub(super) fn activate_picker_action(
     match action {
         PickerAction::SwitchModel(model) => {
             agent.switch_model(model);
-            state.model = agent.model().to_string();
-            state.context_window = agent.context_window();
-            state.context_tokens = 0;
+            refresh_model_selection(agent, state);
             if crate::model::is_codex(agent.config(), agent.model()) {
                 open_reasoning_picker(agent, state, false);
             } else {
@@ -379,13 +532,7 @@ pub(super) fn activate_picker_action(
                     );
                 }
             } else {
-                agent.set_reasoning_effort(effort.clone());
-                state.reasoning_effort = effort;
-                let label = state
-                    .reasoning_effort
-                    .as_deref()
-                    .unwrap_or("provider default");
-                state.notice(format!("Using {} with {label} reasoning.", agent.model()));
+                apply_reasoning_effort(agent, effort, state);
             }
         }
         PickerAction::SetHideReasoning(enabled) => {
@@ -476,9 +623,7 @@ pub(super) fn activate_picker_action(
                     if let Some(model) = session_model {
                         agent.switch_model(model);
                     }
-                    state.model = agent.model().to_string();
-                    state.context_window = agent.context_window();
-                    state.context_tokens = 0;
+                    refresh_model_selection(agent, state);
                     state.notice(format!("{} connection saved.", plan.provider_label));
                 }
                 Err(error) => state.notice(format!("Could not save connection: {error}")),
@@ -552,6 +697,10 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::ShowSettings => show_settings(agent, state),
+        PickerAction::ImplementPlan => {
+            state.pending_plan_implementation = true;
+        }
+        PickerAction::ReturnFromPlan => {}
         PickerAction::OpenStatusBarEditor { .. }
         | PickerAction::OpenStatusBarItem { .. }
         | PickerAction::OpenStatusBarFormats(_)
@@ -808,7 +957,9 @@ fn apply_config_change(agent: &mut Agent, change: ConfigChange, state: &mut View
     match agent.change_global_config(change) {
         Ok(effect) => {
             state.model = agent.model().to_string();
-            state.reasoning_effort = agent.config().reasoning_effort.clone();
+            state.reasoning_effort =
+                crate::model::effective_reasoning_effort(agent.config(), agent.model())
+                    .map(str::to_string);
             state.hide_reasoning = agent.config().hide_reasoning;
             state.accent_color = agent.config().accent_color;
             state.selection_color = agent.config().effective_selection_color();

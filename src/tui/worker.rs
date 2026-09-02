@@ -26,10 +26,19 @@ use super::state::{
 };
 use super::terminal::Terminal;
 
+#[derive(Clone, Copy)]
+pub(super) enum TurnKind {
+    Normal,
+    Goal,
+    Plan,
+    PlanFollowUp,
+    PlanImplement,
+}
+
 pub(super) fn turn_interactive<R: Read>(
     agent: &mut Agent,
     input: Option<crate::provider::TurnInput>,
-    goal_mode: bool,
+    kind: TurnKind,
     state: &mut ViewState,
     editor: &mut Editor,
     terminal: &mut Terminal,
@@ -41,15 +50,25 @@ pub(super) fn turn_interactive<R: Read>(
         editor,
         terminal,
         events,
-        move |agent, sink| {
-            if goal_mode {
-                agent.run_goal_preserving_cancellation(sink)
-            } else {
-                agent.run_turn_input_preserving_cancellation(input, sink)
+        move |agent, sink| match kind {
+            TurnKind::Normal => agent.run_turn_input_preserving_cancellation(input, sink),
+            TurnKind::Goal => agent.run_goal_preserving_cancellation(sink),
+            TurnKind::Plan => agent.run_plan_preserving_cancellation(sink),
+            TurnKind::PlanFollowUp => agent.run_plan_follow_up_preserving_cancellation(
+                input.ok_or_else(|| Error::Protocol("plan follow-up input is missing".into()))?,
+                sink,
+            ),
+            TurnKind::PlanImplement => {
+                agent.run_plan_implementation_preserving_cancellation(input, sink)
             }
         },
     );
     state.active_goal = agent.active_goal().map(str::to_string);
+    state.active_plan = agent.active_plan().map(str::to_string);
+    state.plan_draft = matches!(
+        agent.plan_state(),
+        Some(crate::session::PlanState::Draft { .. })
+    );
     result
 }
 
@@ -95,6 +114,7 @@ where
     let active_cancellation = agent.cancellation_token();
     let steers = agent.steer_inbox();
     let background = agent.background_processes();
+    let questions = agent.question_broker();
     agent.clear_cancellation();
     let active_agent = &mut *agent;
     let result = std::thread::scope(|scope| {
@@ -119,6 +139,7 @@ where
                 cancellation: active_cancellation,
                 steers,
                 background,
+                questions,
             },
             state,
             editor,
@@ -140,6 +161,7 @@ pub(super) struct WorkerChannels<T> {
     cancellation: CancellationToken,
     steers: SteerInbox,
     background: crate::background::BackgroundProcessManager,
+    questions: crate::tools::QuestionBroker,
 }
 
 pub(super) fn pump_events<R: Read, T>(
@@ -153,6 +175,7 @@ pub(super) fn pump_events<R: Read, T>(
 ) -> Result<T, Error> {
     let mut needs_draw = false;
     loop {
+        needs_draw |= sync_question(state, &worker.questions);
         while let Ok(update) = worker.updates.try_recv() {
             state.apply(update);
             needs_draw = true;
@@ -162,6 +185,7 @@ pub(super) fn pump_events<R: Read, T>(
                 while let Ok(update) = worker.updates.try_recv() {
                     state.apply(update);
                 }
+                state.question = None;
                 terminal.draw(state, editor)?;
                 return result;
             }
@@ -181,6 +205,7 @@ pub(super) fn pump_events<R: Read, T>(
                 crate::set_interrupted(false);
                 if !super::processes::handle_interrupt(state) {
                     state.subagent_manager.interrupt_all();
+                    worker.questions.cancel_pending();
                     cancel_worker(worker.thread, &worker.cancellation, state);
                 }
                 needs_draw = true;
@@ -195,6 +220,36 @@ pub(super) fn pump_events<R: Read, T>(
                 super::processes::handle_event(state, event);
                 break;
             }
+            if state.question.is_some() {
+                match event {
+                    Event::Key(Key::Ctrl('c')) => {
+                        worker.questions.cancel_pending();
+                        cancel_worker(worker.thread, &worker.cancellation, state);
+                    }
+                    Event::Key(Key::Escape)
+                        if state
+                            .question
+                            .as_ref()
+                            .is_none_or(|question| !question.is_custom()) =>
+                    {
+                        worker.questions.cancel_pending();
+                        cancel_worker(worker.thread, &worker.cancellation, state);
+                    }
+                    Event::Key(key) => {
+                        if let Some(question) = state.question.as_mut() {
+                            handle_question_key(question, &worker.questions, key);
+                        }
+                    }
+                    Event::Tick => {
+                        needs_draw |= advance_ticks(state);
+                        needs_draw |= sync_question(state, &worker.questions);
+                    }
+                    Event::MouseScroll(amount) => scroll(state, amount),
+                    Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
+                    Event::Paste(text) => paste_question_answer(state, &text),
+                }
+                break;
+            }
             if state.picker.is_some() {
                 match event {
                     Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
@@ -202,6 +257,7 @@ pub(super) fn pump_events<R: Read, T>(
                         if let Some(action) = take_picker_action(state, editor, key) {
                             if let PickerAction::SendQueued(index) = action {
                                 if promote_queued(state, index) {
+                                    worker.questions.cancel_pending();
                                     cancel_worker(worker.thread, &worker.cancellation, state);
                                 }
                             } else {
@@ -339,6 +395,90 @@ pub(super) fn pump_events<R: Read, T>(
     }
 }
 
+fn sync_question(state: &mut ViewState, broker: &crate::tools::QuestionBroker) -> bool {
+    let snapshot = broker.snapshot();
+    match (state.question.as_mut(), snapshot) {
+        (Some(active), Some(snapshot))
+            if active.snapshot.request_id == snapshot.request_id
+                && active.snapshot.question_index == snapshot.question_index =>
+        {
+            let changed = active
+                .snapshot
+                .remaining
+                .map(|remaining| remaining.as_secs())
+                != snapshot.remaining.map(|remaining| remaining.as_secs());
+            active.snapshot = snapshot;
+            changed
+        }
+        (_, Some(snapshot)) => {
+            state.question = Some(super::state::ActiveQuestion::new(snapshot));
+            true
+        }
+        (Some(_), None) => {
+            state.question = None;
+            true
+        }
+        (None, None) => false,
+    }
+}
+
+fn handle_question_key(
+    active: &mut super::state::ActiveQuestion,
+    broker: &crate::tools::QuestionBroker,
+    key: Key,
+) {
+    if let super::state::QuestionInput::Custom(editor) = &mut active.input {
+        if key == Key::Escape {
+            active.input = super::state::QuestionInput::Choices;
+            return;
+        }
+        if let EditAction::Submit(answer) = editor.handle_key(key) {
+            let _ = broker.answer_custom(active.snapshot.request_id, answer.text);
+        }
+        return;
+    }
+
+    let model_option_count = active.snapshot.question.options.len();
+    let option_count = model_option_count.saturating_add(1);
+    let previous_selection = active.selected;
+    match key {
+        Key::Up | Key::Char('k') => {
+            active.selected = active.selected.saturating_sub(1);
+        }
+        Key::Down | Key::Char('j') => {
+            active.selected = (active.selected + 1).min(option_count.saturating_sub(1));
+        }
+        Key::Char(digit @ '1'..='4') => {
+            let selected = usize::from(digit as u8 - b'1');
+            if selected < option_count {
+                active.selected = selected;
+            }
+        }
+        Key::Enter => {
+            if active.selected == model_option_count {
+                active.input = super::state::QuestionInput::Custom(Box::default());
+            } else {
+                let _ = broker.answer(active.snapshot.request_id, active.selected);
+            }
+        }
+        _ => {}
+    }
+    if active.selected != previous_selection {
+        let _ = broker.mark_present(active.snapshot.request_id);
+    }
+}
+
+fn paste_question_answer(state: &mut ViewState, text: &str) {
+    let Some(super::state::ActiveQuestion {
+        input: super::state::QuestionInput::Custom(editor),
+        ..
+    }) = state.question.as_mut()
+    else {
+        return;
+    };
+    editor.paste(text);
+}
+
 pub(super) fn handle_mouse_selection(
     terminal: &mut Terminal,
     state: &mut ViewState,
@@ -440,6 +580,7 @@ pub(super) fn handle_submission_while_busy(
         Some(BusyCommand::CopyAll) => copy_all_from_transcript(terminal, state)?,
         Some(BusyCommand::Usage) => super::commands::show_usage(state),
         Some(BusyCommand::Goal(argument)) => super::commands::goal_while_busy(&argument, state),
+        Some(BusyCommand::Plan(argument)) => super::commands::plan_while_busy(&argument, state),
         None => {
             state.queued_inputs.push_back(input);
             state.scroll_offset = 0;
@@ -460,6 +601,7 @@ pub(super) enum BusyCommand {
     CopyAll,
     Usage,
     Goal(String),
+    Plan(String),
 }
 
 pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
@@ -478,6 +620,7 @@ pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
         "copy-all" if argument.is_empty() => Some(BusyCommand::CopyAll),
         "usage" if argument.is_empty() => Some(BusyCommand::Usage),
         "goal" => Some(BusyCommand::Goal(argument.to_string())),
+        "plan" => Some(BusyCommand::Plan(argument.to_string())),
         _ => None,
     }
 }
@@ -704,4 +847,82 @@ pub(super) fn native_thread_id() -> usize {
 
 pub(super) fn interrupt_thread(thread: usize) {
     crate::cancellation::wake_thread(thread);
+}
+
+#[cfg(test)]
+mod question_tests {
+    use super::*;
+
+    fn active_question() -> super::super::state::ActiveQuestion {
+        super::super::state::ActiveQuestion::new(crate::tools::QuestionSnapshot {
+            request_id: 1,
+            question_index: 0,
+            question_count: 1,
+            question: crate::tools::UserQuestion {
+                id: "scope".into(),
+                question: "Which scope?".into(),
+                options: vec![
+                    crate::tools::QuestionOption {
+                        label: "Focused".into(),
+                        description: "small".into(),
+                    },
+                    crate::tools::QuestionOption {
+                        label: "Broad".into(),
+                        description: "large".into(),
+                    },
+                ],
+                recommended: 0,
+            },
+            remaining: Some(std::time::Duration::from_secs(30)),
+        })
+    }
+
+    #[test]
+    fn other_choice_opens_editor_and_escape_returns_to_choices() {
+        let broker = crate::tools::QuestionBroker::default();
+        let mut active = active_question();
+
+        handle_question_key(&mut active, &broker, Key::Char('3'));
+        assert_eq!(active.selected, 2);
+        handle_question_key(&mut active, &broker, Key::Enter);
+        assert!(active.is_custom());
+        handle_question_key(&mut active, &broker, Key::Char('o'));
+        handle_question_key(&mut active, &broker, Key::Char('w'));
+        let super::super::state::QuestionInput::Custom(editor) = &active.input else {
+            panic!("custom editor should stay open");
+        };
+        assert_eq!(editor.text(), "ow");
+
+        handle_question_key(&mut active, &broker, Key::Escape);
+        assert!(!active.is_custom());
+        assert_eq!(active.selected, 2);
+    }
+
+    #[test]
+    fn changing_the_selected_option_marks_the_user_present() {
+        let broker = crate::tools::QuestionBroker::default();
+        broker.enable();
+        broker.begin_turn();
+        let asker = broker.clone();
+        let questions = vec![active_question().snapshot.question];
+        let handle = std::thread::spawn(move || asker.ask(questions));
+        while broker.snapshot().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut active =
+            super::super::state::ActiveQuestion::new(broker.snapshot().expect("active question"));
+
+        handle_question_key(&mut active, &broker, Key::Down);
+        assert_eq!(active.selected, 1);
+        assert!(
+            broker
+                .snapshot()
+                .expect("question should remain pending")
+                .remaining
+                .is_none()
+        );
+
+        broker.cancel_pending();
+        assert!(handle.join().expect("asker thread").is_err());
+    }
 }

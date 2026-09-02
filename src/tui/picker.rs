@@ -264,6 +264,8 @@ pub(super) enum PickerAction {
     },
     RemoveQueued(usize),
     ClearQueued,
+    ImplementPlan,
+    ReturnFromPlan,
     Reload,
     ShowSettings,
 }
@@ -1217,6 +1219,16 @@ pub(super) fn picker_is_secret(state: &ViewState) -> bool {
     })
 }
 
+pub(super) fn picker_is_plan_handoff(picker: &Picker) -> bool {
+    matches!(
+        picker.items.first().map(|item| &item.action),
+        Some(PickerAction::ImplementPlan)
+    ) && matches!(
+        picker.items.get(1).map(|item| &item.action),
+        Some(PickerAction::ReturnFromPlan)
+    )
+}
+
 pub(super) fn take_picker_action(
     state: &mut ViewState,
     editor: &mut Editor,
@@ -1292,6 +1304,13 @@ pub(super) fn take_picker_action(
                 let _ = editor.handle_key(key);
             }
         }
+        return None;
+    }
+
+    if picker_is_plan_handoff(picker)
+        && let Key::Char(digit @ '1'..='2') = key
+    {
+        picker.selected = usize::from(digit as u8 - b'1');
         return None;
     }
 

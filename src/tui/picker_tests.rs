@@ -229,6 +229,18 @@ fn escape_returns_the_typed_parent_action() {
 }
 
 #[test]
+fn plan_handoff_number_keys_choose_before_confirmation() {
+    let mut state = test_picker_state(super::commands::plan_handoff_picker());
+    let mut editor = Editor::default();
+
+    assert!(take_picker_action(&mut state, &mut editor, Key::Char('2')).is_none());
+    assert_eq!(state.picker.as_ref().map(|picker| picker.selected), Some(1));
+
+    let action = take_picker_action(&mut state, &mut editor, Key::Enter);
+    assert!(matches!(action, Some(PickerAction::ReturnFromPlan)));
+}
+
+#[test]
 fn secret_picker_edit_masks_the_row_and_editor_layout() {
     let secret = "sk-secret-value";
     let mut editor = Editor::default();
@@ -321,6 +333,10 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -402,6 +418,10 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,

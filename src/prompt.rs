@@ -5,6 +5,22 @@ use std::path::Path;
 
 use crate::skills::Skill;
 
+#[derive(Clone, Copy)]
+pub(crate) enum PlanPrompt<'a> {
+    Active(&'a str),
+    Draft(&'a str),
+    Revise(&'a str),
+    FollowUp(&'a str),
+    Implement(&'a str),
+}
+
+#[derive(Default)]
+pub(crate) struct MainPromptState<'a> {
+    pub(crate) goal: Option<&'a str>,
+    pub(crate) plan: Option<PlanPrompt<'a>>,
+    pub(crate) interactive_questions: bool,
+}
+
 #[derive(Clone, Copy, Default)]
 struct PromptOptions {
     subagents: bool,
@@ -19,10 +35,10 @@ pub(crate) fn build_system_prompt(
     print_mode: bool,
     web_browsing: bool,
     skills: &[Skill],
-    goal: Option<&str>,
+    state: MainPromptState<'_>,
 ) -> String {
     let cwd = std::env::current_dir().ok();
-    build_system_prompt_from(
+    let mut prompt = build_system_prompt_from(
         cwd.as_deref(),
         global_dir,
         PromptOptions {
@@ -33,8 +49,15 @@ pub(crate) fn build_system_prompt(
         },
         None,
         skills,
-        goal,
-    )
+        state.goal,
+    );
+    if state.interactive_questions {
+        prompt.push_str(
+            "\n<interactive_questions>\nYou may call request_user_input to ask one to three multiple-choice questions. It must be the only tool call in that model step. Every question needs a recommended option. Use the recommended index and do not put '(Recommended)' in an option label. Yawl adds an open-answer choice automatically; a custom reply has label 'Other', a null option_index, and its text in answer. If a result reports timed_out, the user is away: accept the defaults and do not ask again during this turn.\n</interactive_questions>\n",
+        );
+    }
+    append_plan_prompt(&mut prompt, state.plan);
+    prompt
 }
 
 pub(crate) fn build_subagent_system_prompt(
@@ -56,6 +79,46 @@ pub(crate) fn build_subagent_system_prompt(
         skills,
         None,
     )
+}
+
+fn append_plan_prompt(prompt: &mut String, plan: Option<PlanPrompt<'_>>) {
+    let Some(plan) = plan else {
+        return;
+    };
+    let (phase, content, instructions) = match plan {
+        PlanPrompt::Active(plan) => (
+            "active",
+            plan,
+            "This completed plan is available as context. Follow the user's current request; do not implement or revise the plan unless the active turn asks you to.",
+        ),
+        PlanPrompt::Draft(objective) => (
+            "planning",
+            objective,
+            "Inspect only with the available read-focused tools. Before plan_complete, call request_user_input at least once with exactly three meaningful questions. Ask further three-question batches only when material choices remain. plan_complete must be the only tool call in its step and contain the full Markdown implementation plan. A text reply does not finish planning.",
+        ),
+        PlanPrompt::Revise(plan) => (
+            "revision",
+            plan,
+            "Revise this plan from the user's latest request using only read-focused tools. Before plan_complete, call request_user_input at least once with exactly three meaningful questions. plan_complete must be the only tool call in its step and contain the full revised Markdown plan. A text reply does not finish revision.",
+        ),
+        PlanPrompt::FollowUp(plan) => (
+            "follow_up",
+            plan,
+            "Call plan_action as the only tool call in the step. Use revise or implement when the user's latest request asks to change or implement this plan. Use unrelated to continue any other request as a normal turn with the full tool set. Do not classify by keyword matching.",
+        ),
+        PlanPrompt::Implement(plan) => (
+            "implementation",
+            plan,
+            "Implement this plan with the normal tool set. Keep the plan active through errors or interruption. Only after successful completion, call plan_implemented with the final user-facing result as the only tool call in its step. A text reply does not finish implementation.",
+        ),
+    };
+    prompt.push_str("\n<active_plan phase=\"");
+    prompt.push_str(phase);
+    prompt.push_str("\">\n");
+    prompt.push_str(content);
+    prompt.push_str("\n\n");
+    prompt.push_str(instructions);
+    prompt.push_str("\n</active_plan>\n");
 }
 
 fn build_system_prompt_from(
@@ -239,6 +302,47 @@ mod tests {
         assert!(prompt.contains("--describe"));
         assert!(prompt.contains("YAWL_SESSION_ID"));
         assert!(prompt.len() < 2_500);
+    }
+
+    #[test]
+    fn planning_prompt_injects_active_state_and_question_timeout_guidance() {
+        let dirs = TestDirs::new();
+        let prompt = build_system_prompt(
+            &dirs.0,
+            false,
+            false,
+            false,
+            &[],
+            MainPromptState {
+                plan: Some(PlanPrompt::Draft("clarify the feature")),
+                interactive_questions: true,
+                ..MainPromptState::default()
+            },
+        );
+        assert!(prompt.contains("clarify the feature"));
+        assert!(prompt.contains("exactly three meaningful questions"));
+        assert!(prompt.contains("do not ask again during this turn"));
+        assert!(prompt.contains("plan_complete must be the only tool call"));
+    }
+
+    #[test]
+    fn follow_up_prompt_routes_unrelated_requests_to_a_normal_turn() {
+        let dirs = TestDirs::new();
+        let prompt = build_system_prompt(
+            &dirs.0,
+            false,
+            false,
+            false,
+            &[],
+            MainPromptState {
+                plan: Some(PlanPrompt::FollowUp("# Plan")),
+                ..MainPromptState::default()
+            },
+        );
+        assert!(prompt.contains("Call plan_action as the only tool call"));
+        assert!(prompt.contains("Use revise or implement"));
+        assert!(prompt.contains("Use unrelated"));
+        assert!(prompt.contains("normal turn with the full tool set"));
     }
 
     #[test]

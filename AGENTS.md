@@ -11,7 +11,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/main.rs`: binary bootstrap, session selection, and TUI/print-mode dispatch
 - `src/cli.rs`, `src/print_mode.rs`, `src/project_trust.rs`: binary-local argument parsing, streamed text presentation, and project skill trust prompts
 - `src/agent.rs`: stable `Agent` facade and public turn events
-- `src/agent/conversation.rs`, `conversation/turn.rs`, `conversation/goal.rs`, `conversation/steer.rs`, `events.rs`: conversation lifecycle, model/tool turns, goal mode, live steering, streamed event translation, and optional session persistence
+- `src/agent/conversation.rs`, `conversation/turn.rs`, `conversation/goal.rs`, `conversation/plan.rs`, `conversation/steer.rs`, `events.rs`: conversation lifecycle, model/tool turns, goal and planning modes, live steering, streamed event translation, and optional session persistence
 - `src/prompt.rs`: compact system prompt, skill catalog, and `AGENTS.md` instruction injection
 - `src/provider/mod.rs`: stable provider facade and re-exports
 - `src/provider/types.rs`, `streaming.rs`, `resolution.rs`, `http.rs`: provider-neutral protocol, retries, provider selection, and SSE/HTTP support
@@ -27,7 +27,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
 - `src/tools/`: builtin registry and executable-tool discovery
-- `src/tools/exec.rs`, `src/tools/web.rs`: exec-tool contract, plus isolated web search/fetch adapters and HTML cleanup
+- `src/tools/exec.rs`, `src/tools/planning_shell.rs`, `src/tools/user_input.rs`, `src/tools/web.rs`: exec-tool contract, gated planning inspection, interactive question broker, plus isolated web search/fetch adapters and HTML cleanup
 - `src/background.rs`, `src/subagent/`, `src/cancellation.rs`: session-bound shell processes, parallel subagents, and interrupt tokens
 - `src/terminal_mode.rs`: shared raw-terminal lifecycle for the TUI and onboarding selector
 - `src/skills.rs`, `src/trust.rs`, `src/image.rs`: skill discovery, project skill trust, and image input

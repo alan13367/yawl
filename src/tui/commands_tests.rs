@@ -195,6 +195,10 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         pending_steers: std::collections::VecDeque::new(),
         active_goal: None,
         goal_running: false,
+        active_plan: None,
+        plan_draft: false,
+        pending_plan_implementation: false,
+        question: None,
         pending_actions: std::collections::VecDeque::new(),
         completions: Vec::new(),
         completion_index: 0,
@@ -396,6 +400,158 @@ fn help_lists_undo_and_copy_commands() {
     assert!(HELP.contains("/copy-all"));
     assert!(HELP.contains("/usage"));
     assert!(HELP.contains("/ps"));
+    assert!(HELP.contains("/reasoning"));
+}
+
+#[test]
+fn reasoning_command_shows_model_levels_and_sets_them_directly() {
+    let root = std::env::temp_dir().join(format!(
+        "yawl-tui-reasoning-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let config = Config {
+        model: Some("openai-codex:gpt-5.4".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
+    };
+    let cwd = root.join("project");
+    let dirs = config.session_dirs(&cwd);
+    let session = crate::session::Session::create(&dirs.project, &cwd, "openai-codex:gpt-5.4")
+        .expect("session should be created");
+    let mut agent = Agent::new(config, "openai-codex:gpt-5.4".into(), session, Vec::new());
+    let mut state = ViewState::from_agent(&agent);
+
+    reasoning(&mut agent, "", &mut state);
+    let picker = state.picker.as_ref().expect("reasoning picker should open");
+    assert!(picker.title.contains("gpt-5.4"));
+    assert_eq!(
+        picker
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Provider default",
+            "Minimal",
+            "Low",
+            "Medium",
+            "High",
+            "Xhigh"
+        ]
+    );
+
+    state.picker = None;
+    reasoning(&mut agent, "High", &mut state);
+    assert_eq!(agent.config().reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(state.reasoning_effort.as_deref(), Some("high"));
+
+    reasoning(&mut agent, "max", &mut state);
+    assert_eq!(
+        agent.config().reasoning_effort.as_deref(),
+        Some("high"),
+        "an unsupported level must not change the effort"
+    );
+    assert!(
+        state
+            .transcript
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Notice(text) if text.contains("supports default")))
+    );
+
+    reasoning(&mut agent, "default", &mut state);
+    assert!(agent.config().reasoning_effort.is_none());
+    assert!(state.reasoning_effort.is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reasoning_status_only_shows_an_effort_supported_by_the_active_model() {
+    let root = std::env::temp_dir().join(format!(
+        "yawl-tui-reasoning-status-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let config = Config {
+        model: Some("claude".into()),
+        reasoning_effort: Some("high".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
+    };
+    let cwd = root.join("project");
+    let dirs = config.session_dirs(&cwd);
+    let session = crate::session::Session::create(&dirs.project, &cwd, "claude")
+        .expect("session should be created");
+    let mut agent = Agent::new(config, "claude".into(), session, Vec::new());
+    let mut state = ViewState::from_agent(&agent);
+
+    assert!(state.reasoning_effort.is_none());
+    assert_eq!(agent.config().reasoning_effort.as_deref(), Some("high"));
+
+    activate_picker_action(
+        &mut agent,
+        &mut state,
+        PickerAction::SwitchModel("openai-codex:gpt-5.4".into()),
+    );
+    assert_eq!(state.reasoning_effort.as_deref(), Some("high"));
+
+    activate_picker_action(
+        &mut agent,
+        &mut state,
+        PickerAction::SwitchModel("claude".into()),
+    );
+    assert!(state.reasoning_effort.is_none());
+    assert_eq!(agent.config().reasoning_effort.as_deref(), Some("high"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reasoning_command_reports_models_without_levels() {
+    let root = std::env::temp_dir().join(format!(
+        "yawl-tui-reasoning-none-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let config = Config {
+        model: Some("claude".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
+    };
+    let cwd = root.join("project");
+    let dirs = config.session_dirs(&cwd);
+    let session = crate::session::Session::create(&dirs.project, &cwd, "claude")
+        .expect("session should be created");
+    let mut agent = Agent::new(config, "claude".into(), session, Vec::new());
+    let mut state = ViewState::from_agent(&agent);
+
+    reasoning(&mut agent, "", &mut state);
+    assert!(state.picker.is_none());
+    reasoning(&mut agent, "high", &mut state);
+    assert!(agent.config().reasoning_effort.is_none());
+    assert!(
+        state
+            .transcript
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Notice(text) if text.contains("does not expose reasoning levels")))
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
