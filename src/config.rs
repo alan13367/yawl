@@ -62,6 +62,9 @@ pub struct Config {
     pub scroll_bar: bool,
     /// Whether an idle transcript scroll bar hides itself after a pause.
     pub scroll_bar_auto_hide: bool,
+    /// Whether the terminal bell rings when a turn settles or a model
+    /// question needs an answer.
+    pub bell: bool,
     pub context_windows: HashMap<String, u64>,
     pub auto_compact: bool,
     pub compact_threshold: f64,
@@ -269,6 +272,7 @@ impl Config {
             status_bar: StatusBarConfig::default(),
             scroll_bar: true,
             scroll_bar_auto_hide: true,
+            bell: true,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,

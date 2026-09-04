@@ -55,7 +55,8 @@ Project skills stay disabled until you trust the repository. `yawl --trust-proje
 - `Tab` focuses the transcript when idle. Arrows move between blocks, `h`/`l` fold, `Enter` opens a viewer, `y` copies. `Ctrl+F` searches the transcript and `Ctrl+O` expands or collapses tool output.
 - Drag to select text; releasing copies to the clipboard. The mouse wheel and `PageUp`/`PageDown` scroll.
 - `Escape` or `Ctrl+C` aborts the active model response or tool. Neither exits Yawl.
-- `/undo` restores files changed through `write_file`/`edit_file` and drops that turn. `/copy` and `/copy-all` put replies on the clipboard.
+- When the bell is on (the default), Yawl rings the terminal bell when a turn finishes and when the model asks a question, so an unfocused terminal window or tab announces activity. Turn it off with `/settings bell off` or Settings > Interface > Bell.
+- `/undo` restores files changed through `write_file`/`edit_file` and drops that turn. `/diff` shows every file those tools changed this session as per-file diff cards. `/copy` and `/copy-all` put replies on the clipboard.
 - Multiple-choice questions from the model replace the composer. A countdown accepts the recommended answers automatically so unattended turns continue; answering yourself cancels it.
 - `/ps` opens the background-process dashboard and `/subagents` the subagent dashboard, both while the model is busy.
 
@@ -73,6 +74,8 @@ The transcript renders Markdown with syntax highlighting for common languages. T
 | `/compact` | Summarize older messages now |
 | `/usage` | Show token and prompt-cache usage |
 | `/undo` | Restore files from before the last prompt and drop that turn |
+| `/diff` | Show files changed through the file tools this session as diff cards |
+| `/init` | Create or update `AGENTS.md` with project guidance for coding agents |
 | `/copy`, `/copy-all` | Copy the last reply, or the whole conversation |
 | `/tools`, `/skills` | List tools and skills |
 | `/skill:NAME [ARGS]` | Run a discovered Markdown skill |
@@ -83,11 +86,12 @@ The transcript renders Markdown with syntax highlighting for common languages. T
 | `/goal [TEXT]` | Start, resume, cancel, or show a persistent goal |
 | `/plan [TEXT]` | Start, resume, cancel, or show the planning workflow |
 | `/help` | Show terminal controls and commands |
+| `/hotkeys` | Show every keyboard shortcut, grouped by area |
 | `/quit` | Exit and print the resumable `yawl --session ID` command |
 
 `/settings` groups model, interface, context, provider, web, subagent, and skill options in one picker and applies generation-affecting changes before the next queued message. The status bar is customizable under Settings > Interface > Status bar, with live preview, reordering (`K`/`J`), and custom labels.
 
-While a turn runs, `Enter` steers and `Tab` queues; queued messages show below the transcript. `/goal TEXT` keeps making model requests until the model calls an internal `goal_complete` tool; a plain reply does not finish it. `/plan TEXT` runs a read-only planning mode that gathers requirements in batches of three multiple-choice questions, stores the finished plan with the session, and offers Implement or Return to editor. Later prompts can revise or implement the active plan; unrelated prompts continue as ordinary turns without clearing it.
+While a turn runs, `Enter` steers and `Tab` queues; queued messages show below the transcript. `/init` inspects the current directory and creates or curates `./AGENTS.md`; it keeps accurate project rules, removes stale or changelog-like material, and changes no other file. `/goal TEXT` keeps making model requests until the model calls an internal `goal_complete` tool; a plain reply does not finish it. `/plan TEXT` runs a read-only planning mode that gathers requirements in batches of three multiple-choice questions, stores the finished plan with the session, and offers Implement or Return to editor. Later prompts can revise or implement the active plan; unrelated prompts continue as ordinary turns without clearing it.
 
 ## Models and configuration
 
@@ -128,13 +132,13 @@ Every field is optional and validated on load. An out-of-range value fails start
 
 Sessions are append-only JSONL under `~/.yawl/sessions/projects/<project-key>/`, scoped to the working directory. `-c` and `/resume` list sessions for the current directory; `--session ID` resumes from any directory. Messages, responses, reasoning, tool results, and usage are written as they happen, so compaction and resume never lose the original log. `/usage` breaks out input, cache reads and writes, and output.
 
-`/undo` saves a file's pre-image the first time `write_file` or `edit_file` touches it, capped at 32 MiB per file, and restores it on request. In git repos where the agent moved `HEAD`, it soft-resets to the pre-turn commit. Files changed through `shell` or exec tools are not tracked.
+`/undo` saves a file's pre-image the first time `write_file` or `edit_file` touches it, capped at 32 MiB per file, and restores it on request. In git repos where the agent moved `HEAD`, it soft-resets to the pre-turn commit. Files changed through `shell` or exec tools are not tracked. `/diff` uses the same pre-images: one diff card per touched file, comparing the oldest pre-image with the current contents, so files written back unchanged disappear and `/undo`-restored files drop out. Files that are non-UTF-8 or over 1 MiB on either side are listed in a notice instead of a card.
 
 Before each request Yawl checks the last reported token usage. At `compact_threshold`, 85 percent by default, it summarizes the older conversation and keeps roughly the last ten messages. `/compact` does the same on demand. For `openai-codex:` models the opaque Codex compaction item is stored and replayed so later turns keep server-side context.
 
 ## Web browsing
 
-Off by default. Enable with `/settings web_browsing on` or Settings > Web. `web_search` returns up to five DuckDuckGo results and is free and keyless; Brave and Firecrawl need `BRAVE_API_KEY` or `FIRECRAWL_API_KEY`. `web_fetch` makes a direct HTTP(S) request with a five-redirect and 2 MiB body cap, runs no JavaScript, and returns cleaned text. Search results and fetched pages are marked untrusted, so page content is never treated as agent instructions.
+Off by default. Enable with `/settings web_browsing on` or Settings > Web. `web_search` returns up to five DuckDuckGo results and is free and keyless; Brave and Firecrawl need `BRAVE_API_KEY` or `FIRECRAWL_API_KEY`. `web_fetch` makes a direct HTTP(S) request with a five-redirect and 10 MiB body cap, runs no JavaScript, and returns cleaned text. Search results and fetched pages are marked untrusted, so page content is never treated as agent instructions.
 
 ## Subagents
 

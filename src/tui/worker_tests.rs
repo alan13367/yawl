@@ -65,6 +65,7 @@ fn display_settings_apply_during_an_active_turn() {
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
+        bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,

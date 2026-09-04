@@ -16,6 +16,7 @@ pub(super) struct Terminal {
     _raw_mode: RawMode,
     stdout: io::Stdout,
     active: bool,
+    focused: bool,
     last_frame: Vec<String>,
     last_base_frame: Vec<String>,
     last_images: Vec<DisplayedImage>,
@@ -112,6 +113,7 @@ impl Terminal {
             _raw_mode: raw_mode,
             stdout: io::stdout(),
             active: true,
+            focused: true,
             last_frame: Vec::new(),
             last_base_frame: Vec::new(),
             last_images: Vec::new(),
@@ -120,7 +122,7 @@ impl Terminal {
             image_protocol: ImageProtocol::detect(),
         };
         terminal.stdout.write_all(
-            b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[>1u\x1b[=1;1u\x1b[>4;1m",
+            b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[>1u\x1b[=1;1u\x1b[>4;1m",
         )?;
         terminal.stdout.flush()?;
         Ok(terminal)
@@ -243,6 +245,26 @@ impl Terminal {
         }
         Ok(true)
     }
+
+    pub(super) fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Rings the terminal bell when the terminal is not focused so an unfocused
+    /// terminal (macOS Terminal tab badge, audible bell) can announce a settled
+    /// turn or a pending question. Best effort: failures never interrupt the
+    /// event loop.
+    pub(super) fn ring_bell(&mut self) {
+        Self::ring_bell_to(&mut self.stdout, self.focused);
+    }
+
+    pub(super) fn ring_bell_to(output: &mut impl Write, focused: bool) {
+        if focused {
+            return;
+        }
+        let _ = write!(output, "\x07");
+        let _ = output.flush();
+    }
 }
 
 pub(super) fn write_inline_images(
@@ -312,7 +334,7 @@ impl Drop for Terminal {
             let _ = self.stdout.write_all(b"\x1b_Ga=d,d=A,q=2;\x1b\\");
         }
         let _ = self.stdout.write_all(
-            b"\x1b[>4;0m\x1b[=0;1u\x1b[<u\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l",
+            b"\x1b[>4;0m\x1b[=0;1u\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l",
         );
         let _ = self.stdout.flush();
         self.active = false;

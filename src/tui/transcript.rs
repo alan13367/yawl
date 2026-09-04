@@ -27,6 +27,11 @@ pub(super) enum Entry {
         started: Option<Instant>,
     },
     Notice(String),
+    /// Ephemeral `/diff` output for one file. Never produced by replay.
+    Diff {
+        path: String,
+        lines: Vec<super::tool_view::ToolLine>,
+    },
     SubagentResult {
         id: String,
         name: String,
@@ -381,6 +386,13 @@ impl Transcript {
         self.entries.push(Entry::Notice(text));
     }
 
+    pub(super) fn push_diff(&mut self, path: String, lines: Vec<super::tool_view::ToolLine>) {
+        self.entries.push(Entry::Diff { path, lines });
+        if self.focused {
+            self.selected = Some(self.entries.len() - 1);
+        }
+    }
+
     pub(super) fn apply(&mut self, event: TranscriptEvent) {
         match event {
             TranscriptEvent::TextDelta(text) => {
@@ -494,6 +506,14 @@ impl Entry {
             Self::Tool {
                 name, args, output, ..
             } => format!("{name}\n{args}\n{output}"),
+            Self::Diff { path, lines } => {
+                let mut text = String::from(path.as_str());
+                for line in lines {
+                    text.push('\n');
+                    text.push_str(&line.text);
+                }
+                text
+            }
             Self::SubagentResult {
                 id,
                 name,
@@ -512,6 +532,14 @@ impl Entry {
             | Self::Assistant(text)
             | Self::Notice(text)
             | Self::Reasoning { content: text, .. } => text.clone(),
+            Self::Diff { path, lines } => {
+                let mut text = String::from(path.as_str());
+                for line in lines {
+                    text.push('\n');
+                    text.push_str(&line.text);
+                }
+                text
+            }
             Self::SubagentResult { content, .. } => content.clone(),
         }
     }
@@ -524,6 +552,7 @@ impl Entry {
             Self::Reasoning { .. } => "Reasoning",
             Self::Tool { name, .. } => name,
             Self::Notice(_) => "Notice",
+            Self::Diff { .. } => "Diff",
             Self::SubagentResult { name, .. } => name,
         }
     }
@@ -533,6 +562,21 @@ impl Entry {
 mod tests {
     use super::*;
     use crate::provider::{Reasoning, SubagentResult, ToolCall};
+
+    #[test]
+    fn diff_entries_carry_label_copy_and_search_text() {
+        let lines = super::super::tool_view::edit_diff("before", "after");
+        let mut transcript = Transcript::from_messages(&[]);
+
+        transcript.push_diff("note.txt".into(), lines);
+
+        assert_eq!(transcript.entry(0).map(Entry::label), Some("Diff"));
+        let entry = transcript.entry(0).expect("diff entry");
+        assert!(entry.copy_text().starts_with("note.txt"));
+        assert!(entry.copy_text().contains("- before"));
+        assert!(entry.copy_text().contains("+ after"));
+        assert_eq!(entry.searchable_text(), entry.copy_text());
+    }
 
     #[test]
     fn live_events_and_replayed_messages_produce_the_same_entries() {

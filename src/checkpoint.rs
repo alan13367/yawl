@@ -61,6 +61,17 @@ pub struct RestoreReport {
     pub warning: Option<String>,
 }
 
+/// One path recorded by the checkpoints, with its oldest pre-image.
+#[derive(Debug, Clone)]
+pub struct TouchedFile {
+    /// Absolute path as it was recorded when the file was touched.
+    pub path: String,
+    /// Whether the file existed before the first touch.
+    pub existed: bool,
+    /// Pre-image bytes when the file existed before the first touch.
+    pub previous: Option<Vec<u8>>,
+}
+
 /// Stack of touched-file restore points for one session.
 pub struct Checkpoints {
     dir: PathBuf,
@@ -159,6 +170,33 @@ impl Checkpoints {
             rel,
         });
         persist_stack(&self.dir, &self.stack)
+    }
+
+    /// Every path this session has touched, one entry per path, in first-touch
+    /// order. The pre-image comes from the first turn that touched the path,
+    /// so the result reflects the state before the session began. Turn records
+    /// popped by `restore_last` drop out.
+    pub fn touched_files(&self) -> Vec<TouchedFile> {
+        let mut seen = std::collections::HashSet::new();
+        let mut files = Vec::new();
+        for turn in &self.stack {
+            for overlay in &turn.overlays {
+                if !seen.insert(&overlay.path) {
+                    continue;
+                }
+                let previous = if overlay.existed {
+                    fs::read(self.dir.join(&overlay.rel)).ok()
+                } else {
+                    None
+                };
+                files.push(TouchedFile {
+                    path: overlay.path.clone(),
+                    existed: overlay.existed,
+                    previous,
+                });
+            }
+        }
+        files
     }
 
     /// Pops the latest snapshot, resets user git HEAD if it moved, and
@@ -522,6 +560,47 @@ mod tests {
         checkpoints.remember_path(&file)?;
 
         assert_eq!(checkpoints.stack[0].overlays.len(), 1);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn touched_files_report_the_oldest_preimage_once_per_path() -> Result<(), Error> {
+        let root = temp_root("touched-report");
+        let home = root.join("home");
+        let work = root.join("work");
+        write(&work.join("note.txt"), "v1");
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
+        checkpoints.snapshot()?;
+        checkpoints.remember_path(&work.join("note.txt"))?;
+        write(&work.join("note.txt"), "v2");
+        checkpoints.snapshot()?;
+        checkpoints.remember_path(&work.join("note.txt"))?;
+        checkpoints.remember_path(&work.join("new.txt"))?;
+
+        let files = checkpoints.touched_files();
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            files[0].path,
+            work.join("note.txt").to_string_lossy().into_owned()
+        );
+        assert!(files[0].existed);
+        assert_eq!(files[0].previous.as_deref(), Some(b"v1".as_slice()));
+        assert_eq!(
+            files[1].path,
+            work.join("new.txt").to_string_lossy().into_owned()
+        );
+        assert!(!files[1].existed);
+        assert_eq!(files[1].previous, None);
+
+        checkpoints.restore_last()?;
+        let files = checkpoints.touched_files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].path,
+            work.join("note.txt").to_string_lossy().into_owned()
+        );
+
         let _ = fs::remove_dir_all(root);
         Ok(())
     }

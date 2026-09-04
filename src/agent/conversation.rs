@@ -343,6 +343,7 @@ impl Conversation {
         self.config.status_bar.clone_from(&config.status_bar);
         self.config.scroll_bar = config.scroll_bar;
         self.config.scroll_bar_auto_hide = config.scroll_bar_auto_hide;
+        self.config.bell = config.bell;
     }
 
     /// Starts a fresh session (used by `/new` and `/clear`).
@@ -537,6 +538,15 @@ impl Conversation {
         match &self.kind {
             ConversationKind::Persistent(state) => state,
             ConversationKind::Child(_) => panic!("operation requires a persistent conversation"),
+        }
+    }
+
+    /// Every path `write_file`/`edit_file` touched this session, each with its
+    /// oldest pre-image. Child conversations track no checkpoints.
+    pub fn touched_files(&self) -> Vec<crate::checkpoint::TouchedFile> {
+        match &self.kind {
+            ConversationKind::Persistent(state) => state.checkpoints.touched_files(),
+            ConversationKind::Child(_) => Vec::new(),
         }
     }
 

@@ -53,6 +53,7 @@ impl Config {
             status_bar: Default::default(),
             scroll_bar: true,
             scroll_bar_auto_hide: true,
+            bell: true,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
@@ -137,6 +138,9 @@ impl Config {
         }
         if let Some(value) = file.scroll_bar_auto_hide {
             self.scroll_bar_auto_hide = value;
+        }
+        if let Some(value) = file.bell {
+            self.bell = value;
         }
         if let Some(map) = file.context_windows {
             for (model, window) in &map {

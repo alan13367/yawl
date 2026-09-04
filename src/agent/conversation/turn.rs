@@ -14,6 +14,7 @@ use crate::agent::events::{TurnEvent, forward};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TurnMode {
     Normal,
+    Init,
     Goal,
     Plan,
     PlanFollowUp,
@@ -49,7 +50,7 @@ fn plan_continuation(mode: TurnMode) -> Option<&'static str> {
         TurnMode::PlanImplement => Some(plan::PLAN_IMPLEMENT_CONTINUATION),
         // Follow-up turns end on a text reply so the model can answer
         // requests unrelated to the plan without being forced to classify.
-        TurnMode::Normal | TurnMode::Goal | TurnMode::PlanFollowUp => None,
+        TurnMode::Normal | TurnMode::Init | TurnMode::Goal | TurnMode::PlanFollowUp => None,
     }
 }
 
@@ -120,6 +121,17 @@ impl Conversation {
                 sink(TurnEvent::Warning("subagent timeout exceeded".into()));
             }
             result
+        })
+    }
+
+    pub(crate) fn run_init_preserving_cancellation(
+        &mut self,
+        input: TurnInput,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        let cancellation = self.cancellation.clone();
+        crate::cancellation::scope(&cancellation, || {
+            self.run_turn_input_with_mode(Some(input), sink, &mut provider::resolve, TurnMode::Init)
         })
     }
 
@@ -307,6 +319,19 @@ impl Conversation {
     }
 
     #[cfg(test)]
+    pub(super) fn run_init_with<F>(
+        &mut self,
+        input: TurnInput,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        self.run_turn_input_with_mode(Some(input), sink, resolve_provider, TurnMode::Init)
+    }
+
+    #[cfg(test)]
     pub(super) fn run_goal_with<F>(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent<'_>),
@@ -464,7 +489,7 @@ impl Conversation {
                     registry.advertise_plan_action();
                 }
                 TurnMode::PlanImplement => registry.advertise_plan_implemented(),
-                TurnMode::Normal => {}
+                TurnMode::Normal | TurnMode::Init => {}
             }
             let specs = registry.specs();
             let system = match &self.kind {
@@ -480,6 +505,7 @@ impl Conversation {
                             .flatten(),
                         plan: plan_prompt(state.session.active_plan(), mode),
                         interactive_questions: self.questions.is_enabled(),
+                        init: mode == TurnMode::Init,
                     },
                 ),
                 ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(
@@ -1118,6 +1144,7 @@ impl Conversation {
                         .and_then(crate::session::PlanState::ready)
                         .map(crate::prompt::PlanPrompt::Active),
                     interactive_questions: self.questions.is_enabled(),
+                    init: false,
                 },
             ),
             ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(

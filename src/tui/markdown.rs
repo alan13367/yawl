@@ -294,6 +294,14 @@ fn parse_cells(line: &str) -> Vec<String> {
         .collect()
 }
 
+fn is_row_separator(row: &[String]) -> bool {
+    !row.is_empty()
+        && row.iter().all(|cell| {
+            let core = cell.trim().trim_matches(':').trim();
+            !core.is_empty() && core.chars().all(|character| character == '-')
+        })
+}
+
 fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     let available = width.saturating_sub(columns + 1);
@@ -305,6 +313,9 @@ fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
     }
     let mut widths = vec![1usize; columns];
     for row in rows {
+        if is_row_separator(row) {
+            continue;
+        }
         for (column, cell) in row.iter().enumerate() {
             widths[column] = widths[column].max(visible_width(&render_inline(cell)));
         }
@@ -323,6 +334,10 @@ fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
 
     output.push(table_border('┌', '┬', '┐', &widths));
     for (row_index, row) in rows.iter().enumerate() {
+        if row_index > 0 && is_row_separator(row) {
+            output.push(table_border('├', '┼', '┤', &widths));
+            continue;
+        }
         let cells = widths
             .iter()
             .copied()
@@ -918,6 +933,13 @@ mod tests {
                 .last()
                 .is_some_and(|line| strip_ansi(line).starts_with('└'))
         );
+    }
+
+    #[test]
+    fn renders_table_with_interior_separator_rows() {
+        let md = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| --- | --- |\n| 3 | 4 |";
+        let lines = render(md, 40);
+        assert_eq!(lines.iter().filter(|l| l.contains('┼')).count(), 2);
     }
 
     #[test]

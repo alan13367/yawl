@@ -16,6 +16,7 @@ fn completion_state(commands: &[&str]) -> ViewState {
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
+        bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
@@ -58,6 +59,36 @@ fn completion_state(commands: &[&str]) -> ViewState {
         process_view: None,
         render_cache: crate::tui::render::RenderCache::default(),
     }
+}
+
+#[test]
+fn command_menu_includes_init() {
+    let root = std::env::temp_dir().join(format!(
+        "yawl-init-completion-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let cwd = root.join("project");
+    let config = Config {
+        model: Some("test".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: cwd.join(".yawl"),
+        ..Config::test_default()
+    };
+    let dirs = config.session_dirs(&cwd);
+    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
+        .expect("session should be created");
+    let agent = Agent::new(config, "test".into(), session, Vec::new());
+
+    let completions = super::completion::command_completions(&agent);
+    assert!(completions.iter().any(|entry| {
+        entry.command == "/init" && entry.description == "Create or update AGENTS.md"
+    }));
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

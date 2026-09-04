@@ -29,6 +29,7 @@ use super::terminal::Terminal;
 #[derive(Clone, Copy)]
 pub(super) enum TurnKind {
     Normal,
+    Init,
     Goal,
     Plan,
     PlanFollowUp,
@@ -52,6 +53,10 @@ pub(super) fn turn_interactive<R: Read>(
         events,
         move |agent, sink| match kind {
             TurnKind::Normal => agent.run_turn_input_preserving_cancellation(input, sink),
+            TurnKind::Init => agent.run_init_preserving_cancellation(
+                input.ok_or_else(|| Error::Protocol("init input is missing".into()))?,
+                sink,
+            ),
             TurnKind::Goal => agent.run_goal_preserving_cancellation(sink),
             TurnKind::Plan => agent.run_plan_preserving_cancellation(sink),
             TurnKind::PlanFollowUp => agent.run_plan_follow_up_preserving_cancellation(
@@ -175,7 +180,7 @@ pub(super) fn pump_events<R: Read, T>(
 ) -> Result<T, Error> {
     let mut needs_draw = false;
     loop {
-        needs_draw |= sync_question(state, &worker.questions);
+        needs_draw |= sync_question(terminal, state, &worker.questions);
         while let Ok(update) = worker.updates.try_recv() {
             state.apply(update);
             needs_draw = true;
@@ -200,7 +205,26 @@ pub(super) fn pump_events<R: Read, T>(
         }
         let mut event = events.read_event()?;
         loop {
-            needs_draw |= !matches!(&event, Event::Tick);
+            match event {
+                Event::FocusGained => {
+                    terminal.set_focused(true);
+                    if !events.has_pending() {
+                        break;
+                    }
+                    event = events.read_event()?;
+                    continue;
+                }
+                Event::FocusLost => {
+                    terminal.set_focused(false);
+                    if !events.has_pending() {
+                        break;
+                    }
+                    event = events.read_event()?;
+                    continue;
+                }
+                _ => {}
+            }
+            needs_draw |= !matches!(&event, Event::Tick | Event::FocusGained | Event::FocusLost);
             if matches!(&event, Event::Tick) && crate::interrupted() {
                 crate::set_interrupted(false);
                 if !super::processes::handle_interrupt(state) {
@@ -242,11 +266,12 @@ pub(super) fn pump_events<R: Read, T>(
                     }
                     Event::Tick => {
                         needs_draw |= advance_ticks(state);
-                        needs_draw |= sync_question(state, &worker.questions);
+                        needs_draw |= sync_question(terminal, state, &worker.questions);
                     }
                     Event::MouseScroll(amount) => scroll(state, amount),
                     Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
                     Event::Paste(text) => paste_question_answer(state, &text),
+                    Event::FocusGained | Event::FocusLost => {}
                 }
                 break;
             }
@@ -276,7 +301,10 @@ pub(super) fn pump_events<R: Read, T>(
                         needs_draw |= advance_ticks(state);
                         needs_draw |= super::connection::poll(state);
                     }
-                    Event::MouseScroll(_) | Event::Paste(_) => {}
+                    Event::MouseScroll(_)
+                    | Event::Paste(_)
+                    | Event::FocusGained
+                    | Event::FocusLost => {}
                 }
                 break;
             }
@@ -285,6 +313,7 @@ pub(super) fn pump_events<R: Read, T>(
                     needs_draw |= advance_ticks(state);
                     needs_draw |= super::connection::poll(state);
                 }
+                Event::FocusGained | Event::FocusLost => {}
                 Event::MouseScroll(amount) => scroll(state, amount),
                 Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
                 Event::Paste(text) => {
@@ -395,7 +424,11 @@ pub(super) fn pump_events<R: Read, T>(
     }
 }
 
-fn sync_question(state: &mut ViewState, broker: &crate::tools::QuestionBroker) -> bool {
+fn sync_question(
+    terminal: &mut Terminal,
+    state: &mut ViewState,
+    broker: &crate::tools::QuestionBroker,
+) -> bool {
     let snapshot = broker.snapshot();
     match (state.question.as_mut(), snapshot) {
         (Some(active), Some(snapshot))
@@ -410,7 +443,10 @@ fn sync_question(state: &mut ViewState, broker: &crate::tools::QuestionBroker) -
             active.snapshot = snapshot;
             changed
         }
-        (_, Some(snapshot)) => {
+        (previous, Some(snapshot)) => {
+            if previous.is_none() && state.bell {
+                terminal.ring_bell();
+            }
             state.question = Some(super::state::ActiveQuestion::new(snapshot));
             true
         }
@@ -791,6 +827,10 @@ pub(super) fn display_config_change(
             ConfigChange::ScrollBarAutoHide(*enabled),
             interface(SettingsItem::ScrollBarAutoHide),
         ))),
+        PickerAction::SetBell(enabled) => Ok(Some((
+            ConfigChange::Bell(*enabled),
+            interface(SettingsItem::Bell),
+        ))),
         PickerAction::ApplySetting { argument, location } => {
             let change = if let Some(value) = argument.strip_prefix("accent_color ") {
                 Some(ConfigChange::AccentColor(
@@ -823,6 +863,7 @@ pub(super) fn apply_display_config_while_busy(
             state.accent_color = config.accent_color;
             state.selection_color = config.effective_selection_color();
             state.sync_scroll_bar_config(config);
+            state.bell = config.bell;
             state.subagents_enabled = config.subagents;
             notice_config_effect(config, outcome.effect, state);
             active_pickers.refresh_display_settings(config);

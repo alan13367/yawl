@@ -26,6 +26,9 @@ pub(super) struct ConfigFile {
     pub(super) scroll_bar: Option<bool>,
     /// Whether an idle transcript scroll bar hides itself after a pause.
     pub(super) scroll_bar_auto_hide: Option<bool>,
+    /// Whether the terminal bell rings when a turn settles or a question
+    /// needs an answer.
+    pub(super) bell: Option<bool>,
     /// Compatibility with the brief two-color settings format.
     pub(super) status_bar_color: Option<UiColor>,
     /// Compatibility with the brief two-color settings format.

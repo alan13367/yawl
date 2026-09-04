@@ -55,7 +55,7 @@ impl SettingsCategory {
     const fn description(self) -> &'static str {
         match self {
             Self::Model => "Default model, output, and reasoning",
-            Self::Interface => "Colors, reasoning display, and scroll bar",
+            Self::Interface => "Colors, reasoning display, scroll bar, and bell",
             Self::Context => "Compaction and context windows",
             Self::Providers => "Add or update model providers",
             Self::Web => "Browsing, search source, fetch limit, and keys",
@@ -84,6 +84,7 @@ pub(super) enum SettingsItem {
     StatusBar,
     ScrollBar,
     ScrollBarAutoHide,
+    Bell,
     AutoCompact,
     CompactThreshold,
     ContextWindow,
@@ -199,6 +200,7 @@ pub(super) enum PickerAction {
     SetWebSearchProvider(WebSearchProvider),
     SetScrollBar(bool),
     SetScrollBarAutoHide(bool),
+    SetBell(bool),
     ResumeSession(String),
     DeleteSession(String),
     /// Reopen the resume picker, restoring `selected` after a canceled delete.
@@ -551,6 +553,11 @@ pub(super) fn settings_category_picker_from(
                 label: "Auto-hide scroll bar".into(),
                 description: format!("{} · Enter to toggle", on_off(config.scroll_bar_auto_hide)),
                 action: PickerAction::SetScrollBarAutoHide(!config.scroll_bar_auto_hide),
+            },
+            PickerItem {
+                label: "Bell".into(),
+                description: format!("{} · Enter to toggle", on_off(config.bell)),
+                action: PickerAction::SetBell(!config.bell),
             },
         ],
         SettingsCategory::Context => vec![
@@ -1488,6 +1495,7 @@ fn settings_items(category: SettingsCategory) -> &'static [SettingsItem] {
             SettingsItem::StatusBar,
             SettingsItem::ScrollBar,
             SettingsItem::ScrollBarAutoHide,
+            SettingsItem::Bell,
         ],
         SettingsCategory::Context => &[
             SettingsItem::AutoCompact,

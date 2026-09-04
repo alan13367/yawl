@@ -74,6 +74,8 @@ pub(super) struct ViewState {
     /// effective `show_scroll_bar` so auto-hide can re-show it on activity.
     pub(super) scroll_bar_enabled: bool,
     pub(super) scroll_bar_auto_hide: bool,
+    /// Whether the terminal bell rings on settle and pending questions.
+    pub(super) bell: bool,
     pub(super) scroll_bar_idle_ticks: u32,
     pub(super) scroll_geometry: Option<ScrollGeometry>,
     pub(super) scroll_bar_drag: Option<usize>,
@@ -136,6 +138,7 @@ impl ViewState {
             status_bar_draft: None,
             scroll_bar_enabled: agent.config().scroll_bar,
             scroll_bar_auto_hide: agent.config().scroll_bar_auto_hide,
+            bell: agent.config().bell,
             show_scroll_bar: agent.config().scroll_bar,
             scroll_bar_idle_ticks: 0,
             scroll_geometry: None,

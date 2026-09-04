@@ -45,9 +45,10 @@ use crate::agent::Agent;
 use crate::error::Error;
 
 use self::commands::{
-    GoalAction, HELP, PlanAction, activate_picker_action, copy_all_messages, copy_last_reply, goal,
-    is_new_session_command, notice_undo, open_resume_picker, plan, plan_handoff_picker, reasoning,
-    refresh_model_selection, resume, settings, show_skills, unqueue,
+    GoalAction, HELP, HOTKEYS, PlanAction, activate_picker_action, copy_all_messages,
+    copy_last_reply, goal, is_new_session_command, notice_undo, open_resume_picker, plan,
+    plan_handoff_picker, reasoning, refresh_model_selection, resume, settings, show_diff,
+    show_skills, unqueue,
 };
 use self::completion::handle_completion_key;
 use self::events::{Event, EventReader, Key};
@@ -149,6 +150,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
             rebuild_transcript_after_deferred_follow_up(&mut state, agent.messages());
             state.activity.clear();
             state.turn_started = None;
+            notify_settled(&mut terminal, &state);
             terminal.draw(&mut state, &editor)?;
             continue;
         }
@@ -176,7 +178,26 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
         let mut event = events.read_event()?;
         let mut needs_draw = false;
         loop {
-            needs_draw |= !matches!(&event, Event::Tick);
+            match event {
+                Event::FocusGained => {
+                    terminal.set_focused(true);
+                    if !events.has_pending() {
+                        break;
+                    }
+                    event = events.read_event()?;
+                    continue;
+                }
+                Event::FocusLost => {
+                    terminal.set_focused(false);
+                    if !events.has_pending() {
+                        break;
+                    }
+                    event = events.read_event()?;
+                    continue;
+                }
+                _ => {}
+            }
+            needs_draw |= !matches!(&event, Event::Tick | Event::FocusGained | Event::FocusLost);
             if matches!(&event, Event::Tick) && crate::interrupted() {
                 crate::set_interrupted(false);
                 if !processes::handle_interrupt(&mut state) {
@@ -218,7 +239,10 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                         needs_draw |= advance_ticks(&mut state);
                         needs_draw |= connection::poll(&mut state);
                     }
-                    Event::MouseScroll(_) | Event::Paste(_) => {}
+                    Event::MouseScroll(_)
+                    | Event::Paste(_)
+                    | Event::FocusGained
+                    | Event::FocusLost => {}
                 }
                 break;
             }
@@ -227,6 +251,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                     needs_draw |= advance_ticks(&mut state);
                     needs_draw |= connection::poll(&mut state);
                 }
+                Event::FocusGained | Event::FocusLost => {}
                 Event::MouseScroll(amount) => scroll(&mut state, amount),
                 Event::Mouse(mouse) => handle_mouse_selection(&mut terminal, &mut state, mouse)?,
                 Event::Paste(text) => {
@@ -300,6 +325,15 @@ fn rebuild_transcript_after_deferred_follow_up(
 ) {
     state.transcript = Transcript::from_messages(messages);
     state.render_cache.invalidate();
+}
+
+/// Announces a settled turn through the terminal bell when the user may be
+/// away. A queued message suppresses the ring because another turn starts
+/// immediately.
+fn notify_settled(terminal: &mut Terminal, state: &ViewState) {
+    if state.bell && state.queued_inputs.is_empty() {
+        terminal.ring_bell();
+    }
 }
 
 fn paste_clipboard_image(agent: &Agent, state: &mut ViewState, editor: &mut Editor) {
@@ -379,6 +413,22 @@ fn handle_submission<R: Read>(
         match name {
             "quit" | "q" => return Ok(true),
             "help" => state.notice(HELP),
+            "hotkeys" => state.notice(HOTKEYS),
+            "diff" => show_diff(agent, state),
+            "init" => match commands::init(argument) {
+                Ok(input) => {
+                    run_agent_turn(
+                        agent,
+                        Some("/init".into()),
+                        TurnDispatch::Init(input),
+                        state,
+                        editor,
+                        terminal,
+                        events,
+                    )?;
+                }
+                Err(usage) => state.notice(usage),
+            },
             "model" if argument.is_empty() => open_model_picker(agent, state, false),
             "model" => {
                 agent.switch_model(argument.to_string());
@@ -557,6 +607,7 @@ enum GoalDispatch {
 
 enum TurnDispatch {
     Normal(Option<crate::provider::TurnInput>),
+    Init(crate::provider::TurnInput),
     Goal,
     Plan,
     PlanFollowUp(crate::provider::TurnInput),
@@ -595,6 +646,7 @@ fn run_agent_turn<R: Read>(
     let goal_mode = matches!(&turn, TurnDispatch::Goal);
     let kind = match &turn {
         TurnDispatch::Normal(_) => TurnKind::Normal,
+        TurnDispatch::Init(_) => TurnKind::Init,
         TurnDispatch::Goal => TurnKind::Goal,
         TurnDispatch::Plan => TurnKind::Plan,
         TurnDispatch::PlanFollowUp(_) => TurnKind::PlanFollowUp,
@@ -616,6 +668,7 @@ fn run_agent_turn<R: Read>(
     terminal.draw(state, editor)?;
     let agent_input = match turn {
         TurnDispatch::Normal(input) => input,
+        TurnDispatch::Init(input) => Some(input),
         TurnDispatch::Goal => None,
         TurnDispatch::Plan => None,
         TurnDispatch::PlanFollowUp(input) => Some(input),
@@ -643,6 +696,7 @@ fn run_agent_turn<R: Read>(
         Some(crate::session::PlanState::Draft { .. })
     );
     state.goal_running = false;
+    notify_settled(terminal, state);
     // Only a turn that ended through plan_complete offers the handoff;
     // follow-up turns replying to unrelated requests must not.
     if completed && agent.plan_ready_this_turn() {

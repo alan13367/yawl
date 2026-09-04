@@ -10,6 +10,17 @@ fn new_and_clear_are_new_session_commands() {
 }
 
 #[test]
+fn init_accepts_no_arguments_and_keeps_the_literal_command() {
+    let input = super::commands::init("").expect("bare init should run");
+    assert_eq!(input.text, "/init");
+    assert!(input.images.is_empty());
+    assert_eq!(
+        super::commands::init("replace").unwrap_err(),
+        "Usage: /init"
+    );
+}
+
+#[test]
 fn goal_submission_expands_long_pastes_for_the_agent() {
     let mut editor = Editor::default();
     let pasted = "goal detail ".repeat(50);
@@ -180,6 +191,7 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
+        bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
@@ -401,6 +413,253 @@ fn help_lists_undo_and_copy_commands() {
     assert!(HELP.contains("/usage"));
     assert!(HELP.contains("/ps"));
     assert!(HELP.contains("/reasoning"));
+    assert!(HELP.contains("/hotkeys"));
+    assert!(HELP.contains("/diff"));
+    assert!(HELP.contains("/init"));
+    assert!(HELP.contains("| Command | Description |"));
+
+    let rendered = crate::tui::markdown::render(HELP, 80);
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains('┌') && line.contains('┬'))
+    );
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains('└') && line.contains('┴'))
+    );
+    assert_eq!(rendered.iter().filter(|line| line.contains('┼')).count(), 5);
+}
+
+#[test]
+fn hotkeys_lists_the_key_reference_sections() {
+    for fragment in [
+        "Input",
+        "Ctrl+G",
+        "Editing",
+        "Ctrl+W",
+        "Transcript",
+        "Ctrl+F",
+        "Viewer",
+        "Questions",
+        "Queue",
+        "K` / `J",
+        "/ps",
+        "/subagents",
+        "| Area | Key | Action |",
+        "| --- | --- | --- |",
+    ] {
+        assert!(HOTKEYS.contains(fragment), "HOTKEYS is missing {fragment}");
+    }
+    assert!(!HOTKEYS.contains("Bell"));
+
+    let rendered = crate::tui::markdown::render(HOTKEYS, 80);
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains('┌') && line.contains('┬'))
+    );
+    assert_eq!(rendered.iter().filter(|line| line.contains('┼')).count(), 9);
+    assert!(
+        rendered
+            .iter()
+            .any(|line| line.contains('└') && line.contains('┴'))
+    );
+}
+
+#[test]
+fn bell_setting_round_trips_through_settings_and_picker() {
+    let root = std::env::temp_dir().join(format!(
+        "yawl-tui-bell-settings-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let config = Config {
+        model: Some("test".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
+    };
+    let cwd = root.join("project");
+    let dirs = config.session_dirs(&cwd);
+    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
+        .expect("session should be created");
+    let mut agent = Agent::new(config, "test".into(), session, Vec::new());
+    let mut state = ViewState::from_agent(&agent);
+    assert!(state.bell);
+
+    assert!(settings(&mut agent, "bell off", &mut state));
+    assert!(!agent.config().bell);
+    assert!(!state.bell);
+    assert!(!settings(&mut agent, "bell maybe", &mut state));
+
+    activate_picker_action(&mut agent, &mut state, PickerAction::SetBell(true));
+    assert!(agent.config().bell);
+    assert!(state.bell);
+    let picker = state.picker.as_ref().expect("interface picker reopens");
+    assert_eq!(picker.title, "Settings · Interface");
+    assert!(picker.items.iter().any(|item| item.label == "Bell"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn show_diff_explains_when_nothing_was_tracked() {
+    let root = std::env::temp_dir().join(format!(
+        "yawl-tui-diff-empty-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let config = Config {
+        model: Some("test".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
+    };
+    let cwd = root.join("project");
+    let dirs = config.session_dirs(&cwd);
+    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
+        .expect("session should be created");
+    let agent = Agent::new(config, "test".into(), session, Vec::new());
+    let mut state = ViewState::from_agent(&agent);
+
+    show_diff(&agent, &mut state);
+
+    assert!(
+        state.transcript.entries().iter().any(|entry| matches!(
+            entry,
+            Entry::Notice(text) if text.contains("No file changes recorded")
+        )),
+        "expected the no-changes notice"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn show_diff_renders_modified_created_and_deleted_files_from_disk() {
+    let root = std::env::temp_dir().join(format!(
+        "yawl-tui-diff-files-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).expect("work dir should be created");
+    let modified = work.join("modified.txt");
+    let created = work.join("created.txt");
+    let deleted = work.join("deleted.txt");
+    let unchanged = work.join("unchanged.txt");
+    let binary = work.join("binary.bin");
+    std::fs::write(&modified, "after").expect("modified file should be written");
+    std::fs::write(&created, "new content").expect("created file should be written");
+    std::fs::write(&unchanged, "same").expect("unchanged file should be written");
+    std::fs::write(&binary, [0xff, 0xfe]).expect("binary file should be written");
+    // `deleted` stays missing on disk so it reads as a removal.
+
+    let files = vec![
+        crate::checkpoint::TouchedFile {
+            path: modified.to_string_lossy().into_owned(),
+            existed: true,
+            previous: Some(b"before".to_vec()),
+        },
+        crate::checkpoint::TouchedFile {
+            path: created.to_string_lossy().into_owned(),
+            existed: false,
+            previous: None,
+        },
+        crate::checkpoint::TouchedFile {
+            path: deleted.to_string_lossy().into_owned(),
+            existed: true,
+            previous: Some(b"gone".to_vec()),
+        },
+        crate::checkpoint::TouchedFile {
+            path: unchanged.to_string_lossy().into_owned(),
+            existed: true,
+            previous: Some(b"same".to_vec()),
+        },
+        crate::checkpoint::TouchedFile {
+            path: binary.to_string_lossy().into_owned(),
+            existed: true,
+            previous: Some(b"old".to_vec()),
+        },
+    ];
+
+    let config = Config {
+        model: Some("test".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
+    };
+    let cwd = root.join("project");
+    let dirs = config.session_dirs(&cwd);
+    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
+        .expect("session should be created");
+    let agent = Agent::new(config, "test".into(), session, Vec::new());
+    let mut state = ViewState::from_agent(&agent);
+
+    super::commands::show_diff_files(&mut state, &work, &files);
+
+    let diffs: Vec<(&String, String)> = state
+        .transcript
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Diff { path, .. } => Some((path, entry.copy_text())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(diffs.len(), 3, "expected cards for {diffs:?}");
+    assert!(
+        diffs
+            .iter()
+            .any(|(path, _)| path.as_str() == "modified.txt")
+    );
+    assert!(diffs.iter().any(|(path, _)| path.as_str() == "created.txt"));
+    assert!(diffs.iter().any(|(path, _)| path.as_str() == "deleted.txt"));
+    assert!(!diffs.iter().any(|(path, _)| path.contains("unchanged")));
+    assert!(!diffs.iter().any(|(path, _)| path.contains("binary")));
+
+    let modified_text = diffs
+        .iter()
+        .find(|(path, _)| path.as_str() == "modified.txt")
+        .map(|(_, text)| text)
+        .expect("modified card");
+    assert!(modified_text.contains("- before"), "{modified_text}");
+    assert!(modified_text.contains("+ after"), "{modified_text}");
+
+    let deleted_text = diffs
+        .iter()
+        .find(|(path, _)| path.as_str() == "deleted.txt")
+        .map(|(_, text)| text)
+        .expect("deleted card");
+    assert!(deleted_text.contains("- gone"), "{deleted_text}");
+
+    let created_text = diffs
+        .iter()
+        .find(|(path, _)| path.as_str() == "created.txt")
+        .map(|(_, text)| text)
+        .expect("created card");
+    assert!(created_text.contains("+ new content"), "{created_text}");
+
+    assert!(
+        state.transcript.entries().iter().any(|entry| matches!(
+            entry,
+            Entry::Notice(text) if text.contains("binary.bin")
+        )),
+        "expected the non-UTF-8 file in the skipped notice"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

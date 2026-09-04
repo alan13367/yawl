@@ -29,6 +29,7 @@ pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
         ("/compact", "Summarize older messages"),
         ("/usage", "Show token and prompt-cache usage"),
         ("/undo", "Undo the last turn"),
+        ("/init", "Create or update AGENTS.md"),
         ("/copy", "Copy the last assistant reply"),
         ("/copy-all", "Copy the conversation without reasoning"),
         ("/tools", "List available tools"),
@@ -38,6 +39,8 @@ pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
         ("/goal", "Start, resume, or cancel a persistent goal"),
         ("/plan", "Start, resume, or cancel a planning workflow"),
         ("/help", "Show help"),
+        ("/hotkeys", "List every keyboard shortcut"),
+        ("/diff", "Show files changed this session"),
         ("/quit", "Exit Yawl"),
     ]
     .into_iter()

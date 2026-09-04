@@ -14,7 +14,7 @@ use crate::provider::ToolSpec;
 
 const SEARCH_RESULT_LIMIT: usize = 5;
 const SEARCH_BODY_LIMIT: usize = 2 * 1024 * 1024;
-const FETCH_BODY_LIMIT: usize = 2 * 1024 * 1024;
+const FETCH_BODY_LIMIT: usize = 10 * 1024 * 1024;
 const QUERY_MAX_CHARS: usize = 500;
 const BRAVE_QUERY_MAX_CHARS: usize = 400;
 const BRAVE_QUERY_MAX_WORDS: usize = 50;

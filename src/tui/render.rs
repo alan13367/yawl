@@ -258,7 +258,7 @@ impl CacheSlot {
 }
 
 fn entry_default_expanded(entry: &Entry, tools_expanded: bool) -> bool {
-    !matches!(entry, Entry::Tool { .. }) || tools_expanded
+    !matches!(entry, Entry::Tool { .. } | Entry::Diff { .. }) || tools_expanded
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -391,6 +391,7 @@ fn render_entry(
             lines.extend(markdown::render(content, width));
             lines
         }
+        Entry::Diff { path, lines } => tool_view::render_diff_card(path, lines, width, expanded),
         Entry::SubagentResult {
             id,
             name,
@@ -972,7 +973,11 @@ pub(super) fn has_visible_in_flight_content(state: &ViewState) -> bool {
         return false;
     };
     match last {
-        Entry::User(_) | Entry::Steer(_) | Entry::Notice(_) | Entry::SubagentResult { .. } => false,
+        Entry::User(_)
+        | Entry::Steer(_)
+        | Entry::Notice(_)
+        | Entry::Diff { .. }
+        | Entry::SubagentResult { .. } => false,
         Entry::Tool { running, .. } => *running,
         Entry::Reasoning { content, .. } => !state.hide_reasoning && !content.trim().is_empty(),
         Entry::Assistant(content) => !content.trim().is_empty(),

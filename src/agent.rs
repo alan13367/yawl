@@ -171,6 +171,12 @@ impl Agent {
         self.conversation.undo_last_turn()
     }
 
+    /// Every path `write_file`/`edit_file` touched this session, each with its
+    /// oldest pre-image.
+    pub fn touched_files(&self) -> Vec<crate::checkpoint::TouchedFile> {
+        self.conversation.touched_files()
+    }
+
     pub fn scan_tools(&mut self) -> Registry {
         self.conversation.scan_tools()
     }
@@ -213,6 +219,15 @@ impl Agent {
     ) -> Result<bool, Error> {
         self.conversation
             .run_turn_input_preserving_cancellation(user_input, sink)
+    }
+
+    pub(crate) fn run_init_preserving_cancellation(
+        &mut self,
+        input: TurnInput,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.conversation
+            .run_init_preserving_cancellation(input, sink)
     }
 
     pub(crate) fn run_goal_preserving_cancellation(

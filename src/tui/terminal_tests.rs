@@ -66,3 +66,13 @@ fn kitty_images_are_chunked_and_do_not_move_the_cursor() {
     assert!(output.contains("\x1b\\\x1b_Gm=0;"));
     assert_eq!(output.matches("\x1b_G").count(), 2);
 }
+
+#[test]
+fn ring_bell_only_emits_when_unfocused() {
+    let mut output = Vec::new();
+    Terminal::ring_bell_to(&mut output, true);
+    assert!(output.is_empty());
+
+    Terminal::ring_bell_to(&mut output, false);
+    assert_eq!(output, b"\x07");
+}

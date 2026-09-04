@@ -28,6 +28,7 @@ enum ProviderStep {
 struct ScriptedProvider {
     steps: Rc<RefCell<VecDeque<ProviderStep>>>,
     requests: Rc<RefCell<Vec<Vec<Role>>>>,
+    systems: Option<Rc<RefCell<Vec<String>>>>,
 }
 
 impl Provider for ScriptedProvider {
@@ -36,6 +37,9 @@ impl Provider for ScriptedProvider {
         request: &Request<'_>,
         on_event: &mut dyn FnMut(ProviderEvent),
     ) -> Result<(), Error> {
+        if let Some(systems) = &self.systems {
+            systems.borrow_mut().push(request.system.to_string());
+        }
         self.requests.borrow_mut().push(
             request
                 .messages
@@ -157,10 +161,12 @@ fn active_display_config_sync_keeps_the_status_bar_layout() {
     let mut active_config = conversation.config().clone();
     active_config.status_bar.items.clear();
     active_config.status_bar.style = crate::config::StatusBarStyle::Plain;
+    active_config.bell = false;
 
     conversation.sync_display_config(&active_config);
 
     assert_eq!(conversation.config().status_bar, active_config.status_bar);
+    assert!(!conversation.config().bell);
 }
 
 #[test]
@@ -206,6 +212,7 @@ fn print_mode_pump_delivers_deferred_results_in_a_follow_up_turn() {
             Box::new(ScriptedProvider {
                 steps: Rc::clone(&steps),
                 requests: Rc::clone(&requests),
+                systems: None,
             }),
             "test".into(),
         ))
@@ -279,6 +286,7 @@ fn conversation_transaction_persists_tool_loop_in_order() {
             Box::new(ScriptedProvider {
                 steps: Rc::clone(&steps),
                 requests: Rc::clone(&requests),
+                systems: None,
             }),
             "test".into(),
         ))
@@ -318,6 +326,123 @@ fn conversation_transaction_persists_tool_loop_in_order() {
     );
 }
 
+fn run_scripted_init_write(test: &mut TestAgent, content: &str) -> Rc<RefCell<Vec<String>>> {
+    let path = test.root.join("cwd/AGENTS.md");
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "init-write".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "content": content,
+                })
+                .to_string(),
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+        ProviderStep::Output {
+            text: "Updated AGENTS.md.",
+            tool_calls: Vec::new(),
+            input_tokens: 12,
+            output_tokens: 3,
+        },
+    ])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let systems = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = |_: &str, _: &Config| {
+        Ok::<(Box<dyn Provider>, String), Error>((
+            Box::new(ScriptedProvider {
+                steps: Rc::clone(&steps),
+                requests: Rc::clone(&requests),
+                systems: Some(Rc::clone(&systems)),
+            }),
+            "test".into(),
+        ))
+    };
+
+    let completed = test
+        .agent
+        .run_init_with("/init".to_string().into(), &mut |_| {}, &mut resolve)
+        .expect("init turn should complete");
+    assert!(completed);
+    systems
+}
+
+#[test]
+fn init_turn_keeps_literal_message_and_created_file_is_undoable() {
+    let mut test = TestAgent::new("init-create");
+    let agents = test.root.join("cwd/AGENTS.md");
+
+    let systems = run_scripted_init_write(&mut test, "# Agent guide\n");
+
+    assert_eq!(
+        std::fs::read_to_string(&agents).expect("read"),
+        "# Agent guide\n"
+    );
+    assert_eq!(test.agent.messages[0].content, "/init");
+    assert_eq!(systems.borrow().len(), 2);
+    assert!(
+        systems
+            .borrow()
+            .iter()
+            .all(|system| system.contains("<init_task>"))
+    );
+    let (_, replayed) = Session::open(&test.sessions_dir, test.agent.session_id())
+        .expect("init session should replay");
+    assert_eq!(replayed[0].content, "/init");
+
+    let report = test.agent.undo_last_turn().expect("undo init");
+    assert!(report.restored_files);
+    assert!(!agents.exists());
+    assert!(test.agent.messages.is_empty());
+
+    let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
+        text: "normal reply",
+        tool_calls: Vec::new(),
+        input_tokens: 5,
+        output_tokens: 2,
+    }])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let normal_systems = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = |_: &str, _: &Config| {
+        Ok::<(Box<dyn Provider>, String), Error>((
+            Box::new(ScriptedProvider {
+                steps: Rc::clone(&steps),
+                requests: Rc::clone(&requests),
+                systems: Some(Rc::clone(&normal_systems)),
+            }),
+            "test".into(),
+        ))
+    };
+    test.agent
+        .run_turn_with(Some("next".into()), &mut |_| {}, &mut resolve)
+        .expect("normal turn should complete");
+    assert!(!normal_systems.borrow()[0].contains("<init_task>"));
+}
+
+#[test]
+fn init_update_restores_existing_agents_file_on_undo() {
+    let mut test = TestAgent::new("init-update");
+    let agents = test.root.join("cwd/AGENTS.md");
+    std::fs::write(&agents, "old guidance\n").expect("seed AGENTS.md");
+
+    run_scripted_init_write(&mut test, "new guidance\n");
+    assert_eq!(
+        std::fs::read_to_string(&agents).expect("read"),
+        "new guidance\n"
+    );
+
+    let report = test.agent.undo_last_turn().expect("undo init update");
+    assert!(report.restored_files);
+    assert_eq!(
+        std::fs::read_to_string(&agents).expect("read"),
+        "old guidance\n"
+    );
+}
+
 #[test]
 fn failed_provider_does_not_persist_partial_assistant() {
     let mut test = TestAgent::new("provider-failure");
@@ -328,6 +453,7 @@ fn failed_provider_does_not_persist_partial_assistant() {
             Box::new(ScriptedProvider {
                 steps: Rc::clone(&steps),
                 requests: Rc::clone(&requests),
+                systems: None,
             }),
             "test".into(),
         ))
@@ -357,6 +483,7 @@ fn provider_usage_saturates_instead_of_wrapping() {
             Box::new(ScriptedProvider {
                 steps: Rc::clone(&steps),
                 requests: Rc::clone(&requests),
+                systems: None,
             }),
             "test".into(),
         ))
@@ -443,6 +570,7 @@ fn failed_auto_compaction_warns_and_the_turn_continues() {
             Box::new(ScriptedProvider {
                 steps: Rc::clone(&steps),
                 requests: Rc::clone(&requests),
+                systems: None,
             }),
             "test".into(),
         ))
@@ -608,6 +736,7 @@ fn scripted_resolve(
             Box::new(ScriptedProvider {
                 steps: Rc::clone(&steps),
                 requests: Rc::clone(&requests),
+                systems: None,
             }),
             "test".into(),
         ))

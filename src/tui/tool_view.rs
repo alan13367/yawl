@@ -8,12 +8,13 @@ use super::markdown;
 
 const OUTPUT_PREVIEW_LINES: usize = 10;
 const CALL_PREVIEW_LINES: usize = 6;
+const DIFF_PREVIEW_LINES: usize = 12;
 const SUCCESS_BACKGROUND: &str = "\x1b[48;2;42;50;41m";
 const ERROR_BACKGROUND: &str = "\x1b[48;2;50;42;42m";
 const SKILL_BACKGROUND: &str = "\x1b[48;2;54;44;82m";
 
-#[derive(Clone, Copy)]
-enum Tone {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Tone {
     Header,
     Output,
     Muted,
@@ -22,10 +23,11 @@ enum Tone {
     Error,
 }
 
-struct ToolLine {
-    text: String,
-    tone: Tone,
-    wrap: bool,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ToolLine {
+    pub(super) text: String,
+    pub(super) tone: Tone,
+    pub(super) wrap: bool,
 }
 
 struct BackgroundStartDetails {
@@ -625,7 +627,7 @@ struct DiffLine<'a> {
     kind: DiffKind,
 }
 
-fn edit_diff(old: &str, new: &str) -> Vec<ToolLine> {
+pub(super) fn edit_diff(old: &str, new: &str) -> Vec<ToolLine> {
     const CONTEXT: usize = 2;
     let old_lines = old.lines().collect::<Vec<_>>();
     let new_lines = new.lines().collect::<Vec<_>>();
@@ -655,6 +657,43 @@ fn edit_diff(old: &str, new: &str) -> Vec<ToolLine> {
         };
         rendered.push(ToolLine::new(format!("{prefix}{}", line.text), tone));
     }
+    rendered
+}
+
+/// Renders one full-width diff card for a `/diff` file entry, mirroring the
+/// edit-call presentation: success background, bold path header, then the
+/// precomputed diff lines with preview truncation.
+pub(super) fn render_diff_card(
+    path: &str,
+    lines: &[ToolLine],
+    width: usize,
+    expanded: bool,
+) -> Vec<String> {
+    let width = width.max(8);
+    let horizontal_padding = usize::from(width >= 3);
+    let content_width = width.saturating_sub(horizontal_padding * 2).max(1);
+    let mut content = vec![ToolLine::new(path, Tone::Header)];
+    content.extend(preview_lines(
+        lines.to_vec(),
+        DIFF_PREVIEW_LINES,
+        expanded,
+        false,
+    ));
+    let background = SUCCESS_BACKGROUND;
+    let padding = format!("{background}{}\x1b[0m", " ".repeat(width));
+    let mut rendered = Vec::new();
+    rendered.push(padding.clone());
+    rendered.extend(content.into_iter().flat_map(|line| {
+        render_line(
+            line,
+            width,
+            content_width,
+            horizontal_padding,
+            expanded,
+            background,
+        )
+    }));
+    rendered.push(padding);
     rendered
 }
 
@@ -1314,6 +1353,36 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
         assert_eq!(format_elapsed(Duration::from_secs(187)), "3m 07s");
         assert_eq!(format_elapsed(Duration::from_secs(3_845)), "1h 04m");
+    }
+
+    #[test]
+    fn diff_cards_truncate_when_compact_and_expand_fully() {
+        let old = "a\n".repeat(20);
+        let new = "b\n".repeat(20);
+        let lines = edit_diff(old.trim_end(), new.trim_end());
+        assert!(lines.len() > DIFF_PREVIEW_LINES);
+
+        let compact = render_diff_card("src/note.txt", &lines, 40, false);
+        assert!(
+            compact
+                .iter()
+                .any(|line| line.contains("... (") && line.contains("Ctrl+O to expand)"))
+        );
+        assert!(
+            !compact
+                .iter()
+                .any(|line| line.contains("[Ctrl+O to collapse]"))
+        );
+
+        let expanded = render_diff_card("src/note.txt", &lines, 40, true);
+        assert!(
+            expanded
+                .iter()
+                .any(|line| line.contains("[Ctrl+O to collapse]"))
+        );
+        assert!(expanded.iter().any(|line| line.contains("- a")));
+        assert!(expanded.iter().any(|line| line.contains("+ b")));
+        assert!(expanded.iter().any(|line| line.contains("src/note.txt")));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::config::{
     parse_bounded, parse_builtin_api_key, parse_on_off, parse_threshold,
 };
 use crate::error::Error;
-use crate::provider::{Message, Role};
+use crate::provider::{Message, Role, TurnInput};
 
 use super::picker::{
     Picker, PickerAction, PickerItem, SettingsCategory, SettingsItem, SettingsLocation,
@@ -19,52 +19,113 @@ use super::state::ViewState;
 
 pub(super) const HELP: &str = "\
 Commands
-  /model [MODEL]       open the model picker or switch directly
-  /reasoning [LEVEL]   show supported reasoning levels or set one
-  /connect             configure a model provider interactively
-  /settings [KEY ...]  open the settings picker or change directly
-  /new                 start a new session without changing directories
-  /clear               alias for /new
-  /compact             summarize older messages now
-  /usage               show token and prompt-cache usage
-  /undo                restore files and drop the last turn
-  /copy                copy the last assistant reply
-  /copy-all            copy the conversation without reasoning
-  /tools               list builtin and discovered tools
-  /skills              list discovered skills and search directories
-  /subagents           open the subagent dashboard
-  /ps                  open the background process dashboard
-  /skill:NAME [ARGS]   run a discovered skill
-  /resume [ID|NUMBER]  open the session picker or resume directly
-  /unqueue [N|all]     cancel queued messages
-  /goal [TEXT]         start, resume, cancel, or show the persistent goal
-  /plan [TEXT]         start, resume, cancel, or show a planning workflow
-  /help                show this help
-  /quit                leave Yawl
+
+| Command | Description |
+| --- | --- |
+| `/new`, `/clear` | Start a fresh session in the current directory |
+| `/resume [ID]` | Open session picker or resume directly |
+| `/undo` | Restore files and drop the last turn |
+| `/diff` | Show files changed this session |
+| `/init` | Create or update project agent guidance |
+| `/quit` | Leave Yawl |
+| --- | --- |
+| `/model [MODEL]` | Open model picker or switch directly |
+| `/reasoning [LVL]` | Show supported reasoning levels or set one |
+| `/settings [KEY]` | Open settings picker or change directly |
+| `/connect` | Configure a model provider interactively |
+| --- | --- |
+| `/usage` | Show token and prompt-cache usage |
+| `/compact` | Summarize older messages now |
+| `/copy` | Copy the last assistant reply |
+| `/copy-all` | Copy conversation without reasoning |
+| `/tools` | List builtin and discovered tools |
+| `/skills` | List discovered skills (run `/skill:NAME`) |
+| --- | --- |
+| `/goal [TEXT]` | Start, resume, cancel, or show goal |
+| `/plan [TEXT]` | Start, resume, cancel, or show plan workflow |
+| `/unqueue [N]` | Cancel or manage queued messages |
+| `/subagents` | Open the subagent dashboard |
+| `/ps` | Open the background process dashboard |
+| --- | --- |
+| `/hotkeys` | Show keyboard shortcuts grid |
+| `/help` | Show this command reference |
 
 Input
-  Enter submits while idle and steers during an active response. Tab queues a
-    non-empty message while a response runs. Shift+Enter, Alt+Enter, or Ctrl+J
-    inserts a newline.
-    Type / for commands; Up/Down select, Tab completes, and Enter runs the selected
-    command or an exact name such as /copy.
-  Model, settings, and provider setup remain available during an active response.
-  Queued messages appear below the response. Ctrl+G steers the running turn at the
-    next safe boundary; Ctrl+Enter also works in terminals that report modified
-    Enter. /unqueue opens an editor: K/J reorder, e edits, d deletes, and Enter
-    stops the turn to send.
-  Outside the menu, Up and Down browse input history. Ctrl+U, Ctrl+K, and Ctrl+W edit.
-  Ctrl+V pastes a clipboard image as [Image #N] when the model accepts images.
-  Otherwise, Tab focuses transcript blocks when no completion is open. Up/Down
-    move, Left/Right fold, Enter opens,
-    y copies, and Esc returns to the editor. Ctrl+F searches the transcript.
-  Ctrl+O expands or collapses tool output. Esc or Ctrl+C aborts the active turn.
-   Mouse wheel and PageUp/PageDown scroll. Click or drag the right-edge
-   scroll bar to move through the transcript. Drag selects text; release copies it.
+
+- `Enter` submits when idle, or steers while a response runs
+- `Tab` completes in menus, or queues a message while busy
+- Run `/hotkeys` for all editing, transcript, and dashboard shortcuts
+";
+
+pub(super) const HOTKEYS: &str = "\
+Keyboard shortcuts
+
+| Area | Key | Action |
+| --- | --- | --- |
+| **Input** | `Enter` | Submit while idle; steer running turn |
+| | `Ctrl+G`, `Ctrl+Enter` | Steer at next safe boundary |
+| | `Tab` | Queue while busy; complete in menus |
+| | `Shift/Alt+Enter`, `Ctrl+J` | Insert a newline |
+| | `Escape`, `Ctrl+C` | Abort active turn; clear editor |
+| | `Ctrl+L` | Repaint the screen |
+| --- | --- | --- |
+| **Editing** | `Left` / `Right` | Move cursor |
+| | `Home` / `End`, `Ctrl+A/E` | Jump to line start / end |
+| | `Backspace`, `Delete` | Delete character |
+| | `Ctrl+U`, `Ctrl+K`, `Ctrl+W` | Delete to start, end, or word |
+| | `Up` / `Down` | Move wrapped line, then history |
+| | `Ctrl+V` | Paste image as `[Image #N]` |
+| --- | --- | --- |
+| **Menus** | `Up` / `Down` | Change selection (wraps) |
+| | `Tab` | Complete selection |
+| | `Enter` | Run command, or insert `@` tag |
+| --- | --- | --- |
+| **Transcript** | `Tab` | Focus transcript when idle |
+| | `Up`/`Down` or `k`/`j` | Move between blocks |
+| | `Left`/`Right` or `h`/`l` | Fold / unfold selected block |
+| | `Enter` | Open full-screen viewer |
+| | `y` | Copy selected block |
+| | `Escape`, `Ctrl+C` | Return to editor |
+| | `Ctrl+O` | Expand / collapse tool output |
+| | `Ctrl+F` | Search: Enter next, Up prev, Esc closes |
+| | `PgUp`/`PgDn`, Wheel | Scroll; drag scroll bar to jump |
+| | Drag (left button) | Select text; release copies to clipboard |
+| --- | --- | --- |
+| **Viewer** | `Up`/`Down`, `PgUp`/`PgDn` | Scroll viewer |
+| | `y` | Copy block contents |
+| | `Escape`, `Enter` | Close viewer |
+| --- | --- | --- |
+| **Questions** | `Up`/`Down` or `k`/`j` | Change selection |
+| | `1`–`4` | Choose option directly |
+| | `Enter` | Confirm (Other… opens multiline editor) |
+| | `Escape` | Cancel question and running turn |
+| --- | --- | --- |
+| **Queue** | `Up` / `Down` | Select queued message |
+| | `K` / `J` | Reorder queued messages |
+| | `e` | Edit selected message |
+| | `d`, `Delete` | Delete selected message |
+| | `Enter` | Stop turn and send now |
+| --- | --- | --- |
+| **/ps** | `Up`/`Down` or `j`/`k` | Select row; Enter views logs |
+| | `x`, `Ctrl+C` | Stop command immediately |
+| | `r` / `d`, `Delete` | Restart / remove settled history |
+| | `Escape` | Close dashboard |
+| --- | --- | --- |
+| **/subagents** | `Up`/`Down` or `j`/`k` | Select run; Enter opens takeover |
+| | `x` | Ask to cancel selected run |
+| | `Escape` | Close dashboard |
 ";
 
 pub(super) fn is_new_session_command(name: &str) -> bool {
     matches!(name, "new" | "clear")
+}
+
+pub(super) fn init(argument: &str) -> Result<TurnInput, &'static str> {
+    if argument.is_empty() {
+        Ok("/init".to_string().into())
+    } else {
+        Err("Usage: /init")
+    }
 }
 
 pub(super) enum GoalAction {
@@ -595,6 +656,11 @@ pub(super) fn activate_picker_action(
                 );
             }
         }
+        PickerAction::SetBell(enabled) => {
+            if apply_config_change(agent, ConfigChange::Bell(enabled), state) {
+                open_settings_location(agent, state, interface_location(SettingsItem::Bell));
+            }
+        }
         PickerAction::SetAccentColor(color) => {
             if apply_config_change(agent, ConfigChange::AccentColor(color), state) {
                 open_settings_location(agent, state, interface_location(SettingsItem::AccentColor));
@@ -815,6 +881,9 @@ pub(super) fn settings(agent: &mut Agent, argument: &str, state: &mut ViewState)
                 .and_then(parse_on_off)
                 .map(ConfigChange::ScrollBarAutoHide)
         }
+        "bell" => one_value(&mut parts, "usage: /settings bell on|off")
+            .and_then(parse_on_off)
+            .map(ConfigChange::Bell),
         "auto_compact" => one_value(&mut parts, "usage: /settings auto_compact on|off")
             .and_then(parse_on_off)
             .map(ConfigChange::AutoCompact),
@@ -966,6 +1035,7 @@ fn apply_config_change(agent: &mut Agent, change: ConfigChange, state: &mut View
             state.status_bar = agent.config().status_bar.clone();
             state.subagents_enabled = agent.config().subagents;
             state.sync_scroll_bar_config(agent.config());
+            state.bell = agent.config().bell;
             state.context_window = agent.context_window();
             notice_config_effect(agent.config(), effect, state);
             true
@@ -1012,7 +1082,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- status_bar: `{} items, {} style`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- web_browsing: `{}`\n- web_search_provider: `{}`\n- web_fetch_max_chars: `{}`\n- brave_api_key: `{}`\n- firecrawl_api_key: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- status_bar: `{} items, {} style`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- bell: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- web_browsing: `{}`\n- web_search_provider: `{}`\n- web_fetch_max_chars: `{}`\n- brave_api_key: `{}`\n- firecrawl_api_key: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -1035,6 +1105,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         } else {
             "off"
         },
+        if agent.config().bell { "on" } else { "off" },
         if agent.config().auto_compact {
             "on"
         } else {
@@ -1101,7 +1172,7 @@ pub(super) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings bell on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);
@@ -1395,6 +1466,89 @@ pub(super) fn copy_all_from_transcript(
 ) -> Result<(), Error> {
     let text = format_copy_all_from_transcript(&state.transcript);
     copy_to_clipboard(terminal, state, &text)
+}
+
+/// Per-side content cap for `/diff` cards, matching the `read_file` limit.
+const DIFF_MAX_BYTES: usize = 1024 * 1024;
+
+/// Renders `/diff`: one diff card per file the file tools touched this
+/// session, comparing the oldest `/undo` pre-image with the current contents.
+pub(super) fn show_diff(agent: &Agent, state: &mut ViewState) {
+    let work_tree = crate::config::working_dir();
+    show_diff_files(state, &work_tree, &agent.touched_files());
+}
+
+/// Renders diff cards for explicit touched-file records. Split from
+/// `show_diff` so tests can drive real files without checkpoint plumbing.
+pub(super) fn show_diff_files(
+    state: &mut ViewState,
+    work_tree: &std::path::Path,
+    files: &[crate::checkpoint::TouchedFile],
+) {
+    let mut skipped: Vec<String> = Vec::new();
+    let mut shown = 0usize;
+    for file in files {
+        let display = diff_display_path(work_tree, &file.path);
+        let previous = match (file.existed, &file.previous) {
+            (true, Some(bytes)) => Some(bytes.clone()),
+            (true, None) => {
+                skipped.push(format!("{display} (pre-image unreadable)"));
+                continue;
+            }
+            (false, _) => None,
+        };
+        let new_bytes = match std::fs::read(&file.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if previous.is_none() {
+                    // Created and deleted again within the session.
+                    continue;
+                }
+                Vec::new()
+            }
+            Err(_) => {
+                skipped.push(format!("{display} (unreadable)"));
+                continue;
+            }
+        };
+        let old_bytes = previous.unwrap_or_default();
+        if old_bytes == new_bytes {
+            continue;
+        }
+        let (Ok(old), Ok(new)) = (String::from_utf8(old_bytes), String::from_utf8(new_bytes))
+        else {
+            skipped.push(format!("{display} (not UTF-8)"));
+            continue;
+        };
+        if old.len() > DIFF_MAX_BYTES || new.len() > DIFF_MAX_BYTES {
+            skipped.push(format!("{display} (over 1 MiB)"));
+            continue;
+        }
+        state
+            .transcript
+            .push_diff(display, super::tool_view::edit_diff(&old, &new));
+        shown += 1;
+    }
+    if shown == 0 && skipped.is_empty() {
+        state.notice(
+            "No file changes recorded this session. Changes made through `shell` or exec tools are not tracked.",
+        );
+        return;
+    }
+    if !skipped.is_empty() {
+        let mut text = String::from("Files not shown\n\n");
+        for path in &skipped {
+            text.push_str(&format!("- {path}\n"));
+        }
+        state.notice(text);
+    }
+}
+
+fn diff_display_path(work_tree: &std::path::Path, path: &str) -> String {
+    std::path::Path::new(path)
+        .strip_prefix(work_tree)
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 pub(super) fn notice_undo(state: &mut ViewState, report: crate::agent::UndoReport) {

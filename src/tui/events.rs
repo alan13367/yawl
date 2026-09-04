@@ -51,6 +51,8 @@ pub enum Event {
     /// Positive values scroll toward older content.
     MouseScroll(i32),
     Mouse(MouseEvent),
+    FocusGained,
+    FocusLost,
     /// Raw mode uses a short read timeout, which also lets the UI notice
     /// terminal resizes and signal-handler state changes.
     Tick,
@@ -163,6 +165,14 @@ impl<R: Read> EventReader<R> {
         }
         if final_byte == b'u' {
             return Ok(Event::Key(parse_kitty_key(&body).unwrap_or(Key::Escape)));
+        }
+        if body.is_empty() {
+            if final_byte == b'I' {
+                return Ok(Event::FocusGained);
+            }
+            if final_byte == b'O' {
+                return Ok(Event::FocusLost);
+            }
         }
         let key = match (body.as_ref(), final_byte) {
             (_, b'A') => Key::Up,
@@ -459,6 +469,14 @@ mod tests {
         assert!(reader.has_pending());
         assert_eq!(reader.read_event()?, Event::MouseScroll(3));
         assert!(!reader.has_pending());
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_focus_events() -> std::io::Result<()> {
+        let mut reader = EventReader::new(Cursor::new(b"\x1b[I\x1b[O"));
+        assert_eq!(reader.read_event()?, Event::FocusGained);
+        assert_eq!(reader.read_event()?, Event::FocusLost);
         Ok(())
     }
 }

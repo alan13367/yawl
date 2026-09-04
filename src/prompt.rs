@@ -19,6 +19,7 @@ pub(crate) struct MainPromptState<'a> {
     pub(crate) goal: Option<&'a str>,
     pub(crate) plan: Option<PlanPrompt<'a>>,
     pub(crate) interactive_questions: bool,
+    pub(crate) init: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -38,8 +39,28 @@ pub(crate) fn build_system_prompt(
     state: MainPromptState<'_>,
 ) -> String {
     let cwd = std::env::current_dir().ok();
-    let mut prompt = build_system_prompt_from(
+    build_main_system_prompt_from(
         cwd.as_deref(),
+        global_dir,
+        subagents,
+        print_mode,
+        web_browsing,
+        skills,
+        state,
+    )
+}
+
+fn build_main_system_prompt_from(
+    cwd: Option<&Path>,
+    global_dir: &Path,
+    subagents: bool,
+    print_mode: bool,
+    web_browsing: bool,
+    skills: &[Skill],
+    state: MainPromptState<'_>,
+) -> String {
+    let mut prompt = build_system_prompt_from(
+        cwd,
         global_dir,
         PromptOptions {
             subagents,
@@ -57,6 +78,7 @@ pub(crate) fn build_system_prompt(
         );
     }
     append_plan_prompt(&mut prompt, state.plan);
+    append_init_task(&mut prompt, state.init);
     prompt
 }
 
@@ -119,6 +141,26 @@ fn append_plan_prompt(prompt: &mut String, plan: Option<PlanPrompt<'_>>) {
     prompt.push_str("\n\n");
     prompt.push_str(instructions);
     prompt.push_str("\n</active_plan>\n");
+}
+
+fn append_init_task(prompt: &mut String, active: bool) {
+    if !active {
+        return;
+    }
+    prompt.push_str(
+        r#"
+<init_task>
+The user ran `/init`. Create or update `./AGENTS.md` as concise working guidance for coding agents.
+
+- Treat the current working directory as the project root. Inspect authoritative repository files before writing and do not invent details.
+- Change only `./AGENTS.md`. Use `write_file` or `edit_file` so `/undo` can restore the change. Shell commands and discovered tools may inspect the project but must not mutate it.
+- If `AGENTS.md` exists, keep accurate hand-written constraints, correct stale details, remove repetition and historical notes, and reorganize the document when that makes it easier to use. Do not replace useful guidance blindly.
+- Choose sections that fit this project. Include only facts an agent needs while working, such as exact build and test commands, important module boundaries, code conventions, generated-file warnings, and operational constraints.
+- Omit generic coding advice, exhaustive file inventories, human setup tutorials, dates, recent-change summaries, and changelog entries. This document is not a changelog.
+- If the current file already meets these rules, leave it unchanged. Finish by saying whether you created, updated, or kept `AGENTS.md` and summarize the useful guidance.
+</init_task>
+"#,
+    );
 }
 
 fn build_system_prompt_from(
@@ -420,6 +462,56 @@ mod tests {
         assert!(prompt.contains("<global_instructions path=\"~/.yawl/AGENTS.md\">"));
         assert!(prompt.contains("<project_instructions path=\"AGENTS.md\">"));
         assert!(!prompt.contains("legacy rule"));
+    }
+
+    #[test]
+    fn init_task_follows_project_instructions_and_is_init_only() {
+        let dirs = TestDirs::new();
+        let global_dir = dirs.0.join("global");
+        let project_dir = dirs.0.join("project");
+        std::fs::create_dir_all(&global_dir).expect("global test directory should be created");
+        std::fs::create_dir_all(&project_dir).expect("project test directory should be created");
+        std::fs::write(project_dir.join("AGENTS.md"), "keep this project rule")
+            .expect("project instructions should be written");
+
+        let init = build_main_system_prompt_from(
+            Some(&project_dir),
+            &global_dir,
+            false,
+            false,
+            false,
+            &[],
+            MainPromptState {
+                init: true,
+                ..MainPromptState::default()
+            },
+        );
+        let normal = build_main_system_prompt_from(
+            Some(&project_dir),
+            &global_dir,
+            false,
+            false,
+            false,
+            &[],
+            MainPromptState::default(),
+        );
+
+        let project_position = init
+            .find("keep this project rule")
+            .expect("project instructions should be present");
+        let init_position = init
+            .find("<init_task>")
+            .expect("init task should be present");
+        assert!(project_position < init_position);
+        for required in [
+            "Change only `./AGENTS.md`",
+            "Use `write_file` or `edit_file`",
+            "Do not replace useful guidance blindly",
+            "This document is not a changelog",
+        ] {
+            assert!(init.contains(required), "init prompt is missing {required}");
+        }
+        assert!(!normal.contains("<init_task>"));
     }
 
     #[test]
