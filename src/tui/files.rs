@@ -20,22 +20,29 @@ const SKIP_DIRS: &[&str] = &["target", "node_modules", "dist", "build", "__pycac
 #[derive(Default)]
 pub(super) struct FileIndex {
     entries: Option<Vec<String>>,
+    cached_query: Option<String>,
+    cached_matches: Vec<String>,
 }
 
 impl FileIndex {
     /// Ranked relative paths matching `query`, building the index on first
     /// use. An empty query lists the front of the index.
-    pub(super) fn matches(&mut self, query: &str) -> Vec<String> {
+    pub(super) fn matches(&mut self, query: &str) -> &[String] {
         let entries = self
             .entries
             .get_or_insert_with(|| scan(&crate::config::working_dir()));
-        rank_matches(entries, query)
+        if self.cached_query.as_deref() != Some(query) {
+            self.cached_matches = rank_matches(entries, query);
+            self.cached_query = Some(query.to_string());
+        }
+        &self.cached_matches
     }
 
     #[cfg(test)]
     pub(super) fn with_entries(entries: Vec<String>) -> Self {
         Self {
             entries: Some(entries),
+            ..Self::default()
         }
     }
 }
@@ -166,6 +173,17 @@ mod tests {
 
     fn entries(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|path| (*path).to_string()).collect()
+    }
+
+    #[test]
+    fn cached_matches_follow_query_changes_and_keep_order() {
+        let paths = entries(&["src/Config.rs", "README.md", "config/notes.md"]);
+        let mut index = FileIndex::with_entries(paths.clone());
+        for query in ["", "config", "config", "CONFIG", "zzzz", "zzzz", "rdme", ""] {
+            assert_eq!(index.matches(query), rank_matches(&paths, query));
+        }
+        let storage = index.matches("").as_ptr();
+        assert_eq!(index.matches("").as_ptr(), storage);
     }
 
     #[test]

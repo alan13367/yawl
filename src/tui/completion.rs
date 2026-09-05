@@ -23,6 +23,7 @@ pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
         ("/connect", "Configure a model provider"),
         ("/settings", "Show or change settings"),
         ("/subagents", "Open the subagent dashboard"),
+        ("/git", "Open the git dashboard"),
         ("/ps", "Open the background process dashboard"),
         ("/new", "Start a session without changing directories"),
         ("/clear", "Alias for /new"),
@@ -117,8 +118,8 @@ pub(super) fn menu_rows(state: &mut ViewState, editor: &Editor) -> Vec<(String, 
         return state
             .file_index
             .matches(&query)
-            .into_iter()
-            .map(|path| mention_row(&path))
+            .iter()
+            .map(|path| mention_row(path))
             .collect();
     }
     Vec::new()

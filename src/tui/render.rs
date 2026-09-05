@@ -869,11 +869,11 @@ pub(super) fn apply_scroll_bar(
     }
 }
 
-struct TranscriptWindow {
-    lines: Vec<(String, Option<usize>)>,
-    images: Vec<FrameImage>,
-    total_lines: usize,
-    max_scroll: usize,
+pub(super) struct TranscriptWindow {
+    pub(super) lines: Vec<(String, Option<usize>)>,
+    pub(super) images: Vec<FrameImage>,
+    pub(super) total_lines: usize,
+    pub(super) max_scroll: usize,
 }
 
 fn subagent_labels(state: &ViewState) -> Vec<(String, String)> {
@@ -891,7 +891,7 @@ fn label_refs(labels: &[(String, String)]) -> Vec<(&str, &str)> {
         .collect()
 }
 
-fn render_transcript_window(
+pub(super) fn render_transcript_window(
     state: &mut ViewState,
     width: usize,
     height: usize,
@@ -1031,8 +1031,24 @@ pub(super) fn build_frame_with_images(
     rows: usize,
     image_support: ImageSupport,
 ) -> RenderedFrame {
+    if state.git_init.is_some() {
+        let (lines, cursor) = super::git::render_init(state, editor, columns, rows);
+        return RenderedFrame {
+            lines,
+            cursor,
+            images: Vec::new(),
+        };
+    }
     if state.process_view.is_some() {
         let (lines, cursor) = super::processes::render(state, columns, rows);
+        return RenderedFrame {
+            lines,
+            cursor,
+            images: Vec::new(),
+        };
+    }
+    if state.git_view.is_some() {
+        let (lines, cursor) = super::git::render(state, editor, columns, rows);
         return RenderedFrame {
             lines,
             cursor,

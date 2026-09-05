@@ -60,9 +60,9 @@ impl Fix {
             Fix::QuarantineFile { path } => {
                 format!("rename {} aside so defaults regenerate", path.display())
             }
-            Fix::RemoveKey { keys, .. } => format!("remove {}", dotted(keys)),
+            Fix::RemoveKey { keys, .. } => format!("remove {}", keys.join(".")),
             Fix::SetValue { keys, value, .. } => {
-                format!("set {} to {}", dotted(keys), value)
+                format!("set {} to {}", keys.join("."), value)
             }
             Fix::ChmodPrivate { path } => format!("chmod 600 {}", path.display()),
             Fix::RestoreBackup { from, to } => {
@@ -70,10 +70,6 @@ impl Fix {
             }
         }
     }
-}
-
-fn dotted(keys: &[String]) -> String {
-    keys.join(".")
 }
 
 /// Returns the value at a nested key path. Digit segments index arrays.

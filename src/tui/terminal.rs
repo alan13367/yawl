@@ -23,6 +23,67 @@ pub(super) struct Terminal {
     last_size: (u16, u16),
     selection: Option<TextSelection>,
     image_protocol: ImageProtocol,
+    mouse_mode: MouseMode,
+}
+
+/// All-motion reports are needed only while the Git dashboard is visible.
+pub(super) struct MouseMode {
+    tracking: bool,
+    pointing: bool,
+    pointer_shapes: bool,
+}
+
+impl MouseMode {
+    pub(super) fn new(pointer_shapes: bool) -> Self {
+        Self {
+            tracking: false,
+            pointing: false,
+            pointer_shapes,
+        }
+    }
+
+    pub(super) fn update(
+        &mut self,
+        output: &mut impl Write,
+        tracking: bool,
+        pointing: bool,
+    ) -> io::Result<()> {
+        if self.tracking != tracking {
+            output.write_all(if tracking {
+                b"\x1b[?1002l\x1b[?1003h"
+            } else {
+                b"\x1b[?1003l\x1b[?1002h"
+            })?;
+            self.tracking = tracking;
+        }
+        let pointing = tracking && pointing && self.pointer_shapes;
+        if self.pointing != pointing {
+            output.write_all(if pointing {
+                b"\x1b]22;pointer\x1b\\"
+            } else {
+                b"\x1b]22;\x1b\\"
+            })?;
+            self.pointing = pointing;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn supports_pointer_shapes(
+    term_program: Option<&str>,
+    term: Option<&str>,
+    kitty_window: bool,
+) -> bool {
+    kitty_window
+        || term_program.is_some_and(|name| {
+            name.eq_ignore_ascii_case("ghostty") || name.eq_ignore_ascii_case("kitty")
+        })
+        || term.is_some_and(|name| {
+            name == "xterm-kitty"
+                || name == "xterm-ghostty"
+                || name == "foot"
+                || name == "foot-extra"
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +181,11 @@ impl Terminal {
             last_size: (0, 0),
             selection: None,
             image_protocol: ImageProtocol::detect(),
+            mouse_mode: MouseMode::new(supports_pointer_shapes(
+                std::env::var("TERM_PROGRAM").ok().as_deref(),
+                std::env::var("TERM").ok().as_deref(),
+                std::env::var_os("KITTY_WINDOW_ID").is_some(),
+            )),
         };
         terminal.stdout.write_all(
             b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[>1u\x1b[=1;1u\x1b[>4;1m",
@@ -144,6 +210,7 @@ impl Terminal {
             column: event.column,
         };
         match event.kind {
+            MouseKind::Move => Ok(false),
             MouseKind::Press => {
                 if self.last_base_frame.is_empty() {
                     return Ok(false);
@@ -179,6 +246,9 @@ impl Terminal {
 
     pub(super) fn draw(&mut self, state: &mut ViewState, editor: &Editor) -> Result<(), Error> {
         let (columns, rows) = terminal_size();
+        if self.last_size != (columns, rows) {
+            super::git::clear_hover(state);
+        }
         let rendered = build_frame_with_images(
             state,
             editor,
@@ -222,6 +292,13 @@ impl Terminal {
         }
         self.stdout
             .write_all(cursor_control(cursor, self.selection.is_some()).as_bytes())?;
+        let git_visible =
+            state.git_view.is_some() && state.git_init.is_none() && state.process_view.is_none();
+        self.mouse_mode.update(
+            &mut self.stdout,
+            git_visible,
+            self.focused && super::git::pointer_over_control(state),
+        )?;
         self.stdout.flush()?;
         self.last_frame = frame;
         self.last_images = displayed_images;
@@ -333,8 +410,9 @@ impl Drop for Terminal {
         if self.image_protocol == ImageProtocol::Kitty && !self.last_images.is_empty() {
             let _ = self.stdout.write_all(b"\x1b_Ga=d,d=A,q=2;\x1b\\");
         }
+        let _ = self.mouse_mode.update(&mut self.stdout, false, false);
         let _ = self.stdout.write_all(
-            b"\x1b[>4;0m\x1b[=0;1u\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l",
+            b"\x1b[>4;0m\x1b[=0;1u\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[0m\x1b[?1049l",
         );
         let _ = self.stdout.flush();
         self.active = false;

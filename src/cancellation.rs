@@ -103,6 +103,11 @@ pub(crate) fn wake_thread(thread: usize) {
     }
 }
 
+/// Whether a bounded cleanup read can be interrupted safely on this host.
+pub(crate) fn wake_handler_installed() -> bool {
+    WAKE_HANDLER_INSTALLED.load(Ordering::Acquire)
+}
+
 pub(crate) fn mark_wake_handler_installed() {
     WAKE_HANDLER_INSTALLED.store(true, Ordering::Release);
 }

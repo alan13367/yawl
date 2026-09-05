@@ -95,6 +95,9 @@ fn frame_keeps_input_and_status_pinned() {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: RenderCache::default(),
     };
     let editor = Editor::default();
@@ -482,6 +485,9 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: RenderCache::default(),
     };
 
@@ -549,6 +555,9 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: RenderCache::default(),
     };
 
@@ -673,6 +682,9 @@ fn loading_state_ignores_status_activity() {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: RenderCache::default(),
     };
     state.notice("Yawl is ready. Type /help for commands.");
@@ -745,6 +757,9 @@ fn overflow_state() -> ViewState {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: RenderCache::default(),
     }
 }
@@ -1052,6 +1067,9 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: RenderCache::default(),
     };
     let editor = Editor::default();
@@ -1245,6 +1263,9 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: RenderCache::default(),
     };
     let mut editor = Editor::default();
@@ -1403,6 +1424,9 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: RenderCache::default(),
     };
     let mut editor = Editor::default();
@@ -1956,6 +1980,9 @@ fn empty_session_state() -> ViewState {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: RenderCache::default(),
     }
 }
@@ -2086,5 +2113,66 @@ fn welcome_types_the_wordmark_then_the_hint() {
     assert!(
         !done_plain.contains('|'),
         "the typing caret should disappear once the wordmark is finished"
+    );
+}
+
+#[test]
+fn git_init_modal_renders_url_field_and_cursor() {
+    let mut state = empty_session_state();
+    state.git_init = Some(git::GitInitFlow::new(std::path::PathBuf::from("/tmp/demo")));
+    let editor = Editor::default();
+    let (frame, cursor) = build_frame(&mut state, &editor, 80, 24);
+    let plain = markdown::strip_ansi(&frame.join("\n"));
+    assert!(plain.contains("Initialize git repository"));
+    assert!(plain.contains("Not a git repository: /tmp/demo"));
+    assert!(plain.contains("Remote URL"));
+    assert!(plain.contains("Enter initialize"));
+    // 24 rows center the 6-row box at row 9, so the URL field sits on frame
+    // row 12 (1-based 13); the empty field starts after `│ > ` at column 11.
+    assert_eq!(cursor, (13, 11), "cursor should sit in the URL field");
+    assert!(frame.len() == 24);
+}
+
+#[test]
+fn git_init_modal_typing_shows_in_the_url_field() {
+    let mut state = empty_session_state();
+    state.git_init = Some(git::GitInitFlow::new(std::path::PathBuf::from("/tmp/demo")));
+    for c in "https://example.com/repo.git".chars() {
+        git::handle_init_event(&mut state, events::Event::Key(events::Key::Char(c)));
+    }
+    let editor = Editor::default();
+    let (frame, cursor) = build_frame(&mut state, &editor, 80, 24);
+    let plain = markdown::strip_ansi(&frame.join("\n"));
+    assert!(plain.contains("https://example.com/repo.git"));
+    assert_eq!(cursor.0, 13);
+    assert!(cursor.1 > 11, "cursor should follow the typed URL");
+}
+
+#[test]
+fn git_init_modal_escape_closes_without_a_dashboard() {
+    let mut state = empty_session_state();
+    state.git_init = Some(git::GitInitFlow::new(std::path::PathBuf::from("/tmp/demo")));
+    git::handle_init_event(&mut state, events::Event::Key(events::Key::Escape));
+    assert!(state.git_init.is_none());
+    assert!(state.git_view.is_none());
+}
+
+#[test]
+fn git_init_modal_failed_init_stays_open_with_the_error() {
+    let mut state = empty_session_state();
+    state.git_init = Some(git::GitInitFlow::new(std::path::PathBuf::from(
+        "/nonexistent-yawl-dir-9f3a",
+    )));
+    // `git init` cannot run there, so the modal must survive with the error
+    // instead of opening a dashboard over a half-built repo.
+    git::handle_init_event(&mut state, events::Event::Key(events::Key::Enter));
+    super::git::jobs::settle(&mut state);
+    assert!(state.git_init.is_some());
+    assert!(state.git_view.is_none());
+    let editor = Editor::default();
+    let (frame, _) = build_frame(&mut state, &editor, 80, 24);
+    assert!(
+        markdown::strip_ansi(&frame.join("\n")).contains("git init failed"),
+        "the failure should be shown inside the modal"
     );
 }

@@ -13,6 +13,7 @@ mod connection;
 mod dashboard;
 pub mod events;
 mod files;
+pub mod git;
 pub mod highlight;
 pub mod input;
 pub mod markdown;
@@ -189,6 +190,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                 }
                 Event::FocusLost => {
                     terminal.set_focused(false);
+                    needs_draw |= git::clear_hover(&mut state);
                     if !events.has_pending() {
                         break;
                     }
@@ -200,7 +202,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
             needs_draw |= !matches!(&event, Event::Tick | Event::FocusGained | Event::FocusLost);
             if matches!(&event, Event::Tick) && crate::interrupted() {
                 crate::set_interrupted(false);
-                if !processes::handle_interrupt(&mut state) {
+                if !git::handle_interrupt(&mut state) && !processes::handle_interrupt(&mut state) {
                     state.subagent_manager.interrupt_all();
                     if !editor.is_empty() {
                         editor.clear();
@@ -208,6 +210,11 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                     state.activity = "input cleared".into();
                 }
                 needs_draw = true;
+            }
+            if state.git_init.is_some() {
+                needs_draw = true;
+                git::handle_init_event(&mut state, event);
+                break;
             }
             if state.subagent_view.is_some() {
                 needs_draw = true;
@@ -217,6 +224,11 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
             if state.process_view.is_some() {
                 needs_draw = true;
                 processes::handle_event(&mut state, event);
+                break;
+            }
+            if state.git_view.is_some() {
+                needs_draw = true;
+                git::handle_event(&mut state, &mut editor, event);
                 break;
             }
             if state.picker.is_some() {
@@ -490,6 +502,8 @@ fn handle_submission<R: Read>(
                 processes::open_dashboard(state, agent.background_processes())
             }
             "ps" => state.notice("Usage: /ps"),
+            "git" if argument.is_empty() => git::open_dashboard(state),
+            "git" => state.notice("Usage: /git"),
             "resume" if argument.is_empty() => open_resume_picker(agent, state),
             "resume" => resume(agent, argument, state),
             "unqueue" => unqueue(argument, state),

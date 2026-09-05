@@ -302,8 +302,10 @@ impl Provider for Codex {
 
         let reader = BufReader::new(response.into_body().into_reader());
         let mut decoder = Decoder::default();
-        for event in SseReader::new(reader) {
+        let mut stream = SseReader::new(reader);
+        while let Some(event) = stream.next() {
             if decoder.decode(event?, on_event)? {
+                stream.finish();
                 return Ok(());
             }
         }

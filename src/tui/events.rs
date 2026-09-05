@@ -30,6 +30,7 @@ pub enum Key {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseKind {
+    Move,
     Press,
     Drag,
     Release,
@@ -329,6 +330,11 @@ fn parse_mouse(body: &str, final_byte: u8) -> Option<Event> {
     // Ignore Shift/Alt/Ctrl modifier bits while preserving the wheel code.
     let button = button & !0b1_1100;
     match button {
+        35 if final_byte == b'M' => Some(Event::Mouse(MouseEvent {
+            kind: MouseKind::Move,
+            column,
+            row,
+        })),
         64 => Some(Event::MouseScroll(3)),
         65 => Some(Event::MouseScroll(-3)),
         0 | 32 => Some(Event::Mouse(MouseEvent {
@@ -423,6 +429,32 @@ mod tests {
         let mut reader = EventReader::new(Cursor::new(b"\x1b[<64;10;4M\x1b[<65;10;4M"));
         assert_eq!(reader.read_event()?, Event::MouseScroll(3));
         assert_eq!(reader.read_event()?, Event::MouseScroll(-3));
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_unpressed_mouse_motion_without_turning_it_into_a_click() -> std::io::Result<()> {
+        let mut reader = EventReader::new(Cursor::new(
+            b"\x1b[<35;4;2M\x1b[<63;120;30M\x1b[<35;0;2M\x1b[<35;4;2m",
+        ));
+        assert_eq!(
+            reader.read_event()?,
+            Event::Mouse(MouseEvent {
+                kind: MouseKind::Move,
+                column: 3,
+                row: 1,
+            })
+        );
+        assert_eq!(
+            reader.read_event()?,
+            Event::Mouse(MouseEvent {
+                kind: MouseKind::Move,
+                column: 119,
+                row: 29,
+            })
+        );
+        assert_eq!(reader.read_event()?, Event::Tick);
+        assert_eq!(reader.read_event()?, Event::Tick);
         Ok(())
     }
 

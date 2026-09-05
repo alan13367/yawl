@@ -623,14 +623,14 @@ fn visible_text_chars(element: ElementRef<'_>) -> usize {
         .sum()
 }
 
-fn acquire_html_extract_slot(started: Instant) -> Result<(), String> {
+fn acquire_html_extract_slot(started: Instant) -> Result<HtmlExtractSlot, String> {
     loop {
         interrupted()?;
         if HTML_EXTRACT_IN_FLIGHT
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            return Ok(());
+            return Ok(HtmlExtractSlot);
         }
         let remaining = HTML_PROCESSING_TIMEOUT.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -640,32 +640,25 @@ fn acquire_html_extract_slot(started: Instant) -> Result<(), String> {
     }
 }
 
-fn release_html_extract_slot() {
-    HTML_EXTRACT_IN_FLIGHT.store(0, Ordering::Release);
-}
-
 struct HtmlExtractSlot;
 
 impl Drop for HtmlExtractSlot {
     fn drop(&mut self) {
-        release_html_extract_slot();
+        HTML_EXTRACT_IN_FLIGHT.store(0, Ordering::Release);
     }
 }
 
 fn extract_html(body: String) -> Result<(Option<String>, String), String> {
     let started = Instant::now();
-    acquire_html_extract_slot(started)?;
+    let slot = acquire_html_extract_slot(started)?;
     let (result_tx, result_rx) = mpsc::sync_channel(1);
-    if let Err(error) = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("yawl-web-html".into())
         .spawn(move || {
-            let _slot = HtmlExtractSlot;
+            let _slot = slot;
             let _ = result_tx.send(extract_html_inner(&body));
         })
-    {
-        release_html_extract_slot();
-        return Err(format!("could not start HTML extraction: {error}"));
-    }
+        .map_err(|error| format!("could not start HTML extraction: {error}"))?;
     loop {
         interrupted()?;
         let remaining = HTML_PROCESSING_TIMEOUT.saturating_sub(started.elapsed());

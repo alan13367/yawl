@@ -538,12 +538,27 @@ impl SubagentManager {
         Ok(output.trim_end().to_string())
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshots(&self) -> Vec<SubagentSnapshot> {
         self.lock()
             .entries
             .iter()
             .map(|entry| entry.snapshot.clone())
             .collect()
+    }
+
+    pub(crate) fn display_snapshots(&self, selected: Option<&str>) -> (Vec<SubagentSnapshot>, u64) {
+        let state = self.lock();
+        let snapshots = state
+            .entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .snapshot
+                    .display_snapshot(selected == Some(entry.snapshot.id.as_str()))
+            })
+            .collect();
+        (snapshots, state.total_child_usage.tokens.total_tokens())
     }
 
     /// Session-wide usage tokens across every subagent run.
@@ -1273,7 +1288,7 @@ fn salvage_result(snapshot: &SubagentSnapshot, final_result: &str) -> String {
         .transcript
         .iter()
         .rev()
-        .find_map(|item| match item {
+        .find_map(|item| match item.as_ref() {
             SubagentTranscriptItem::Assistant(text) => Some(text.as_str()),
             _ => None,
         });
@@ -2110,7 +2125,7 @@ mod tests {
         assert_eq!(first_thread, second_thread);
         assert_eq!(snapshot.completed_turns, 2);
         assert!(snapshot.transcript.iter().any(|item| {
-            matches!(item, super::super::types::SubagentTranscriptItem::Assistant(text) if text == "first")
+            matches!(item.as_ref(), super::super::types::SubagentTranscriptItem::Assistant(text) if text == "first")
         }));
         assert_eq!(snapshot.latest_final_result, "second");
         server.join().expect("provider server should exit");
@@ -2169,7 +2184,7 @@ mod tests {
         let messages = snapshot
             .transcript
             .iter()
-            .filter_map(|item| match item {
+            .filter_map(|item| match item.as_ref() {
                 super::super::types::SubagentTranscriptItem::User { text, .. } => {
                     Some(text.as_str())
                 }

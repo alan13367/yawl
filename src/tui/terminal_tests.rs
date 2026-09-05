@@ -1,7 +1,7 @@
 //! Focused tests for the corresponding TUI responsibility.
 
 use super::render::FrameImage;
-use super::terminal::{ImageProtocol, write_inline_images};
+use super::terminal::{ImageProtocol, MouseMode, supports_pointer_shapes, write_inline_images};
 use super::*;
 
 #[test]
@@ -75,4 +75,48 @@ fn ring_bell_only_emits_when_unfocused() {
 
     Terminal::ring_bell_to(&mut output, false);
     assert_eq!(output, b"\x07");
+}
+
+#[test]
+fn git_mouse_mode_restores_drag_reporting_and_pointer_on_exit() -> std::io::Result<()> {
+    let mut mode = MouseMode::new(true);
+    let mut output = Vec::new();
+    mode.update(&mut output, true, false)?;
+    assert_eq!(output, b"\x1b[?1002l\x1b[?1003h");
+    output.clear();
+    mode.update(&mut output, true, true)?;
+    assert_eq!(output, b"\x1b]22;pointer\x1b\\");
+    output.clear();
+    mode.update(&mut output, true, true)?;
+    assert!(
+        output.is_empty(),
+        "unchanged hover must not resend terminal modes"
+    );
+    mode.update(&mut output, true, false)?;
+    assert_eq!(output, b"\x1b]22;\x1b\\");
+    mode.update(&mut output, true, true)?;
+    output.clear();
+    mode.update(&mut output, false, true)?;
+    assert_eq!(output, b"\x1b[?1003l\x1b[?1002h\x1b]22;\x1b\\");
+    Ok(())
+}
+
+#[test]
+fn unknown_terminals_get_hover_tracking_without_cursor_shape_commands() -> std::io::Result<()> {
+    for (program, term, kitty, supported) in [
+        (Some("Ghostty"), Some("xterm-256color"), false, true),
+        (None, Some("xterm-kitty"), false, true),
+        (None, Some("screen-256color"), true, true),
+        (None, Some("foot-extra"), false, true),
+        (Some("Apple_Terminal"), Some("xterm-256color"), false, false),
+        (None, Some("xterm-256color"), false, false),
+    ] {
+        assert_eq!(supports_pointer_shapes(program, term, kitty), supported);
+    }
+    let mut mode = MouseMode::new(false);
+    let mut output = Vec::new();
+    mode.update(&mut output, true, true)?;
+    mode.update(&mut output, false, false)?;
+    assert_eq!(output, b"\x1b[?1002l\x1b[?1003h\x1b[?1003l\x1b[?1002h");
+    Ok(())
 }

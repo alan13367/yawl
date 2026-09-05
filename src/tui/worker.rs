@@ -216,6 +216,7 @@ pub(super) fn pump_events<R: Read, T>(
                 }
                 Event::FocusLost => {
                     terminal.set_focused(false);
+                    needs_draw |= super::git::clear_hover(state);
                     if !events.has_pending() {
                         break;
                     }
@@ -227,16 +228,28 @@ pub(super) fn pump_events<R: Read, T>(
             needs_draw |= !matches!(&event, Event::Tick | Event::FocusGained | Event::FocusLost);
             if matches!(&event, Event::Tick) && crate::interrupted() {
                 crate::set_interrupted(false);
-                if !super::processes::handle_interrupt(state) {
+                if !super::git::handle_interrupt(state)
+                    && !super::processes::handle_interrupt(state)
+                {
                     state.subagent_manager.interrupt_all();
                     worker.questions.cancel_pending();
                     cancel_worker(worker.thread, &worker.cancellation, state);
                 }
                 needs_draw = true;
             }
+            if state.git_init.is_some() {
+                needs_draw = true;
+                super::git::handle_init_event(state, event);
+                break;
+            }
             if state.subagent_view.is_some() {
                 needs_draw = true;
                 super::subagents::handle_event(state, editor, event);
+                break;
+            }
+            if state.git_view.is_some() {
+                needs_draw = true;
+                super::git::handle_event(state, editor, event);
                 break;
             }
             if state.process_view.is_some() {
@@ -611,6 +624,7 @@ pub(super) fn handle_submission_while_busy(
         Some(BusyCommand::Connect) => super::connection::open(state, active_config, false),
         Some(BusyCommand::Unqueue(argument)) => unqueue(&argument, state),
         Some(BusyCommand::Subagents) => super::subagents::open_dashboard(state),
+        Some(BusyCommand::Git) => super::git::open_dashboard(state),
         Some(BusyCommand::Processes) => super::processes::open_dashboard(state, background.clone()),
         Some(BusyCommand::Copy) => copy_last_reply(terminal, state, &[])?,
         Some(BusyCommand::CopyAll) => copy_all_from_transcript(terminal, state)?,
@@ -632,6 +646,7 @@ pub(super) enum BusyCommand {
     Connect,
     Unqueue(String),
     Subagents,
+    Git,
     Processes,
     Copy,
     CopyAll,
@@ -651,6 +666,7 @@ pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
         "connect" if argument.is_empty() => Some(BusyCommand::Connect),
         "unqueue" => Some(BusyCommand::Unqueue(argument.to_string())),
         "subagents" if argument.is_empty() => Some(BusyCommand::Subagents),
+        "git" if argument.is_empty() => Some(BusyCommand::Git),
         "ps" if argument.is_empty() => Some(BusyCommand::Processes),
         "copy" if argument.is_empty() => Some(BusyCommand::Copy),
         "copy-all" if argument.is_empty() => Some(BusyCommand::CopyAll),

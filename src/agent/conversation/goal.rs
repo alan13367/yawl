@@ -25,16 +25,7 @@ pub(super) fn is_goal_complete(call: &ToolCall) -> bool {
 }
 
 pub(super) fn split_goal_complete(calls: &[ToolCall]) -> (Vec<&ToolCall>, Vec<&ToolCall>) {
-    let mut completes = Vec::new();
-    let mut ordinary = Vec::new();
-    for call in calls {
-        if is_goal_complete(call) {
-            completes.push(call);
-        } else {
-            ordinary.push(call);
-        }
-    }
-    (completes, ordinary)
+    calls.iter().partition(|call| is_goal_complete(call))
 }
 
 #[cfg(test)]

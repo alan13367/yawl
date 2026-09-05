@@ -4,8 +4,6 @@ use std::io;
 
 use crate::error::Error;
 
-const RESTORE_ACTION: libc::c_int = libc::TCSAFLUSH;
-
 /// Switches stdin to raw mode while keeping Ctrl+C signal delivery enabled.
 pub(crate) struct RawMode {
     original: libc::termios,
@@ -43,17 +41,7 @@ impl Drop for RawMode {
         // SAFETY: `original` came from a successful `tcgetattr` call for
         // stdin and remains initialized for the lifetime of this guard.
         unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, RESTORE_ACTION, &self.original);
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.original);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn restoration_discards_unread_raw_input() {
-        assert_eq!(RESTORE_ACTION, libc::TCSAFLUSH);
     }
 }

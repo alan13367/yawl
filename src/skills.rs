@@ -233,13 +233,11 @@ fn frontmatter(text: &str) -> Result<ParsedFrontmatter, String> {
     let Some((header, body)) = rest.split_once("\n---\n") else {
         return Err("unterminated YAML frontmatter".into());
     };
-    let lines = header.lines().collect::<Vec<_>>();
+    let mut lines = header.lines().peekable();
     let mut name = None;
     let mut description = None;
     let mut disable_model_invocation = false;
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index];
+    while let Some(line) = lines.next() {
         if let Some(value) = line.strip_prefix("name:") {
             name = scalar(value);
         } else if let Some(value) = line.strip_prefix("description:") {
@@ -247,11 +245,10 @@ fn frontmatter(text: &str) -> Result<ParsedFrontmatter, String> {
             if matches!(value, ">" | ">-" | "|" | "|-") {
                 let separator = if value.starts_with('|') { "\n" } else { " " };
                 let mut parts = Vec::new();
-                while lines.get(index + 1).is_some_and(|line| {
+                while let Some(line) = lines.next_if(|line| {
                     line.starts_with(' ') || line.starts_with('\t') || line.is_empty()
                 }) {
-                    index += 1;
-                    let part = lines[index].trim();
+                    let part = line.trim();
                     if !part.is_empty() {
                         parts.push(part);
                     }
@@ -267,7 +264,6 @@ fn frontmatter(text: &str) -> Result<ParsedFrontmatter, String> {
                 _ => return Err("disable-model-invocation must be true or false".into()),
             };
         }
-        index += 1;
     }
     Ok(ParsedFrontmatter {
         name,

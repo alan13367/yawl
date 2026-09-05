@@ -297,8 +297,10 @@ impl Provider for Anthropic {
 
         let reader = BufReader::new(response.into_body().into_reader());
         let mut decoder = Decoder::default();
-        for sse in SseReader::new(reader) {
+        let mut stream = SseReader::new(reader);
+        while let Some(sse) = stream.next() {
             if decoder.decode(sse?, on_event)? {
+                stream.finish();
                 return Ok(());
             }
         }

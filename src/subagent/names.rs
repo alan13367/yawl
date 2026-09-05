@@ -21,8 +21,7 @@ const NOUNS: &[&str] = &[
 const MAX_ATTEMPTS: usize = 50;
 
 /// Returns a handle that does not appear in `existing`. Random picks come
-/// first; repeated collisions gain `-2`, `-3` suffixes; `agent-{sequence}` is
-/// the guaranteed fallback.
+/// first, then `agent-{sequence}` with a numeric suffix if needed.
 pub(crate) fn generate_name(existing: &[String], sequence: u64) -> String {
     let mut rng = Rng::new(sequence);
     for _ in 0..MAX_ATTEMPTS {
@@ -33,8 +32,7 @@ pub(crate) fn generate_name(existing: &[String], sequence: u64) -> String {
             return candidate;
         }
     }
-    // The word space is exhausted for this session; fall back to a
-    // deterministic, collision-free handle derived from the ID sequence.
+    // Random attempts failed; use the ID sequence and check for collisions.
     let base = format!("agent-{sequence}");
     let mut suffix = 2;
     let mut candidate = base.clone();
@@ -104,10 +102,16 @@ mod tests {
 
     #[test]
     fn collisions_fall_back_to_sequenced_handles() {
-        // Occupy the fallback name so the suffix ladder must engage.
-        let existing = vec!["agent-7".to_string()];
-        let name = generate_name(&existing, 7);
-        assert_ne!(name, "agent-7");
-        assert!(!name.is_empty());
+        let mut existing = ADJECTIVES
+            .iter()
+            .flat_map(|adjective| {
+                NOUNS
+                    .iter()
+                    .map(move |noun| format!("{}{}", capitalize(adjective), capitalize(noun)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(generate_name(&existing, 7), "agent-7");
+        existing.extend(["agent-7".into(), "agent-7-2".into()]);
+        assert_eq!(generate_name(&existing, 7), "agent-7-3");
     }
 }

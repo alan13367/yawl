@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 
+use crate::config::validate_environment_name;
 use crate::error::Error;
 
 use super::select::{self, Choice};
@@ -163,20 +164,4 @@ fn read_line() -> Result<String, Error> {
         return Err(Error::Config("onboarding canceled".into()));
     }
     Ok(line.trim().to_string())
-}
-
-pub(super) fn validate_environment_name(name: &str) -> Result<(), Error> {
-    crate::config::validate_environment_name(name)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_environment_variable_names() {
-        assert!(validate_environment_name("OMLX_API_KEY").is_ok());
-        assert!(validate_environment_name("2BAD").is_err());
-        assert!(validate_environment_name("BAD-NAME").is_err());
-    }
 }

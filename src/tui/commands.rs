@@ -45,6 +45,7 @@ Commands
 | `/plan [TEXT]` | Start, resume, cancel, or show plan workflow |
 | `/unqueue [N]` | Cancel or manage queued messages |
 | `/subagents` | Open the subagent dashboard |
+| `/git` | Open the git dashboard (offers repo setup outside a repo) |
 | `/ps` | Open the background process dashboard |
 | --- | --- |
 | `/hotkeys` | Show keyboard shortcuts grid |
@@ -114,6 +115,22 @@ Keyboard shortcuts
 | **/subagents** | `Up`/`Down` or `j`/`k` | Select run; Enter opens takeover |
 | | `x` | Ask to cancel selected run |
 | | `Escape` | Close dashboard |
+| --- | --- | --- |
+| **/git** | `Up`/`Down` or `j`/`k` | Select file; Enter opens diff |
+| | `Space` | Stage / unstage selected file |
+| | `+` / `-` | Stage / unstage selected file |
+| | `↩` (undo) | Discard selected file (always confirms) |
+| | `a` / `u` | Stage all / unstage all |
+| | `e`, `Tab` | Edit commit message; Enter commits |
+| | `C`, `m` | Commit now; toggle amend |
+| | `v` | Commit menu: push, sync, amend |
+| | `Tab` | Cycle files, history, and message |
+| | `Enter` on history | View that commit's diff |
+| | `d` | Discard selected file (always confirms) |
+| | `p` / `f` / `F` | Push / fetch / pull |
+| | `b` / `l` / `s` / `S` | Branches / log / stash / pop |
+| | `r` | Refresh status |
+| | `Escape` | Close diff, then dashboard |
 ";
 
 pub(super) fn is_new_session_command(name: &str) -> bool {

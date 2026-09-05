@@ -168,6 +168,8 @@ fn render_inline(text: &str) -> String {
     let chars: Vec<char> = sanitize(text).chars().collect();
     let mut output = String::new();
     let mut index = 0usize;
+    let mut labels = DelimiterSearch::default();
+    let mut urls = DelimiterSearch::default();
     while index < chars.len() {
         if starts_with(&chars, index, "**")
             && let Some(end) = find_marker(&chars, index + 2, "**")
@@ -187,17 +189,11 @@ fn render_inline(text: &str) -> String {
             output.push_str(RESET);
             index = end + 1;
         } else if chars[index] == '['
-            && let Some(close_label) = chars[index + 1..]
-                .iter()
-                .position(|character| *character == ']')
+            && let Some(close_label) = labels.find(&chars, index + 1, ']')
         {
-            let close_label = index + 1 + close_label;
             if chars.get(close_label + 1) == Some(&'(')
-                && let Some(close_url) = chars[close_label + 2..]
-                    .iter()
-                    .position(|character| *character == ')')
+                && let Some(close_url) = urls.find(&chars, close_label + 2, ')')
             {
-                let close_url = close_label + 2 + close_url;
                 output.push_str("\x1b[4m");
                 output.extend(&chars[index + 1..close_label]);
                 output.push_str(RESET);
@@ -225,6 +221,26 @@ fn render_inline(text: &str) -> String {
         }
     }
     output
+}
+
+/// Searches only forwards. Failed link parses can revisit the same closing
+/// delimiter, but never rescan the suffix for every opening bracket.
+#[derive(Default)]
+struct DelimiterSearch {
+    cursor: usize,
+}
+
+impl DelimiterSearch {
+    fn find(&mut self, chars: &[char], start: usize, delimiter: char) -> Option<usize> {
+        self.cursor = self.cursor.max(start);
+        while self.cursor < chars.len() {
+            if chars[self.cursor] == delimiter {
+                return Some(self.cursor);
+            }
+            self.cursor += 1;
+        }
+        None
+    }
 }
 
 fn find_marker(chars: &[char], start: usize, marker: &str) -> Option<usize> {
@@ -801,6 +817,24 @@ pub(crate) fn wrapped_plain_prefixed_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_links_preserve_literal_text_and_later_valid_links() {
+        for text in [
+            "[".repeat(40_000),
+            format!("{}](unfinished", "[".repeat(20_000)),
+        ] {
+            assert_eq!(render_inline(&text), text);
+        }
+        assert_eq!(
+            render_inline("[broken] then [ok](url)"),
+            "[broken] then \x1b[4mok\x1b[0m \x1b[2m(url)\x1b[0m"
+        );
+        assert_eq!(
+            render_inline("[[label](url)"),
+            "\x1b[4m[label\x1b[0m \x1b[2m(url)\x1b[0m"
+        );
+    }
 
     #[test]
     fn renders_inline_styles_and_wraps_by_visible_width() {

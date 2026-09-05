@@ -226,6 +226,9 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: crate::tui::render::RenderCache::default(),
     };
     open_queue_picker(&mut state);
@@ -412,6 +415,7 @@ fn help_lists_undo_and_copy_commands() {
     assert!(HELP.contains("/copy-all"));
     assert!(HELP.contains("/usage"));
     assert!(HELP.contains("/ps"));
+    assert!(HELP.contains("/git"));
     assert!(HELP.contains("/reasoning"));
     assert!(HELP.contains("/hotkeys"));
     assert!(HELP.contains("/diff"));
@@ -447,6 +451,7 @@ fn hotkeys_lists_the_key_reference_sections() {
         "K` / `J",
         "/ps",
         "/subagents",
+        "/git",
         "| Area | Key | Action |",
         "| --- | --- | --- |",
     ] {
@@ -460,7 +465,10 @@ fn hotkeys_lists_the_key_reference_sections() {
             .iter()
             .any(|line| line.contains('┌') && line.contains('┬'))
     );
-    assert_eq!(rendered.iter().filter(|line| line.contains('┼')).count(), 9);
+    assert_eq!(
+        rendered.iter().filter(|line| line.contains('┼')).count(),
+        10
+    );
     assert!(
         rendered
             .iter()

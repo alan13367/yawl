@@ -77,6 +77,9 @@ fn state_with(geometry: Option<ScrollGeometry>) -> ViewState {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: super::render::RenderCache::default(),
     }
 }

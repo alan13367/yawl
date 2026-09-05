@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use std::time::Instant;
 
 use crate::subagent::{RunOrigin, SubagentSnapshot, SubagentStatus, SubagentTranscriptItem};
@@ -40,6 +42,7 @@ pub(super) struct TakeoverScroll {
     pin_floor: usize,
     /// First visible line of the last rendered frame; anchors new pins.
     window_top: usize,
+    cache: SnapshotRenderCache,
 }
 
 impl TakeoverScroll {
@@ -94,8 +97,12 @@ fn empty_dashboard_message(subagents_enabled: bool) -> &'static str {
 }
 
 pub(super) fn refresh(state: &mut ViewState) {
-    state.subagent_snapshots = state.subagent_manager.snapshots();
-    state.subagent_tokens = state.subagent_manager.total_child_tokens();
+    let selected = match state.subagent_view.as_ref() {
+        Some(SubagentView::Takeover { id, .. }) => Some(id.as_str()),
+        _ => None,
+    };
+    (state.subagent_snapshots, state.subagent_tokens) =
+        state.subagent_manager.display_snapshots(selected);
     let Some(SubagentView::Dashboard {
         selected_id,
         selected_index,
@@ -130,7 +137,6 @@ fn reconcile_selection(
 }
 
 pub(super) fn handle_event(state: &mut ViewState, editor: &mut Editor, event: Event) {
-    refresh(state);
     let Some(view) = state.subagent_view.take() else {
         return;
     };
@@ -680,8 +686,12 @@ fn render_takeover(
         .cloned()
         .unwrap_or_default();
     let transcript_height = rows.saturating_sub(5);
-    let content = render_snapshot(context.hide_reasoning, snapshot, columns);
-    let max_top = content.len().saturating_sub(transcript_height);
+    scroll
+        .cache
+        .update(context.hide_reasoning, snapshot, columns);
+    let tail = render_snapshot_tail(context.hide_reasoning, snapshot, columns);
+    let content_len = scroll.cache.lines.len() + tail.len();
+    let max_top = content_len.saturating_sub(transcript_height);
     let top = match scroll.pinned {
         None => max_top,
         Some(pinned) => {
@@ -698,9 +708,17 @@ fn render_takeover(
     scroll.window_top = top;
     let end = top
         .checked_add(transcript_height)
-        .unwrap_or(content.len())
-        .min(content.len());
-    let visible = content[top..end].to_vec();
+        .unwrap_or(content_len)
+        .min(content_len);
+    let visible = (top..end)
+        .map(|index| {
+            if index < scroll.cache.lines.len() {
+                scroll.cache.lines[index].clone()
+            } else {
+                tail[index - scroll.cache.lines.len()].clone()
+            }
+        })
+        .collect::<Vec<_>>();
     let mut frame = vec![markdown::fit_width(
         &format!("\x1b[1m{header}\x1b[0m"),
         columns,
@@ -736,38 +754,106 @@ fn render_takeover(
     (frame, (cursor_row, cursor_col))
 }
 
-fn render_snapshot(hide_reasoning: bool, snapshot: &SubagentSnapshot, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    for item in &snapshot.transcript {
-        match item {
-            SubagentTranscriptItem::User { text, private } => {
-                if *private {
-                    lines.push("\x1b[2m[private]\x1b[0m".into());
-                }
-                lines.extend(render_user_panel(text, width));
+#[derive(Default)]
+struct SnapshotRenderCache {
+    width: usize,
+    hide_reasoning: bool,
+    entries: Vec<Arc<SubagentTranscriptItem>>,
+    starts: Vec<usize>,
+    lines: Vec<String>,
+}
+
+impl SnapshotRenderCache {
+    fn update(&mut self, hide_reasoning: bool, snapshot: &SubagentSnapshot, width: usize) {
+        // The bounded history can evict its front. Retain the rendering of
+        // surviving entries instead of reparsing the full transcript.
+        if self.width == width
+            && self.hide_reasoning == hide_reasoning
+            && let Some(first) = snapshot.transcript.first()
+            && let Some(offset) = self
+                .entries
+                .iter()
+                .position(|entry| Arc::ptr_eq(entry, first))
+            && offset > 0
+        {
+            let removed_lines = self.starts[offset];
+            self.lines.drain(..removed_lines);
+            self.entries.drain(..offset);
+            self.starts.drain(..offset);
+            for start in &mut self.starts {
+                *start -= removed_lines;
             }
-            SubagentTranscriptItem::Steer(text) => {
-                lines.push("\x1b[2;36m[steer]\x1b[0m".into());
-                lines.extend(render_user_panel(text, width));
-            }
-            SubagentTranscriptItem::Assistant(text) => {
-                lines.extend(markdown::render(text, width));
-            }
-            SubagentTranscriptItem::Reasoning { kind, text } if !hide_reasoning => {
-                lines.extend(render_reasoning(*kind, text, width));
-            }
-            SubagentTranscriptItem::Reasoning { .. } => {}
-            SubagentTranscriptItem::Tool {
-                name,
-                arguments,
-                output,
-                is_error,
-            } => lines.extend(tool_view::render(
-                name, arguments, output, *is_error, false, None, width, false,
-            )),
         }
-        lines.push(String::new());
+        let common = if self.width == width && self.hide_reasoning == hide_reasoning {
+            self.entries
+                .iter()
+                .zip(&snapshot.transcript)
+                .take_while(|(old, new)| Arc::ptr_eq(old, new))
+                .count()
+        } else {
+            0
+        };
+        self.lines
+            .truncate(self.starts.get(common).copied().unwrap_or(self.lines.len()));
+        if common == 0 {
+            self.lines.clear();
+        }
+        self.entries.truncate(common);
+        self.starts.truncate(common);
+        self.width = width;
+        self.hide_reasoning = hide_reasoning;
+        for item in &snapshot.transcript[common..] {
+            self.starts.push(self.lines.len());
+            self.lines
+                .extend(render_snapshot_item(hide_reasoning, item, width));
+            self.entries.push(Arc::clone(item));
+        }
     }
+}
+
+fn render_snapshot_item(
+    hide_reasoning: bool,
+    item: &Arc<SubagentTranscriptItem>,
+    width: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    match item.as_ref() {
+        SubagentTranscriptItem::User { text, private } => {
+            if *private {
+                lines.push("\x1b[2m[private]\x1b[0m".into());
+            }
+            lines.extend(render_user_panel(text, width));
+        }
+        SubagentTranscriptItem::Steer(text) => {
+            lines.push("\x1b[2;36m[steer]\x1b[0m".into());
+            lines.extend(render_user_panel(text, width));
+        }
+        SubagentTranscriptItem::Assistant(text) => {
+            lines.extend(markdown::render(text, width));
+        }
+        SubagentTranscriptItem::Reasoning { kind, text } if !hide_reasoning => {
+            lines.extend(render_reasoning(*kind, text, width));
+        }
+        SubagentTranscriptItem::Reasoning { .. } => {}
+        SubagentTranscriptItem::Tool {
+            name,
+            arguments,
+            output,
+            is_error,
+        } => lines.extend(tool_view::render(
+            name, arguments, output, *is_error, false, None, width, false,
+        )),
+    }
+    lines.push(String::new());
+    lines
+}
+
+fn render_snapshot_tail(
+    hide_reasoning: bool,
+    snapshot: &SubagentSnapshot,
+    width: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
     if !hide_reasoning && !snapshot.live_reasoning.is_empty() {
         lines.extend(render_reasoning(
             snapshot
@@ -836,9 +922,11 @@ mod tests {
         );
         snapshot.status = SubagentStatus::Running;
         snapshot.context_tokens = 50;
-        snapshot.transcript.push(SubagentTranscriptItem::Assistant(
-            "live transcript content".into(),
-        ));
+        snapshot
+            .transcript
+            .push(Arc::new(SubagentTranscriptItem::Assistant(
+                "live transcript content".into(),
+            )));
         snapshot.queued_messages.push(QueuedSubagentMessage {
             text: "queued private message".into(),
             origin: RunOrigin::PrivateUser,
@@ -895,6 +983,9 @@ mod tests {
             background_processes: crate::background::BackgroundProcessManager::default(),
             background_active_count: 0,
             process_view: None,
+            git_view: None,
+            git_job: None,
+            git_init: None,
             render_cache: crate::tui::render::RenderCache::default(),
         }
     }
@@ -903,9 +994,46 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.queued_messages.clear();
         snapshot.transcript = (1..=items)
-            .map(|index| SubagentTranscriptItem::Assistant(format!("line {index:02}")))
+            .map(|index| {
+                Arc::new(SubagentTranscriptItem::Assistant(format!(
+                    "line {index:02}"
+                )))
+            })
             .collect();
         snapshot
+    }
+
+    #[test]
+    fn cached_transcript_matches_fresh_render_after_append_eviction_resize_and_hiding() {
+        let mut snapshot = long_snapshot(3);
+        let mut cache = SnapshotRenderCache::default();
+        cache.update(false, &snapshot, 60);
+        let retained_line = cache.lines[cache.starts[1]].as_ptr();
+        snapshot.transcript.remove(0);
+        snapshot
+            .transcript
+            .push(Arc::new(SubagentTranscriptItem::Reasoning {
+                kind: crate::provider::ReasoningKind::Full,
+                text: "reasoning".into(),
+            }));
+        cache.update(false, &snapshot, 60);
+        assert_eq!(
+            cache.lines[0].as_ptr(),
+            retained_line,
+            "surviving entries must reuse rendering"
+        );
+        for (width, hidden) in [(60, false), (20, false), (20, true), (80, false)] {
+            cache.update(hidden, &snapshot, width);
+            let fresh = snapshot
+                .transcript
+                .iter()
+                .flat_map(|item| render_snapshot_item(hidden, item, width))
+                .collect::<Vec<_>>();
+            assert_eq!(cache.lines, fresh);
+        }
+        snapshot.transcript.clear();
+        cache.update(false, &snapshot, 80);
+        assert!(cache.lines.is_empty());
     }
 
     #[test]
@@ -1020,9 +1148,11 @@ mod tests {
 
         // Streaming output appends below the pinned window.
         if let Some(snapshot) = view.subagent_snapshots.first_mut() {
-            snapshot.transcript.push(SubagentTranscriptItem::Assistant(
-                "newly generated tail".into(),
-            ));
+            snapshot
+                .transcript
+                .push(Arc::new(SubagentTranscriptItem::Assistant(
+                    "newly generated tail".into(),
+                )));
         }
         let (frozen, _) = render(&mut view, &editor, 80, 12);
         assert_eq!(

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::agent::TurnEvent;
@@ -126,7 +127,7 @@ pub(crate) struct SubagentSnapshot {
     pub(crate) run_usage: UsageSummary,
     /// Usage across the retained lifetime of this child conversation.
     pub(crate) usage: UsageSummary,
-    pub(crate) transcript: Vec<SubagentTranscriptItem>,
+    pub(crate) transcript: Vec<Arc<SubagentTranscriptItem>>,
     pub(crate) live_assistant: String,
     pub(crate) live_reasoning: String,
     pub(crate) live_reasoning_kind: Option<ReasoningKind>,
@@ -181,6 +182,46 @@ impl SubagentSnapshot {
             latest_outcome: None,
             run_number: 1,
         }
+    }
+
+    /// UI summaries omit conversation text. Only the selected takeover receives
+    /// shared immutable entries and the current live tail.
+    pub(crate) fn display_snapshot(&self, detail: bool) -> Self {
+        let mut result = Self::new(
+            self.id.clone(),
+            self.name.clone(),
+            self.agent.clone(),
+            String::new(),
+            self.model.clone(),
+            self.context_window,
+        );
+        result.status = self.status;
+        result.created_at = self.created_at;
+        result.started_at = self.started_at;
+        result.settled_at = self.settled_at;
+        result.context_tokens = self.context_tokens;
+        result.queued_messages = self
+            .queued_messages
+            .iter()
+            .map(|message| QueuedSubagentMessage {
+                text: if detail {
+                    message.text.clone()
+                } else {
+                    String::new()
+                },
+                origin: message.origin,
+            })
+            .collect();
+        if detail {
+            result.transcript.clone_from(&self.transcript);
+            result.live_assistant.clone_from(&self.live_assistant);
+            result.live_reasoning.clone_from(&self.live_reasoning);
+            result.live_reasoning_kind = self.live_reasoning_kind;
+            result.current_tool.clone_from(&self.current_tool);
+            result.pending_steers.clone_from(&self.pending_steers);
+            result.error.clone_from(&self.error);
+        }
+        result
     }
 
     pub(crate) fn elapsed(&self, now: Instant) -> Duration {
@@ -361,7 +402,7 @@ impl SubagentSnapshot {
         if self.transcript.len() == MAX_TRANSCRIPT_ITEMS {
             self.transcript.remove(0);
         }
-        self.transcript.push(item);
+        self.transcript.push(Arc::new(item));
     }
 }
 
@@ -428,6 +469,36 @@ mod tests {
     }
 
     #[test]
+    fn display_summaries_omit_text_and_detail_shares_completed_entries() {
+        let mut source = snapshot();
+        source.apply_event(TurnEvent::TextDelta("completed"));
+        source.apply_event(TurnEvent::AssistantDone);
+        source.apply_event(TurnEvent::TextDelta("live"));
+        source.latest_final_result = "large final result".repeat(1000);
+        source.queued_messages.push(QueuedSubagentMessage {
+            text: "private next turn".into(),
+            origin: RunOrigin::PrivateUser,
+        });
+        let summary = source.display_snapshot(false);
+        assert_eq!(summary.status, source.status);
+        assert!(summary.transcript.is_empty());
+        assert!(summary.live_assistant.is_empty());
+        assert!(summary.initial_prompt.is_empty());
+        assert!(summary.latest_final_result.is_empty());
+        assert_eq!(summary.queued_messages.len(), 1);
+        assert!(summary.queued_messages[0].text.is_empty());
+        let detail = source.display_snapshot(true);
+        assert!(Arc::ptr_eq(&detail.transcript[0], &source.transcript[0]));
+        assert_eq!(detail.live_assistant, "live");
+        assert_eq!(detail.queued_messages[0].text, "private next turn");
+        source.apply_event(TurnEvent::TextDelta(" more"));
+        assert_eq!(
+            detail.live_assistant, "live",
+            "live tails remain immutable snapshots"
+        );
+    }
+
+    #[test]
     fn retry_discards_only_live_buffers() {
         let mut snapshot = snapshot();
         snapshot.apply_event(TurnEvent::TextDelta("partial"));
@@ -437,7 +508,9 @@ mod tests {
 
         assert_eq!(
             snapshot.transcript,
-            [SubagentTranscriptItem::Assistant("complete".into())]
+            [Arc::new(SubagentTranscriptItem::Assistant(
+                "complete".into()
+            ))]
         );
     }
 
@@ -454,7 +527,7 @@ mod tests {
         assert_eq!(snapshot.live_assistant.len(), MAX_LIVE_TEXT_BYTES);
         snapshot.apply_event(TurnEvent::AssistantDone);
         assert!(matches!(
-            snapshot.transcript.last(),
+            snapshot.transcript.last().map(Arc::as_ref),
             Some(SubagentTranscriptItem::Assistant(text))
                 if text.len() == MAX_TRANSCRIPT_TEXT_BYTES
         ));
@@ -528,10 +601,10 @@ mod tests {
         assert_eq!(snapshot.latest_outcome, Some(RunOutcome::Completed));
         assert_eq!(snapshot.latest_final_result, "done");
         assert!(snapshot.transcript.iter().any(|item| {
-            matches!(item, SubagentTranscriptItem::Reasoning { text, .. } if text == "checking")
+            matches!(item.as_ref(), SubagentTranscriptItem::Reasoning { text, .. } if text == "checking")
         }));
         assert!(snapshot.transcript.iter().any(|item| {
-            matches!(item, SubagentTranscriptItem::Tool { arguments, output, .. }
+            matches!(item.as_ref(), SubagentTranscriptItem::Tool { arguments, output, .. }
                 if arguments == "echo red" && output == "ok next")
         }));
     }

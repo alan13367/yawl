@@ -516,15 +516,7 @@ fn local_base_url<'a>(config: &'a Config, name: &str) -> &'a str {
         .get(name)
         .map(|provider| provider.base_url.trim())
         .filter(|url| !url.is_empty())
-        .unwrap_or_else(|| default_local_url(name))
-}
-
-fn default_local_url(name: &str) -> &'static str {
-    match name {
-        "ollama" => "http://127.0.0.1:11434/v1",
-        "lmstudio" => "http://127.0.0.1:1234/v1",
-        _ => "http://127.0.0.1:8000/v1",
-    }
+        .unwrap_or_else(|| provider::default_compatible_url(name))
 }
 
 /// Picks a model from `models`, or falls through to manual entry. `None`

@@ -713,6 +713,9 @@ mod tests {
             background_processes: manager,
             background_active_count: 1,
             process_view: None,
+            git_view: None,
+            git_job: None,
+            git_init: None,
             render_cache: crate::tui::render::RenderCache::default(),
         }
     }

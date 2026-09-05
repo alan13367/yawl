@@ -57,6 +57,9 @@ fn completion_state(commands: &[&str]) -> ViewState {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: crate::tui::render::RenderCache::default(),
     }
 }

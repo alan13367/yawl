@@ -368,6 +368,9 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: crate::tui::render::RenderCache::default(),
     };
     let mut editor = Editor::default();
@@ -454,6 +457,9 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         background_processes: crate::background::BackgroundProcessManager::default(),
         background_active_count: 0,
         process_view: None,
+        git_view: None,
+        git_job: None,
+        git_init: None,
         render_cache: crate::tui::render::RenderCache::default(),
     };
     let mut editor = Editor::default();

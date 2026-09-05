@@ -58,7 +58,10 @@ Project skills stay disabled until you trust the repository. `yawl --trust-proje
 - When the bell is on (the default), Yawl rings the terminal bell when a turn finishes and when the model asks a question, so an unfocused terminal window or tab announces activity. Turn it off with `/settings bell off` or Settings > Interface > Bell.
 - `/undo` restores files changed through `write_file`/`edit_file` and drops that turn. `/diff` shows every file those tools changed this session as per-file diff cards. `/copy` and `/copy-all` put replies on the clipboard.
 - Multiple-choice questions from the model replace the composer. A countdown accepts the recommended answers automatically so unattended turns continue; answering yourself cancels it.
-- `/ps` opens the background-process dashboard and `/subagents` the subagent dashboard, both while the model is busy.
+- `/ps` opens the background-process dashboard, `/subagents` the subagent dashboard, and `/git` the git dashboard, all while the model is busy.
+- Git operations run in the background so typing and navigation remain responsive. `Ctrl+C` cancels the current Git operation. Results preserve commit-message edits made while the operation runs.
+- `/git` refreshes the open diff as working or staged contents change. Large diffs fall back to compact hunks and show a warning if the preview is still truncated. Unstaging works before the first commit. Discarding untracked files preserves ignored files and nested repositories.
+- In `/git`, moving the mouse highlights file and history rows without changing keyboard selection. Click a file to open its diff; `Esc` closes the current diff and a second `Esc` closes `/git`. Clickable controls use a hand cursor in Kitty, Ghostty, and foot; other terminals retain their own cursor. Hover requires mouse-motion reporting support.
 
 The transcript renders Markdown with syntax highlighting for common languages. Tool calls use full-width cards: diffs for edits, image previews for `read_file` in terminals that support them.
 
@@ -80,6 +83,7 @@ The transcript renders Markdown with syntax highlighting for common languages. T
 | `/tools`, `/skills` | List tools and skills |
 | `/skill:NAME [ARGS]` | Run a discovered Markdown skill |
 | `/subagents` | Open the subagent dashboard and takeover view |
+| `/git` | Open the git dashboard with stage, undo, commit, push, history, and diff views; refreshes live as files change. Outside a repo it asks for a remote and runs the first-commit push (`init`, seeded `README.md`, `branch -M main`, `push -u origin main`) |
 | `/ps` | Open the background-process dashboard |
 | `/resume [ID\|NUMBER]` | Open the session picker or resume directly; `d` deletes a session |
 | `/unqueue [NUMBER\|all]` | Edit, remove, or clear queued messages |

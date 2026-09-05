@@ -23,7 +23,8 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tui/commands.rs`, `completion.rs`, `files.rs`, `picker.rs`, `state.rs`, `worker.rs`: TUI behavior and state
 - `src/tui/render.rs`, `terminal.rs`, `events.rs`, `input.rs`, `transcript.rs`: frame composition, terminal lifecycle, input decoding/editing, and transcript reduction
 - `src/tui/markdown.rs`, `highlight.rs`, `tool_view.rs`, `status_bar.rs`: sanitized Markdown, syntax highlighting, tool presentation, and configurable status rendering
-- `src/tui/processes.rs`, `subagents.rs`, `connection.rs`, `dashboard.rs`: background-process and subagent dashboards, provider setup, and shared dashboard layout
+- `src/tui/git/jobs.rs`, `git/operations.rs`: cancellable Git workers, UI result merging, and blocking repository operations
+- `src/tui/processes.rs`, `subagents.rs`, `git.rs`, `connection.rs`, `dashboard.rs`: background-process, subagent, and git dashboards, provider setup, and shared dashboard layout
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
 - `src/tools/`: builtin registry and executable-tool discovery

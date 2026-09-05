@@ -99,7 +99,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         if agent.discard_if_empty()? {
             return Ok(0);
         }
-        println!("{}", resume_command(agent.session_id()));
+        println!("yawl --session {}", agent.session_id());
         return Ok(0);
     }
 
@@ -135,10 +135,6 @@ fn select_session(
     Ok((Session::create(&dirs.project, cwd, model)?, Vec::new()))
 }
 
-fn resume_command(session_id: &str) -> String {
-    format!("yawl --session {session_id}")
-}
-
 fn list_tools(config: &Config) {
     let mut cache = DescribeCache::default();
     let registry = Registry::scan_for_main_listing(config, &mut cache);
@@ -153,14 +149,6 @@ fn list_tools(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resume_command_is_copy_pasteable() {
-        assert_eq!(
-            resume_command("20260820-093301-1a2b"),
-            "yawl --session 20260820-093301-1a2b"
-        );
-    }
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(

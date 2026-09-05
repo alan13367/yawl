@@ -46,9 +46,14 @@ pub(super) fn compact(codex: &Codex, request: &Request<'_>) -> Result<Compaction
 
     let reader = BufReader::new(response.into_body().into_reader());
     let mut decoder = Decoder::default();
-    for event in SseReader::new(reader) {
+    let mut stream = SseReader::new(reader);
+    while let Some(event) = stream.next() {
         if decoder.decode(event?)? {
-            return decoder.finish(&input);
+            let result = decoder.finish(&input);
+            if result.is_ok() {
+                stream.finish();
+            }
+            return result;
         }
     }
     Err(Error::Io(std::io::Error::new(

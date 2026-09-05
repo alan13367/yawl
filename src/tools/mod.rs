@@ -370,7 +370,7 @@ impl Registry {
             ToolImpl::EditFile => edit_file(&args),
             ToolImpl::WebSearch => self.execute_web(&args, true),
             ToolImpl::WebFetch => self.execute_web(&args, false),
-            ToolImpl::GoalComplete => goal_complete_outcome(&args),
+            ToolImpl::GoalComplete => non_empty_arg(&args, "result", GOAL_COMPLETE_TOOL_NAME),
             ToolImpl::PlanningShell => match planning_shell::prepare(&args) {
                 Ok(args) => {
                     shell_with_path(&args, None, planning_shell::inspection_path().as_deref())
@@ -383,9 +383,9 @@ impl Registry {
                 Ok(content) => ToolOutcome::ok(content),
                 Err(error) => ToolOutcome::error(error),
             },
-            ToolImpl::PlanComplete => plan_complete_outcome(&args),
+            ToolImpl::PlanComplete => non_empty_arg(&args, "plan", PLAN_COMPLETE_TOOL_NAME),
             ToolImpl::PlanAction => plan_action_outcome(&args),
-            ToolImpl::PlanImplemented => plan_implemented_outcome(&args),
+            ToolImpl::PlanImplemented => non_empty_arg(&args, "result", PLAN_IMPLEMENTED_TOOL_NAME),
             ToolImpl::Exec(tool) => {
                 let (content, is_error) = exec::invoke(tool, args_json, session_id);
                 ToolOutcome {
@@ -637,13 +637,6 @@ fn planning_shell_entry() -> ToolEntry {
     }
 }
 
-fn goal_complete_outcome(args: &Value) -> ToolOutcome {
-    match args.get("result").and_then(Value::as_str).map(str::trim) {
-        Some(result) if !result.is_empty() => ToolOutcome::ok(result.to_string()),
-        _ => ToolOutcome::error("goal_complete requires a non-empty string 'result'"),
-    }
-}
-
 fn user_input_entry(broker: QuestionBroker) -> ToolEntry {
     ToolEntry {
         spec: ToolSpec {
@@ -735,10 +728,6 @@ fn plan_implemented_entry() -> ToolEntry {
     }
 }
 
-fn plan_complete_outcome(args: &Value) -> ToolOutcome {
-    non_empty_arg(args, "plan", PLAN_COMPLETE_TOOL_NAME)
-}
-
 fn plan_action_outcome(args: &Value) -> ToolOutcome {
     match args.get("action").and_then(Value::as_str) {
         Some(action @ ("revise" | "implement" | "unrelated")) => ToolOutcome::ok(action.into()),
@@ -746,10 +735,6 @@ fn plan_action_outcome(args: &Value) -> ToolOutcome {
             ToolOutcome::error("plan_action requires action 'revise', 'implement', or 'unrelated'")
         }
     }
-}
-
-fn plan_implemented_outcome(args: &Value) -> ToolOutcome {
-    non_empty_arg(args, "result", PLAN_IMPLEMENTED_TOOL_NAME)
 }
 
 fn non_empty_arg(args: &Value, key: &str, tool: &str) -> ToolOutcome {
@@ -1244,11 +1229,6 @@ fn shell_stop(background: Option<&BackgroundProcessManager>, args: &Value) -> To
         Ok(snapshot) => ToolOutcome::ok(format!("{id}: {}", snapshot.status.detail())),
         Err(error) => ToolOutcome::error(error),
     }
-}
-
-#[cfg(test)]
-fn read_file(args: &Value) -> ToolOutcome {
-    read_file_for_model(args, false)
 }
 
 fn read_file_for_model(args: &Value, supports_images: bool) -> ToolOutcome {
@@ -2013,7 +1993,7 @@ fi
         let path = temp_path("large.bin");
         std::fs::write(&path, vec![b'a'; MAX_READ_FILE_BYTES as usize + 1])?;
 
-        let out = read_file(&json!({"path": path.to_string_lossy()}));
+        let out = read_file_for_model(&json!({"path": path.to_string_lossy()}), false);
 
         assert!(out.is_error);
         assert!(out.content.contains("read limit"));

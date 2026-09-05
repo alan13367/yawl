@@ -32,7 +32,7 @@ pub(super) fn run(agent: &mut Agent, prompt: String) -> Result<i32, Box<dyn std:
     agent.set_print_mode();
     let mut sink = PrintSink::new(agent.config().hide_reasoning);
     let completed = agent.run_turn(Some(prompt), &mut |event| sink.handle(event));
-    if let Some(error) = sink.take_output_error() {
+    if let Some(error) = sink.output_error.take() {
         return Err(Box::new(error));
     }
     let completed = completed?;
@@ -43,7 +43,7 @@ pub(super) fn run(agent: &mut Agent, prompt: String) -> Result<i32, Box<dyn std:
     // Print mode has no event loop for background delivery, so settled
     // subagent results are pumped here before the process exits.
     let pumped = agent.pump_subagent_results(&mut |event| sink.handle(event), 30)?;
-    if let Some(error) = sink.take_output_error() {
+    if let Some(error) = sink.output_error.take() {
         return Err(Box::new(error));
     }
     if !pumped {
@@ -75,13 +75,9 @@ impl PrintSink {
         }
     }
 
-    fn take_output_error(&mut self) -> Option<io::Error> {
-        self.output_error.take()
-    }
-
     fn handle(&mut self, event: TurnEvent<'_>) {
         match event {
-            TurnEvent::TextDelta(text) => {
+            TurnEvent::TextDelta(text) | TurnEvent::AssistantReplace(text) => {
                 print_reasoning(&mut self.pending_reasoning);
                 if self.output_error.is_none() {
                     match self
@@ -126,22 +122,6 @@ impl PrintSink {
                         yawl::set_interrupted(true);
                     }
                     self.response_has_text = false;
-                }
-            }
-            TurnEvent::AssistantReplace(text) => {
-                print_reasoning(&mut self.pending_reasoning);
-                if self.output_error.is_none() {
-                    match self
-                        .stdout
-                        .write_all(text.as_bytes())
-                        .and_then(|()| self.stdout.flush())
-                    {
-                        Ok(()) => self.response_has_text = true,
-                        Err(error) => {
-                            self.output_error = Some(error);
-                            yawl::set_interrupted(true);
-                        }
-                    }
                 }
             }
             TurnEvent::SteerAccepted { .. } => {}

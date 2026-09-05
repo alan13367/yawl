@@ -8,6 +8,7 @@ use crate::subagent::{SubagentManager, SubagentSnapshot};
 
 use super::completion::{Completion, command_completions};
 use super::events::{MouseEvent, MouseKind};
+use super::git::{GitInitFlow, GitView};
 use super::picker::{Picker, PickerAction};
 use super::processes::ProcessView;
 use super::subagents::SubagentView;
@@ -114,6 +115,11 @@ pub(super) struct ViewState {
     /// Session-wide usage tokens across finished subagent runs.
     pub(super) subagent_tokens: u64,
     pub(super) subagent_view: Option<SubagentView>,
+    pub(super) git_view: Option<GitView>,
+    pub(super) git_job: Option<super::git::jobs::GitJob>,
+    /// Repository-init modal opened by `/git` outside a work tree: asks for
+    /// a remote URL, then runs the first-commit push flow.
+    pub(super) git_init: Option<GitInitFlow>,
     pub(super) background_processes: BackgroundProcessManager,
     pub(super) background_active_count: usize,
     pub(super) process_view: Option<ProcessView>,
@@ -171,9 +177,12 @@ impl ViewState {
             connection: None,
             subagents_enabled: agent.config().subagents,
             subagent_manager: agent.subagents(),
-            subagent_snapshots: agent.subagents().snapshots(),
+            subagent_snapshots: agent.subagents().display_snapshots(None).0,
             subagent_tokens: agent.subagents().total_child_tokens(),
             subagent_view: None,
+            git_view: None,
+            git_job: None,
+            git_init: None,
             background_processes: agent.background_processes(),
             background_active_count: agent.background_processes().active_count(),
             process_view: None,
@@ -414,6 +423,7 @@ pub(super) fn advance_ticks(state: &mut ViewState) -> bool {
     }
     super::subagents::refresh(state);
     super::processes::refresh(state);
+    changed |= super::git::poll_tick(state);
     if state.transcript.poll_search() {
         changed = true;
         if state.transcript.search_position().is_some()
@@ -465,6 +475,7 @@ pub(super) fn scroll_bar_position(travel: usize, max_scroll: usize, scroll_offse
 /// the event belongs to the bar so text selection leaves it alone.
 pub(super) fn handle_scroll_bar_mouse(state: &mut ViewState, event: MouseEvent) -> bool {
     match event.kind {
+        MouseKind::Move => false,
         MouseKind::Press => {
             let Some(geometry) = state.scroll_geometry else {
                 return false;

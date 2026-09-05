@@ -283,7 +283,7 @@ fn apply_edit(
             let name = value.trim().trim_start_matches('$').to_string();
             if let Err(error) = provider::validate_environment_name(&name) {
                 state.notice(error.to_string());
-                state.picker = Some(environment_picker(flow, name));
+                state.picker = Some(environment_picker(name));
                 return;
             }
             flow.credential = CredentialChoice::Environment(name);
@@ -369,7 +369,7 @@ fn default_environment(flow: &ConnectFlow) -> String {
         .unwrap_or_default()
 }
 
-fn environment_picker(_flow: &ConnectFlow, initial: String) -> Picker {
+fn environment_picker(initial: String) -> Picker {
     edit_picker(
         "Environment credential",
         "Variable",
