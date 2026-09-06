@@ -1,7 +1,7 @@
 # Yawl
 
 <div align="center">
-  <img src="Assets/WelcomeScreen.png" alt="Yawl welcome screen in a terminal" width="800">
+  <img src="https://raw.githubusercontent.com/alan13367/yawl/main/Assets/WelcomeScreen.png" alt="Yawl welcome screen in a terminal" width="800">
   <p><strong>A small AI coding harness that stays in your terminal.</strong><br>
   Stream answers, run tools, keep sessions, and bring your own model.</p>
   <p>
@@ -15,8 +15,8 @@ Yawl is a terminal AI agent for macOS and Linux. It has a full-screen TUI and a 
 
 <table>
   <tr>
-    <td width="50%" align="center"><img src="Assets/CommandsList.png" alt="Yawl command and skill completion menu"><br><sub>Type <code>/</code> to search commands and skills</sub></td>
-    <td width="50%" align="center"><img src="Assets/SubagentsDashboard.png" alt="Yawl subagent dashboard"><br><sub>The subagent dashboard</sub></td>
+    <td width="50%" align="center"><img src="https://raw.githubusercontent.com/alan13367/yawl/main/Assets/CommandsList.png" alt="Yawl command and skill completion menu"><br><sub>Type <code>/</code> to search commands and skills</sub></td>
+    <td width="50%" align="center"><img src="https://raw.githubusercontent.com/alan13367/yawl/main/Assets/SubagentsDashboard.png" alt="Yawl subagent dashboard"><br><sub>The subagent dashboard</sub></td>
   </tr>
 </table>
 

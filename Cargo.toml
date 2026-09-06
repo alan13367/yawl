@@ -6,6 +6,7 @@ rust-version = "1.98.0"
 description = "A minimal, self-extending AI agent harness"
 license = "MIT"
 repository = "https://github.com/alan13367/yawl"
+exclude = ["Assets/"]
 
 [dependencies]
 base64 = "0.23"
