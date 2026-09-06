@@ -11,7 +11,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/main.rs`: binary bootstrap, session selection, and TUI/print-mode dispatch
 - `src/cli.rs`, `src/print_mode.rs`, `src/project_trust.rs`: binary-local argument parsing, streamed text presentation, and project skill trust prompts
 - `src/agent.rs`: stable `Agent` facade and public turn events
-- `src/agent/conversation.rs`, `conversation/turn.rs`, `conversation/goal.rs`, `conversation/plan.rs`, `conversation/steer.rs`, `events.rs`: conversation lifecycle, model/tool turns, goal and planning modes, live steering, streamed event translation, and optional session persistence
+- `src/agent/conversation.rs`, `conversation/turn.rs`, `conversation/goal.rs`, `conversation/plan.rs`, `conversation/steer.rs`, `conversation/recovery.rs`, `conversation/context.rs`, `events.rs`: conversation lifecycle, model/tool turns, goal and planning modes, live steering, undo and tool-result recovery, context estimates, streamed event translation, and optional session persistence
 - `src/prompt.rs`: compact system prompt, skill catalog, and `AGENTS.md` instruction injection
 - `src/provider/mod.rs`: stable provider facade and re-exports
 - `src/provider/types.rs`, `streaming.rs`, `resolution.rs`, `http.rs`: provider-neutral protocol, retries, provider selection, and SSE/HTTP support
@@ -32,7 +32,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/background.rs`, `src/subagent/`, `src/cancellation.rs`: session-bound shell processes, parallel subagents, and interrupt tokens
 - `src/terminal_mode.rs`: shared raw-terminal lifecycle for the TUI and onboarding selector
 - `src/skills.rs`, `src/trust.rs`, `src/image.rs`: skill discovery, project skill trust, and image input
-- `src/session.rs`, `src/compaction.rs`, `src/checkpoint.rs`: append-only sessions, context compaction, and `/undo` working-tree snapshots
+- `src/session.rs`, `src/session/recovery.rs`, `src/compaction.rs`, `src/checkpoint.rs`: append-only sessions, recovery records, context compaction, and `/undo` working-tree snapshots
 - `README.md`: user-facing behavior, contracts, and a concise architecture map
 
 Most tests live in `#[cfg(test)]` modules beside their implementation. TUI cross-module tests use focused `*_tests.rs` modules under `src/tui/` so production visibility stays narrow.

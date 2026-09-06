@@ -6,9 +6,9 @@ use crate::provider::{
 };
 use crate::tools::Registry;
 
-use super::goal;
 use super::plan::{self, FollowUpAction};
 use super::{Conversation, ConversationKind, last_undoable_user_index};
+use super::{context, goal};
 use crate::agent::events::{TurnEvent, forward};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -253,39 +253,9 @@ impl Conversation {
     where
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
     {
-        let manager = self
-            .persistent_subagents()
-            .expect("deferred results require a subagent manager");
-        let deliveries = manager.drain_deferred();
-        if deliveries.is_empty() {
+        self.recover_history()?;
+        if !self.drain_deferred_subagent_results_into_history()? {
             return Ok(None);
-        }
-        let backup = deliveries.clone();
-        let mut results = Vec::new();
-        for delivery in deliveries {
-            let status = match delivery.outcome {
-                crate::subagent::RunOutcome::Completed => "completed",
-                crate::subagent::RunOutcome::Failed => "failed",
-                crate::subagent::RunOutcome::Interrupted => "interrupted",
-            };
-            let content = if delivery.error.is_empty() {
-                delivery.result
-            } else if delivery.result.is_empty() {
-                delivery.error
-            } else {
-                format!("{}\n\nError: {}", delivery.result, delivery.error)
-            };
-            results.push(SubagentResult {
-                id: delivery.id.to_string(),
-                name: delivery.name,
-                status: status.into(),
-                run_number: delivery.run_number,
-                content,
-            });
-        }
-        if let Err(error) = self.append_input_message(Message::subagent_results(results)) {
-            manager.restore_deferred(backup);
-            return Err(error);
         }
         let cancellation = self.cancellation.clone();
         crate::cancellation::scope(&cancellation, || {
@@ -391,6 +361,7 @@ impl Conversation {
     where
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
     {
+        self.recover_history()?;
         if mode == TurnMode::Goal && self.active_goal().is_none() {
             return Err(Error::Config("no active goal to resume".into()));
         }
@@ -516,32 +487,47 @@ impl Conversation {
                 ),
             };
 
-            self.maybe_compact(sink, resolve_provider)?;
+            let overhead = context::prompt_tokens(&system, &specs);
+            self.maybe_compact(overhead, sink, resolve_provider)?;
 
             let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;
-            let request = provider::Request {
-                model: &bare_model,
-                system: &system,
-                messages: &self.messages,
-                tools: &specs,
-                max_tokens: crate::model::max_tokens(&self.config, &self.model),
-                supports_images: crate::model::supports_images(&self.config, &self.model),
-                prompt_cache_control: true,
-                prompt_cache_key: Some(self.prompt_cache_key()),
-            };
-            let out = match stream_turn(provider.as_ref(), &request, &mut forward(sink)) {
-                Ok(out) => out,
-                // Abort quietly: partial output is discarded, history stays
-                // valid (it still ends with a user/tool message).
-                Err(Error::Interrupted) => return Ok(false),
-                Err(e) => return Err(e),
+            let mut retried_context = false;
+            let out = loop {
+                let request = provider::Request {
+                    model: &bare_model,
+                    system: &system,
+                    messages: &self.messages,
+                    tools: &specs,
+                    max_tokens: crate::model::max_tokens(&self.config, &self.model),
+                    supports_images: crate::model::supports_images(&self.config, &self.model),
+                    prompt_cache_control: true,
+                    prompt_cache_key: Some(self.prompt_cache_key()),
+                };
+                let response = stream_turn(provider.as_ref(), &request, &mut forward(sink));
+                match response {
+                    Ok(out) => break out,
+                    Err(Error::Interrupted) => return Ok(false),
+                    Err(error)
+                        if self.config.auto_compact
+                            && !retried_context
+                            && context::is_context_limit(&error) =>
+                    {
+                        retried_context = true;
+                        sink(TurnEvent::RetryReset);
+                        sink(TurnEvent::Warning(
+                            "Context limit reached; compacting before one retry".into(),
+                        ));
+                        self.compact_now_with(sink, resolve_provider)?;
+                    }
+                    Err(error) => return Err(error),
+                }
             };
             if crate::cancellation::interrupted() {
                 return Ok(false);
             }
 
             self.record_usage(out.usage)?;
-            self.context_tokens = out.usage.total_tokens();
+            self.record_context(out.usage.total_tokens(), overhead)?;
             requests_made = requests_made.saturating_add(1);
             sink(TurnEvent::Usage {
                 context_tokens: self.context_tokens,
@@ -807,7 +793,7 @@ impl Conversation {
     ) -> Result<bool, Error> {
         let mut aborted = false;
         let mut skip_remaining = false;
-        for call in calls {
+        for (index, call) in calls.iter().enumerate() {
             let result = if aborted {
                 Message::tool_result(
                     &call.id,
@@ -872,8 +858,19 @@ impl Conversation {
                     outcome.is_error,
                 )
             };
-            self.persist_message(&result)?;
-            self.messages.push(result);
+            if let Err(error) = self.save_tool_result(result) {
+                self.pending_tool_results
+                    .extend(calls[index + 1..].iter().map(|remaining| {
+                        Message::tool_result(
+                            &remaining.id,
+                            &remaining.name,
+                            "[not executed because an earlier tool result could not be saved]"
+                                .into(),
+                            true,
+                        )
+                    }));
+                return Err(error);
+            }
         }
         Ok(aborted)
     }
@@ -1026,16 +1023,16 @@ impl Conversation {
         Ok(())
     }
 
-    fn drain_deferred_subagent_results_into_history(&mut self) -> Result<(), Error> {
+    fn drain_deferred_subagent_results_into_history(&mut self) -> Result<bool, Error> {
         let Some(manager) = self.persistent_subagents() else {
-            return Ok(());
+            return Ok(false);
         };
         if !manager.has_deferred() {
-            return Ok(());
+            return Ok(false);
         }
         let deliveries = manager.drain_deferred();
         if deliveries.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let backup = deliveries.clone();
         let mut results = Vec::new();
@@ -1064,11 +1061,12 @@ impl Conversation {
             manager.restore_deferred(backup);
             return Err(error);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn maybe_compact<F>(
         &mut self,
+        overhead: u64,
         sink: &mut dyn FnMut(TurnEvent<'_>),
         resolve_provider: &mut F,
     ) -> Result<(), Error>
@@ -1077,7 +1075,7 @@ impl Conversation {
     {
         if !self.config.auto_compact
             || !compaction::should_compact(
-                self.context_tokens,
+                self.estimated_context(overhead),
                 self.context_window(),
                 self.config.compact_threshold,
             )
@@ -1126,6 +1124,7 @@ impl Conversation {
     where
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
     {
+        self.recover_history()?;
         sink(TurnEvent::Compacting);
         let registry = self.scan_tools();
         let specs = registry.specs();
@@ -1215,6 +1214,7 @@ impl Conversation {
         // Old usage estimate is stale after compaction; a fresh number
         // arrives with the next response.
         self.context_tokens = 0;
+        self.context_usage = None;
         sink(TurnEvent::Usage {
             context_tokens: 0,
             context_window: self.context_window(),

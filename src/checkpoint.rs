@@ -7,6 +7,7 @@
 //! recorded so `/undo` can reset it when the agent moved it.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -175,7 +176,7 @@ impl Checkpoints {
     /// Every path this session has touched, one entry per path, in first-touch
     /// order. The pre-image comes from the first turn that touched the path,
     /// so the result reflects the state before the session began. Turn records
-    /// popped by `restore_last` drop out.
+    /// removed by a committed undo drop out.
     pub fn touched_files(&self) -> Vec<TouchedFile> {
         let mut seen = std::collections::HashSet::new();
         let mut files = Vec::new();
@@ -206,12 +207,29 @@ impl Checkpoints {
     ///
     /// Returns I/O errors while updating the stack file. Restore failures are
     /// reported on [`RestoreReport::warning`] so messages can still be dropped.
+    #[cfg(test)]
     pub fn restore_last(&mut self) -> Result<RestoreReport, Error> {
-        let turn_index = self.stack.len().checked_sub(1);
-        let Some(turn) = self.stack.pop() else {
+        let index = self.last_index();
+        let report = self.restore_retained(index)?;
+        self.discard_restored(index)?;
+        Ok(report)
+    }
+
+    pub(crate) fn last_index(&self) -> Option<usize> {
+        self.stack.len().checked_sub(1)
+    }
+
+    /// Restore without consuming the checkpoint until session history commits.
+    pub(crate) fn restore_retained(&self, index: Option<usize>) -> Result<RestoreReport, Error> {
+        let Some(index) = index else {
             return Ok(RestoreReport::default());
         };
-        persist_stack(&self.dir, &self.stack)?;
+        if self.last_index() != Some(index) {
+            return Err(Error::Protocol(
+                "undo checkpoint is missing or out of order".into(),
+            ));
+        }
+        let turn = &self.stack[index];
         let mut report = RestoreReport {
             restored: true,
             reset_head: false,
@@ -220,11 +238,20 @@ impl Checkpoints {
         let mut staged_to_restore = None;
         if let UserHead::Sha { sha, staged } = &turn.user_head {
             let current = read_user_head(&self.work_tree);
-            if let UserHead::Sha {
-                sha: current_sha, ..
-            } = current
-                && current_sha != *sha
-            {
+            let reset_marker = self
+                .dir
+                .join("overlays")
+                .join(index.to_string())
+                .join("reset-head");
+            let moved =
+                matches!(current, UserHead::Sha { sha: current_sha, .. } if current_sha != *sha);
+            if moved || reset_marker.exists() {
+                // A crash after resetting HEAD must still restore the index
+                // on retry, even though HEAD now matches the checkpoint.
+                if let Some(parent) = reset_marker.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::File::create(&reset_marker)?.sync_all()?;
                 match prepare_user_head_restore(&self.work_tree, sha) {
                     Ok(()) => {
                         report.reset_head = true;
@@ -254,10 +281,24 @@ impl Checkpoints {
                 None => detail,
             });
         }
-        if let Some(index) = turn_index {
-            let _ = fs::remove_dir_all(self.dir.join("overlays").join(index.to_string()));
-        }
         Ok(report)
+    }
+
+    /// Idempotent cleanup after the session's undo event has committed.
+    pub(crate) fn discard_restored(&mut self, index: Option<usize>) -> Result<(), Error> {
+        let Some(index) = index else {
+            return Ok(());
+        };
+        if self.stack.len() == index + 1 {
+            persist_stack(&self.dir, &self.stack[..index])?;
+            self.stack.truncate(index);
+        } else if self.stack.len() != index {
+            return Err(Error::Protocol(
+                "undo checkpoint cleanup is out of order".into(),
+            ));
+        }
+        let _ = fs::remove_dir_all(self.dir.join("overlays").join(index.to_string()));
+        Ok(())
     }
 }
 
@@ -293,7 +334,11 @@ fn persist_stack(dir: &Path, stack: &[TurnRecord]) -> Result<(), Error> {
         version: STORE_VERSION,
         turns: stack,
     };
-    fs::write(dir.join("stack.json"), serde_json::to_vec(&stored)?)?;
+    let temporary = dir.join("stack.json.tmp");
+    let mut file = fs::File::create(&temporary)?;
+    file.write_all(&serde_json::to_vec(&stored)?)?;
+    file.sync_all()?;
+    fs::rename(&temporary, dir.join("stack.json"))?;
     Ok(())
 }
 
@@ -735,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn git_head_restore_recreates_preturn_staged_paths() -> Result<(), Error> {
+    fn git_head_restore_recreates_preturn_staged_paths_on_retry() -> Result<(), Error> {
         if !git_available() {
             return Ok(());
         }
@@ -784,7 +829,11 @@ mod tests {
                 .args(["commit", "-m", "agent"]),
         )?;
 
-        let report = checkpoints.restore_last()?;
+        let report = checkpoints.restore_retained(Some(0))?;
+        // Simulate a crash after HEAD reset but before staging was restored.
+        user_git(&work, &["reset", "--", "."])?;
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
+        checkpoints.restore_last()?;
 
         assert!(report.restored);
         assert!(report.reset_head);

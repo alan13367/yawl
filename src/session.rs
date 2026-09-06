@@ -7,7 +7,8 @@
 //! rebuilt by replaying the log.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::provider::{Message, Role, TokenUsage, UsageSummary};
+
+mod recovery;
+pub(crate) use recovery::{PendingUndo, missing_tool_results};
 
 /// Planning state retained with a session, outside the working tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +92,17 @@ enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan_state: Option<PlanState>,
     },
+    UndoStarted {
+        undo: PendingUndo,
+    },
+    UndoFinished,
+    ToolResultsRecovered {
+        index: usize,
+        results: Vec<Message>,
+    },
+    Context {
+        context: ContextUsage,
+    },
     GoalStart {
         goal: String,
         message: Message,
@@ -117,14 +132,28 @@ enum SessionEvent {
     },
 }
 
+/// Last measured context, separate from aggregate billing and compaction usage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ContextUsage {
+    pub tokens: u64,
+    pub messages: usize,
+    pub model: String,
+    pub overhead: u64,
+}
+
 #[derive(Debug)]
 pub struct Session {
     pub id: String,
     file: File,
+    rollback_to: Option<u64>,
+    #[cfg(test)]
+    fail_after_appends: Option<usize>,
     active_goal: Option<String>,
     active_plan: Option<PlanState>,
     plan_before_turn: Option<PlanState>,
     usage: UsageSummary,
+    pending_undo: Option<Box<PendingUndo>>,
+    context: Option<ContextUsage>,
 }
 
 struct ReplayedSession {
@@ -133,6 +162,8 @@ struct ReplayedSession {
     active_plan: Option<PlanState>,
     plan_before_turn: Option<PlanState>,
     usage: UsageSummary,
+    pending_undo: Option<Box<PendingUndo>>,
+    context: Option<ContextUsage>,
 }
 
 impl Session {
@@ -167,10 +198,15 @@ impl Session {
         let mut session = Session {
             id: id.clone(),
             file,
+            rollback_to: None,
+            #[cfg(test)]
+            fail_after_appends: None,
             active_goal: None,
             active_plan: None,
             plan_before_turn: None,
             usage: UsageSummary::default(),
+            pending_undo: None,
+            context: None,
         };
         session.append(&SessionEvent::Meta {
             id,
@@ -185,19 +221,34 @@ impl Session {
     pub fn open(dir: &Path, id: &str) -> Result<(Session, Vec<Message>), Error> {
         validate_id(id)?;
         let path = dir.join(format!("{id}.jsonl"));
-        let replayed = replay(&path)?;
-        let file = OpenOptions::new().append(true).open(&path)?;
-        Ok((
-            Session {
-                id: id.to_string(),
-                file,
-                active_goal: replayed.active_goal,
-                active_plan: replayed.active_plan,
-                plan_before_turn: replayed.plan_before_turn,
-                usage: replayed.usage,
-            },
-            replayed.messages,
-        ))
+        let mut replayed = replay(&path)?;
+        let mut file = OpenOptions::new().read(true).append(true).open(&path)?;
+        // Separate an unterminated crash tail from subsequent JSONL events.
+        if file.metadata()?.len() > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
+        let mut session = Session {
+            id: id.to_string(),
+            file,
+            rollback_to: None,
+            #[cfg(test)]
+            fail_after_appends: None,
+            active_goal: replayed.active_goal,
+            active_plan: replayed.active_plan,
+            plan_before_turn: replayed.plan_before_turn,
+            usage: replayed.usage,
+            pending_undo: replayed.pending_undo,
+            context: replayed.context,
+        };
+        if session.pending_undo.is_none() {
+            session.repair_tool_results(&mut replayed.messages)?;
+        }
+        Ok((session, replayed.messages))
     }
 
     /// Opens the most recently modified session, if any.
@@ -236,15 +287,16 @@ impl Session {
     }
 
     pub fn append_message(&mut self, message: &Message) -> Result<(), Error> {
+        self.append(&SessionEvent::Message {
+            message: message.clone(),
+        })?;
         if message.role == Role::User
             && (!message.is_hidden_control() || message.is_plan_implementation_start())
             && !message.is_steering()
         {
             self.plan_before_turn.clone_from(&self.active_plan);
         }
-        self.append(&SessionEvent::Message {
-            message: message.clone(),
-        })
+        Ok(())
     }
 
     pub fn append_compaction(&mut self, summary: &str, replaced: usize) -> Result<(), Error> {
@@ -275,6 +327,7 @@ impl Session {
             provider_data: provider_data.to_vec(),
             provider_data_model: provider_data_model.map(str::to_string),
         })?;
+        self.context = None;
         self.usage.record_cache_reset();
         Ok(())
     }
@@ -307,6 +360,10 @@ impl Session {
         }
         self.active_plan = plan_state;
         self.plan_before_turn = None;
+        self.context = None;
+        if let Some(undo) = &mut self.pending_undo {
+            undo.committed = true;
+        }
         Ok(())
     }
 
@@ -434,10 +491,49 @@ impl Session {
     }
 
     fn append(&mut self, event: &SessionEvent) -> Result<(), Error> {
+        if let Some(start) = self.rollback_to {
+            self.file.set_len(start)?;
+            self.rollback_to = None;
+        }
+        #[cfg(test)]
+        let fail_write = if let Some(remaining) = &mut self.fail_after_appends {
+            if *remaining == 0 {
+                self.fail_after_appends = None;
+                true
+            } else {
+                *remaining -= 1;
+                false
+            }
+        } else {
+            false
+        };
         let mut line = serde_json::to_string(event)?;
         line.push('\n');
-        self.file.write_all(line.as_bytes())?;
+        let start = self.file.metadata()?.len();
+        self.rollback_to = Some(start);
+        let written = (|| {
+            #[cfg(test)]
+            if fail_write {
+                self.file.write_all(&line.as_bytes()[..line.len() / 2])?;
+                return Err(std::io::Error::other(
+                    "injected partial session append failure",
+                ));
+            }
+            self.file.write_all(line.as_bytes())?;
+            self.file.sync_data()
+        })();
+        if let Err(error) = written {
+            self.file.set_len(start)?;
+            self.rollback_to = None;
+            return Err(error.into());
+        }
+        self.rollback_to = None;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_append_after(&mut self, successful_appends: usize) {
+        self.fail_after_appends = Some(successful_appends);
     }
 }
 
@@ -460,6 +556,8 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
     let mut active_plan = None;
     let mut plan_before_turn = None;
     let mut usage = UsageSummary::default();
+    let mut pending_undo: Option<Box<PendingUndo>> = None;
+    let mut context = None;
     let mut has_meta = false;
     for line in BufReader::new(file).lines() {
         let line = line?;
@@ -486,6 +584,14 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
         };
         match event {
             SessionEvent::Meta { .. } => {}
+            SessionEvent::UndoStarted { undo } => pending_undo = Some(Box::new(undo)),
+            SessionEvent::UndoFinished => pending_undo = None,
+            SessionEvent::Context { context: value } => context = Some(value),
+            SessionEvent::ToolResultsRecovered { index, results } => {
+                let index = index.min(messages.len());
+                messages.splice(index..index, results);
+                context = None;
+            }
             SessionEvent::Message { message } => {
                 if message.role == Role::User
                     && (!message.is_hidden_control() || message.is_plan_implementation_start())
@@ -512,6 +618,7 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
                         provider_data_model,
                     )),
                 ));
+                context = None;
                 usage.record_cache_reset();
             }
             SessionEvent::Undo {
@@ -526,6 +633,10 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
                 }
                 active_plan = plan_state;
                 plan_before_turn = None;
+                context = None;
+                if let Some(undo) = &mut pending_undo {
+                    undo.committed = true;
+                }
             }
             SessionEvent::GoalStart { goal, message } => {
                 active_goal = Some(goal);
@@ -584,6 +695,8 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
         active_plan,
         plan_before_turn,
         usage,
+        pending_undo,
+        context,
     })
 }
 
@@ -724,6 +837,41 @@ fn format_timestamp(unix_secs: u64) -> String {
 mod tests {
     use super::*;
     use crate::provider::SubagentResult;
+
+    #[test]
+    fn partial_append_rolls_back_before_retry() -> Result<(), Error> {
+        let dir = temp_root("partial-append");
+        let mut session = Session::create(&dir, &dir, "test")?;
+        let path = dir.join(format!("{}.jsonl", session.id));
+        let before = fs::read(&path)?;
+        session.fail_append_after(0);
+        assert!(session.append_message(&Message::user("failed")).is_err());
+        assert_eq!(fs::read(&path)?, before);
+        session.append_message(&Message::user("saved"))?;
+        let (_, messages) = Session::open(&dir, &session.id)?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "saved");
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn append_after_a_crash_tail_keeps_the_new_event() -> Result<(), Error> {
+        let dir = temp_root("crash-tail");
+        let session = Session::create(&dir, &dir, "test")?;
+        let path = dir.join(format!("{}.jsonl", session.id));
+        OpenOptions::new()
+            .append(true)
+            .open(&path)?
+            .write_all(b"{\"type\":\"message\",\"message\":")?;
+        let (mut resumed, _) = Session::open(&dir, &session.id)?;
+        resumed.append_message(&Message::user("after crash"))?;
+        let (_, messages) = Session::open(&dir, &session.id)?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "after crash");
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
 
     #[test]
     fn timestamp_formats_known_date() {

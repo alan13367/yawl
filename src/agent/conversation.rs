@@ -1,7 +1,9 @@
 //! Provider-neutral conversation state and turn execution.
 
+mod context;
 mod goal;
 mod plan;
+mod recovery;
 mod steer;
 mod turn;
 
@@ -85,6 +87,8 @@ pub(crate) struct Conversation {
     /// Last provider-reported total (input + output) tokens — the best
     /// estimate of current context usage.
     context_tokens: u64,
+    context_usage: Option<crate::session::ContextUsage>,
+    pending_tool_results: std::collections::VecDeque<Message>,
     latest_turn_result: String,
     /// Set when a turn ends through plan_complete so the TUI can offer the
     /// implement/revise handoff only for freshly finished plans.
@@ -107,6 +111,10 @@ impl Conversation {
         let subagents = SubagentManager::new(session.id.clone(), config.max_subagents);
         let checkpoints = Checkpoints::open(&config.home_dir, &session.id, work_tree);
         let active_goal = session.active_goal().map(str::to_string);
+        let context_usage = session
+            .context()
+            .filter(|usage| usage.model == model && usage.messages <= messages.len())
+            .cloned();
         Self {
             config,
             model,
@@ -118,7 +126,9 @@ impl Conversation {
                 background: BackgroundProcessManager::default(),
                 active_goal,
             }),
-            context_tokens: 0,
+            context_tokens: context_usage.as_ref().map_or(0, |usage| usage.tokens),
+            context_usage,
+            pending_tool_results: Default::default(),
             latest_turn_result: String::new(),
             plan_ready_this_turn: false,
             describe_cache: DescribeCache::default(),
@@ -143,6 +153,8 @@ impl Conversation {
                 role_fragment: None,
             }),
             context_tokens: 0,
+            context_usage: None,
+            pending_tool_results: Default::default(),
             latest_turn_result: String::new(),
             plan_ready_this_turn: false,
             describe_cache: DescribeCache::default(),
@@ -250,6 +262,7 @@ impl Conversation {
     /// no extra user input. Returns a checkpoint warning when snapshotting
     /// fails.
     pub(crate) fn start_goal(&mut self, input: TurnInput) -> Result<Option<String>, Error> {
+        self.recover_history()?;
         let warning = self
             .persistent_mut()
             .checkpoints
@@ -267,6 +280,7 @@ impl Conversation {
     }
 
     pub(crate) fn cancel_goal(&mut self) -> Result<bool, Error> {
+        self.recover_history()?;
         if self.persistent_state().active_goal.is_none() {
             return Ok(false);
         }
@@ -277,6 +291,7 @@ impl Conversation {
     }
 
     pub(crate) fn start_plan(&mut self, input: TurnInput) -> Result<Option<String>, Error> {
+        self.recover_history()?;
         let objective = input.text.clone();
         if objective.trim().is_empty() {
             return Err(Error::Config("plan objective is empty".into()));
@@ -296,6 +311,7 @@ impl Conversation {
     }
 
     pub(crate) fn cancel_plan(&mut self) -> Result<bool, Error> {
+        self.recover_history()?;
         if self.plan_state().is_none() {
             return Ok(false);
         }
@@ -331,6 +347,8 @@ impl Conversation {
 
     pub(crate) fn switch_model(&mut self, model: String) {
         self.model = model;
+        self.context_tokens = 0;
+        self.context_usage = None;
     }
 
     pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
@@ -348,6 +366,7 @@ impl Conversation {
 
     /// Starts a fresh session (used by `/new` and `/clear`).
     pub fn reset(&mut self) -> Result<(), Error> {
+        self.recover_history()?;
         let cwd = crate::config::working_dir();
         let dirs = self.config.session_dirs(&cwd);
         let old_id = self.session_id().to_string();
@@ -365,6 +384,7 @@ impl Conversation {
         });
         self.messages.clear();
         self.context_tokens = 0;
+        self.context_usage = None;
         self.latest_turn_result.clear();
         let _ = self.steers.drain();
         Checkpoints::remove(&self.config.home_dir, &old_id);
@@ -406,6 +426,7 @@ impl Conversation {
 
     /// Replaces the conversation with a saved session (used by `/resume`).
     pub fn load_session(&mut self, id: &str) -> Result<(), Error> {
+        self.recover_history()?;
         let cwd = crate::config::working_dir();
         let (session, messages) =
             Session::open_searching(&self.config.session_dirs(&cwd).search, id)?;
@@ -421,9 +442,16 @@ impl Conversation {
             active_goal,
         });
         self.messages = messages;
-        self.context_tokens = 0;
+        self.context_usage = self
+            .persistent_state()
+            .session
+            .context()
+            .filter(|usage| usage.model == self.model && usage.messages <= self.messages.len())
+            .cloned();
+        self.context_tokens = self.context_usage.as_ref().map_or(0, |usage| usage.tokens);
         self.latest_turn_result.clear();
         let _ = self.steers.drain();
+        self.recover_history()?;
         Ok(())
     }
 
@@ -510,28 +538,22 @@ impl Conversation {
     /// Returns session or checkpoint I/O errors. A missing turn is not an
     /// error; [`UndoReport::dropped`] is zero.
     pub fn undo_last_turn(&mut self) -> Result<UndoReport, Error> {
+        if let Some(report) = self.recover_undo()? {
+            return Ok(report);
+        }
+        self.recover_history()?;
         let Some(start) = last_undoable_user_index(&self.messages) else {
             return Ok(UndoReport::default());
         };
-        let dropped = self.messages.len() - start;
-        let clear_goal = self.messages[start..].iter().any(Message::is_goal_start);
-        let plan_state = self.persistent_state().session.plan_before_turn().cloned();
-        let restore = self.persistent_mut().checkpoints.restore_last()?;
-        self.persistent_mut()
-            .session
-            .append_undo_event_with_plan(dropped, clear_goal, plan_state)?;
-        self.messages.truncate(start);
-        if clear_goal {
-            self.persistent_mut().active_goal = None;
-        }
-        self.context_tokens = 0;
-        self.latest_turn_result.clear();
-        Ok(UndoReport {
-            dropped,
-            restored_files: restore.restored,
-            reset_head: restore.reset_head,
-            warning: restore.warning,
-        })
+        let undo = crate::session::PendingUndo {
+            dropped: self.messages.len() - start,
+            clear_goal: self.messages[start..].iter().any(Message::is_goal_start),
+            plan_state: self.persistent_state().session.plan_before_turn().cloned(),
+            checkpoint: self.persistent_state().checkpoints.last_index(),
+            committed: false,
+        };
+        self.persistent_mut().session.begin_undo(undo)?;
+        Ok(self.recover_undo()?.unwrap_or_default())
     }
 
     fn persistent_state(&self) -> &PersistentState {

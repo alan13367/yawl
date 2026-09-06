@@ -23,6 +23,7 @@ enum ProviderStep {
         output_tokens: u64,
     },
     Fail,
+    ContextLimit,
 }
 
 struct ScriptedProvider {
@@ -74,6 +75,10 @@ impl Provider for ScriptedProvider {
                 Ok(())
             }
             ProviderStep::Fail => Err(Error::Protocol("scripted failure".into())),
+            ProviderStep::ContextLimit => Err(Error::Http {
+                status: 400,
+                body: "context_length_exceeded".into(),
+            }),
         }
     }
 }
@@ -538,7 +543,10 @@ fn compaction_persists_and_replays_provider_native_history() {
 fn failed_auto_compaction_warns_and_the_turn_continues() {
     let mut test = TestAgent::new("compact-warning");
     test.agent.config.auto_compact = true;
-    test.agent.config.context_windows.insert("test".into(), 10);
+    test.agent
+        .config
+        .context_windows
+        .insert("test".into(), 100_000);
     // Enough history that auto-compaction has something to summarize.
     for index in 0..12 {
         test.agent
@@ -553,14 +561,14 @@ fn failed_auto_compaction_warns_and_the_turn_continues() {
                 name: "shell".into(),
                 arguments: r#"{"command":"true"}"#.into(),
             }],
-            input_tokens: 100,
+            input_tokens: 100_000,
             output_tokens: 0,
         },
         ProviderStep::Fail,
         ProviderStep::Output {
             text: "done",
             tool_calls: Vec::new(),
-            input_tokens: 100,
+            input_tokens: 100_000,
             output_tokens: 0,
         },
     ])));
@@ -1375,4 +1383,390 @@ fn steering_skips_pending_tools_and_injects_the_steer_message() {
         "accepted steer should be recorded as a steering user message"
     );
     assert!(steer_accepted, "steer acceptance should surface to the UI");
+}
+
+fn reopen_test_agent(test: &mut TestAgent) {
+    let (session, messages) = Session::open(&test.sessions_dir, test.agent.session_id()).unwrap();
+    test.agent = Conversation::persistent(
+        test.agent.config.clone(),
+        "test".into(),
+        session,
+        messages,
+        test.root.join("cwd"),
+    );
+}
+
+fn two_checkpoint_turns(test: &mut TestAgent) -> PathBuf {
+    let path = test.root.join("cwd/undo.txt");
+    std::fs::write(&path, "original").unwrap();
+    for (prompt, contents) in [("first", "first edit"), ("second", "second edit")] {
+        test.agent.checkpoint_snapshot().unwrap().unwrap();
+        test.agent
+            .append_input_message(Message::user(prompt))
+            .unwrap();
+        test.agent.checkpoint_path(&path).unwrap().unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    path
+}
+
+#[test]
+fn undo_retries_the_same_checkpoint_after_history_write_fails() {
+    for reopen in [false, true] {
+        let mut test = TestAgent::new("undo-write-failure");
+        let path = two_checkpoint_turns(&mut test);
+        // No files change unless the intent was saved successfully.
+        test.agent.persistent_mut().session.fail_append_after(0);
+        assert!(test.agent.undo_last_turn().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second edit");
+        assert!(
+            test.agent
+                .persistent_state()
+                .session
+                .pending_undo()
+                .is_none()
+        );
+        // The intent persists, files restore, then the history append fails.
+        test.agent.persistent_mut().session.fail_append_after(1);
+        assert!(test.agent.undo_last_turn().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first edit");
+        assert_eq!(test.agent.messages.len(), 2);
+        assert_eq!(
+            test.agent.persistent_state().checkpoints.last_index(),
+            Some(1)
+        );
+        if reopen {
+            reopen_test_agent(&mut test);
+        }
+        assert_eq!(test.agent.undo_last_turn().unwrap().dropped, 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first edit");
+        assert_eq!(test.agent.messages.len(), 1);
+        assert_eq!(
+            test.agent.persistent_state().checkpoints.last_index(),
+            Some(0)
+        );
+        test.agent.undo_last_turn().unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+    }
+}
+
+#[test]
+fn undo_recovery_after_cleanup_does_not_restore_an_older_turn() {
+    let mut test = TestAgent::new("undo-finish-failure");
+    let path = two_checkpoint_turns(&mut test);
+    // Intent and history commit; the checkpoint is removed, but finishing fails.
+    test.agent.persistent_mut().session.fail_append_after(2);
+    assert!(test.agent.undo_last_turn().is_err());
+    assert_eq!(test.agent.messages.len(), 1);
+    reopen_test_agent(&mut test);
+    let report = test.agent.undo_last_turn().unwrap();
+    assert_eq!(report.dropped, 1);
+    assert!(report.restored_files);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "first edit");
+    assert_eq!(test.agent.messages.len(), 1);
+    assert!(
+        test.agent
+            .persistent_state()
+            .session
+            .pending_undo()
+            .is_none()
+    );
+}
+
+#[test]
+fn undo_recovery_after_checkpoint_cleanup_failure_is_idempotent() {
+    let mut test = TestAgent::new("undo-cleanup-failure");
+    let path = two_checkpoint_turns(&mut test);
+    let temporary = test
+        .agent
+        .config
+        .home_dir
+        .join("checkpoints")
+        .join(test.agent.session_id())
+        .join("stack.json.tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    assert!(test.agent.undo_last_turn().is_err());
+    assert_eq!(test.agent.messages.len(), 1);
+    std::fs::remove_dir(&temporary).unwrap();
+    reopen_test_agent(&mut test);
+    test.agent.undo_last_turn().unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "first edit");
+    assert_eq!(
+        test.agent.persistent_state().checkpoints.last_index(),
+        Some(0)
+    );
+}
+
+#[test]
+fn failed_tool_result_is_saved_on_retry_without_rerunning_tools() {
+    let mut test = TestAgent::new("tool-storage-failure");
+    let path = test.root.join("cwd/tool.txt");
+    let calls = vec![
+        ToolCall {
+            id: "first".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": path, "content": "executed once"}).to_string(),
+        },
+        ToolCall {
+            id: "second".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": path, "content": "must not execute"}).to_string(),
+        },
+    ];
+    test.agent
+        .append_input_message(Message::assistant("".into(), calls.clone()))
+        .unwrap();
+    let registry = test.agent.scan_tools();
+    test.agent.persistent_mut().session.fail_append_after(0);
+    assert!(
+        test.agent
+            .run_tools_while(&registry, &calls, &mut |_| {}, || false)
+            .is_err()
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "executed once");
+    let actual_output = test.agent.pending_tool_results[0].content.clone();
+    assert!(!test.agent.pending_tool_results[0].is_error);
+    // Prove recovery does not execute the first tool again either.
+    std::fs::write(&path, "external change").unwrap();
+    test.agent.recover_history().unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "external change");
+    assert_eq!(test.agent.messages[1].content, actual_output);
+    assert!(test.agent.messages[2].content.contains("not executed"));
+    reopen_test_agent(&mut test);
+    assert_eq!(test.agent.messages.len(), 3);
+    assert_eq!(test.agent.messages[1].content, actual_output);
+}
+
+#[test]
+fn resume_repairs_missing_results_without_executing_uncertain_calls() {
+    let mut test = TestAgent::new("missing-results");
+    let calls = ["done", "unknown"].map(|id| ToolCall {
+        id: id.into(),
+        name: "shell".into(),
+        arguments: "{}".into(),
+    });
+    test.agent
+        .append_input_message(Message::assistant("".into(), calls.to_vec()))
+        .unwrap();
+    test.agent
+        .append_input_message(Message::tool_result(
+            "done",
+            "shell",
+            "known output".into(),
+            false,
+        ))
+        .unwrap();
+    // Also cover old sessions with a user message after the incomplete batch.
+    test.agent
+        .append_input_message(Message::user("continue"))
+        .unwrap();
+    reopen_test_agent(&mut test);
+    assert_eq!(test.agent.messages.len(), 4);
+    assert_eq!(test.agent.messages[1].content, "known output");
+    assert_eq!(
+        test.agent.messages[2].tool_call_id.as_deref(),
+        Some("unknown")
+    );
+    assert!(test.agent.messages[2].content.contains("may have executed"));
+    assert_eq!(test.agent.messages[3].content, "continue");
+    reopen_test_agent(&mut test);
+    assert_eq!(test.agent.messages.len(), 4);
+}
+
+#[test]
+fn context_metadata_survives_resume_and_counts_new_content() {
+    let mut test = TestAgent::new("context-replay");
+    test.agent
+        .append_input_message(Message::user("start"))
+        .unwrap();
+    test.agent.record_context(1000, 50).unwrap();
+    test.agent
+        .append_input_message(Message::assistant("answer".into(), vec![]))
+        .unwrap();
+    reopen_test_agent(&mut test);
+    assert_eq!(test.agent.estimated_context(50), 1000);
+    test.agent
+        .append_input_message(Message::user("x".repeat(3000)))
+        .unwrap();
+    assert_eq!(test.agent.estimated_context(50), 2008);
+    assert_eq!(test.agent.estimated_context(150), 2108);
+    test.agent.switch_model("other".into());
+    assert!(test.agent.estimated_context(50) < 2008);
+}
+
+fn text_step(text: &'static str) -> ProviderStep {
+    ProviderStep::Output {
+        text,
+        tool_calls: vec![],
+        input_tokens: 100,
+        output_tokens: 1,
+    }
+}
+
+#[test]
+fn context_limit_gets_at_most_one_compaction_retry() {
+    for (enabled, repeat_error) in [(true, false), (true, true), (false, false)] {
+        let mut test = TestAgent::new("context-retry");
+        test.agent.config.auto_compact = enabled;
+        for _ in 0..12 {
+            test.agent
+                .append_input_message(Message::user("old history"))
+                .unwrap();
+        }
+        let steps = Rc::new(RefCell::new(VecDeque::from([
+            ProviderStep::ContextLimit,
+            text_step("portable summary"),
+            if repeat_error {
+                ProviderStep::ContextLimit
+            } else {
+                text_step("done")
+            },
+        ])));
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
+        let mut compactions = 0;
+        let result = test.agent.run_turn_with(
+            Some("continue".into()),
+            &mut |event| {
+                if matches!(event, TurnEvent::Compacted { .. }) {
+                    compactions += 1;
+                }
+            },
+            &mut resolve,
+        );
+        assert_eq!(result.is_ok(), enabled && !repeat_error);
+        assert_eq!(compactions, usize::from(enabled));
+        assert_eq!(requests.borrow().len(), if enabled { 3 } else { 1 });
+        if enabled {
+            assert_eq!(
+                test.agent.usage().requests,
+                if repeat_error { 1 } else { 2 }
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_resumed_history_is_compacted_before_the_first_request() {
+    let mut test = TestAgent::new("legacy-context");
+    test.agent.config.auto_compact = true;
+    test.agent
+        .config
+        .context_windows
+        .insert("test".into(), 20_000);
+    for _ in 0..12 {
+        test.agent
+            .append_input_message(Message::user("x".repeat(6000)))
+            .unwrap();
+    }
+    reopen_test_agent(&mut test);
+    assert!(test.agent.context_usage.is_none());
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        text_step("summary"),
+        text_step("done"),
+    ])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve(steps, Rc::clone(&requests));
+    assert!(
+        test.agent
+            .run_turn_with(Some("continue".into()), &mut |_| {}, &mut resolve)
+            .unwrap()
+    );
+    assert_eq!(
+        requests.borrow()[0].len(),
+        1,
+        "first request must be the summarizer"
+    );
+    assert_eq!(test.agent.usage().cache_resets, 1);
+}
+
+#[test]
+fn fresh_tool_output_triggers_compaction_even_when_reported_usage_was_low() {
+    let mut test = TestAgent::new("tool-context");
+    test.agent.config.auto_compact = true;
+    test.agent
+        .config
+        .context_windows
+        .insert("test".into(), 20_000);
+    let path = test.root.join("large.txt");
+    std::fs::write(&path, "x".repeat(60_000)).unwrap();
+    for _ in 0..12 {
+        test.agent
+            .append_input_message(Message::user("old history"))
+            .unwrap();
+    }
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "read".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": path}).to_string(),
+            }],
+            input_tokens: 100,
+            output_tokens: 10,
+        },
+        text_step("summary"),
+        text_step("done"),
+    ])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve(steps, Rc::clone(&requests));
+    assert!(
+        test.agent
+            .run_turn_with(Some("read the file".into()), &mut |_| {}, &mut resolve)
+            .unwrap()
+    );
+    assert_eq!(
+        requests.borrow()[1].len(),
+        1,
+        "summarize after the large result"
+    );
+    assert_eq!(test.agent.usage().cache_resets, 1);
+}
+
+#[test]
+fn failed_assistant_append_does_not_hide_the_next_user_inputs_context_cost() {
+    let mut test = TestAgent::new("context-missing-assistant");
+    test.agent
+        .append_input_message(Message::user("start"))
+        .unwrap();
+    test.agent.record_context(1000, 50).unwrap();
+    // The response's context measurement persisted, but its assistant did not.
+    reopen_test_agent(&mut test);
+    test.agent
+        .append_input_message(Message::user("x".repeat(3000)))
+        .unwrap();
+    assert_eq!(test.agent.estimated_context(50), 2008);
+}
+
+#[test]
+fn deferred_delivery_is_restored_after_a_partial_append_failure() {
+    let mut test = TestAgent::new("deferred-storage-failure");
+    test.agent.subagent_manager().push_test_deferred(
+        1,
+        "scout",
+        crate::subagent::RunOutcome::Completed,
+        "found it",
+    );
+    let steps = Rc::new(RefCell::new(VecDeque::from([text_step("summary")])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve(steps, Rc::clone(&requests));
+    test.agent.persistent_mut().session.fail_append_after(0);
+    assert!(
+        test.agent
+            .run_deferred_subagent_results_with(&mut |_| {}, &mut resolve)
+            .is_err()
+    );
+    assert!(test.agent.subagent_manager().has_deferred());
+    assert!(requests.borrow().is_empty());
+    assert_eq!(
+        test.agent
+            .run_deferred_subagent_results_with(&mut |_| {}, &mut resolve)
+            .unwrap(),
+        Some(true)
+    );
+    assert!(!test.agent.subagent_manager().has_deferred());
+    reopen_test_agent(&mut test);
+    assert_eq!(test.agent.messages.len(), 2);
+    assert_eq!(test.agent.messages[0].subagent_results.len(), 1);
 }
