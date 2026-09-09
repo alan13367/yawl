@@ -49,6 +49,28 @@ const STATUS_ARGS: &[&str] = &[
     "--untracked-files=normal",
 ];
 
+/// History pagination: the dashboard loads only the newest batch up front so
+/// opening stays fast on large repositories, then pages in older commits as
+/// the history (or full log) scrolls near the oldest loaded row.
+const INITIAL_HISTORY_LIMIT: usize = 100;
+const HISTORY_PAGE_SIZE: usize = 100;
+/// How close to the oldest loaded commit (in rows) triggers the next page.
+const HISTORY_PRELOAD_THRESHOLD: usize = 10;
+/// Fixed right-panel chrome rows: title, three-row message box, commit
+/// button, meta, notice, blank.
+const FIXED_ROWS: usize = 8;
+/// First frame row of the message box (top border); the input sits one row
+/// below and the bottom border one row further down.
+const COMMIT_BOX_TOP: usize = 1;
+const COMMIT_BOX_INPUT: usize = COMMIT_BOX_TOP + 1;
+/// Height of the message box in rows (top border, input, bottom border).
+const COMMIT_BOX_HEIGHT: usize = 3;
+/// HISTORY chrome: header row plus the two-line detail footer.
+const HISTORY_CHROME_ROWS: usize = 3;
+/// Minimum visible history entries when the panel must share space with a
+/// long file list. Small terminals may still shrink below this.
+const MIN_HISTORY_ENTRIES: usize = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum GitFocus {
     Files,
@@ -152,8 +174,8 @@ struct LoadedDiff {
     path: String,
     staged: bool,
     untracked: bool,
-    /// Short hash when the diff shows a historical commit rather than the
-    /// worktree. Such diffs are never reloaded by `refresh`.
+    /// Full commit hash when the diff shows a historical commit rather than
+    /// the worktree. Such diffs are never reloaded by `refresh`.
     commit: Option<String>,
     lines: Vec<DiffLine>,
     added: usize,
@@ -213,7 +235,7 @@ fn confirm_message(confirm: &Confirm) -> String {
 
 /// Modal confirm box for destructive undo actions. Anchored over the file
 /// area so it cannot be missed; exactly `CONFIRM_HEIGHT` rows.
-const CONFIRM_TOP: usize = 6;
+const CONFIRM_TOP: usize = FIXED_ROWS;
 const CONFIRM_HEIGHT: usize = 4;
 
 /// Clickable answer inside the confirm box. Columns are zero-based screen
@@ -231,10 +253,12 @@ struct GitLayout {
     divider: usize,
     file_rows: Vec<(usize, usize)>,
     actions: Vec<FileActionHit>,
+    stage_all_row: Option<usize>,
     history_rows: Vec<(usize, usize)>,
     menu_rows: Vec<(usize, usize)>,
     confirm_rows: Vec<ConfirmHit>,
     commit_row: usize,
+    commit_box_top: usize,
     commit_x0: usize,
     commit_x1: usize,
     commit_button_row: usize,
@@ -250,6 +274,7 @@ struct GitLayout {
 enum MouseTarget {
     File(usize),
     FileAction(usize, FileAction),
+    StageAll,
     History(usize),
     CommitInput,
     Commit,
@@ -299,6 +324,12 @@ impl GitLayout {
         {
             return Some(MouseTarget::ToggleMenu);
         }
+        // The whole message box focuses the input, borders included.
+        if (self.commit_box_top..self.commit_box_top + COMMIT_BOX_HEIGHT).contains(&row)
+            && (self.commit_x0..self.commit_x1).contains(&column)
+        {
+            return Some(MouseTarget::CommitInput);
+        }
         if let Some(hit) = self
             .actions
             .iter()
@@ -306,8 +337,10 @@ impl GitLayout {
         {
             return Some(MouseTarget::FileAction(hit.index, hit.action));
         }
-        if row == self.commit_row && (self.commit_x0..self.commit_x1).contains(&column) {
-            return Some(MouseTarget::CommitInput);
+        if self.stage_all_row == Some(row)
+            && column >= self.divider + 1 + self.right_width.saturating_sub(3)
+        {
+            return Some(MouseTarget::StageAll);
         }
         if commit {
             return Some(MouseTarget::Commit);
@@ -364,6 +397,11 @@ pub(super) struct GitView {
     history: Vec<HistoryEntry>,
     history_selected: usize,
     history_scroll: usize,
+    /// How many newest commits are loaded (`git log --max-count`). Grows by
+    /// [`HISTORY_PAGE_SIZE`] as the user scrolls toward older history.
+    history_limit: usize,
+    /// True when the last load hit the limit, so older commits may remain.
+    history_has_more: bool,
     confirm: Option<Confirm>,
     notice: String,
     notice_error: bool,
@@ -406,7 +444,7 @@ fn commit_menu_items(amend: bool) -> [(&'static str, &'static str); 4] {
 
 /// First content row of the dropdown and its height (header + items +
 /// footer). Anchored directly under the commit button.
-const MENU_TOP: usize = 3;
+const MENU_TOP: usize = COMMIT_BOX_TOP + COMMIT_BOX_HEIGHT + 1;
 const MENU_ITEMS: usize = 4;
 const MENU_HEIGHT: usize = MENU_ITEMS + 2;
 
@@ -451,6 +489,8 @@ impl GitView {
             history: Vec::new(),
             history_selected: 0,
             history_scroll: 0,
+            history_limit: INITIAL_HISTORY_LIMIT,
+            history_has_more: false,
             confirm: None,
             notice: String::new(),
             notice_error: false,
@@ -1101,18 +1141,51 @@ fn parse_history(output: &str) -> Vec<HistoryEntry> {
         .collect()
 }
 
-fn load_history(root: &Path) -> Vec<HistoryEntry> {
-    run_git(
+/// Loads up to `limit` newest commits plus whether older commits may remain.
+/// The `has_more` flag is optimistic: reaching the limit assumes more history
+/// until a wider load proves otherwise, so huge repositories never pay for a
+/// full log up front.
+fn load_history_limit(root: &Path, limit: usize) -> (Vec<HistoryEntry>, bool) {
+    let limit = limit.max(1);
+    let max_count = format!("--max-count={limit}");
+    let output = run_git(
         root,
         &[
             "log",
             "--format=%H%x1f%h%x1f%D%x1f%an%x1f%ad%x1f%s",
             "--date=short",
-            "-30",
+            max_count.as_str(),
         ],
     )
-    .map(|output| parse_history(&output))
-    .unwrap_or_default()
+    .unwrap_or_default();
+    let history = parse_history(&output);
+    let has_more = history.len() >= limit;
+    (history, has_more)
+}
+
+/// Starts a background page-in when the selection, the history window, or the
+/// full log sits within [`HISTORY_PRELOAD_THRESHOLD`] rows of the oldest
+/// loaded commit. No-op while another git job runs or no more history is
+/// expected, so rapid scrolling issues at most one extra load at a time.
+fn maybe_load_more_history(state: &mut ViewState) {
+    let needs_more = state.git_view.as_ref().is_some_and(|view| {
+        if !view.history_has_more || view.history.is_empty() {
+            return false;
+        }
+        let loaded = view.history.len();
+        let near_selected = view.history_selected + HISTORY_PRELOAD_THRESHOLD >= loaded;
+        let near_window = view.history_scroll + HISTORY_PRELOAD_THRESHOLD >= loaded;
+        let near_log = view.show_log && view.log_scroll + HISTORY_PRELOAD_THRESHOLD >= loaded;
+        near_selected || near_window || near_log
+    });
+    if !needs_more {
+        return;
+    }
+    jobs::start(
+        state,
+        "Loading more history…",
+        operations::load_more_history,
+    );
 }
 
 /// Full-file diff of a historical commit for the left-pane viewer.
@@ -1139,8 +1212,11 @@ fn load_commit_diff(root: &Path, entry: &HistoryEntry) -> Result<LoadedDiff, Str
         let output = run_git_output(root, &args, &[], MAX_DIFF_BYTES + 1)?;
         diff = parse_unified_diff(&title, false, &output);
     }
-    diff.commit = Some(entry.short.clone());
-    diff.scroll = first_change_scroll(&diff.lines);
+    diff.commit = Some(entry.hash.clone());
+    // The first-change anchor is resolved to visual rows on the next render,
+    // when the pane width is known (long lines wrap). `usize::MAX` marks it
+    // pending; explicit scrolling before that render cancels it to the top.
+    diff.scroll = usize::MAX;
     Ok(diff)
 }
 
@@ -1228,6 +1304,47 @@ fn history_top(view: &GitView, visible: usize) -> usize {
         0
     } else {
         view.history_scroll.min(view.history.len() - visible)
+    }
+}
+
+/// Splits the right panel between the file list and the history section so
+/// history reaches the bottom instead of stopping after five rows.
+///
+/// Returns `(file_capacity, history_capacity, pad_between)` where `pad_between`
+/// are blank rows inserted between the files and the history header to anchor
+/// history to the bottom when everything fits. When overflowing, files keep
+/// the top and history takes the remainder (at least [`MIN_HISTORY_ENTRIES`]
+/// when the terminal allows), both scrollable.
+fn panel_split(view: &GitView, content_height: usize) -> (usize, usize, usize) {
+    let available = content_height.saturating_sub(FIXED_ROWS);
+    let file_needed = if view.status.is_clean() {
+        2
+    } else {
+        file_area_rows(view).len()
+    };
+    let history_total = view.history.len();
+    if file_needed + history_total + HISTORY_CHROME_ROWS <= available {
+        let pad = available - (file_needed + history_total + HISTORY_CHROME_ROWS);
+        (file_needed.max(1), history_total, pad)
+    } else {
+        let max_file = available
+            .saturating_sub(MIN_HISTORY_ENTRIES + HISTORY_CHROME_ROWS)
+            .max(1);
+        let mut file_capacity = file_needed.min(max_file).max(1);
+        let remainder = available.saturating_sub(file_capacity + HISTORY_CHROME_ROWS);
+        if remainder >= history_total {
+            // Short history: show it all and hand the spare rows back to files.
+            file_capacity = file_needed
+                .min(
+                    available
+                        .saturating_sub(history_total + HISTORY_CHROME_ROWS)
+                        .max(1),
+                )
+                .max(1);
+            (file_capacity, history_total, 0)
+        } else {
+            (file_capacity, remainder.max(1), 0)
+        }
     }
 }
 
@@ -1681,36 +1798,48 @@ pub(super) fn handle_event(state: &mut ViewState, _editor: &mut Editor, event: E
             if view.confirm.is_some() {
                 return;
             }
+            // Wheel-up (`amount > 0`, button 64) moves toward the top
+            // (earlier rows); wheel-down moves toward the bottom. All git
+            // scroll offsets count from the top, so positive amounts shrink
+            // the offset. (The main transcript counts from the bottom, which
+            // is why its sign looks reversed.)
             if view.show_log {
                 if amount > 0 {
-                    view.log_scroll = view.log_scroll.saturating_add(amount as usize);
+                    view.log_scroll = view.log_scroll.saturating_sub(amount as usize);
                 } else {
                     view.log_scroll = view
                         .log_scroll
-                        .saturating_sub(amount.unsigned_abs() as usize);
+                        .saturating_add(amount.unsigned_abs() as usize);
                 }
             } else if view.focus == GitFocus::Diff || view.diff.is_some() {
                 if let Some(diff) = view.diff.as_mut() {
+                    resolve_diff_scroll(diff);
                     if amount > 0 {
-                        diff.scroll = diff.scroll.saturating_add(amount as usize);
+                        diff.scroll = diff.scroll.saturating_sub(amount as usize);
                     } else {
-                        diff.scroll = diff.scroll.saturating_sub(amount.unsigned_abs() as usize);
+                        diff.scroll = diff.scroll.saturating_add(amount.unsigned_abs() as usize);
                     }
                 }
             } else if view.focus == GitFocus::History {
                 if amount > 0 {
-                    view.history_scroll = view.history_scroll.saturating_add(amount as usize);
+                    view.history_scroll = view.history_scroll.saturating_sub(amount as usize);
                 } else {
                     view.history_scroll = view
                         .history_scroll
-                        .saturating_sub(amount.unsigned_abs() as usize);
+                        .saturating_add(amount.unsigned_abs() as usize);
                 }
             } else if amount > 0 {
-                view.file_scroll = view.file_scroll.saturating_add(amount as usize);
+                view.file_scroll = view.file_scroll.saturating_sub(amount as usize);
             } else {
                 view.file_scroll = view
                     .file_scroll
-                    .saturating_sub(amount.unsigned_abs() as usize);
+                    .saturating_add(amount.unsigned_abs() as usize);
+            }
+            // Scrolling the history (or the full log) near the oldest loaded
+            // commit pages in the next batch so the list can grow to the full
+            // history without an upfront full-log load.
+            if state.git_job.is_none() {
+                maybe_load_more_history(state);
             }
         }
         Event::Mouse(mouse) => {
@@ -1766,6 +1895,9 @@ fn handle_mouse(state: &mut ViewState, mouse: MouseEvent) {
             activate_commit_menu(state);
         }
         Some(MouseTarget::Commit) => do_commit(state),
+        Some(MouseTarget::StageAll) => {
+            run_simple(state, &["add", "-A"], "Staged all files.");
+        }
         Some(MouseTarget::DismissMenu) => view.commit_menu = None,
         Some(MouseTarget::ToggleMenu) => {
             view.commit_menu = Some(CommitMenuState::default());
@@ -1804,6 +1936,9 @@ fn handle_mouse(state: &mut ViewState, mouse: MouseEvent) {
             view.history_selected = index;
             view.focus = GitFocus::History;
             view.confirm = None;
+            // Same one-click behaviour as changed files: selecting a commit
+            // immediately shows its diff on the left.
+            open_commit_diff(state);
         }
         None => {}
     }
@@ -2012,6 +2147,7 @@ fn handle_key(state: &mut ViewState, key: Key) {
                 if let Some(view) = state.git_view.as_mut()
                     && let Some(diff) = view.diff.as_mut()
                 {
+                    resolve_diff_scroll(diff);
                     diff.scroll = diff.scroll.saturating_sub(1);
                 }
             }
@@ -2019,6 +2155,7 @@ fn handle_key(state: &mut ViewState, key: Key) {
                 if let Some(view) = state.git_view.as_mut()
                     && let Some(diff) = view.diff.as_mut()
                 {
+                    resolve_diff_scroll(diff);
                     diff.scroll = diff.scroll.saturating_add(1);
                 }
             }
@@ -2026,6 +2163,7 @@ fn handle_key(state: &mut ViewState, key: Key) {
                 if let Some(view) = state.git_view.as_mut()
                     && let Some(diff) = view.diff.as_mut()
                 {
+                    resolve_diff_scroll(diff);
                     diff.scroll = diff.scroll.saturating_sub(10);
                 }
             }
@@ -2033,6 +2171,7 @@ fn handle_key(state: &mut ViewState, key: Key) {
                 if let Some(view) = state.git_view.as_mut()
                     && let Some(diff) = view.diff.as_mut()
                 {
+                    resolve_diff_scroll(diff);
                     diff.scroll = diff.scroll.saturating_add(10);
                 }
             }
@@ -2067,6 +2206,9 @@ fn handle_key(state: &mut ViewState, key: Key) {
                 {
                     view.history_selected = (view.history_selected + 1).min(view.history.len() - 1);
                 }
+                if state.git_job.is_none() {
+                    maybe_load_more_history(state);
+                }
             }
             Key::PageUp => {
                 if let Some(view) = state.git_view.as_mut() {
@@ -2078,6 +2220,9 @@ fn handle_key(state: &mut ViewState, key: Key) {
                     && !view.history.is_empty()
                 {
                     view.history_selected = (view.history_selected + 5).min(view.history.len() - 1);
+                }
+                if state.git_job.is_none() {
+                    maybe_load_more_history(state);
                 }
             }
             Key::Enter | Key::Right | Key::Char('l') => open_commit_diff(state),
@@ -2124,6 +2269,9 @@ fn handle_key(state: &mut ViewState, key: Key) {
                         view.selected = (view.selected + 1).min(view.flat.len() - 1);
                     }
                 }
+                if state.git_job.is_none() {
+                    maybe_load_more_history(state);
+                }
             }
             Key::PageUp => {
                 if let Some(view) = state.git_view.as_mut() {
@@ -2141,6 +2289,9 @@ fn handle_key(state: &mut ViewState, key: Key) {
                     } else if !view.flat.is_empty() {
                         view.selected = (view.selected + 10).min(view.flat.len().saturating_sub(1));
                     }
+                }
+                if state.git_job.is_none() {
+                    maybe_load_more_history(state);
                 }
             }
             Key::Enter | Key::Right => {
@@ -2257,17 +2408,27 @@ fn handle_key(state: &mut ViewState, key: Key) {
             }
             Key::Char('S') => run_simple(state, &["stash", "pop"], "Restored stash."),
             Key::Char('l') => {
-                let root = state.git_view.as_ref().map(|view| view.root.clone());
-                if let Some(root) = root {
-                    let history = load_history(&root);
-                    if let Some(view) = state.git_view.as_mut() {
-                        view.show_log = !view.show_log;
-                        view.history = history;
-                        view.history_selected = 0;
-                        view.log_scroll = 0;
-                        view.diff = None;
-                        view.show_branches = false;
+                let turning_on = state.git_view.as_ref().is_some_and(|view| !view.show_log);
+                if turning_on {
+                    let (root, limit) = state
+                        .git_view
+                        .as_ref()
+                        .map(|view| (view.root.clone(), view.history_limit))
+                        .unwrap_or((PathBuf::new(), INITIAL_HISTORY_LIMIT));
+                    if !root.as_os_str().is_empty() {
+                        let (history, has_more) = load_history_limit(&root, limit);
+                        if let Some(view) = state.git_view.as_mut() {
+                            view.show_log = true;
+                            view.history = history;
+                            view.history_has_more = has_more;
+                            view.history_selected = 0;
+                            view.log_scroll = 0;
+                            view.diff = None;
+                            view.show_branches = false;
+                        }
                     }
+                } else if let Some(view) = state.git_view.as_mut() {
+                    view.show_log = false;
                 }
             }
             Key::Char('b') => {
@@ -2494,17 +2655,14 @@ pub(super) fn render(
     let left_width = divider;
     let content_height = rows - 1;
 
-    // Fixed right-panel chrome rows: title, commit box, commit button, meta,
-    // notice, blank.
-    const FIXED_ROWS: usize = 6;
-    // HISTORY section: header + entry rows + two detail rows. It gets a
-    // bounded slice so the file list keeps the majority of the space.
-    let history_capacity = content_height
-        .saturating_sub(FIXED_ROWS + 4 + 3)
-        .clamp(2, 5);
-    let file_capacity = content_height
-        .saturating_sub(FIXED_ROWS + 1 + history_capacity + 2)
-        .max(1);
+    // Files stay on top; history anchors to the bottom and takes the
+    // remainder so it is no longer capped at five rows. `pad_between` pushes
+    // history down when everything fits.
+    let (file_capacity, history_capacity, pad_between) = state
+        .git_view
+        .as_ref()
+        .map(|view| panel_split(view, content_height))
+        .unwrap_or((1, 2, 0));
     {
         let Some(view) = state.git_view.as_mut() else {
             return (vec![" ".repeat(columns); rows], HIDDEN_CURSOR);
@@ -2521,10 +2679,11 @@ pub(super) fn render(
         let mut layout = GitLayout {
             divider,
             right_width,
-            commit_row: 1,
-            commit_x0: divider + 1 + 2,
-            commit_x1: columns,
-            commit_button_row: 2,
+            commit_row: COMMIT_BOX_INPUT,
+            commit_box_top: COMMIT_BOX_TOP,
+            commit_x0: divider + 1,
+            commit_x1: divider + 1 + right_width,
+            commit_button_row: COMMIT_BOX_TOP + COMMIT_BOX_HEIGHT,
             commit_button_x0: divider + 1,
             commit_button_x1: divider + 1 + commit_button_width(right_width),
             menu_button_x0: divider + 1 + commit_button_width(right_width),
@@ -2532,6 +2691,7 @@ pub(super) fn render(
             close_button: None,
             file_rows: Vec::new(),
             actions: Vec::new(),
+            stage_all_row: None,
             history_rows: Vec::new(),
             menu_rows: Vec::new(),
             confirm_rows: Vec::new(),
@@ -2573,6 +2733,9 @@ pub(super) fn render(
             row += 2;
         }
         for slot in area.iter().skip(scroll).take(file_capacity) {
+            if matches!(slot, FileAreaRow::Header(GitSection::Unstaged)) {
+                layout.stage_all_row = Some(row);
+            }
             if let FileAreaRow::File(idx) = slot {
                 layout.file_rows.push((row, *idx));
                 if let Some(file) = view.flat.get(*idx) {
@@ -2597,8 +2760,10 @@ pub(super) fn render(
                 break;
             }
         }
-        // HISTORY rows follow the file area: header, entries, detail footer.
+        // HISTORY rows follow the file area (plus bottom-anchoring padding):
+        // header, entries, detail footer.
         let hist_top = history_top(view, history_capacity);
+        row += pad_between;
         row += 1; // header row
         for (offset, _) in view
             .history
@@ -2625,6 +2790,7 @@ pub(super) fn render(
         content_height,
         file_capacity,
         history_capacity,
+        pad_between,
     );
     let left_lines = render_left(state, editor, left_width, content_height);
 
@@ -2735,8 +2901,9 @@ fn commit_visible(view: &GitView, width: usize) -> String {
 
 /// 1-based terminal coordinates for the commit-box cursor. The frame is drawn
 /// with 1-based `CUP` positioning (`cursor_control`), so the row is the frame
-/// index plus one and the column accounts for the divider, the `"> "` prefix,
-/// and the visible cursor offset within the (possibly scrolled) message.
+/// index plus one and the column accounts for the divider, the box border,
+/// the `"> "` prefix, and the visible cursor offset within the (possibly
+/// scrolled) message.
 fn commit_cursor_position(
     divider: usize,
     commit_row: usize,
@@ -2754,7 +2921,7 @@ fn commit_cursor_position(
     };
     (
         commit_row + 1,
-        (divider + 4 + cursor_in_shown).min(columns.saturating_sub(1)),
+        (divider + 5 + cursor_in_shown).min(columns.saturating_sub(1)),
     )
 }
 
@@ -2771,8 +2938,13 @@ fn render_history_section(
 ) {
     const DIM: &str = "\x1b[2m";
     const RESET: &str = "\x1b[0m";
+    let count_label = if view.history_has_more {
+        format!("HISTORY ({}+)", view.history.len())
+    } else {
+        format!("HISTORY ({})", view.history.len())
+    };
     lines.push(markdown::fit_width(
-        &format!("\x1b[1mHISTORY ({})\x1b[0m", view.history.len()),
+        &format!("\x1b[1m{count_label}\x1b[0m"),
         width,
     ));
     if view.history.is_empty() {
@@ -2786,8 +2958,14 @@ fn render_history_section(
     let selection = selection_style(selection_color);
     let top = history_top(view, visible);
     let hovered_history = view.hovered_history();
+    let open_commit = view.diff.as_ref().and_then(|diff| diff.commit.as_deref());
     for (offset, entry) in view.history.iter().enumerate().skip(top).take(visible) {
-        let is_selected = offset == view.history_selected && view.focus == GitFocus::History;
+        // Opening a commit moves focus to the diff pane for scrolling, but
+        // the row that owns the open diff stays highlighted (matched by hash
+        // so a concurrent reload cannot misattribute it).
+        let is_open = view.focus == GitFocus::Diff && open_commit == Some(entry.hash.as_str());
+        let is_selected =
+            (offset == view.history_selected && view.focus == GitFocus::History) || is_open;
         let hovered = hovered_history == Some(offset) && !is_selected;
         let marker = if is_selected { "›" } else { " " };
         let subject = truncate_visible(
@@ -2842,6 +3020,7 @@ fn render_right(
     height: usize,
     file_capacity: usize,
     history_rows: usize,
+    pad_between: usize,
 ) -> Vec<String> {
     let Some(view) = state.git_view.as_ref() else {
         return vec![String::new(); height];
@@ -2862,25 +3041,56 @@ fn render_right(
         ),
         width,
     ));
-    // Commit message row.
+    // Commit message box: a labeled three-row box so the input reads as an
+    // input even before it is focused. The border takes the accent color
+    // while editing and stays dim otherwise.
+    let editing = view.focus == GitFocus::Commit;
+    let frame = if editing {
+        foreground_color(state.accent_color)
+    } else {
+        "\x1b[2m".to_string()
+    };
+    let amend_tag = if view.amend && width >= 22 {
+        " (amend)"
+    } else {
+        ""
+    };
+    let title = format!("Message{amend_tag}");
+    let dashes = "─".repeat(width.saturating_sub(title.len() + 5));
+    lines.push(markdown::fit_width(
+        &format!("{frame}╭─ \x1b[1m{title}\x1b[0m{frame} {dashes}╮\x1b[0m"),
+        width,
+    ));
+    let text_width = width.saturating_sub(4).max(1);
     let commit_inner = if view.commit.is_empty() {
-        "\x1b[2mMessage (e to edit, Enter to commit)…\x1b[0m".to_string()
+        if editing {
+            "\x1b[2mType a message · Enter to commit…\x1b[0m".to_string()
+        } else {
+            "\x1b[2mMessage (e to edit)…\x1b[0m".to_string()
+        }
     } else {
-        sanitize_plain(&commit_visible(view, width.saturating_sub(4)))
+        sanitize_plain(&commit_visible(view, text_width))
     };
-    let commit_line = if view.focus == GitFocus::Commit {
-        format!(
-            "{}> \x1b[0m{}",
-            foreground_color(state.accent_color),
-            markdown::fit_width(&commit_inner, width.saturating_sub(2))
-        )
+    let prompt = if editing {
+        format!("{}> \x1b[0m", foreground_color(state.accent_color))
     } else {
-        format!(
-            "> {}",
-            markdown::fit_width(&commit_inner, width.saturating_sub(2))
-        )
+        "> ".to_string()
     };
-    lines.push(markdown::fit_width(&commit_line, width));
+    let input_body = markdown::fit_width(
+        &format!("{prompt}{}", markdown::fit_width(&commit_inner, text_width)),
+        width.saturating_sub(2),
+    );
+    lines.push(markdown::fit_width(
+        &format!("{frame}│\x1b[0m{input_body}{frame}│\x1b[0m"),
+        width,
+    ));
+    lines.push(markdown::fit_width(
+        &format!(
+            "{frame}╰{}╯\x1b[0m",
+            "─".repeat(width.saturating_sub(2).max(2))
+        ),
+        width,
+    ));
     // Commit button row.
     let amend = if view.amend { " (amend)" } else { "" };
     let button = format!(
@@ -2939,14 +3149,24 @@ fn render_right(
                         GitSection::Unstaged => view.status.unstaged.len(),
                         GitSection::Untracked => view.status.untracked.len(),
                     };
-                    lines.push(markdown::fit_width(
-                        &format!("\x1b[1m{} ({count})\x1b[0m", section.title()),
-                        width,
-                    ));
+                    let title = format!("\x1b[1m{} ({count})\x1b[0m", section.title());
+                    if *section == GitSection::Unstaged {
+                        lines.push(format!(
+                            "{}\x1b[1m  +\x1b[0m",
+                            markdown::fit_width(&title, width.saturating_sub(3))
+                        ));
+                    } else {
+                        lines.push(markdown::fit_width(&title, width));
+                    }
                 }
                 FileAreaRow::File(i) => {
                     let file = &view.flat[*i];
-                    let selected = *i == view.selected && view.focus != GitFocus::Commit;
+                    // A commit diff belongs to history, not to any worktree
+                    // file: clear the file highlight so the panel does not
+                    // look like a file diff is still open.
+                    let commit_open = view.diff.as_ref().is_some_and(|diff| diff.commit.is_some());
+                    let selected =
+                        *i == view.selected && view.focus != GitFocus::Commit && !commit_open;
                     let hovered = hovered_file == Some(*i) && !selected;
                     let marker = if selected { "›" } else { " " };
                     let label = file.status_label();
@@ -2979,6 +3199,12 @@ fn render_right(
                 }
             }
         }
+    }
+    // Bottom-anchoring gap: when files and history both fit, empty rows sit
+    // between them so history ends at the panel bottom instead of floating
+    // right under the file list.
+    for _ in 0..pad_between {
+        lines.push(markdown::fit_width("", width));
     }
     render_history_section(
         view,
@@ -3217,10 +3443,10 @@ fn render_log(state: &mut ViewState, width: usize, height: usize) -> Vec<String>
 }
 
 fn render_diff_pane(state: &mut ViewState, width: usize, height: usize) -> Vec<String> {
-    let Some(view) = state.git_view.as_ref() else {
+    let Some(view) = state.git_view.as_mut() else {
         return vec![String::new(); height];
     };
-    let Some(diff) = view.diff.as_ref() else {
+    let Some(diff) = view.diff.as_mut() else {
         return vec![String::new(); height];
     };
     let kind = if diff.commit.is_some() {
@@ -3264,13 +3490,41 @@ fn render_diff_pane(state: &mut ViewState, width: usize, height: usize) -> Vec<S
     } else {
         let language = language_for_path(&diff.path);
         let body_height = height.saturating_sub(1 + usize::from(diff.truncated));
-        let max_top = diff.lines.len().saturating_sub(body_height);
-        let top = diff.scroll.min(max_top);
         // Gutter: 4-wide old number + space + 4-wide new number + space +
-        // prefix + space = 12 columns.
-        let code_width = width.saturating_sub(12).max(8);
-        for line in diff.lines.iter().skip(top).take(body_height) {
-            lines.push(render_diff_line(line, language, code_width, width));
+        // prefix + space = 12 columns. Long lines wrap onto further screen
+        // rows with a blank gutter; only actual lines show numbers.
+        let code_width = width.saturating_sub(DIFF_GUTTER_WIDTH).max(8);
+        // Plain chunks locate the scroll window without paying for
+        // syntax highlighting off-screen.
+        let plain: Vec<Vec<String>> = diff
+            .lines
+            .iter()
+            .map(|line| diff_plain_chunks(line, code_width, width))
+            .collect();
+        if diff.scroll == SCROLL_ANCHOR_PENDING {
+            let anchor = first_change_scroll(&diff.lines).min(diff.lines.len());
+            diff.scroll = plain.iter().take(anchor).map(Vec::len).sum();
+        }
+        let total: usize = plain.iter().map(Vec::len).sum();
+        let max_top = total.saturating_sub(body_height);
+        let top = diff.scroll.min(max_top);
+        let mut visual = 0usize;
+        for (line, chunks) in diff.lines.iter().zip(&plain) {
+            let remaining = body_height.saturating_sub(lines.len() - 1);
+            if remaining == 0 {
+                break;
+            }
+            let start = top.saturating_sub(visual);
+            visual += chunks.len();
+            if start >= chunks.len() {
+                continue;
+            }
+            let styled = diff_styled_chunks(line, language, code_width, width);
+            lines.extend(render_diff_chunks(
+                line,
+                width,
+                styled.iter().enumerate().skip(start).take(remaining),
+            ));
         }
     }
     while lines.len() < height {
@@ -3288,7 +3542,69 @@ fn render_diff_pane(state: &mut ViewState, width: usize, height: usize) -> Vec<S
     lines
 }
 
-fn render_diff_line(line: &DiffLine, language: &str, code_width: usize, width: usize) -> String {
+/// Gutter before diff code: 4-wide old number + space + 4-wide new number +
+/// space + prefix + space. Wrapped continuations repeat the width as blanks.
+const DIFF_GUTTER_WIDTH: usize = 12;
+
+/// Marks a diff opened but not yet rendered: the first-change anchor still
+/// needs the pane width (long lines wrap), so it resolves on the next render.
+/// Explicit scrolling before that render cancels the anchor to the top.
+const SCROLL_ANCHOR_PENDING: usize = usize::MAX;
+
+/// Resolves a pending first-change anchor to an explicit offset before manual
+/// scrolling; explicit input always wins over the auto-anchor.
+fn resolve_diff_scroll(diff: &mut LoadedDiff) {
+    if diff.scroll == SCROLL_ANCHOR_PENDING {
+        diff.scroll = 0;
+    }
+}
+
+/// Plain-text screen chunks of one diff line for width-aware wrapping.
+/// Hunks use the full row width (no gutter); code lines use `code_width`.
+fn diff_plain_chunks(line: &DiffLine, code_width: usize, width: usize) -> Vec<String> {
+    let (text, chunk_width) = match line.kind {
+        DiffKind::Hunk => (format!("{}…", line.text), width.max(1)),
+        _ => (sanitize_plain(&line.text), code_width.max(1)),
+    };
+    let mut chunks = super::markdown::split_chars(&text, chunk_width);
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+#[cfg(test)]
+fn render_diff_line(
+    line: &DiffLine,
+    language: &str,
+    code_width: usize,
+    width: usize,
+) -> Vec<String> {
+    let chunks = diff_styled_chunks(line, language, code_width, width);
+    render_diff_chunks(line, width, chunks.iter().enumerate())
+}
+
+fn diff_styled_chunks(
+    line: &DiffLine,
+    language: &str,
+    code_width: usize,
+    width: usize,
+) -> Vec<String> {
+    if line.kind == DiffKind::Hunk {
+        return diff_plain_chunks(line, code_width, width);
+    }
+    // Tokenize the source line before wrapping so comments, strings, and
+    // split identifiers keep their style on continuation rows. Only source
+    // lines intersecting the viewport reach this function.
+    let highlighted = super::highlight::render_line(language, &line.text);
+    markdown::wrap_ansi_hard(&highlighted, code_width.max(1))
+}
+
+fn render_diff_chunks<'a>(
+    line: &DiffLine,
+    width: usize,
+    chunks: impl Iterator<Item = (usize, &'a String)>,
+) -> Vec<String> {
     const DIM: &str = "\x1b[2m";
     const HUNK: &str = "\x1b[2;36m";
     const RESET: &str = "\x1b[0m";
@@ -3300,7 +3616,9 @@ fn render_diff_line(line: &DiffLine, language: &str, code_width: usize, width: u
     const DEL_FG: &str = "\x1b[38;2;242;216;216m";
     const DEL_PREFIX: &str = "\x1b[1;38;5;203m";
     if line.kind == DiffKind::Hunk {
-        return markdown::fit_width(&format!("{HUNK}{}…{RESET}", line.text), width);
+        return chunks
+            .map(|(_, chunk)| markdown::fit_width(&format!("{HUNK}{chunk}{RESET}"), width))
+            .collect();
     }
     let old = line
         .old_no
@@ -3309,13 +3627,18 @@ fn render_diff_line(line: &DiffLine, language: &str, code_width: usize, width: u
         .new_no
         .map_or("    ".to_string(), |n| format!("{n:>4}"));
     if line.kind == DiffKind::Context {
-        let highlighted = if language.is_empty() {
-            sanitize_diff_text(&line.text, code_width)
-        } else {
-            let rendered = super::highlight::render_line(language, &line.text);
-            markdown::fit_width(&rendered, code_width)
-        };
-        return markdown::fit_width(&format!("{DIM}{old} {new}  {RESET} {highlighted}"), width);
+        return chunks
+            .map(|(index, highlighted)| {
+                if index == 0 {
+                    markdown::fit_width(&format!("{DIM}{old} {new}  {RESET} {highlighted}"), width)
+                } else {
+                    markdown::fit_width(
+                        &format!("{}{highlighted}", " ".repeat(DIFF_GUTTER_WIDTH)),
+                        width,
+                    )
+                }
+            })
+            .collect();
     }
     let (bg, fg, prefix_style, prefix) = match line.kind {
         DiffKind::Added => (ADD_BG, ADD_FG, ADD_PREFIX, "+"),
@@ -3324,24 +3647,28 @@ fn render_diff_line(line: &DiffLine, language: &str, code_width: usize, width: u
         // exhaustive so a new `DiffKind` variant fails to compile here.
         DiffKind::Hunk | DiffKind::Context => (DEL_BG, DEL_FG, DEL_PREFIX, "-"),
     };
-    let truncated = super::markdown::split_chars(&line.text, code_width)
-        .into_iter()
-        .next()
-        .unwrap_or_default();
-    let highlighted = if language.is_empty() {
-        sanitize_plain(&truncated)
-    } else {
-        super::highlight::render_line(language, &truncated)
-    };
-    // Keep the background alive across syntax-highlight resets.
-    let rearm = format!("{RESET}{bg}{fg}");
-    let body = highlighted.replace(RESET, &rearm);
-    let inner = format!("{old} {new} {prefix_style}{prefix}{RESET}{bg}{fg} {body}");
-    let visible = markdown::visible_width(&inner);
-    if visible > width {
-        return markdown::fit_width(&inner, width);
-    }
-    format!("{bg}{fg}{inner}{}\x1b[0m", " ".repeat(width - visible))
+    chunks
+        .map(|(index, highlighted)| {
+            // Keep the background alive across syntax-highlight resets.
+            let rearm = format!("{RESET}{bg}{fg}");
+            let body = highlighted.replace(RESET, &rearm);
+            if index == 0 {
+                let inner = format!("{old} {new} {prefix_style}{prefix}{RESET}{bg}{fg} {body}");
+                let visible = markdown::visible_width(&inner);
+                if visible > width {
+                    return markdown::fit_width(&inner, width);
+                }
+                format!("{bg}{fg}{inner}{}\x1b[0m", " ".repeat(width - visible))
+            } else {
+                let inner = format!("{bg}{fg}{}{body}", " ".repeat(DIFF_GUTTER_WIDTH));
+                let visible = DIFF_GUTTER_WIDTH + markdown::visible_width(&body);
+                if visible > width {
+                    return markdown::fit_width(&inner, width);
+                }
+                format!("{inner}{}\x1b[0m", " ".repeat(width - visible))
+            }
+        })
+        .collect()
 }
 
 fn sanitize_plain(text: &str) -> String {
@@ -3356,22 +3683,6 @@ fn sanitize_plain(text: &str) -> String {
             }
         })
         .collect()
-}
-
-fn sanitize_diff_text(text: &str, width: usize) -> String {
-    let clean: String = text
-        .chars()
-        .map(|c| {
-            if c == '\t' {
-                ' '
-            } else if c.is_control() {
-                '�'
-            } else {
-                c
-            }
-        })
-        .collect();
-    markdown::fit_width(&clean, width)
 }
 
 // ---------------------------------------------------------------------------
@@ -3442,9 +3753,71 @@ mod tests {
             kind: DiffKind::Added,
             text: "fn main() {}".to_string(),
         };
-        let rendered = render_diff_line(&line, "rust", 8, 20);
-        assert!(markdown::visible_width(&rendered) <= 20);
-        assert!(markdown::strip_ansi(&rendered).contains('+'));
+        let rows = render_diff_line(&line, "rust", 8, 20);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert!(markdown::visible_width(row) <= 20);
+        }
+        assert!(markdown::strip_ansi(&rows[0]).contains('+'));
+    }
+
+    #[test]
+    fn long_diff_lines_wrap_with_blank_continuation_gutters() {
+        let added = DiffLine {
+            old_no: None,
+            new_no: Some(7),
+            kind: DiffKind::Added,
+            text: "abcdefghijklmnopqrstuvwxyz0123456789".to_string(),
+        };
+        let rows = render_diff_line(&added, "", 8, 20);
+        // 36 chars at width 8: five screen rows, numbers only on the first.
+        assert_eq!(rows.len(), 5);
+        for row in &rows {
+            assert_eq!(markdown::visible_width(row), 20);
+        }
+        let first = markdown::strip_ansi(&rows[0]);
+        assert!(first.contains('7'), "first row keeps its line number");
+        assert!(first.contains('+'));
+        for continuation in rows.iter().skip(1).map(|row| markdown::strip_ansi(row)) {
+            assert!(
+                !continuation.chars().take(12).any(|c| c.is_ascii_digit()),
+                "continuations show no numbers, got {continuation:?}"
+            );
+            assert!(
+                !continuation.contains('+'),
+                "continuations show no prefix, got {continuation:?}"
+            );
+        }
+        // The wrapped chunks reassemble the full line.
+        let body: String = rows
+            .iter()
+            .map(|row| {
+                markdown::strip_ansi(row)
+                    .chars()
+                    .skip(12)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(body, added.text);
+
+        let context = DiffLine {
+            old_no: Some(3),
+            new_no: Some(3),
+            kind: DiffKind::Context,
+            text: "abcdefghijklmnopqrstuvwxyz0123456789".to_string(),
+        };
+        let rows = render_diff_line(&context, "", 8, 20);
+        assert_eq!(rows.len(), 5);
+        let first = markdown::strip_ansi(&rows[0]);
+        assert!(first.contains('3'));
+        for continuation in rows.iter().skip(1).map(|row| markdown::strip_ansi(row)) {
+            assert!(
+                !continuation.chars().take(12).any(|c| c.is_ascii_digit()),
+                "context continuations show no numbers, got {continuation:?}"
+            );
+        }
     }
 
     #[test]
@@ -3467,30 +3840,35 @@ mod tests {
             kind: DiffKind::Context,
             text: "let y = 2;".to_string(),
         };
-        let added_row = render_diff_line(&added, "rust", 30, 44);
-        let removed_row = render_diff_line(&removed, "rust", 30, 44);
-        let context_row = render_diff_line(&context, "rust", 30, 44);
+        let added_rows = render_diff_line(&added, "rust", 30, 44);
+        let removed_rows = render_diff_line(&removed, "rust", 30, 44);
+        let context_rows = render_diff_line(&context, "rust", 30, 44);
+        assert_eq!(added_rows.len(), 1);
+        assert_eq!(removed_rows.len(), 1);
+        assert_eq!(context_rows.len(), 1);
+        let (added_row, removed_row, context_row) =
+            (&added_rows[0], &removed_rows[0], &context_rows[0]);
         assert!(added_row.contains("48;2"));
         assert!(removed_row.contains("48;2"));
         assert!(!context_row.contains("48;2"));
         // Background spans the whole row, not just the code fragment.
-        assert_eq!(markdown::visible_width(&added_row), 44);
-        assert_eq!(markdown::visible_width(&removed_row), 44);
+        assert_eq!(markdown::visible_width(added_row), 44);
+        assert_eq!(markdown::visible_width(removed_row), 44);
         // Syntax highlighting survives under the background tint.
         assert!(added_row.contains("1;34m") || added_row.contains("32m"));
     }
 
     #[test]
     fn commit_cursor_uses_one_based_terminal_coordinates() {
-        // Divider at 64, commit row is frame index 1: the cursor belongs on
-        // the second screen line, after "> " plus the typed text.
-        assert_eq!(commit_cursor_position(64, 1, "rrw", 3, 30, 100), (2, 71));
-        assert_eq!(commit_cursor_position(64, 1, "", 0, 30, 100), (2, 68));
+        // Divider at 64, input row is frame index 2: the cursor belongs on
+        // the third screen line, after "│> " plus the typed text.
+        assert_eq!(commit_cursor_position(64, 2, "rrw", 3, 30, 100), (3, 72));
+        assert_eq!(commit_cursor_position(64, 2, "", 0, 30, 100), (3, 69));
         // Long messages scroll; the cursor stays on the visible tail.
         let long = "m".repeat(40);
-        let (row, col) = commit_cursor_position(64, 1, &long, 40, 30, 100);
-        assert_eq!(row, 2);
-        assert!(col > 68 && col < 100);
+        let (row, col) = commit_cursor_position(64, 2, &long, 40, 30, 100);
+        assert_eq!(row, 3);
+        assert!(col > 70 && col < 100);
     }
 
     #[test]
@@ -3834,7 +4212,9 @@ mod tests {
         assert_eq!(work_git(&["log", "-1", "--format=%s"])?, "first commit");
         assert_eq!(work_git(&["remote", "get-url", "origin"])?, remote);
         let head = work_git(&["rev-parse", "HEAD"])?;
-        let remote_head = run_git(&bare, &["rev-parse", "HEAD"])
+        // The bare remote keeps its default HEAD (often master) even after
+        // pushing main, so resolve the pushed branch explicitly.
+        let remote_head = run_git(&bare, &["rev-parse", "refs/heads/main"])
             .map(|output| output.trim().to_string())
             .map_err(crate::error::Error::Protocol)?;
         assert_eq!(head, remote_head);
@@ -4108,6 +4488,95 @@ mod tests {
             "diff should exceed the pipe buffer, got {} bytes",
             output.len()
         );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn history_panel_expands_beyond_five_rows_and_anchors_to_bottom() {
+        // Clean tree with 30 commits on a 30-row terminal: files need 2 rows,
+        // chrome needs 8 + 3, leaving 16 rows for history (not 5).
+        let mut view = GitView::new(PathBuf::from("/unused"), GitStatus::default());
+        view.history = (0..30)
+            .map(|index| HistoryEntry {
+                hash: format!("hash{index:03}"),
+                short: format!("{index:07x}"),
+                subject: format!("commit {index}"),
+                ..HistoryEntry::default()
+            })
+            .collect();
+        let (file_capacity, history_capacity, pad) = panel_split(&view, 29);
+        assert_eq!(file_capacity, 2);
+        assert_eq!(
+            history_capacity, 16,
+            "history must fill the panel, not stop at 5"
+        );
+        assert_eq!(pad, 0, "overflowing panels need no anchoring gap");
+
+        // Few commits: show them all and pad between files and history so the
+        // section ends at the panel bottom.
+        view.history.truncate(3);
+        let (file_capacity, history_capacity, pad) = panel_split(&view, 29);
+        assert_eq!(history_capacity, 3);
+        assert_eq!(file_capacity, 2);
+        assert_eq!(
+            pad,
+            29 - FIXED_ROWS - (2 + 3 + 3),
+            "empty rows sit above history to anchor it to the bottom"
+        );
+
+        // Many files: history keeps a usable minimum instead of collapsing.
+        view.status = parse_status_porcelain(
+            "## main\0M  a0\0M  a1\0M  a2\0M  a3\0M  a4\0M  a5\0M  a6\0M  a7\0M  a8\0M  a9\0M  a10\0M  a11\0M  a12\0M  a13\0M  a14\0M  a15\0M  a16\0M  a17\0M  a18\0M  a19\0",
+        );
+        view.flat = view.status.flat();
+        view.history = (0..30)
+            .map(|index| HistoryEntry {
+                hash: format!("hash{index:03}"),
+                ..HistoryEntry::default()
+            })
+            .collect();
+        let (file_capacity, history_capacity, pad) = panel_split(&view, 29);
+        assert_eq!(pad, 0);
+        assert!(
+            history_capacity >= MIN_HISTORY_ENTRIES,
+            "history keeps at least {MIN_HISTORY_ENTRIES} rows, got {history_capacity}"
+        );
+        assert_eq!(
+            file_capacity + history_capacity + HISTORY_CHROME_ROWS,
+            29 - FIXED_ROWS,
+            "overflowing panels fill the available height"
+        );
+    }
+
+    #[test]
+    fn history_pagination_reports_more_only_until_a_short_page() -> Result<(), crate::error::Error>
+    {
+        if !git_available() {
+            return Ok(());
+        }
+        let root = temp_dir_unique("history-pages");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work)?;
+        let identity_path = write_test_gitconfig(&root)?;
+        let identity = [("GIT_CONFIG_GLOBAL", identity_path.as_str())];
+        let git = |args: &[&str]| {
+            run_git_env(&work, args, &identity).map_err(crate::error::Error::Protocol)
+        };
+        git(&["init", "--template="])?;
+        for index in 0..5 {
+            std::fs::write(work.join("note.txt"), format!("v{index}\n"))?;
+            git(&["add", "note.txt"])?;
+            git(&["commit", "-m", &format!("commit {index}")])?;
+        }
+        let (first_page, has_more) = load_history_limit(&work, 2);
+        assert_eq!(first_page.len(), 2);
+        assert!(has_more, "hitting the limit assumes more history");
+        let (full, has_more) = load_history_limit(&work, 10);
+        assert_eq!(full.len(), 5);
+        assert!(!has_more, "a short page proves the end of history");
+        assert_eq!(full[0].subject, "commit 4");
+        assert_eq!(full[4].subject, "commit 0");
         let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }

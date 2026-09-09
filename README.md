@@ -60,8 +60,9 @@ Project skills stay disabled until you trust the repository. `yawl --trust-proje
 - Multiple-choice questions from the model replace the composer. A countdown accepts the recommended answers automatically so unattended turns continue; answering yourself cancels it.
 - `/ps` opens the background-process dashboard, `/subagents` the subagent dashboard, and `/git` the git dashboard, all while the model is busy.
 - Git operations run in the background so typing and navigation remain responsive. `Ctrl+C` cancels the current Git operation. Results preserve commit-message edits made while the operation runs.
+- Click `+` beside the `UNSTAGED` heading to stage all changes, including untracked files, just like the `a` shortcut.
 - `/git` refreshes the open diff as working or staged contents change. Large diffs fall back to compact hunks and show a warning if the preview is still truncated. Unstaging works before the first commit. Discarding untracked files preserves ignored files and nested repositories.
-- In `/git`, moving the mouse highlights file and history rows without changing keyboard selection. Click a file to open its diff; `Esc` closes the current diff and a second `Esc` closes `/git`. Clickable controls use a hand cursor in Kitty, Ghostty, and foot; other terminals retain their own cursor. Hover requires mouse-motion reporting support.
+- In `/git`, moving the mouse highlights file and history rows without changing keyboard selection. Click a file or a commit to open its diff; `Esc` closes the current diff and a second `Esc` closes `/git`. History fills the bottom of the panel and pages in older commits as you scroll, so large repositories stay fast. Clickable controls use a hand cursor in Kitty, Ghostty, and foot; other terminals retain their own cursor. Hover requires mouse-motion reporting support.
 
 The transcript renders Markdown with syntax highlighting for common languages. Tool calls use full-width cards: diffs for edits, image previews for `read_file` in terminals that support them.
 

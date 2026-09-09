@@ -624,7 +624,7 @@ fn wrap_ansi(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn wrap_ansi_hard(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap_ansi_hard(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
     }

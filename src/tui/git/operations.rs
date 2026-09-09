@@ -35,7 +35,9 @@ pub(super) fn open_dashboard(state: &mut OperationState) {
     match load_status(&root) {
         Ok((status, raw)) => {
             let mut view = GitView::new(root, status);
-            view.history = load_history(&view.root);
+            let (history, has_more) = load_history_limit(&view.root, view.history_limit);
+            view.history = history;
+            view.history_has_more = has_more;
             view.last_status_raw = Some(raw);
             view.last_poll = Some(Instant::now());
             state.git_view = Some(view);
@@ -79,7 +81,9 @@ fn apply_status(view: &mut GitView, status: GitStatus, raw: String) {
     }
     view.commit = commit;
     view.commit_cursor = commit_cursor.min(view.commit.chars().count());
-    view.history = load_history(&view.root);
+    let (history, has_more) = load_history_limit(&view.root, view.history_limit);
+    view.history = history;
+    view.history_has_more = has_more;
     if view.history.is_empty() {
         view.history_selected = 0;
     } else if let Some(hash) = history_hash {
@@ -183,8 +187,9 @@ pub(super) fn open_selected_diff(state: &mut OperationState) {
     match load_diff(&root, &file) {
         Ok(mut diff) => {
             // Land on the first change with a couple of context lines above
-            // it instead of the top of the file.
-            diff.scroll = first_change_scroll(&diff.lines);
+            // it instead of the top of the file. The anchor resolves to
+            // visual rows on the next render, when the pane width is known.
+            diff.scroll = SCROLL_ANCHOR_PENDING;
             if let Some(view) = state.git_view.as_mut() {
                 view.diff = Some(diff);
                 view.show_log = false;
@@ -425,6 +430,52 @@ pub(super) fn confirm_action(state: &mut OperationState) {
             );
         }
     }
+}
+
+/// Pages in the next batch of older commits. Appends to the same newest-first
+/// order, so existing indices stay valid unless newer commits arrived
+/// concurrently (remapped by hash like a refresh). Growing the limit instead
+/// of offsetting keeps the load to one bounded `git log` per page.
+pub(super) fn load_more_history(state: &mut OperationState) {
+    let Some(view) = state.git_view.as_mut() else {
+        return;
+    };
+    if !view.history_has_more {
+        return;
+    }
+    let selected_hash = view
+        .history
+        .get(view.history_selected)
+        .map(|entry| entry.hash.clone());
+    let next_limit = view
+        .history_limit
+        .saturating_add(HISTORY_PAGE_SIZE)
+        .max(view.history.len().saturating_add(1));
+    let (history, has_more) = load_history_limit(&view.root, next_limit);
+    // A short page proves the end of history even when the previous load hit
+    // its limit exactly.
+    if history.len() <= view.history.len() {
+        view.history_has_more = false;
+        return;
+    }
+    view.history_limit = next_limit;
+    view.history = history;
+    view.history_has_more = has_more;
+    if view.history.is_empty() {
+        view.history_selected = 0;
+        view.history_scroll = 0;
+    } else if let Some(hash) = selected_hash {
+        view.history_selected = view
+            .history
+            .iter()
+            .position(|entry| entry.hash == hash)
+            .unwrap_or(0);
+    } else {
+        view.history_selected = view.history_selected.min(view.history.len() - 1);
+    }
+    view.history_scroll = view
+        .history_scroll
+        .min(view.history.len().saturating_sub(1));
 }
 
 /// Status is fetched once; only changed status needs a history refresh.

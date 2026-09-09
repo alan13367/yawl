@@ -191,7 +191,11 @@ fn merge_ui(original: &GitView, current: &GitView, updated: &mut GitView) {
         (Some(old), Some(now), Some(new))
             if old.path == now.path && old.commit == now.commit && old.staged == now.staged =>
         {
-            if now.scroll != old.scroll {
+            if new.path == now.path
+                && new.commit == now.commit
+                && new.staged == now.staged
+                && now.scroll != old.scroll
+            {
                 new.scroll = now.scroll;
             }
         }
@@ -207,5 +211,41 @@ pub(in crate::tui) fn settle(state: &mut ViewState) {
         assert!(Instant::now() < deadline, "Git worker failed to settle");
         poll(state);
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrolling_during_a_load_preserves_the_requested_diff() {
+        let mut original = GitView::new(PathBuf::from("/unused"), GitStatus::default());
+        let mut diff = parse_unified_diff("file.rs", false, "@@ -1 +1 @@\n-old\n+new\n");
+        diff.commit = Some("first".into());
+        original.diff = Some(diff);
+        let mut current = original.clone();
+        current.diff.as_mut().unwrap().scroll = 10;
+
+        // Both a new commit and another file must survive scrolling the old preview.
+        for commit in [Some("second".to_string()), None] {
+            let mut updated = original.clone();
+            let loaded = updated.diff.as_mut().unwrap();
+            loaded.commit = commit;
+            loaded.scroll = SCROLL_ANCHOR_PENDING;
+            let expected = updated.diff.clone();
+            merge_ui(&original, &current, &mut updated);
+            assert_eq!(updated.diff, expected);
+        }
+
+        // A refresh of the same diff still keeps the user's scroll position.
+        let mut updated = original.clone();
+        merge_ui(&original, &current, &mut updated);
+        assert_eq!(updated.diff.as_ref().unwrap().scroll, 10);
+
+        // Closing the preview while the worker runs still takes precedence.
+        current.diff = None;
+        merge_ui(&original, &current, &mut updated);
+        assert!(updated.diff.is_none());
     }
 }
