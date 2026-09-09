@@ -1,9 +1,13 @@
 //! Background Git jobs with UI-owned state and cancellation.
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+use super::GitView;
 use super::operations::OperationState;
-use super::*;
 use crate::cancellation::CancellationToken;
+use crate::tui::ViewState;
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 pub(in crate::tui) struct GitJob {
     receiver: Receiver<OperationState>,
@@ -216,7 +220,11 @@ pub(in crate::tui) fn settle(state: &mut ViewState) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::GitStatus;
+    use super::super::diff::SCROLL_ANCHOR_PENDING;
+    use super::super::repository::parse_unified_diff;
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn scrolling_during_a_load_preserves_the_requested_diff() {

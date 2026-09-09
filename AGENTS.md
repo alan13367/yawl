@@ -23,8 +23,10 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tui/commands.rs`, `completion.rs`, `files.rs`, `picker.rs`, `state.rs`, `worker.rs`: TUI behavior and state
 - `src/tui/render.rs`, `terminal.rs`, `events.rs`, `input.rs`, `transcript.rs`: frame composition, terminal lifecycle, input decoding/editing, and transcript reduction
 - `src/tui/markdown.rs`, `highlight.rs`, `tool_view.rs`, `status_bar.rs`: sanitized Markdown, syntax highlighting, tool presentation, and configurable status rendering
-- `src/tui/git/jobs.rs`, `git/operations.rs`: cancellable Git workers, UI result merging, and blocking repository operations
-- `src/tui/processes.rs`, `subagents.rs`, `git.rs`, `connection.rs`, `dashboard.rs`: background-process, subagent, and git dashboards, provider setup, and shared dashboard layout
+- `src/tui/git.rs`: Git dashboard entry points, shared state and geometry, and refresh coordination
+- `src/tui/git/repository.rs`, `git/jobs.rs`, `git/operations.rs`: Git subprocess execution and data loading, cancellable workers, UI result merging, and blocking repository actions
+- `src/tui/git/input.rs`, `git/init.rs`, `git/render.rs`, `git/diff.rs`: dashboard input and commit editing, repository initialization, panel rendering, and diff wrapping/highlighting
+- `src/tui/processes.rs`, `subagents.rs`, `connection.rs`, `dashboard.rs`: background-process and subagent dashboards, provider setup, and shared dashboard layout
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
 - `src/tools/`: builtin registry and executable-tool discovery
@@ -38,7 +40,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/session.rs`, `src/session/recovery.rs`, `src/compaction.rs`, `src/checkpoint.rs`: append-only sessions, recovery records, context compaction, and `/undo` working-tree snapshots
 - `README.md`: user-facing behavior, contracts, and a concise architecture map
 
-Most tests live in `#[cfg(test)]` modules beside their implementation. TUI cross-module tests use focused `*_tests.rs` modules under `src/tui/` so production visibility stays narrow.
+Most tests live in `#[cfg(test)]` modules beside their implementation. TUI cross-module tests use focused `*_tests.rs` modules under `src/tui/` so production visibility stays narrow. Git unit tests follow their owning child modules; `src/tui/git/test_support.rs` contains shared test-only repository helpers, and `src/tui/git_tests.rs` covers dashboard behavior across children.
 
 ## Commands
 
@@ -55,7 +57,7 @@ Run `cargo fmt --all` after editing Rust. After making code changes, run `cargo 
 ## Code rules
 
 - Follow existing module boundaries and Rust naming conventions. Organize by responsibility, not by file size alone.
-- Keep `main.rs`, `agent.rs`, `provider/mod.rs`, `config.rs`, `tui/mod.rs`, `onboarding.rs`, and `doctor.rs` as facades. Put implementation in their private child modules.
+- Keep `main.rs`, `agent.rs`, `provider/mod.rs`, `config.rs`, `tui/mod.rs`, `tui/git.rs`, `onboarding.rs`, and `doctor.rs` as facades. Put implementation in their private child modules.
 - Preserve established public paths when moving code. Re-export from the facade instead of forcing callers to follow the internal layout.
 - Prefer sibling visibility through `pub(super)` over widening internal APIs to `pub(crate)` or `pub`.
 - Prefer the standard library over a new dependency. Commit `Cargo.lock` when dependencies change.

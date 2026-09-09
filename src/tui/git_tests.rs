@@ -1,7 +1,28 @@
 //! Git dashboard behavior regressions.
 
 use super::super::{RenderCache, Transcript};
-use super::*;
+use super::diff::{SCROLL_ANCHOR_PENDING, render_diff_pane};
+use super::init::{GitInitFlow, render_init};
+use super::input::{handle_key, handle_mouse, pointer_over_control};
+use super::render::{file_area_start, render, render_branches, render_log};
+use super::repository::{
+    MAX_DIFF_BYTES, MAX_DIFF_LINES, STATUS_ARGS, drain_pipe, git_available, load_commit_diff,
+    load_diff, load_history_limit, load_status, parse_status_porcelain, parse_unified_diff,
+    run_git, run_git_files,
+};
+use super::{
+    COMMIT_BOX_INPUT, CommitMenuState, Confirm, DiffKind, DiffLine, FileAreaRow, GitFile, GitFocus,
+    GitSection, GitStatus, GitView, HistoryEntry, INITIAL_HISTORY_LIMIT, LoadedDiff, MouseTarget,
+    file_area_rows, jobs,
+};
+use crate::config::UiColor;
+use crate::tui::events::{Event, Key, MouseEvent, MouseKind};
+use crate::tui::input::Editor;
+use crate::tui::render::HIDDEN_CURSOR;
+use crate::tui::terminal::ScreenPoint;
+use crate::tui::{ViewState, markdown};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 // Existing behavior tests wait for the public asynchronous action to settle.
 fn handle_event(state: &mut ViewState, editor: &mut Editor, event: Event) {
@@ -10,17 +31,17 @@ fn handle_event(state: &mut ViewState, editor: &mut Editor, event: Event) {
 }
 
 fn open_selected_diff(state: &mut ViewState) {
-    super::open_selected_diff(state);
+    super::input::open_selected_diff(state);
     jobs::settle(state);
 }
 
 fn confirm_action(state: &mut ViewState) {
-    super::confirm_action(state);
+    super::input::confirm_action(state);
     jobs::settle(state);
 }
 
 fn set_file_staged(state: &mut ViewState, index: usize, staged: bool) {
-    super::set_file_staged(state, index, staged);
+    super::input::set_file_staged(state, index, staged);
     jobs::settle(state);
 }
 
@@ -1353,34 +1374,123 @@ fn scrolling_near_oldest_history_pages_in_more_commits() {
     let Some(repo) = Repo::new("history-pages") else {
         return;
     };
-    for index in 0..5 {
+    for index in 0..25 {
         std::fs::write(repo.0.join("note.txt"), format!("v{index}\n")).unwrap();
         run_git(&repo.0, &["add", "note.txt"]).unwrap();
         repo.commit();
     }
     let mut state = repo.state();
     let view = state.git_view.as_mut().unwrap();
-    let (history, _) = load_history_limit(&repo.0, 2);
+    let (history, _) = load_history_limit(&repo.0, 20);
     view.history = history;
-    view.history_limit = 2;
+    view.history_limit = 20;
     view.history_has_more = true;
-    view.history_selected = 1;
+    view.history_selected = 0;
     view.focus = GitFocus::History;
-    maybe_load_more_history(&mut state);
-    jobs::settle(&mut state);
+    let mut editor = Editor::default();
+    render(&mut state, &editor, 120, 30);
+    handle_event(&mut state, &mut editor, Event::MouseScroll(-3));
+    render(&mut state, &editor, 120, 30);
     let view = state.git_view.as_ref().unwrap();
     assert!(
-        view.history.len() > 2,
+        view.history.len() > 20,
         "paging must grow beyond the initial limit, got {}",
         view.history.len()
     );
     assert!(
-        view.history_limit > 2,
+        view.history_limit > 20,
         "the limit must grow so refreshes keep the deeper history"
     );
-    assert_eq!(view.history.len(), 5);
+    assert_eq!(view.history.len(), 25);
     assert!(
         !view.history_has_more,
         "a short page proves the end of history"
     );
+}
+
+#[test]
+fn diff_bottom_scroll_reverses_on_first_wheel_event() {
+    let mut state = state();
+    let mut editor = Editor::default();
+    let patch = String::from("@@ -0,0 +1,80 @@\n")
+        + &(0..80).map(|i| format!("+line {i}\n")).collect::<String>();
+    let view = state.git_view.as_mut().unwrap();
+    view.diff = Some(parse_unified_diff("a.rs", false, &patch));
+    view.focus = GitFocus::Diff;
+    render(&mut state, &editor, 120, 30);
+    handle_event(&mut state, &mut editor, Event::MouseScroll(-1000));
+    let (bottom, _) = render(&mut state, &editor, 120, 30);
+    for _ in 0..3 {
+        handle_event(&mut state, &mut editor, Event::MouseScroll(-3));
+        assert_eq!(render(&mut state, &editor, 120, 30).0, bottom);
+    }
+    handle_event(&mut state, &mut editor, Event::MouseScroll(1));
+    assert_ne!(render(&mut state, &editor, 120, 30).0, bottom);
+}
+
+#[test]
+fn history_wheel_survives_render_with_a_diff_open() {
+    let mut state = state();
+    let mut editor = Editor::default();
+    let view = state.git_view.as_mut().unwrap();
+    view.history = (0..100)
+        .map(|i| HistoryEntry {
+            hash: format!("hash{i}"),
+            subject: format!("commit {i}"),
+            ..HistoryEntry::default()
+        })
+        .collect();
+    view.diff = Some(parse_unified_diff("a.rs", false, "+line\n"));
+    view.focus = GitFocus::Diff;
+    render(&mut state, &editor, 120, 30);
+    let view = state.git_view.as_mut().unwrap();
+    view.mouse_position = Some(ScreenPoint {
+        row: view.layout.history_rows[0].0,
+        column: view.layout.divider + 5,
+    });
+    handle_event(&mut state, &mut editor, Event::MouseScroll(-3));
+    render(&mut state, &editor, 120, 30);
+    assert_eq!(state.git_view.as_ref().unwrap().layout.history_rows[0].1, 3);
+}
+
+#[test]
+fn untracked_files_share_the_unstaged_group() {
+    let mut state = state();
+    let status = parse_status_porcelain("## main\0 M tracked.rs\0?? new.rs\0");
+    state.git_view = Some(GitView::new(PathBuf::from("/unused"), status));
+    let (lines, _) = render(&mut state, &Editor::default(), 120, 30);
+    let text = lines.join("\n");
+    assert!(text.contains("UNSTAGED (2)"));
+    assert!(!text.contains("UNTRACKED"));
+    assert!(text.contains("U new.rs"));
+}
+
+#[test]
+fn history_and_log_reverse_at_bottom() {
+    for show_log in [false, true] {
+        let mut state = state();
+        let mut editor = Editor::default();
+        let view = state.git_view.as_mut().unwrap();
+        view.history = (0..100)
+            .map(|i| HistoryEntry {
+                subject: format!("commit {i}"),
+                ..HistoryEntry::default()
+            })
+            .collect();
+        view.show_log = show_log;
+        view.focus = if show_log {
+            GitFocus::Files
+        } else {
+            GitFocus::History
+        };
+        render(&mut state, &editor, 120, 30);
+        for _ in 0..40 {
+            handle_event(&mut state, &mut editor, Event::MouseScroll(-3));
+            render(&mut state, &editor, 120, 30);
+        }
+        let (bottom, _) = render(&mut state, &editor, 120, 30);
+        assert!(bottom.iter().any(|line| line.contains("commit 99")));
+        handle_event(&mut state, &mut editor, Event::MouseScroll(1));
+        assert_ne!(render(&mut state, &editor, 120, 30).0, bottom);
+    }
 }

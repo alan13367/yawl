@@ -1,5 +1,16 @@
 //! Blocking Git work. Owned inputs and results cross the UI worker channel.
-use super::*;
+
+use super::diff::SCROLL_ANCHOR_PENDING;
+use super::init::GitInitFlow;
+use super::repository::{
+    FindRootError, find_root, git_available, is_unknown_subcommand, load_commit_diff, load_diff,
+    load_history_limit, load_status, run_git, run_git_files, target_paths,
+};
+use super::{
+    CommitMode, Confirm, GitFocus, GitSection, GitStatus, GitView, HISTORY_PAGE_SIZE,
+    refresh_visible_diff,
+};
+use std::time::Instant;
 
 pub(super) struct OperationState {
     pub(super) git_view: Option<GitView>,
@@ -278,7 +289,7 @@ pub(super) fn run_simple(state: &mut OperationState, args: &[&str], ok_message: 
 }
 
 /// Run literal status-derived paths without glob expansion.
-pub(super) fn run_simple_files(
+fn run_simple_files(
     state: &mut OperationState,
     tool: &str,
     flags: &[&str],
@@ -295,7 +306,7 @@ pub(super) fn run_simple_files(
 }
 
 /// Apply a completed command result before refreshing repository data.
-pub(super) fn report_simple_result(
+fn report_simple_result(
     state: &mut OperationState,
     result: Result<String, String>,
     ok_message: &str,

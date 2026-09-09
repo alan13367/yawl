@@ -61,8 +61,8 @@ Project skills stay disabled until you trust the repository. `yawl --trust-proje
 - `/ps` opens the background-process dashboard, `/subagents` the subagent dashboard, and `/git` the git dashboard, all while the model is busy.
 - Git operations run in the background so typing and navigation remain responsive. `Ctrl+C` cancels the current Git operation. Results preserve commit-message edits made while the operation runs.
 - Click `+` beside the `UNSTAGED` heading to stage all changes, including untracked files, just like the `a` shortcut.
-- `/git` refreshes the open diff as working or staged contents change. Large diffs fall back to compact hunks and show a warning if the preview is still truncated. Unstaging works before the first commit. Discarding untracked files preserves ignored files and nested repositories.
-- In `/git`, moving the mouse highlights file and history rows without changing keyboard selection. Click a file or a commit to open its diff; `Esc` closes the current diff and a second `Esc` closes `/git`. History fills the bottom of the panel and pages in older commits as you scroll, so large repositories stay fast. Clickable controls use a hand cursor in Kitty, Ghostty, and foot; other terminals retain their own cursor. Hover requires mouse-motion reporting support.
+- `/git` groups unstaged tracked changes and untracked files under Unstaged, with `U` marking untracked files. It refreshes the open diff as working or staged contents change. Large diffs fall back to compact hunks and show a warning if the preview is still truncated. Unstaging works before the first commit. Discarding untracked files preserves ignored files and nested repositories.
+- In `/git`, moving the mouse highlights file and history rows without changing keyboard selection. Click a file or a commit to open its diff; `Esc` closes the current diff and a second `Esc` closes `/git`. History fills the bottom of the panel and pages in older commits as you scroll, including when a diff is open. Scroll over the history rows to browse older commits. Diff and log scrolling stop at the bottom and reverse immediately. Clickable controls use a hand cursor in Kitty, Ghostty, and foot; other terminals retain their own cursor. Hover requires mouse-motion reporting support.
 
 The transcript renders Markdown with syntax highlighting for common languages. Tool calls use full-width cards: diffs for edits, image previews for `read_file` in terminals that support them.
 
@@ -212,6 +212,8 @@ Yawl appends `~/.yawl/AGENTS.md` and then `./AGENTS.md` after its system prompt.
 ## Development
 
 One Cargo package. Facade modules (`main.rs`, `agent.rs`, `provider/mod.rs`, `config.rs`, `tui/mod.rs`, and friends) re-export stable public paths while private child modules own the implementation. `AGENTS.md` has the full module map.
+
+The Git dashboard follows the same structure. `src/tui/git.rs` owns shared state and coordinates refreshes; `git/repository.rs` loads repository data, `jobs.rs` and `operations.rs` handle background work, `input.rs` handles interaction, `init.rs` owns repository setup, and `render.rs` and `diff.rs` draw the dashboard. Unit tests stay with each responsibility, with dashboard regressions in `src/tui/git_tests.rs`.
 
 ```sh
 cargo fmt --all --check
