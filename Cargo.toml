@@ -1,6 +1,6 @@
 [package]
 name = "yawl"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.98.0"
 description = "A minimal, self-extending AI agent harness"

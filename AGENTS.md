@@ -20,9 +20,16 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/config.rs`: effective `Config` facade and stable re-exports
 - `src/config/types.rs`, `schema.rs`, `loading.rs`, `storage.rs`, `change.rs`: runtime types, on-disk schema, merge logic, JSON storage, and validated mutations
 - `src/tui/mod.rs`: `tui::run` facade and top-level event/submission coordination
-- `src/tui/commands.rs`, `completion.rs`, `files.rs`, `picker.rs`, `state.rs`, `worker.rs`: TUI behavior and state
-- `src/tui/render.rs`, `terminal.rs`, `events.rs`, `input.rs`, `transcript.rs`: frame composition, terminal lifecycle, input decoding/editing, and transcript reduction
-- `src/tui/markdown.rs`, `highlight.rs`, `tool_view.rs`, `status_bar.rs`: sanitized Markdown, syntax highlighting, tool presentation, and configurable status rendering
+- `src/tui/commands.rs`, `picker.rs`: slash-command and picker facades with dispatch and shared models
+- `src/tui/commands/settings.rs`, `commands/copy.rs`: settings parsing/application plus usage summaries, and transcript-to-clipboard formatting
+- `src/tui/picker/settings.rs`, `picker/status_bar.rs`: settings/color/provider picker construction and status-bar editor construction
+- `src/tui/completion.rs`, `files.rs`, `state.rs`, `worker.rs`: TUI behavior and state
+- `src/tui/render.rs`: frame-composition facade and coordinator
+- `src/tui/render/cache.rs`, `render/welcome.rs`: transcript cache with entry rendering and transcript windows, plus the welcome animation
+- `src/tui/terminal.rs`, `events.rs`, `input.rs`, `transcript.rs`: terminal lifecycle, input decoding/editing, and transcript reduction
+- `src/tui/markdown.rs`, `highlight.rs`, `status_bar.rs`: sanitized Markdown, syntax highlighting, and configurable status rendering
+- `src/tui/tool_view.rs`: generic tool-card rendering facade
+- `src/tui/tool_view/diff.rs`: edit-diff calculation with context elision
 - `src/tui/git.rs`: Git dashboard entry points, shared state and geometry, and refresh coordination
 - `src/tui/git/repository.rs`, `git/jobs.rs`, `git/operations.rs`: Git subprocess execution and data loading, cancellable workers, UI result merging, and blocking repository actions
 - `src/tui/git/input.rs`, `git/init.rs`, `git/render.rs`, `git/diff.rs`: dashboard input and commit editing, repository initialization, panel rendering, and diff wrapping/highlighting
@@ -30,9 +37,13 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
 - `src/tools/`: builtin registry and executable-tool discovery
+- `src/tools/shell.rs`: foreground/background shell schemas and execution
 - `src/tools/files.rs`: bounded native file listing, literal text search, and paged UTF-8 reads
 - `src/tools/git.rs`: fixed read-only Git inspection for restricted children
-- `src/tools/exec.rs`, `src/tools/planning_shell.rs`, `src/tools/user_input.rs`, `src/tools/web.rs`: exec-tool contract, gated planning inspection, interactive question broker, plus isolated web search/fetch adapters and HTML cleanup
+- `src/tools/exec.rs`, `src/tools/planning_shell.rs`, `src/tools/user_input.rs`, `src/tools/web.rs`: exec-tool contract, gated planning inspection, interactive question broker, plus web search/fetch request execution and provider parsing
+- `src/tools/web/html.rs`: HTML-to-Markdown extraction with bounded concurrency
+- `src/subagent/manager.rs`: subagent capacity, execution, waiting, and delivery facade
+- `src/subagent/manager/format.rs`: snapshot and deferred-result presentation
 - `src/subagent/reports.rs`: durable large-report storage and bounded result excerpts
 - `src/background.rs`, `src/subagent/`, `src/cancellation.rs`: session-bound shell processes, parallel subagents, and interrupt tokens
 - `src/terminal_mode.rs`: shared raw-terminal lifecycle for the TUI and onboarding selector
@@ -57,7 +68,7 @@ Run `cargo fmt --all` after editing Rust. After making code changes, run `cargo 
 ## Code rules
 
 - Follow existing module boundaries and Rust naming conventions. Organize by responsibility, not by file size alone.
-- Keep `main.rs`, `agent.rs`, `provider/mod.rs`, `config.rs`, `tui/mod.rs`, `tui/git.rs`, `onboarding.rs`, and `doctor.rs` as facades. Put implementation in their private child modules.
+- Keep `main.rs`, `agent.rs`, `provider/mod.rs`, `config.rs`, `tui/mod.rs`, `tui/git.rs`, `tui/picker.rs`, `tui/commands.rs`, `tui/render.rs`, `tui/tool_view.rs`, `tools/mod.rs`, `tools/web.rs`, `subagent/manager.rs`, `onboarding.rs`, and `doctor.rs` as facades. Put implementation in their private child modules.
 - Preserve established public paths when moving code. Re-export from the facade instead of forcing callers to follow the internal layout.
 - Prefer sibling visibility through `pub(super)` over widening internal APIs to `pub(crate)` or `pub`.
 - Prefer the standard library over a new dependency. Commit `Cargo.lock` when dependencies change.
