@@ -28,7 +28,10 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
 - `src/tools/`: builtin registry and executable-tool discovery
+- `src/tools/files.rs`: bounded native file listing, literal text search, and paged UTF-8 reads
+- `src/tools/git.rs`: fixed read-only Git inspection for restricted children
 - `src/tools/exec.rs`, `src/tools/planning_shell.rs`, `src/tools/user_input.rs`, `src/tools/web.rs`: exec-tool contract, gated planning inspection, interactive question broker, plus isolated web search/fetch adapters and HTML cleanup
+- `src/subagent/reports.rs`: durable large-report storage and bounded result excerpts
 - `src/background.rs`, `src/subagent/`, `src/cancellation.rs`: session-bound shell processes, parallel subagents, and interrupt tokens
 - `src/terminal_mode.rs`: shared raw-terminal lifecycle for the TUI and onboarding selector
 - `src/skills.rs`, `src/trust.rs`, `src/image.rs`: skill discovery, project skill trust, and image input

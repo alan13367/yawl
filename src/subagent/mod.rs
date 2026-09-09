@@ -1,6 +1,7 @@
 mod manager;
 mod names;
 pub(crate) mod presets;
+mod reports;
 mod types;
 
 pub(crate) use manager::SubagentManager;

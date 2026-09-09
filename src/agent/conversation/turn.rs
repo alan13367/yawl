@@ -98,6 +98,9 @@ impl Conversation {
         user_input: Option<TurnInput>,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
+        if let ConversationKind::Child(state) = &mut self.kind {
+            state.stop_reason = None;
+        }
         let cancellation = self.cancellation.clone();
         crate::cancellation::scope(&cancellation, || {
             let Some(timeout) = self.run_limits().and_then(|limits| limits.timeout) else {
@@ -118,7 +121,10 @@ impl Conversation {
                     )
                 });
             if timed_out {
-                sink(TurnEvent::Warning("subagent timeout exceeded".into()));
+                self.child_mut().stop_reason = Some(super::RunStopReason::Timeout);
+                sink(TurnEvent::Warning(
+                    super::RunStopReason::Timeout.message().into(),
+                ));
             }
             result
         })
@@ -439,8 +445,9 @@ impl Conversation {
                     ))?;
                 }
                 if requests_made >= hard_requests {
+                    self.child_mut().stop_reason = Some(super::RunStopReason::RequestBudget);
                     sink(TurnEvent::Warning(
-                        "subagent request budget exceeded".into(),
+                        super::RunStopReason::RequestBudget.message().into(),
                     ));
                     self.cancellation.cancel();
                     return Ok(false);

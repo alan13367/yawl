@@ -180,6 +180,12 @@ pub(super) fn render_labeled(
         lines.push(ToolLine::new(format!("● {status}"), Tone::Output));
     } else if should_show_output(name, output, is_error) {
         lines.push(ToolLine::new("", Tone::Output));
+        let readable = if is_error {
+            None
+        } else {
+            saved_file_output(name, parsed.as_ref(), output)
+        };
+        let output = readable.as_deref().unwrap_or(output);
         let output_lines = text_lines(output, if is_error { Tone::Error } else { Tone::Output });
         let keep_tail = name == "shell";
         lines.extend(preview_lines(
@@ -404,6 +410,60 @@ fn render_call(
             vec![ToolLine::new(title, Tone::Header)]
         }
     }
+}
+
+/// Older sessions contain the original JSON file-tool envelopes. Decode only
+/// those known shapes so resumed transcripts benefit from readable output too.
+fn saved_file_output(name: &str, args: Option<&Value>, output: &str) -> Option<String> {
+    if !matches!(name, "list_files" | "search_files" | "read_file") {
+        return None;
+    }
+    let value: Value = serde_json::from_str(output).ok()?;
+    if name == "read_file" {
+        let args = args?;
+        if args.get("offset").is_none() && args.get("limit").is_none() {
+            return None;
+        }
+        let content = value.get("content")?.as_str()?;
+        let offset = value.get("offset")?.as_u64()?;
+        let total = value.get("total_bytes")?.as_u64()?;
+        let next = value.get("next_offset")?;
+        let continuation = if next.is_null() {
+            "EOF".into()
+        } else {
+            format!("next_offset={}", next.as_u64()?)
+        };
+        return Some(format!(
+            "bytes from {offset} of {total}; {continuation}\n\n{content}"
+        ));
+    }
+    let results = value.get("results")?.as_array()?;
+    let mut lines = Vec::new();
+    for result in results {
+        let path = result.get("path")?.as_str()?;
+        if name == "list_files" {
+            lines.push(path.to_string());
+        } else {
+            let line = result.get("line")?.as_u64()?;
+            let column = result.get("column")?.as_u64()?;
+            let text = result.get("text")?.as_str()?;
+            lines.push(format!("{path}:{line}:{column}: {text}"));
+        }
+    }
+    if lines.is_empty() {
+        lines.push("No results.".into());
+    }
+    if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+        lines.push("[truncated; narrow path or path_contains]".into());
+    }
+    if let Some(skipped) = value
+        .get("skipped")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)
+    {
+        lines.push(format!("[skipped {skipped} entries]"));
+    }
+    Some(lines.join("\n"))
 }
 
 fn should_show_output(name: &str, output: &str, is_error: bool) -> bool {
@@ -1087,6 +1147,55 @@ mod tests {
             markdown::strip_ansi(&fetch.join("\n"))
                 .contains("Fetch web  ·  https://example.com/guide")
         );
+    }
+
+    #[test]
+    fn saved_file_tool_json_renders_as_readable_text() {
+        let output = r#"{"note":"skip trees","results":[{"path":"src/main.rs"},{"path":"src/agent.rs"}],"skipped":0,"truncated":true}"#;
+        let rendered = render(
+            "list_files",
+            r#"{"path":"."}"#,
+            output,
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&rendered.join("\n"));
+        assert!(plain.lines().any(|line| line.trim() == "src/main.rs"));
+        assert!(plain.lines().any(|line| line.trim() == "src/agent.rs"));
+        assert!(!plain.contains("{\"note\""));
+        assert!(plain.contains("truncated"));
+        let page = r##"{"content":"# Repository guide\nUse Rust.\n","offset":0,"total_bytes":29,"next_offset":null}"##;
+        let rendered = render(
+            "read_file",
+            r#"{"path":"AGENTS.md","offset":0}"#,
+            page,
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&rendered.join("\n"));
+        assert!(
+            plain
+                .lines()
+                .any(|line| line.trim() == "# Repository guide")
+        );
+        assert!(plain.lines().any(|line| line.trim() == "Use Rust."));
+        assert!(!plain.contains("{\"content\""));
+        assert!(
+            saved_file_output(
+                "read_file",
+                Some(&serde_json::json!({"path": "data.json"})),
+                page
+            )
+            .is_none(),
+            "ordinary JSON files must retain their literal content"
+        );
+        assert!(saved_file_output("list_files", None, "{broken JSON").is_none());
     }
 
     #[test]

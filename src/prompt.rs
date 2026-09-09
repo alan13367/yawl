@@ -187,7 +187,7 @@ Guidelines:
 - Report outcomes and file paths clearly. Keep responses concise.
 
 Tools:
-- Builtins: shell, read_file, write_file, edit_file.
+- Use the tools available in this request. For file discovery and git inspection when shell is available, use shell with rg or git.
 - Yawl rescans executable tools in `~/.yawl/tools/` and `./.yawl/tools/` before each model step. Add one with an executable whose `--describe` returns JSON fields `name`, `description`, `input_schema`, and optional `timeout_secs`. Calls read JSON stdin, write stdout, run in the working directory with `YAWL_SESSION_ID`, and report errors with a nonzero exit.
 "#
     );
@@ -225,24 +225,25 @@ Tools:
     }
     if options.subagents {
         let delivery = if options.print_mode {
-            "- Print mode delivers settled results after the turn; wait only when blocked.\n"
+            "- Print mode delivers settled results after the turn; collect all child results before finalizing.\n"
         } else {
-            "- TUI results arrive automatically; wait only when blocked.\n"
+            "- TUI results arrive automatically; collect all child results before finalizing.\n"
         };
         prompt.push_str(r#"
 <subagent_guidance>
-- Before spawning, inspect the repository root, top-level files, instructions, and empty or uninitialized state yourself; never use scout for discovery.
+- Delegate directly when the task has enough scope; inspect only to resolve missing scope. Use scout for scoped code discovery.
 - Delegate only useful, self-contained work. Prompts need # Target (paths, ownership, non-goals), # Change, and # Acceptance. Give parallel agents disjoint scopes, define interfaces first, and keep working.
-- Declare every required tool; use [] only for tool-free answers. Omit agent for commands, file changes, or missing preset capabilities. File changes require write_file or edit_file. scout may only read named files or skills. Never set a model.
-- Children lack this conversation and cannot delegate. Use subagent_send for follow-ups. They skip project-wide formatting, linting, builds, and tests; validate once after all finish. Large disk output requires the default agent and write_file.
-- subagent_wait without a timeout blocks until every ID settles. Set timeout_secs only for a bounded status check. Cancel only unwanted work.
+- Declare every required tool; use [] only for tool-free answers. Omit agent for shell commands, file changes, or missing preset capabilities. File changes require write_file or edit_file. scout can discover/read files and inspect Git changes. Never set a model.
+- Children lack this conversation and cannot delegate. Use subagent_send to queue follow-ups. They skip project-wide formatting, linting, builds, and tests; validate once after all finish. Long reports are saved; use paged read_file.
+- Settled does not mean completed. Resolve missing capabilities or finish the work yourself; do not just relay suggested commands.
+- Before your final response, wait for every spawned subagent and consider each result. subagent_wait without a timeout blocks until every ID settles. Set timeout_secs only for a bounded status check. Cancel only unwanted work.
 "#);
         prompt.push_str(delivery);
         prompt.push_str("</subagent_guidance>\n");
     }
     if options.is_subagent {
         prompt.push_str(
-            "\n<subagent_role>\nYou are a background subagent working on one delegated task. You share the parent's working directory but not its conversation. Do not ask the user questions and do not create subagents. Preserve concurrent edits and do not revert work you did not make. Project-wide validation is the parent's job: never run formatters, linters, or project-wide builds or test suites unless your task explicitly requires it; scoped proof of your own change is fine. Complete only the delegated task, verify it when possible, and return a concise result to the parent.\n",
+            "\n<subagent_role>\nYou are a background subagent working on one delegated task. You share the parent's working directory but not its conversation. Do not ask the user questions and do not create subagents. Preserve concurrent edits and do not revert work you did not make. Project-wide validation is the parent's job: never run formatters, linters, or project-wide builds or test suites unless your task explicitly requires it; scoped proof of your own change is fine. Complete only the delegated task, verify it when possible, and return a concise result to the parent. Start your final answer with a short summary of findings, changed files, and verification, then provide detailed evidence if needed.\n",
         );
         if let Some(fragment) = role_fragment.map(str::trim)
             && !fragment.is_empty()
@@ -298,6 +299,7 @@ fn append_instructions(prompt: &mut String, tag: &str, display_path: &str, path:
     prompt.push_str(" path=\"");
     prompt.push_str(display_path);
     prompt.push_str("\">\n");
+    prompt.push_str("These instructions are already loaded for this request; do not reread this file merely to load them.\n\n");
     prompt.push_str(instructions);
     prompt.push_str("\n</");
     prompt.push_str(tag);
@@ -561,6 +563,7 @@ mod tests {
         );
 
         assert!(main.contains("<subagent_guidance>"));
+        assert!(main.contains("Resolve missing capabilities or finish the work yourself"));
         assert!(child.contains("<subagent_role>"));
         assert!(!child.contains("<subagent_guidance>"));
         assert!(!disabled.contains("subagent_guidance"));
@@ -586,8 +589,8 @@ mod tests {
         assert!(
             main.contains("Declare every required tool")
                 && main.contains("Never set a model")
-                && main.contains("scout may only read named files or skills")
-                && main.contains("Omit agent for commands, file changes"),
+                && main.contains("scout can discover/read files and inspect Git changes")
+                && main.contains("Omit agent for shell commands, file changes"),
             "the parent must route write tasks away from read-only presets"
         );
         assert!(
@@ -597,7 +600,35 @@ mod tests {
     }
 
     #[test]
-    fn subagent_guidance_requires_a_local_repository_check_before_delegation() {
+    fn injected_instructions_do_not_require_reloading_before_delegation() {
+        let dirs = TestDirs::new();
+        let global = dirs.0.join("global");
+        let project = dirs.0.join("project");
+        std::fs::create_dir_all(&global).expect("global directory");
+        std::fs::create_dir_all(&project).expect("project directory");
+        std::fs::write(global.join("AGENTS.md"), "Global instruction marker.")
+            .expect("global instructions");
+        std::fs::write(project.join("AGENTS.md"), "Project instruction marker.")
+            .expect("project instructions");
+        let prompt = build_system_prompt_from(
+            Some(&project),
+            &global,
+            PromptOptions {
+                subagents: true,
+                ..PromptOptions::default()
+            },
+            None,
+            &[],
+            None,
+        );
+        assert!(prompt.contains("Global instruction marker."));
+        assert!(prompt.contains("Project instruction marker."));
+        assert!(prompt.contains("already loaded"));
+        assert!(!prompt.contains("Before spawning, inspect the repository root"));
+    }
+
+    #[test]
+    fn subagent_guidance_allows_direct_delegation_with_known_scope() {
         let dirs = TestDirs::new();
         let prompt = build_system_prompt_from(
             Some(&dirs.0),
@@ -610,16 +641,10 @@ mod tests {
             &[],
             None,
         );
-        let local_check = prompt
-            .find("Before spawning")
-            .expect("the parent must check the working directory before spawning");
-        let delegation = prompt
-            .find("Delegate only useful, self-contained work")
-            .expect("the delegation guidance should be present");
-
-        assert!(local_check < delegation);
-        assert!(prompt.contains("empty or uninitialized state yourself"));
-        assert!(prompt.contains("never use scout for discovery"));
+        assert!(prompt.contains("Delegate directly when the task has enough scope"));
+        assert!(!prompt.contains("Before spawning, inspect the repository root"));
+        assert!(prompt.contains("Use scout for scoped code discovery"));
+        assert!(prompt.contains("wait for every spawned subagent and consider each result"));
     }
 
     #[test]

@@ -42,12 +42,12 @@ pub(crate) fn bundled() -> Vec<AgentPreset> {
         // `shell` is intentionally excluded. Even commands that look like
         // searches can contain redirection or invoke mutating subprocesses,
         // so a prompt instruction cannot make the shell read-only.
-        tools: Some(vec!["read_file".into(), "read_skill".into()]),
+        tools: Some(vec!["read_file".into(), "read_skill".into(), "list_files".into(), "search_files".into(), "git_inspect".into()]),
         prompt: Some(
-            "You are a read-only research specialist. Inspect the files named in the delegated \
-             task and report findings with exact paths and line references. Never modify files \
-             or run commands; keep the investigation short and return a concise report. If the \
-             task does not provide enough file paths, report what additional scope is needed."
+            "You are a read-only research specialist. Use list_files and search_files to discover \
+             relevant code within the delegated scope, then read_file to inspect it. Report \
+             findings with exact paths and line references. Use git_inspect for status and staged or unstaged diffs. Never modify files or run arbitrary commands. \
+             Narrow searches when results are truncated; return a concise summary before detailed evidence."
                 .into(),
         ),
     }]
@@ -157,7 +157,16 @@ mod tests {
         assert_eq!(presets[0].name, "scout");
         assert_eq!(
             presets[0].tools.as_deref(),
-            Some(["read_file".to_string(), "read_skill".to_string()].as_slice())
+            Some(
+                [
+                    "read_file".to_string(),
+                    "read_skill".to_string(),
+                    "list_files".to_string(),
+                    "search_files".to_string(),
+                    "git_inspect".to_string()
+                ]
+                .as_slice()
+            )
         );
     }
 

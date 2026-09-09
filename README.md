@@ -146,13 +146,19 @@ Off by default. Enable with `/settings web_browsing on` or Settings > Web. `web_
 
 ## Subagents
 
-Off by default; enable with `/settings subagents on`. The model then gets `subagent_spawn`, `subagent_send`, `subagent_wait`, `subagent_cancel`, and `subagent_list`. Children run memory-only conversations in the same working directory, cannot spawn further subagents, and are capped at 16 concurrent runs. `subagent_model` selects the child model, `inherit` by default; `subagent_request_budget` and `subagent_timeout_secs` cap each run. JSON presets in `~/.yawl/agents/` or `./.yawl/agents/` pin a model, tool set, and role; Yawl bundles `scout`, a read-only investigator. `/subagents` opens a dashboard where Enter takes over a child interactively.
+Off by default; enable with `/settings subagents on`. The model then gets `subagent_spawn`, `subagent_send`, `subagent_wait`, `subagent_cancel`, and `subagent_list`. Children run memory-only conversations in the same working directory, cannot spawn further subagents, and are capped at 16 concurrent runs. `subagent_model` selects the child model, `inherit` by default; `subagent_request_budget` and `subagent_timeout_secs` cap each run. Interrupted results report when a timeout or request budget stopped the run and include partial output from that run when available. Canceling a child discards queued messages and unaccepted steering. JSON presets in `~/.yawl/agents/` or `./.yawl/agents/` pin a model, tool set, and role; Yawl bundles `scout`, a read-only investigator with native `list_files`, `search_files`, `read_file`, `read_skill`, and `git_inspect` tools. `/subagents` opens a dashboard where Enter takes over a child interactively.
+
+Global and working-directory `AGENTS.md` instructions are injected into each model request. The orchestrator can delegate directly when the task has enough scope, without a mandatory repository inventory or rereading injected instructions. It is instructed to wait for every spawned child and consider every result before its final response. `subagent_wait` continues to wait for all selected IDs; follow-ups use queued `subagent_send` turns.
+
+Results longer than 2 KiB are saved in `~/.yawl/artifacts/subagents/`. Waits, status reads, and automatic delivery include the opening 1 KiB and an absolute path instead of the full report. Children are instructed to put a short summary first. These files survive child pruning and session restarts; they remain on disk until removed. Read details with `read_file` using `offset: 0` and `limit: 16384`, then continue with the returned `next_offset`. Artifact write failures are reported explicitly with a bounded excerpt.
 
 ## Builtin tools
 
 - `shell` runs `sh -c` in the working directory with a 120-second default timeout. `background: true` returns a `bg-N` ID and runs without a timeout.
 - `shell_output`, `shell_list`, and `shell_stop` read, list, and stop background commands.
-- `read_file` reads UTF-8 files up to 1 MiB, and images up to 5 MB become model input when the model accepts images.
+- `read_file` reads UTF-8 files up to 1 MiB, and images up to 5 MB become model input when the model accepts images. Optional byte `offset` and `limit` enable paged UTF-8 reads, including for larger reports. Pages show a byte-range header with `next_offset` or `EOF`, followed by the file text.
+- `git_inspect` is available to restricted child presets such as `scout`. It accepts only `status`, `unstaged_diff`, or `staged_diff`, plus an optional literal relative `path` filter. It uses the working directory, disables external diff/text conversion and filesystem-monitor hooks, refuses repositories configured with clean or process filters, avoids optional index writes and lazy fetches, ignores submodule changes, and caps execution at 15 seconds with bounded output. Untracked file contents need `read_file`. This is a restricted tool interface, not an OS sandbox.
+- Restricted child presets such as `scout` can opt into `list_files` and `search_files`. They are not exposed to the main agent or unrestricted children, which use `shell` with `rg` or Git. `list_files` returns one path per line; `search_files` returns `path:line:column: snippet` for case-sensitive literal matches. Both accept `path`, `path_contains`, and a result `limit` of 1–200. They skip non-UTF-8 filenames, hidden entries, symlinks, and nested `.git`, `target`, and `node_modules` directories, without interpreting ignore files. Use an explicit hidden path or `include_hidden: true` when needed. Traversal stops at 20,000 entries or depth 32; search skips files over 2 MiB and reads at most 32 MiB per call. Output indicates truncation and skipped files so the model can narrow its scope.
 - `write_file` writes a file and creates missing parent directories.
 - `edit_file` performs one exact string replacement and rejects missing or repeated matches.
 
@@ -182,7 +188,7 @@ else:
     print(len(json.load(sys.stdin)["text"].split()))
 ```
 
-The process inherits the working directory and receives the session ID in `YAWL_SESSION_ID`. The `subagent_*` names are reserved; `web_search` and `web_fetch` are reserved while web browsing is enabled.
+The process inherits the working directory and receives the session ID in `YAWL_SESSION_ID`. The `list_files`, `search_files`, `git_inspect`, and `subagent_*` names are reserved; `web_search` and `web_fetch` are reserved while web browsing is enabled.
 
 ## Skills
 

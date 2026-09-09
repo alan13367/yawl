@@ -791,15 +791,23 @@ impl SubagentManager {
             );
             let (outcome, error) = match result {
                 Ok(true) => (RunOutcome::Completed, None),
-                Ok(false) | Err(crate::error::Error::Interrupted) => {
-                    (RunOutcome::Interrupted, None)
-                }
+                Ok(false) | Err(crate::error::Error::Interrupted) => (
+                    RunOutcome::Interrupted,
+                    conversation
+                        .run_stop_reason()
+                        .map(|reason| reason.message().to_string()),
+                ),
                 // Attribution: a failed child rarely knows which provider or
                 // model actually errored, so the label rides the error text.
                 Err(error) => (RunOutcome::Failed, Some(format!("[{run_model}] {error}"))),
             };
             let mut leftovers = conversation.take_unaccepted_steers();
-            let final_result = conversation.latest_turn_result();
+            // Persist outside the manager lock so disk I/O does not block
+            // cancellation, steering, or other workers' progress events.
+            let final_result = super::reports::prepare(
+                &conversation.config().home_dir.join("artifacts/subagents"),
+                &conversation.latest_turn_result(),
+            );
             let mut state = self.lock();
             // Steering also takes the manager lock before pushing into the
             // inbox. Draining again while holding it closes the boundary
@@ -838,6 +846,12 @@ impl SubagentManager {
                 });
             }
             entry.snapshot.pending_steers.clear();
+            let canceling = entry.snapshot.status == SubagentStatus::Canceling;
+            if canceling {
+                leftovers.clear();
+                entry.work.clear();
+                entry.snapshot.queued_messages.clear();
+            }
             for leftover in leftovers {
                 if entry.work.len() >= MAX_QUEUE_MESSAGES {
                     break;
@@ -854,7 +868,6 @@ impl SubagentManager {
                     origin: RunOrigin::PrivateUser,
                 });
             }
-            let canceling = entry.snapshot.status == SubagentStatus::Canceling;
             let next = entry.work.pop_front();
             if !entry.snapshot.queued_messages.is_empty() {
                 entry.snapshot.queued_messages.remove(0);
@@ -1288,6 +1301,7 @@ fn salvage_result(snapshot: &SubagentSnapshot, final_result: &str) -> String {
         .transcript
         .iter()
         .rev()
+        .take_while(|item| !matches!(item.as_ref(), SubagentTranscriptItem::User { .. }))
         .find_map(|item| match item.as_ref() {
             SubagentTranscriptItem::Assistant(text) => Some(text.as_str()),
             _ => None,
@@ -1543,6 +1557,96 @@ mod tests {
         assert!(!manager.has_deferred());
         server.join().expect("provider server should exit");
         manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn large_reports_are_bounded_in_deliveries_and_readable_after_shutdown() {
+        let root =
+            std::env::temp_dir().join(format!("yawl-report-delivery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let mut config = provider_config(format!(
+            "http://{}/v1",
+            listener.local_addr().expect("address")
+        ));
+        config.home_dir = root.clone();
+        let read_config = config.clone();
+        let report = format!(
+            "Summary: traced cancellation.\n{}\nFINAL EVIDENCE",
+            "detailed evidence é\n".repeat(500)
+        );
+        let expected = report.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("connection");
+            read_request(&mut stream).expect("request");
+            write_multiline_response(&mut stream, &report).expect("response");
+            let (mut stream, _) = listener.accept().expect("follow-up connection");
+            read_request(&mut stream).expect("follow-up request");
+            write_response(&mut stream, "short follow-up").expect("follow-up response");
+        });
+        let manager = SubagentManager::new("reports".into(), 1);
+        let id = manager
+            .spawn(config, "local:model", None, "investigate", None)
+            .expect("spawn");
+        assert!(manager.wait_all(5));
+        let deliveries = manager.drain_deferred();
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].result.len() < 2048);
+        assert!(
+            deliveries[0]
+                .result
+                .contains("Summary: traced cancellation")
+        );
+        assert!(!deliveries[0].result.contains("FINAL EVIDENCE"));
+        manager.restore_deferred(deliveries.clone());
+        let waited = manager.wait(&[id.to_string()], Some(5)).expect("wait");
+        let listed = manager.list(Some(id.as_str())).expect("list");
+        let path = std::fs::read_dir(root.join("artifacts/subagents"))
+            .expect("reports")
+            .next()
+            .expect("one report")
+            .expect("entry")
+            .path();
+        for result in [&waited, &listed, &deliveries[0].result] {
+            assert!(result.contains(&path.display().to_string()));
+            assert!(!result.contains("FINAL EVIDENCE"));
+        }
+        manager
+            .send(id.as_str(), "follow up", RunOrigin::Model)
+            .expect("restart");
+        let follow_up = manager.wait(&[id.to_string()], Some(5)).expect("follow-up");
+        assert!(follow_up.contains("short follow-up"));
+        server.join().expect("server");
+        manager.shutdown_and_discard();
+
+        // Retrieval uses only the persisted path, with no live child or manager.
+        let registry =
+            crate::tools::Registry::scan(&read_config, &mut crate::tools::DescribeCache::default());
+        let mut offset = 0;
+        let mut restored = String::new();
+        loop {
+            let outcome = registry.execute(
+                "read_file",
+                &serde_json::json!({"path": path, "offset": offset, "limit": 1024}).to_string(),
+                "resumed",
+            );
+            assert!(!outcome.is_error, "{}", outcome.content);
+            let (header, content) = outcome
+                .content
+                .split_once("\n\n")
+                .expect("page header and text");
+            restored.push_str(content);
+            if let Some((_, next)) = header.rsplit_once("next_offset=") {
+                let next: u64 = next.parse().expect("next offset");
+                assert!(next > offset);
+                offset = next;
+            } else {
+                assert!(header.ends_with("EOF"));
+                break;
+            }
+        }
+        assert_eq!(restored, expected);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -2454,6 +2558,9 @@ mod tests {
                 write_tool_call_response(&mut stream, "working", &format!("call-{index}"))
                     .expect("subagent provider response");
             }
+            let (mut stream, _) = listener.accept().expect("follow-up connection");
+            read_request(&mut stream).expect("follow-up request");
+            write_response(&mut stream, "finished follow-up").expect("follow-up response");
             bodies
         });
         let mut config = provider_config(base_url);
@@ -2468,9 +2575,19 @@ mod tests {
                 None,
             )
             .expect("runaway subagent spawn");
+        assert!(manager.wait_all(10));
+        let deliveries = manager.drain_deferred();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].outcome, RunOutcome::Interrupted);
+        assert_eq!(deliveries[0].error, "subagent request budget exceeded");
         let waited = manager
             .wait(&[id.to_string()], Some(10))
             .expect("budget-stopped subagent should settle");
+        assert!(waited.contains("subagent request budget exceeded"));
+        assert_eq!(
+            manager.snapshots()[0].error,
+            "subagent request budget exceeded"
+        );
 
         assert!(
             waited.contains("[cancelled after 3 requests]"),
@@ -2484,6 +2601,15 @@ mod tests {
         assert_eq!(snapshot.requests, 3);
         assert_eq!(snapshot.run_tokens, 36);
         assert_eq!(manager.total_child_tokens(), 36);
+        manager
+            .send(id.as_str(), "finish the follow-up", RunOrigin::Model)
+            .expect("restart after budget stop");
+        assert!(manager.wait_all(5));
+        let deliveries = manager.drain_deferred();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].outcome, RunOutcome::Completed);
+        assert!(deliveries[0].error.is_empty());
+        assert!(manager.snapshots()[0].error.is_empty());
         let bodies = server.join().expect("provider server should exit");
         assert_eq!(bodies.len(), 3, "the fourth request must never happen");
         assert!(
@@ -2517,9 +2643,16 @@ mod tests {
         let id = manager
             .spawn(config, "local:model", Some("slow"), "slow work", None)
             .expect("slow subagent spawn");
+        assert!(manager.wait_all(10));
+        let deliveries = manager.drain_deferred();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].outcome, RunOutcome::Interrupted);
+        assert_eq!(deliveries[0].error, "subagent timeout exceeded");
         let waited = manager
             .wait(&[id.to_string()], Some(10))
             .expect("timed-out subagent should settle");
+        assert!(waited.contains("subagent timeout exceeded"));
+        assert_eq!(manager.snapshots()[0].error, "subagent timeout exceeded");
 
         assert!(
             waited.contains("[cancelled after"),
@@ -2531,6 +2664,106 @@ mod tests {
         );
         server.join().expect("provider server should exit");
         manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn canceled_steers_do_not_restart_work_or_consume_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let config = provider_config(format!(
+            "http://{}/v1",
+            listener.local_addr().expect("address")
+        ));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("connection");
+            read_request(&mut stream).expect("request");
+            ready_tx.send(()).expect("ready");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release");
+            let _ = write_response(&mut stream, "done");
+            let (mut follow_up, _) = listener.accept().expect("follow-up connection");
+            let request = read_request(&mut follow_up).expect("follow-up request");
+            write_response(&mut follow_up, "follow-up answer").expect("follow-up response");
+            request
+        });
+        let manager = SubagentManager::new("session".into(), 1);
+        let id = manager
+            .spawn(config, "local:model", None, "task", None)
+            .expect("spawn");
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request started");
+        manager
+            .steer(id.as_str(), "first steer")
+            .expect("first steer");
+        manager
+            .steer(id.as_str(), "second steer")
+            .expect("second steer");
+        // Cancel while the request is blocked so both steers remain unaccepted.
+        let cancel_manager = manager.clone();
+        let cancel_id = id.to_string();
+        let cancel = std::thread::spawn(move || cancel_manager.cancel(&[cancel_id], false));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = manager.lock();
+            if state.entries[0].snapshot.status != SubagentStatus::Running {
+                break;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "cancellation did not start");
+            std::thread::yield_now();
+        }
+        release_tx.send(()).expect("release response");
+        cancel
+            .join()
+            .expect("cancel thread")
+            .expect("cancel result");
+        {
+            let state = manager.lock();
+            let entry = &state.entries[0];
+            assert!(entry.work.is_empty(), "canceled work was requeued");
+            assert!(entry.snapshot.queued_messages.is_empty());
+            assert_eq!(entry.snapshot.completed_turns, 1);
+            assert_eq!(entry.snapshot.status, SubagentStatus::Done);
+            assert_eq!(state.active, 0);
+            assert!(
+                entry.snapshot.error.is_empty(),
+                "user cancellation is not a limit stop"
+            );
+        }
+        manager
+            .send(id.as_str(), "authorized follow-up", RunOrigin::Model)
+            .expect("capacity released for restart");
+        let waited = manager
+            .wait(&[id.to_string()], Some(5))
+            .expect("follow-up settled");
+        assert!(waited.contains("follow-up answer"));
+        let request = server.join().expect("server");
+        assert!(request.contains("authorized follow-up"));
+        assert!(!request.contains("first steer"));
+        assert!(!request.contains("second steer"));
+        assert_eq!(manager.active_count(), 0);
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn interrupted_follow_up_does_not_salvage_a_previous_answer() {
+        let mut snapshot = test_entry(SubagentStatus::Done).snapshot;
+        snapshot.begin_turn("first task", RunOrigin::Model, 1);
+        snapshot.apply_event(crate::agent::TurnEvent::TextDelta("previous answer"));
+        snapshot.finish_turn(RunOutcome::Completed, "previous answer", None);
+        snapshot.begin_turn("follow-up", RunOrigin::Model, 2);
+        snapshot.finish_turn(RunOutcome::Interrupted, "", None);
+        assert_eq!(
+            salvage_result(&snapshot, ""),
+            "[cancelled after 0 requests]"
+        );
+        snapshot.push_transcript(SubagentTranscriptItem::Assistant("current partial".into()));
+        let salvage = salvage_result(&snapshot, "");
+        assert!(salvage.contains("current partial"));
+        assert!(!salvage.contains("previous answer"));
     }
 
     #[test]

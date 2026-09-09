@@ -31,6 +31,22 @@ pub(crate) struct RunLimits {
     pub(crate) timeout: Option<Duration>,
 }
 
+/// Why a child run was stopped by its configured limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunStopReason {
+    Timeout,
+    RequestBudget,
+}
+
+impl RunStopReason {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Timeout => "subagent timeout exceeded",
+            Self::RequestBudget => "subagent request budget exceeded",
+        }
+    }
+}
+
 /// Result of `/undo`: how many messages were dropped and whether files/HEAD
 /// were restored.
 #[derive(Debug, Default)]
@@ -66,6 +82,7 @@ struct ChildState {
     prompt_cache_key: String,
     usage: UsageSummary,
     run_limits: Option<RunLimits>,
+    stop_reason: Option<RunStopReason>,
     tool_allowlist: Option<Vec<String>>,
     role_fragment: Option<String>,
 }
@@ -149,6 +166,7 @@ impl Conversation {
                 session_id,
                 usage: UsageSummary::default(),
                 run_limits: None,
+                stop_reason: None,
                 tool_allowlist: None,
                 role_fragment: None,
             }),
@@ -335,6 +353,13 @@ impl Conversation {
         self.persistent_state().background.clone()
     }
 
+    pub(crate) fn run_stop_reason(&self) -> Option<RunStopReason> {
+        match &self.kind {
+            ConversationKind::Child(state) => state.stop_reason,
+            ConversationKind::Persistent(_) => None,
+        }
+    }
+
     pub(crate) fn latest_turn_result(&self) -> String {
         self.latest_turn_result.clone()
     }
@@ -471,15 +496,12 @@ impl Conversation {
                 &mut self.describe_cache,
                 state.background.clone(),
             ),
-            ConversationKind::Child(_) => Registry::scan(&self.config, &mut self.describe_cache),
+            ConversationKind::Child(state) => Registry::scan_for_child(
+                &self.config,
+                &mut self.describe_cache,
+                state.tool_allowlist.as_deref(),
+            ),
         };
-        if let ConversationKind::Child(ChildState {
-            tool_allowlist: Some(allowed),
-            ..
-        }) = &self.kind
-        {
-            registry.retain_names(allowed);
-        }
         if matches!(&self.kind, ConversationKind::Persistent(_)) && self.questions.is_enabled() {
             registry.advertise_user_input(self.questions.clone());
         }

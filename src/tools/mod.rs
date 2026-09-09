@@ -5,6 +5,8 @@
 //! wins (builtins < `~/.yawl/tools` < `./.yawl/tools`).
 
 pub mod exec;
+mod files;
+mod git;
 mod planning_shell;
 mod user_input;
 mod web;
@@ -40,6 +42,9 @@ enum ToolImpl {
     ShellOutput,
     ShellStop,
     ReadFile,
+    ListFiles,
+    SearchFiles,
+    GitInspect,
     ReadSkill,
     WriteFile,
     EditFile,
@@ -122,6 +127,22 @@ impl Registry {
     /// `cache` avoids respawning `--describe` for unchanged tools.
     pub fn scan(config: &Config, cache: &mut DescribeCache) -> Registry {
         Self::scan_inner(config, cache, None)
+    }
+
+    /// Restricted children can opt into native file discovery through their
+    /// preset allowlist. Main agents and unrestricted children use shell.
+    pub(crate) fn scan_for_child(
+        config: &Config,
+        cache: &mut DescribeCache,
+        allowlist: Option<&[String]>,
+    ) -> Registry {
+        let mut registry = Self::scan(config, cache);
+        if let Some(allowed) = allowlist {
+            registry.entries.extend(files::entries());
+            registry.entries.push(git::entry());
+            registry.retain_names(allowed);
+        }
+        registry
     }
 
     /// Scans the tools advertised by the persistent main agent without
@@ -289,6 +310,9 @@ impl Registry {
                 &entry.imp,
                 ToolImpl::Shell
                     | ToolImpl::ReadFile
+                    | ToolImpl::ListFiles
+                    | ToolImpl::SearchFiles
+                    | ToolImpl::GitInspect
                     | ToolImpl::ReadSkill
                     | ToolImpl::WebSearch
                     | ToolImpl::WebFetch
@@ -365,6 +389,9 @@ impl Registry {
             ToolImpl::ShellOutput => shell_output(self.background.as_ref(), &args),
             ToolImpl::ShellStop => shell_stop(self.background.as_ref(), &args),
             ToolImpl::ReadFile => read_file_for_model(&args, supports_images),
+            ToolImpl::ListFiles => files::discover(&args, false),
+            ToolImpl::SearchFiles => files::discover(&args, true),
+            ToolImpl::GitInspect => git::inspect(&args),
             ToolImpl::ReadSkill => read_skill(&self.skills, &args),
             ToolImpl::WriteFile => write_file(&args),
             ToolImpl::EditFile => edit_file(&args),
@@ -525,6 +552,9 @@ impl Registry {
 }
 
 const RESERVED_TOOL_NAMES: &[&str] = &[
+    "list_files",
+    "search_files",
+    "git_inspect",
     "read_skill",
     "shell_list",
     "shell_output",
@@ -815,7 +845,7 @@ fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         tool(
             "subagent_wait",
             "Wait for every ID to finish or fail. Omit timeout_secs to block; set it only for a \
-             bounded status check. Settled runs include their full result.",
+             bounded status check. Long results include an excerpt and a full report path.",
             json!({
                 "type": "object",
                 "properties": {
@@ -841,7 +871,7 @@ fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         ),
         tool(
             "subagent_list",
-            "List all subagents, or full status and result for one ID.",
+            "List all subagents, or status and result for one ID; long results link to full reports.",
             json!({
                 "type": "object",
                 "properties": {"id": {"type": "string"}}
@@ -907,7 +937,9 @@ fn builtins(background: bool) -> Vec<ToolEntry> {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "File path (absolute or relative to cwd)"}
+                        "path": {"type": "string", "description": "File path (absolute or relative to cwd)"},
+                        "offset": {"type": "integer", "minimum": 0, "description": "Optional byte offset for a paged UTF-8 text read; use returned next_offset to continue."},
+                        "limit": {"type": "integer", "minimum": 4, "maximum": 32768, "description": "Page size in bytes; default 16384 when paging. Omit offset and limit for normal text/image reads."}
                     },
                     "required": ["path"]
                 }),
@@ -1232,6 +1264,9 @@ fn shell_stop(background: Option<&BackgroundProcessManager>, args: &Value) -> To
 }
 
 fn read_file_for_model(args: &Value, supports_images: bool) -> ToolOutcome {
+    if args.get("offset").is_some() || args.get("limit").is_some() {
+        return files::read_page(args);
+    }
     let path = match str_arg(args, "path") {
         Ok(p) => p,
         Err(e) => return e,
@@ -1734,7 +1769,9 @@ fi
             .find(|spec| spec.name == "subagent_spawn")
             .expect("spawn tool present");
         assert!(
-            spawn.description.contains("scout (read_file+read_skill)"),
+            spawn
+                .description
+                .contains("scout (read_file+read_skill+list_files+search_files+git_inspect)"),
             "the description should advertise bundled presets; got:\n{}",
             spawn.description
         );
@@ -1864,6 +1901,110 @@ fi
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, ["read_file", "shell"]);
+    }
+
+    #[test]
+    fn main_agent_does_not_advertise_scout_discovery_tools() {
+        let root = temp_path("main-no-scout-tools");
+        let config = registry_config(root.join("home"), root.join("project"));
+        let manager = SubagentManager::new("main".into(), 1);
+        let registries = [
+            Registry::scan(&config, &mut DescribeCache::default()),
+            Registry::scan_for_child(&config, &mut DescribeCache::default(), None),
+            Registry::scan_for_main_listing(&config, &mut DescribeCache::default()),
+            Registry::scan_with_subagents(
+                &config,
+                &mut DescribeCache::default(),
+                manager.clone(),
+                "test",
+            ),
+        ];
+        for registry in registries {
+            let names = registry
+                .specs()
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>();
+            assert!(names.iter().any(|name| name == "shell"));
+            for name in ["list_files", "search_files", "git_inspect"] {
+                assert!(
+                    !names.iter().any(|candidate| candidate == name),
+                    "main advertised {name}"
+                );
+                assert!(registry.execute(name, "{}", "main").is_error);
+            }
+        }
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn scout_discovers_code_with_native_tools_and_cannot_run_commands() {
+        let root = temp_path("scout-native-discovery");
+        let tools_dir = root.join("home/tools");
+        std::fs::create_dir_all(&tools_dir).expect("tools directory");
+        std::fs::create_dir_all(root.join("project/src")).expect("source directory");
+        std::fs::write(
+            root.join("project/src/example.rs"),
+            "fn cancellation_entry() {}\n",
+        )
+        .expect("source");
+        for name in ["list_files", "search_files", "git_inspect"] {
+            let path = tools_dir.join(name);
+            let spec = json!({"name": name, "description": "override", "input_schema": {"type": "object"}});
+            std::fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", spec))
+                .expect("exec fixture");
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .expect("executable");
+        }
+        let config = registry_config(root.join("home"), root.join("project"));
+        let scout = crate::subagent::presets::bundled().remove(0);
+        let mut child = crate::agent::Conversation::memory(config, "test".into(), "scout".into());
+        child.set_tool_allowlist(scout.tools.expect("scout allowlist"));
+        let registry = child.scan_tools();
+        assert!(
+            registry
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("reserved"))
+                .count()
+                >= 3
+        );
+        assert!(
+            registry
+                .specs()
+                .iter()
+                .any(|spec| spec.name == "git_inspect")
+        );
+        assert!(
+            registry
+                .execute("git_inspect", r#"{"operation":"reset"}"#, "scout")
+                .is_error
+        );
+        let listing = registry.execute(
+            "list_files",
+            &json!({"path": root.join("project")}).to_string(),
+            "scout",
+        );
+        assert!(!listing.is_error, "{}", listing.content);
+        assert!(listing.content.contains("example.rs"));
+        let search = registry.execute(
+            "search_files",
+            &json!({"path": root.join("project"), "query": "cancellation_entry"}).to_string(),
+            "scout",
+        );
+        assert!(!search.is_error, "{}", search.content);
+        assert!(
+            search
+                .content
+                .contains("example.rs:1:4: fn cancellation_entry() {}")
+        );
+        assert!(
+            registry
+                .execute("shell", r#"{"command":"true"}"#, "scout")
+                .is_error
+        );
+        assert!(registry.execute("write_file", "{}", "scout").is_error);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
