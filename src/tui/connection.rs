@@ -31,6 +31,7 @@ pub(super) enum ConnectStep {
     Discovery,
     Login,
     Models,
+    Reasoning,
     Recovery,
     Review,
 }
@@ -44,6 +45,7 @@ pub(super) struct ConnectFlow {
     credential: CredentialChoice,
     model: String,
     models: Vec<String>,
+    reasoning_efforts: Vec<String>,
     job: Option<ConnectJob>,
     root_parent: Option<PickerAction>,
 }
@@ -78,6 +80,7 @@ pub(super) fn open(state: &mut ViewState, config: &Config, from_settings: bool) 
         credential: CredentialChoice::Keep,
         model: String::new(),
         models: Vec::new(),
+        reasoning_efforts: Vec::new(),
         job: None,
         root_parent: root_parent.clone(),
     });
@@ -105,6 +108,23 @@ pub(super) fn handle_action(state: &mut ViewState, action: PickerAction) -> Opti
         }
         PickerAction::ConnectChooseModel(model) => {
             flow.model = model;
+            configure_model_reasoning(&mut flow, state);
+            None
+        }
+        PickerAction::ConnectToggleReasoning(index) => {
+            if let Some(effort) = crate::config::REASONING_EFFORTS.get(index) {
+                if flow.reasoning_efforts.iter().any(|value| value == effort) {
+                    flow.reasoning_efforts.retain(|value| value != effort);
+                } else {
+                    flow.reasoning_efforts.push((*effort).into());
+                }
+            }
+            let mut picker = connection_reasoning_picker(&flow);
+            picker.selected = index.min(picker.items.len().saturating_sub(1));
+            state.picker = Some(picker);
+            None
+        }
+        PickerAction::ConnectConfirmReasoning => {
             flow.step = ConnectStep::Review;
             state.picker = Some(review_picker(&flow));
             None
@@ -305,8 +325,7 @@ fn apply_edit(
                 return;
             }
             flow.model = value;
-            flow.step = ConnectStep::Review;
-            state.picker = Some(review_picker(flow));
+            configure_model_reasoning(flow, state);
         }
     }
 }
@@ -697,6 +716,51 @@ fn manual_model_picker(flow: &ConnectFlow) -> Picker {
     )
 }
 
+fn configure_model_reasoning(flow: &mut ConnectFlow, state: &mut ViewState) {
+    if matches!(flow.provider, Some(ProviderId::Compatible(_))) {
+        let saved = crate::model::saved_reasoning_efforts(&flow.config, &qualified_model(flow));
+        // `None` is an unknown provider or unlisted model and defaults to
+        // every level; `Some(vec![])` is the explicit "send no effort" choice
+        // from clearing every box, preserved so it survives re-entry.
+        flow.reasoning_efforts = match saved {
+            None => crate::config::REASONING_EFFORTS
+                .iter()
+                .map(|effort| (*effort).to_string())
+                .collect(),
+            Some(efforts) => efforts.into_iter().map(str::to_string).collect(),
+        };
+        flow.step = ConnectStep::Reasoning;
+        state.picker = Some(connection_reasoning_picker(flow));
+    } else {
+        flow.reasoning_efforts.clear();
+        flow.step = ConnectStep::Review;
+        state.picker = Some(review_picker(flow));
+    }
+}
+
+fn connection_reasoning_picker(flow: &ConnectFlow) -> Picker {
+    Picker {
+        title: "Supported reasoning efforts".into(),
+        hint: "↑/↓ move  Space toggle  Enter confirm  Esc back".into(),
+        items: crate::config::REASONING_EFFORTS
+            .iter()
+            .enumerate()
+            .map(|(index, effort)| {
+                let checked = flow.reasoning_efforts.iter().any(|value| value == effort);
+                PickerItem {
+                    label: format!("[{}] {effort}", if checked { "x" } else { " " }),
+                    description: "Select levels this model accepts; leave all clear for none"
+                        .into(),
+                    action: PickerAction::ConnectToggleReasoning(index),
+                }
+            })
+            .collect(),
+        selected: 0,
+        editing: None,
+        parent: Some(PickerAction::ConnectBack(ConnectStep::Models)),
+    }
+}
+
 fn review_picker(flow: &ConnectFlow) -> Picker {
     let description = format!("{} · {}", flow.provider_label, qualified_model(flow));
     Picker {
@@ -721,7 +785,13 @@ fn review_picker(flow: &ConnectFlow) -> Picker {
         ],
         selected: 0,
         editing: None,
-        parent: Some(PickerAction::ConnectBack(ConnectStep::Models)),
+        parent: Some(PickerAction::ConnectBack(
+            if matches!(flow.provider, Some(ProviderId::Compatible(_))) {
+                ConnectStep::Reasoning
+            } else {
+                ConnectStep::Models
+            },
+        )),
     }
 }
 
@@ -755,6 +825,11 @@ fn build_plan(
             changes.push(crate::config::ConfigChange::ProviderModel {
                 name: name.clone(),
                 model: flow.model.clone(),
+                reasoning_efforts: crate::config::REASONING_EFFORTS
+                    .iter()
+                    .filter(|effort| flow.reasoning_efforts.iter().any(|value| value == *effort))
+                    .map(|effort| (*effort).to_string())
+                    .collect(),
             });
         }
         if let Some(change) = provider::credential_change(provider, &flow.credential) {
@@ -794,6 +869,7 @@ fn go_back(flow: &mut ConnectFlow, step: ConnectStep, state: &mut ViewState) {
         ),
         ConnectStep::Authentication => authentication_picker(flow),
         ConnectStep::Models => models_picker(flow, &flow.models),
+        ConnectStep::Reasoning => connection_reasoning_picker(flow),
         ConnectStep::Recovery => recovery_picker(flow, "Enter a model ID or try discovery again."),
         ConnectStep::ProviderName
         | ConnectStep::Discovery
@@ -821,6 +897,7 @@ mod tests {
             credential: CredentialChoice::None,
             model: "chosen-model".into(),
             models: vec!["chosen-model".into()],
+            reasoning_efforts: vec!["low".into(), "ultra".into()],
             job: None,
             root_parent: None,
         };
@@ -842,6 +919,10 @@ mod tests {
                 .any(|(model, _)| model == "local-api:chosen-model")
         );
         assert_eq!(saved.model, config.model);
+        assert_eq!(
+            saved.providers["local-api"].models[0].reasoning_efforts,
+            ["low", "ultra"]
+        );
 
         let saved_again = saved.change_global_batch(plan.changes_for_save())?.config;
         assert_eq!(saved_again.providers["local-api"].models.len(), 1);

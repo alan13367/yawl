@@ -1590,8 +1590,71 @@ fn context_metadata_survives_resume_and_counts_new_content() {
         .unwrap();
     assert_eq!(test.agent.estimated_context(50), 2008);
     assert_eq!(test.agent.estimated_context(150), 2108);
-    test.agent.switch_model("other".into());
+    test.agent.switch_model("other".into()).unwrap();
     assert!(test.agent.estimated_context(50) < 2008);
+}
+
+#[test]
+fn connect_default_model_is_recorded_in_the_session() {
+    let mut test = TestAgent::new("connect-default-model");
+    test.agent
+        .append_input_message(Message::user("start"))
+        .unwrap();
+    let plan = crate::onboarding::provider::ConnectionPlan {
+        changes: Vec::new(),
+        model: "openai:gpt-4.1".into(),
+        activation: crate::onboarding::provider::ConnectionActivation::Default,
+        provider_label: "OpenAI".into(),
+    };
+
+    test.agent
+        .change_global_config_batch(plan.changes_for_save())
+        .unwrap();
+    assert_eq!(test.agent.model(), "openai:gpt-4.1");
+    assert_eq!(test.agent.config().model.as_deref(), Some("openai:gpt-4.1"));
+
+    // The switch must be in the log so resuming continues with this model.
+    let (session, _) = Session::open(&test.sessions_dir, test.agent.session_id()).unwrap();
+    assert_eq!(session.model(), "openai:gpt-4.1");
+}
+
+#[test]
+fn switched_models_are_recorded_and_adopted_on_resume() {
+    let mut test = TestAgent::new("model-resume");
+    test.agent
+        .append_input_message(Message::user("start"))
+        .unwrap();
+    test.agent.switch_model("other-model".into()).unwrap();
+    assert_eq!(test.agent.model(), "other-model");
+
+    // The switch is in the log, so a replayed session reports it.
+    let id = test.agent.session_id().to_string();
+    let (session, messages) = Session::open(&test.sessions_dir, &id).unwrap();
+    assert_eq!(session.model(), "other-model");
+    assert_eq!(messages.len(), 1);
+    drop(session);
+
+    // `/resume` continues with that model rather than the configured one.
+    let cwd = crate::config::working_dir();
+    let dirs = test.agent.config.session_dirs(&cwd);
+    std::fs::create_dir_all(&dirs.project).unwrap();
+    // `/resume` searches every project directory, so move the log rather than
+    // duplicating it into a second one.
+    std::fs::rename(
+        test.sessions_dir.join(format!("{id}.jsonl")),
+        dirs.project.join(format!("{id}.jsonl")),
+    )
+    .unwrap();
+    let mut resumed = Conversation::persistent(
+        test.agent.config.clone(),
+        "test".into(),
+        Session::create(&dirs.project, &cwd, "test").unwrap(),
+        Vec::new(),
+        cwd.clone(),
+    );
+    resumed.load_session(&id).unwrap();
+    assert_eq!(resumed.model(), "other-model");
+    assert_eq!(resumed.messages().len(), 1);
 }
 
 fn text_step(text: &'static str) -> ProviderStep {

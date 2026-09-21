@@ -196,6 +196,7 @@ pub(super) fn build_frame_with_images(
 ) -> RenderedFrame {
     if state.git_init.is_some() {
         let (lines, cursor) = super::git::render_init(state, editor, columns, rows);
+        state.transcript_row_entries.clear();
         return RenderedFrame {
             lines,
             cursor,
@@ -204,6 +205,7 @@ pub(super) fn build_frame_with_images(
     }
     if state.process_view.is_some() {
         let (lines, cursor) = super::processes::render(state, columns, rows);
+        state.transcript_row_entries.clear();
         return RenderedFrame {
             lines,
             cursor,
@@ -212,6 +214,7 @@ pub(super) fn build_frame_with_images(
     }
     if state.git_view.is_some() {
         let (lines, cursor) = super::git::render(state, editor, columns, rows);
+        state.transcript_row_entries.clear();
         return RenderedFrame {
             lines,
             cursor,
@@ -220,6 +223,7 @@ pub(super) fn build_frame_with_images(
     }
     if state.subagent_view.is_some() {
         let (lines, cursor) = super::subagents::render(state, editor, columns, rows);
+        state.transcript_row_entries.clear();
         return RenderedFrame {
             lines,
             cursor,
@@ -230,6 +234,7 @@ pub(super) fn build_frame_with_images(
     let rows = rows.max(8);
     if state.transcript.viewer_open() {
         let (lines, cursor) = render_block_viewer(state, columns, rows);
+        state.transcript_row_entries.clear();
         return RenderedFrame {
             lines,
             cursor,
@@ -351,6 +356,10 @@ pub(super) fn build_frame_with_images(
     let visible = &transcript.lines;
 
     let mut region = Vec::with_capacity(transcript_height);
+    // Click-to-expand hit-testing mirrors exactly what is drawn: padding rows
+    // map to `None`, transcript rows map to their owning entry, and picker or
+    // welcome screens clear the map because no tool card is visible.
+    let mut click_map = Vec::with_capacity(transcript_height);
     if let Some(picker) = state
         .picker
         .as_ref()
@@ -365,6 +374,7 @@ pub(super) fn build_frame_with_images(
             columns,
             transcript_height,
         ));
+        state.transcript_row_entries.clear();
     } else if visible.is_empty() && state.transcript.is_empty() {
         region.extend(render_welcome(
             state.accent_color,
@@ -372,7 +382,14 @@ pub(super) fn build_frame_with_images(
             transcript_height,
             state.spinner_tick,
         ));
+        state.transcript_row_entries.clear();
     } else {
+        click_map.extend(std::iter::repeat_n(
+            None,
+            transcript_height.saturating_sub(visible.len()),
+        ));
+        click_map.extend(visible.iter().map(|(_, owner)| *owner));
+        state.transcript_row_entries = click_map;
         region.extend(std::iter::repeat_n(
             " ".repeat(transcript_width),
             transcript_height.saturating_sub(visible.len()),

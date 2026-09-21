@@ -20,6 +20,11 @@ pub struct Codex {
 }
 
 impl Codex {
+    pub(super) fn with_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        self.reasoning_effort = effort.map(str::to_string);
+        self
+    }
+
     pub fn from_config(config: &Config) -> Result<Self, Error> {
         let credential = auth::load_and_refresh_credential(config)?;
         Ok(Self {

@@ -304,6 +304,99 @@ fn test_agent() -> Agent {
 }
 
 #[test]
+fn compatible_connection_toggles_with_space_and_confirms_with_enter() {
+    use super::connection::{self, ConnectEditField, ConnectStep};
+    use crate::onboarding::provider::ProviderId;
+
+    let agent = test_agent();
+    let mut state = ViewState::from_agent(&agent);
+    connection::open(&mut state, agent.config(), false);
+    connection::handle_action(
+        &mut state,
+        PickerAction::ConnectChooseProvider(ProviderId::Compatible("local".into())),
+    );
+    connection::handle_action(
+        &mut state,
+        PickerAction::ConnectChooseModel("custom".into()),
+    );
+    let picker = state.picker.as_ref().unwrap();
+    assert_eq!(
+        picker
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "[x] minimal",
+            "[x] low",
+            "[x] medium",
+            "[x] high",
+            "[x] xhigh",
+            "[x] max",
+            "[x] ultra"
+        ]
+    );
+    let mut editor = Editor::default();
+    take_picker_action(&mut state, &mut editor, Key::Down);
+    for expected in ["[ ] low", "[x] low"] {
+        let action = take_picker_action(&mut state, &mut editor, Key::Char(' ')).unwrap();
+        assert!(matches!(action, PickerAction::ConnectToggleReasoning(1)));
+        connection::handle_action(&mut state, action);
+        assert_eq!(state.picker.as_ref().unwrap().selected, 1);
+        assert_eq!(state.picker.as_ref().unwrap().items[1].label, expected);
+    }
+    let action = take_picker_action(&mut state, &mut editor, Key::Enter).unwrap();
+    assert!(matches!(action, PickerAction::ConnectConfirmReasoning));
+    connection::handle_action(&mut state, action);
+    assert_eq!(state.picker.as_ref().unwrap().title, "Review connection");
+    let action = take_picker_action(&mut state, &mut editor, Key::Escape).unwrap();
+    assert!(matches!(
+        action,
+        PickerAction::ConnectBack(ConnectStep::Reasoning)
+    ));
+    connection::handle_action(&mut state, action);
+    assert_eq!(state.picker.as_ref().unwrap().items[1].label, "[x] low");
+
+    connection::handle_action(
+        &mut state,
+        PickerAction::ApplyConnect {
+            field: ConnectEditField::Model,
+            value: "different".into(),
+        },
+    );
+    // An unrecognized model is treated as supporting every level; clearing
+    // every box is the explicit "send no effort" choice.
+    assert!(
+        state
+            .picker
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.label.starts_with("[x]"))
+    );
+    for index in 0..crate::config::REASONING_EFFORTS.len() {
+        let action = take_picker_action(&mut state, &mut editor, Key::Char(' ')).unwrap();
+        connection::handle_action(&mut state, action);
+        if index + 1 < crate::config::REASONING_EFFORTS.len() {
+            take_picker_action(&mut state, &mut editor, Key::Down);
+        }
+    }
+    assert!(
+        state
+            .picker
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.label.starts_with("[ ]"))
+    );
+    let action = take_picker_action(&mut state, &mut editor, Key::Enter).unwrap();
+    connection::handle_action(&mut state, action);
+    assert_eq!(state.picker.as_ref().unwrap().title, "Review connection");
+}
+
+#[test]
 fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
     let mut state = ViewState {
         transcript: Transcript::from_messages(&[]),
@@ -322,6 +415,8 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,
@@ -411,6 +506,8 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,

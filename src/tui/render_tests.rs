@@ -64,6 +64,8 @@ fn frame_keeps_input_and_status_pinned() {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,
@@ -295,7 +297,7 @@ fn tool_entries_are_compact_and_visually_separated() {
     let plain = markdown::strip_ansi(&rendered.join("\n"));
     assert!(rendered.len() <= 16, "tool used {} lines", rendered.len());
     assert!(plain.contains("$ cargo test --all-targets"));
-    assert!(plain.contains("lines, Ctrl+O to expand"));
+    assert!(plain.contains("lines, Ctrl+O or click to expand"));
     assert!(rendered.iter().any(|line| line.contains("\x1b[48;")));
 }
 
@@ -454,6 +456,8 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,
@@ -524,6 +528,8 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,
@@ -651,6 +657,8 @@ fn loading_state_ignores_status_activity() {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,
@@ -726,6 +734,8 @@ fn overflow_state() -> ViewState {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,
@@ -1036,6 +1046,8 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,
@@ -1227,6 +1239,8 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,
@@ -1389,6 +1403,8 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,
@@ -1949,6 +1965,8 @@ fn empty_session_state() -> ViewState {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,
@@ -2175,4 +2193,60 @@ fn git_init_modal_failed_init_stays_open_with_the_error() {
         markdown::strip_ansi(&frame.join("\n")).contains("git init failed"),
         "the failure should be shown inside the modal"
     );
+}
+
+#[test]
+fn rendered_tool_rows_map_to_their_entries_for_click_to_expand() {
+    use crate::provider::{Message, ToolCall};
+
+    let mut state = empty_session_state();
+    state.transcript = Transcript::from_messages(&[
+        Message::assistant(
+            String::new(),
+            vec![
+                ToolCall {
+                    id: "click-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"first"}"#.into(),
+                },
+                ToolCall {
+                    id: "click-2".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"second"}"#.into(),
+                },
+            ],
+        ),
+        Message::tool_result("click-1", "shell", "first".into(), false),
+        Message::tool_result("click-2", "shell", "second".into(), false),
+    ]);
+    let editor = Editor::default();
+    let (_frame, _) = build_frame(&mut state, &editor, 40, 12);
+
+    assert!(
+        state.transcript_row_entries.contains(&Some(0)),
+        "first tool card must be clickable"
+    );
+    assert!(
+        state.transcript_row_entries.contains(&Some(1)),
+        "second tool card must be clickable"
+    );
+
+    let first_row = state
+        .transcript_row_entries
+        .iter()
+        .position(|row| *row == Some(0))
+        .expect("first tool row");
+    let press = super::events::MouseEvent {
+        kind: super::events::MouseKind::Press,
+        column: 2,
+        row: first_row,
+    };
+    let release = super::events::MouseEvent {
+        kind: super::events::MouseKind::Release,
+        column: 2,
+        row: first_row,
+    };
+    assert!(super::state::handle_tool_click(&mut state, press, release));
+    assert!(state.transcript.entry_expanded(0, state.tools_expanded));
+    assert!(!state.transcript.entry_expanded(1, state.tools_expanded));
 }

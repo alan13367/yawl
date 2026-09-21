@@ -730,13 +730,13 @@ fn preview_lines(
     }
     let omitted = lines.len() - limit;
     if expanded {
-        lines.push(ToolLine::new("[Ctrl+O to collapse]", Tone::Muted));
+        lines.push(ToolLine::new("[Ctrl+O or click to collapse]", Tone::Muted));
         return lines;
     }
     let marker = if keep_tail {
-        format!("... ({omitted} earlier lines, Ctrl+O to expand)")
+        format!("... ({omitted} earlier lines, Ctrl+O or click to expand)")
     } else {
-        format!("... ({omitted} more lines, Ctrl+O to expand)")
+        format!("... ({omitted} more lines, Ctrl+O or click to expand)")
     };
     if keep_tail {
         let mut preview = Vec::with_capacity(limit + 1);
@@ -1193,7 +1193,7 @@ mod tests {
         let plain = markdown::strip_ansi(&rendered.join("\n"));
         assert!(plain.contains("line 1 "));
         assert!(plain.contains("line 20"));
-        assert!(plain.contains("Ctrl+O to collapse"));
+        assert!(plain.contains("or click to collapse"));
     }
 
     #[test]
@@ -1352,22 +1352,23 @@ mod tests {
         assert!(lines.len() > DIFF_PREVIEW_LINES);
 
         let compact = render_diff_card("src/note.txt", &lines, 40, false);
+        // At width 40 the marker is char-truncated, but must still name click.
         assert!(
             compact
                 .iter()
-                .any(|line| line.contains("... (") && line.contains("Ctrl+O to expand)"))
+                .any(|line| line.contains("... (") && line.contains("or click"))
         );
         assert!(
             !compact
                 .iter()
-                .any(|line| line.contains("[Ctrl+O to collapse]"))
+                .any(|line| line.contains("or click to collapse]"))
         );
 
         let expanded = render_diff_card("src/note.txt", &lines, 40, true);
         assert!(
             expanded
                 .iter()
-                .any(|line| line.contains("[Ctrl+O to collapse]"))
+                .any(|line| line.contains("or click to collapse]"))
         );
         assert!(expanded.iter().any(|line| line.contains("- a")));
         assert!(expanded.iter().any(|line| line.contains("+ b")));

@@ -48,15 +48,14 @@ use crate::error::Error;
 use self::commands::{
     GoalAction, HELP, HOTKEYS, PlanAction, activate_picker_action, copy_all_messages,
     copy_last_reply, goal, is_new_session_command, notice_undo, open_resume_picker, plan,
-    plan_handoff_picker, reasoning, refresh_model_selection, resume, settings, show_diff,
-    show_skills, unqueue,
+    plan_handoff_picker, reasoning, resume, settings, show_diff, show_skills, unqueue,
 };
 use self::completion::handle_completion_key;
 use self::events::{Event, EventReader, Key};
 use self::input::{EditAction, Editor, Submission};
 use self::picker::{
-    open_model_picker, open_reasoning_picker, open_settings_picker, picker_is_editing,
-    picker_is_plan_handoff, take_picker_action,
+    open_model_picker, open_settings_picker, picker_is_editing, picker_is_plan_handoff,
+    take_picker_action,
 };
 use self::state::{Update, ViewState, advance_ticks, scroll, toggle_tool_expansion};
 use self::subagents::open_dashboard as open_subagent_dashboard;
@@ -442,15 +441,7 @@ fn handle_submission<R: Read>(
                 Err(usage) => state.notice(usage),
             },
             "model" if argument.is_empty() => open_model_picker(agent, state, false),
-            "model" => {
-                agent.switch_model(argument.to_string());
-                refresh_model_selection(agent, state);
-                if crate::model::is_codex(agent.config(), agent.model()) {
-                    open_reasoning_picker(agent, state, false);
-                } else {
-                    state.notice(format!("Switched to {}.", agent.model()));
-                }
-            }
+            "model" => commands::switch_model(agent, argument.to_string(), state),
             "reasoning" => reasoning(agent, argument, state),
             "settings" if argument.is_empty() => open_settings_picker(agent, state),
             "settings" => {

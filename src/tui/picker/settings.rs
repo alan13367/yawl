@@ -105,12 +105,12 @@ pub(in crate::tui) fn settings_category_picker_from(
                 config.max_tokens.to_string(),
             ),
             PickerItem {
-                label: "Codex reasoning effort".into(),
+                label: "Reasoning effort".into(),
                 description: config
                     .reasoning_effort
                     .clone()
                     .unwrap_or_else(|| "provider default".into()),
-                action: if crate::model::is_codex(config, model) {
+                action: if !crate::model::reasoning_efforts(config, model).is_empty() {
                     PickerAction::OpenReasoning { save: true }
                 } else {
                     PickerAction::EditSetting {

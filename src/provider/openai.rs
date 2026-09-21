@@ -21,6 +21,7 @@ pub struct OpenAi {
     headers: Vec<(String, String)>,
     compat: OpenAiCompatibility,
     prompt_cache_key: bool,
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAi {
@@ -35,6 +36,7 @@ impl OpenAi {
             headers: Vec::new(),
             compat: OpenAiCompatibility::default(),
             prompt_cache_key,
+            reasoning_effort: None,
         }
     }
 
@@ -54,7 +56,12 @@ impl OpenAi {
             headers,
             compat,
             prompt_cache_key,
+            reasoning_effort: None,
         }
+    }
+    pub(super) fn with_reasoning_effort(mut self, effort: Option<&str>) -> Self {
+        self.reasoning_effort = effort.map(str::to_string);
+        self
     }
 }
 
@@ -159,13 +166,21 @@ fn push_tool_images(out: &mut Vec<Value>, images: &mut Vec<(&str, &str, &super::
     images.clear();
 }
 
-fn build_body(req: &Request<'_>, compat: &OpenAiCompatibility, prompt_cache_key: bool) -> Value {
+fn build_body(
+    req: &Request<'_>,
+    compat: &OpenAiCompatibility,
+    prompt_cache_key: bool,
+    reasoning_effort: Option<&str>,
+) -> Value {
     let mut body = json!({
         "model": req.model,
         "stream": true,
         "messages": build_messages(req.system, req.messages, compat, req.supports_images),
     });
     body[compat.max_tokens_field()] = json!(req.max_tokens);
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
     if compat.usage_in_stream() {
         body["stream_options"] = json!({"include_usage": true});
     }
@@ -379,7 +394,13 @@ impl Decoder {
 impl Provider for OpenAi {
     fn stream_once(&self, req: &Request<'_>, on_event: &mut dyn FnMut(Event)) -> Result<(), Error> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = build_body(req, &self.compat, self.prompt_cache_key).to_string();
+        let body = build_body(
+            req,
+            &self.compat,
+            self.prompt_cache_key,
+            self.reasoning_effort.as_deref(),
+        )
+        .to_string();
         let mut request = self
             .agent
             .post(&url)
@@ -475,7 +496,7 @@ mod tests {
             prompt_cache_key: Some("session-test"),
         };
         assert_eq!(
-            build_body(&request, &OpenAiCompatibility::default(), false)["max_tokens"],
+            build_body(&request, &OpenAiCompatibility::default(), false, None)["max_tokens"],
             321
         );
     }
@@ -503,7 +524,7 @@ mod tests {
         );
         assert!(!local.prompt_cache_key);
         assert!(
-            build_body(&request, &local.compat, local.prompt_cache_key)
+            build_body(&request, &local.compat, local.prompt_cache_key, None)
                 .get("prompt_cache_key")
                 .is_none()
         );
@@ -513,7 +534,12 @@ mod tests {
             ..OpenAiCompatibility::default()
         };
         assert_eq!(
-            build_body(&request, &opted_in, opted_in.prompt_cache_key_supported())["prompt_cache_key"],
+            build_body(
+                &request,
+                &opted_in,
+                opted_in.prompt_cache_key_supported(),
+                None
+            )["prompt_cache_key"],
             "session-test"
         );
         let long_key = "x".repeat(65);
@@ -525,7 +551,8 @@ mod tests {
             build_body(
                 &long_request,
                 &opted_in,
-                opted_in.prompt_cache_key_supported()
+                opted_in.prompt_cache_key_supported(),
+                None
             )["prompt_cache_key"],
             "x".repeat(64)
         );
@@ -537,7 +564,8 @@ mod tests {
             build_body(
                 &without_cache_controls,
                 &opted_in,
-                opted_in.prompt_cache_key_supported()
+                opted_in.prompt_cache_key_supported(),
+                None
             )
             .get("prompt_cache_key")
             .is_none()
@@ -545,6 +573,43 @@ mod tests {
         assert!(
             OpenAi::new(crate::config::DEFAULT_OPENAI_BASE_URL.into(), "key".into())
                 .prompt_cache_key
+        );
+    }
+
+    #[test]
+    fn requests_include_selected_reasoning_and_omit_provider_default() {
+        let request = Request {
+            model: "custom",
+            system: "",
+            messages: &[],
+            tools: &[],
+            max_tokens: 100,
+            supports_images: false,
+            prompt_cache_control: true,
+            prompt_cache_key: None,
+        };
+        let compat = OpenAiCompatibility::default();
+        for effort in crate::config::REASONING_EFFORTS {
+            let provider = OpenAi::configured(
+                "http://localhost/v1".into(),
+                String::new(),
+                false,
+                Vec::new(),
+                compat.clone(),
+            )
+            .with_reasoning_effort(Some(effort));
+            let body = build_body(
+                &request,
+                &provider.compat,
+                false,
+                provider.reasoning_effort.as_deref(),
+            );
+            assert_eq!(body["reasoning_effort"], *effort);
+        }
+        assert!(
+            build_body(&request, &compat, false, None)
+                .get("reasoning_effort")
+                .is_none()
         );
     }
 
@@ -639,7 +704,7 @@ mod tests {
             prompt_cache_control: true,
             prompt_cache_key: Some("session-test"),
         };
-        let body = build_body(&request, &compat, false);
+        let body = build_body(&request, &compat, false, None);
         assert!(body.get("stream_options").is_none());
         assert_eq!(body["max_completion_tokens"], 123);
         assert_eq!(body["messages"][0]["name"], "shell");

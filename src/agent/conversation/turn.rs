@@ -479,7 +479,7 @@ impl Conversation {
                     registry.skills(),
                     crate::prompt::MainPromptState {
                         goal: (mode == TurnMode::Goal)
-                            .then_some(state.active_goal.as_deref())
+                            .then_some(state.session.active_goal())
                             .flatten(),
                         plan: plan_prompt(state.session.active_plan(), mode),
                         interactive_questions: self.questions.is_enabled(),
@@ -980,7 +980,6 @@ impl Conversation {
             .append_goal_complete(&assistant)?;
         self.messages.push(assistant);
         self.latest_turn_result.clone_from(&result);
-        self.persistent_mut().active_goal = None;
         sink(TurnEvent::AssistantDone);
         Ok(())
     }
@@ -1143,7 +1142,7 @@ impl Conversation {
                 registry.has_web_tools(),
                 registry.skills(),
                 crate::prompt::MainPromptState {
-                    goal: state.active_goal.as_deref(),
+                    goal: state.session.active_goal(),
                     plan: state
                         .session
                         .active_plan()

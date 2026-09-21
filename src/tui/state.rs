@@ -80,6 +80,13 @@ pub(super) struct ViewState {
     pub(super) scroll_bar_idle_ticks: u32,
     pub(super) scroll_geometry: Option<ScrollGeometry>,
     pub(super) scroll_bar_drag: Option<usize>,
+    /// Maps each transcript screen row (0..transcript height) to its owning
+    /// transcript entry, captured each frame for click-to-expand hit-testing.
+    /// `None` rows are padding, separators, or non-transcript content.
+    pub(super) transcript_row_entries: Vec<Option<usize>>,
+    /// Pending mouse press for click (press+release on the same cell)
+    /// detection. Drags select text instead of toggling expansion.
+    pub(super) tool_click_press: Option<MouseEvent>,
     pub(super) copy_toast_ticks: u8,
     pub(super) spinner_tick: usize,
     /// Start of the in-flight turn, driving the status-bar turn timer.
@@ -149,6 +156,8 @@ impl ViewState {
             scroll_bar_idle_ticks: 0,
             scroll_geometry: None,
             scroll_bar_drag: None,
+            transcript_row_entries: Vec::new(),
+            tool_click_press: None,
             copy_toast_ticks: 0,
             spinner_tick: 0,
             turn_started: None,
@@ -521,6 +530,7 @@ fn scroll_bar_jump(state: &mut ViewState, geometry: ScrollGeometry, row: usize, 
 pub(super) fn toggle_tool_expansion(state: &mut ViewState) {
     state.tools_expanded = !state.tools_expanded;
     state.transcript.clear_expansion_overrides();
+    state.tool_click_press = None;
     state.render_cache.invalidate();
     state.scroll_offset = 0;
     state.activity = if state.tools_expanded {
@@ -528,4 +538,48 @@ pub(super) fn toggle_tool_expansion(state: &mut ViewState) {
     } else {
         "tool output compact".into()
     };
+}
+
+/// Toggles a single tool/diff card, leaving every other entry untouched.
+/// Returns true when `index` names a tool card whose expansion changed.
+pub(super) fn toggle_tool_entry(state: &mut ViewState, index: usize) -> bool {
+    let Some(entry) = state.transcript.entry(index) else {
+        return false;
+    };
+    if !matches!(
+        entry,
+        super::transcript::Entry::Tool { .. } | super::transcript::Entry::Diff { .. }
+    ) {
+        return false;
+    }
+    let default = state.tools_expanded;
+    if state.transcript.toggle_entry_expanded(index, default) {
+        state.transcript.select_entry(index);
+        state.tool_click_press = None;
+        state.render_cache.invalidate();
+        true
+    } else {
+        false
+    }
+}
+
+fn entry_at_mouse_row(state: &ViewState, row: usize) -> Option<usize> {
+    state.transcript_row_entries.get(row).copied().flatten()
+}
+
+/// Click-to-expand hit-test: a press+release on the exact same cell toggles
+/// only that tool card. Drags (different cells) stay reserved for text
+/// selection and return false.
+pub(super) fn handle_tool_click(
+    state: &mut ViewState,
+    press: MouseEvent,
+    release: MouseEvent,
+) -> bool {
+    if press.row != release.row || press.column != release.column {
+        return false;
+    }
+    let Some(index) = entry_at_mouse_row(state, release.row) else {
+        return false;
+    };
+    toggle_tool_entry(state, index)
 }

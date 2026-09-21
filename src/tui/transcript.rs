@@ -252,7 +252,28 @@ impl Transcript {
         let Some(index) = self.selected_index() else {
             return false;
         };
+        self.set_entry_expanded(index, expanded)
+    }
+
+    pub(super) fn set_entry_expanded(&mut self, index: usize, expanded: bool) -> bool {
+        if index >= self.entries.len() {
+            return false;
+        }
         self.expansion_overrides.insert(index, expanded) != Some(expanded)
+    }
+
+    pub(super) fn toggle_entry_expanded(&mut self, index: usize, default: bool) -> bool {
+        if index >= self.entries.len() {
+            return false;
+        }
+        let current = self.entry_expanded(index, default);
+        self.set_entry_expanded(index, !current)
+    }
+
+    pub(super) fn select_entry(&mut self, index: usize) {
+        if index < self.entries.len() {
+            self.selected = Some(index);
+        }
     }
 
     pub(super) fn entry_expanded(&self, index: usize, default: bool) -> bool {

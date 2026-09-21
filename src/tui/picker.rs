@@ -221,6 +221,8 @@ pub(super) enum PickerAction {
     },
     ConnectCredential(CredentialChoice),
     ConnectChooseModel(String),
+    ConnectToggleReasoning(usize),
+    ConnectConfirmReasoning,
     ConnectRetry,
     ConnectCancelJob,
     CloseConnect,
@@ -473,6 +475,7 @@ pub(super) fn reasoning_description(effort: &str) -> &'static str {
         "high" => "More thorough reasoning",
         "xhigh" => "Very thorough reasoning",
         "max" => "Maximum available reasoning",
+        "ultra" => "Ultra reasoning effort",
         _ => "",
     }
 }
@@ -586,6 +589,20 @@ pub(super) fn take_picker_action(
     {
         picker.selected = usize::from(digit as u8 - b'1');
         return None;
+    }
+
+    if let Some(PickerAction::ConnectToggleReasoning(index)) =
+        picker.items.get(picker.selected).map(|item| &item.action)
+    {
+        let action = match key {
+            Key::Char(' ') => Some(PickerAction::ConnectToggleReasoning(*index)),
+            Key::Enter => Some(PickerAction::ConnectConfirmReasoning),
+            _ => None,
+        };
+        if action.is_some() {
+            state.picker = None;
+            return action;
+        }
     }
 
     match key {

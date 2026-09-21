@@ -52,7 +52,7 @@ Project skills stay disabled until you trust the repository. `yawl --trust-proje
 - `Shift+Enter`, `Alt+Enter`, and `Ctrl+J` insert newlines. Pastes over 400 characters or 8 lines appear as a `[Pasted #N]` marker in the editor; the model receives the full text.
 - `Ctrl+V` attaches a clipboard image, up to five PNG, JPEG, GIF, or WebP files of 5 MB each per prompt. On Linux this needs `wl-paste` or `xclip`.
 - `/` opens the command and skill menu. `@` tags a project file for the model.
-- `Tab` focuses the transcript when idle. Arrows move between blocks, `h`/`l` fold, `Enter` opens a viewer, `y` copies. `Ctrl+F` searches the transcript and `Ctrl+O` expands or collapses tool output.
+- `Tab` focuses the transcript when idle. Arrows move between blocks, `h`/`l` fold, `Enter` opens a viewer, `y` copies. `Ctrl+F` searches the transcript and `Ctrl+O` expands or collapses all tool output. Clicking a tool card expands or collapses only that card.
 - Drag to select text; releasing copies to the clipboard. The mouse wheel and `PageUp`/`PageDown` scroll.
 - `Escape` or `Ctrl+C` aborts the active model response or tool. Neither exits Yawl.
 - When the bell is on (the default), Yawl rings the terminal bell when a turn finishes and when the model asks a question, so an unfocused terminal window or tab announces activity. Turn it off with `/settings bell off` or Settings > Interface > Bell.
@@ -125,7 +125,13 @@ Every field is optional and validated on load. An out-of-range value fails start
     "omlx": {
       "baseUrl": "http://127.0.0.1:8000/v1",
       "api": "openai-completions",
-      "apiKey": "$OMLX_API_KEY"
+      "apiKey": "$OMLX_API_KEY",
+      "models": [
+        {
+          "id": "my-model",
+          "reasoning_efforts": ["low", "medium", "high"]
+        }
+      ]
     }
   }
 }
@@ -133,9 +139,13 @@ Every field is optional and validated on load. An out-of-range value fails start
 
 `apiKey` accepts `$ENV_VAR` and `${ENV_VAR}` references; omit it for keyless local servers. An optional `models` array supplies labels, token limits, and image support for `/model`; unlisted model IDs still work and remain text-only. `/connect` and Settings > Providers walk through the same setup interactively. `/settings provider NAME URL KEY` writes the direct form, with `-` in place of `KEY` removing a saved key.
 
+For compatible providers, `--setup` and `/connect` ask which reasoning efforts the selected model accepts. Use arrows to move, Space to toggle, and Enter to confirm. Choices are `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. The selections are saved in `providers.NAME.models[].reasoning_efforts` in `~/.yawl/config.json`; you can edit the array manually, or override it through a provider's `models` array in `./.yawl/config.json`. `reasoningEfforts` is also accepted. An empty or omitted list disables explicit reasoning effort for that model.
+
+Use `/reasoning` to choose an effort for the session, or `/settings reasoning_effort high` to save a default in the top-level `reasoning_effort` field. Only levels listed for the active model are sent, using the Chat Completions `reasoning_effort` field. `default` or `off` lets the endpoint choose. After editing the config file, use `/settings reload` or restart Yawl.
+
 ## Sessions, undo, and compaction
 
-Sessions are append-only JSONL under `~/.yawl/sessions/projects/<project-key>/`, scoped to the working directory. `-c` and `/resume` list sessions for the current directory; `--session ID` resumes from any directory. Messages, responses, reasoning, tool results, and usage are written as they happen; compaction records a summary without deleting the original log. If a tool result cannot be saved, the batch stops and Yawl retains the result in memory for a storage retry. Resuming an incomplete batch adds error results for missing outputs, marks execution as uncertain, and does not rerun those tools. `/usage` breaks out input, cache reads and writes, and output.
+Sessions are append-only JSONL under `~/.yawl/sessions/projects/<project-key>/`, scoped to the working directory. `-c` and `/resume` list sessions for the current directory; `--session ID` resumes from any directory. A resumed session continues with the model it last used, written as a `model_switch` event by `/model`, `/connect`, and `/settings model`; `-m MODEL` overrides it for that run, and a saved model whose provider is no longer configured falls back to the default. Messages, responses, reasoning, tool results, and usage are written as they happen; compaction records a summary without deleting the original log. If a tool result cannot be saved, the batch stops and Yawl retains the result in memory for a storage retry. Resuming an incomplete batch adds error results for missing outputs, marks execution as uncertain, and does not rerun those tools. `/usage` breaks out input, cache reads and writes, and output.
 
 `/undo` saves a file's pre-image the first time `write_file` or `edit_file` touches it, capped at 32 MiB per file, and restores it on request. An undo intent is saved before restoration, and the checkpoint stays available until the history change commits. If interrupted, the next turn or `/undo` finishes the pending operation before starting another. In git repos where the agent moved `HEAD`, it soft-resets to the pre-turn commit. Files changed through `shell` or exec tools are not tracked. `/diff` uses the same pre-images: one diff card per touched file, comparing the oldest pre-image with the current contents, so files written back unchanged disappear and `/undo`-restored files drop out. Files that are non-UTF-8 or over 1 MiB on either side are listed in a notice instead of a card.
 

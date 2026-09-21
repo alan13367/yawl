@@ -52,6 +52,7 @@ pub(crate) enum ConfigChange {
     ProviderModel {
         name: String,
         model: String,
+        reasoning_efforts: Vec<String>,
     },
     AnthropicBaseUrl(String),
     OpenAiBaseUrl(String),
@@ -182,8 +183,18 @@ impl ConfigChange {
                 }
                 validate_http_url(base_url)
             }
-            Self::ProviderModel { name, model } => {
+            Self::ProviderModel {
+                name,
+                model,
+                reasoning_efforts,
+            } => {
                 validate_provider_name(name)?;
+                if reasoning_efforts
+                    .iter()
+                    .any(|effort| !super::REASONING_EFFORTS.contains(&effort.as_str()))
+                {
+                    return Err(Error::Config("unsupported reasoning effort".into()));
+                }
                 if model.trim().is_empty() {
                     Err(Error::Config("provider model must not be empty".into()))
                 } else {
@@ -330,7 +341,11 @@ impl ConfigChange {
                 }
                 Ok(())
             }
-            Self::ProviderModel { name, model } => {
+            Self::ProviderModel {
+                name,
+                model,
+                reasoning_efforts,
+            } => {
                 let providers = object_field(root, "providers")?;
                 let provider = providers
                     .entry(name.clone())
@@ -348,11 +363,17 @@ impl ConfigChange {
                         "providers.{name}.models must be an array"
                     )));
                 };
-                if !models
-                    .iter()
-                    .any(|entry| entry.get("id").and_then(Value::as_str) == Some(model))
+                if let Some(entry) = models
+                    .iter_mut()
+                    .find(|entry| entry.get("id").and_then(Value::as_str) == Some(model))
                 {
-                    models.push(json!({"id": model}));
+                    let entry = entry.as_object_mut().ok_or_else(|| {
+                        Error::Config("provider model must be a JSON object".into())
+                    })?;
+                    entry.remove("reasoningEfforts");
+                    entry.insert("reasoning_efforts".into(), json!(reasoning_efforts));
+                } else {
+                    models.push(json!({"id": model, "reasoning_efforts": reasoning_efforts}));
                 }
                 Ok(())
             }
@@ -413,10 +434,15 @@ impl ConfigChange {
             } => config.providers.get(name).is_some_and(|provider| {
                 provider.base_url == *base_url && api_key_is_effective(provider, api_key.as_deref())
             }),
-            Self::ProviderModel { name, model } => config
-                .providers
-                .get(name)
-                .is_some_and(|provider| provider.models.iter().any(|entry| entry.id == *model)),
+            Self::ProviderModel {
+                name,
+                model,
+                reasoning_efforts,
+            } => config.providers.get(name).is_some_and(|provider| {
+                provider.models.iter().any(|entry| {
+                    entry.id == *model && entry.reasoning_efforts == *reasoning_efforts
+                })
+            }),
             Self::AnthropicBaseUrl(url) => config.anthropic_base_url == *url,
             Self::OpenAiBaseUrl(url) => config.openai_base_url == *url,
             Self::AnthropicApiKey(key) => config.anthropic_api_key == *key,
@@ -595,6 +621,62 @@ mod tests {
         )
         .expect("saved config should remain JSON");
         assert_eq!(saved["unknown"]["keep"], true);
+    }
+
+    #[test]
+    fn model_reasoning_save_preserves_metadata_and_reports_project_override() {
+        let dirs = TestDirs::new("model-reasoning");
+        fs::create_dir_all(&dirs.home).unwrap();
+        fs::write(dirs.home.join("config.json"), json!({
+            "providers": {"local": {"base_url": "http://localhost/v1", "models": [
+                {"id": "m", "name": "My model", "input": ["image"], "reasoningEfforts": ["low"], "custom": true},
+                {"id": "other", "reasoning_efforts": ["medium"]}
+            ]}}
+        }).to_string()).unwrap();
+        let config = dirs.config();
+        let change = ConfigChange::ProviderModel {
+            name: "local".into(),
+            model: "m".into(),
+            reasoning_efforts: vec!["high".into(), "ultra".into()],
+        };
+        let outcome = config.change_global(change.clone()).unwrap();
+        assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
+        assert_eq!(
+            outcome.config.providers["local"].models[0].reasoning_efforts,
+            ["high", "ultra"]
+        );
+        let saved: Value =
+            serde_json::from_str(&fs::read_to_string(dirs.home.join("config.json")).unwrap())
+                .unwrap();
+        let models = &saved["providers"]["local"]["models"];
+        assert_eq!(models[0]["name"], "My model");
+        assert_eq!(models[0]["input"], json!(["image"]));
+        assert_eq!(models[0]["custom"], true);
+        assert!(models[0].get("reasoningEfforts").is_none());
+        assert_eq!(models[1]["reasoning_efforts"], json!(["medium"]));
+
+        fs::create_dir_all(&dirs.project).unwrap();
+        fs::write(
+            dirs.project.join("config.json"),
+            r#"{"providers":{"local":{"models":[{"id":"m","reasoning_efforts":[]}]}}}"#,
+        )
+        .unwrap();
+        let outcome = config.change_global(change).unwrap();
+        assert_eq!(outcome.effect, ConfigChangeEffect::Overridden);
+        assert!(
+            outcome.config.providers["local"].models[0]
+                .reasoning_efforts
+                .is_empty()
+        );
+        assert!(
+            config
+                .change_global(ConfigChange::ProviderModel {
+                    name: "local".into(),
+                    model: "m".into(),
+                    reasoning_efforts: vec!["typo".into()]
+                })
+                .is_err()
+        );
     }
 
     #[test]

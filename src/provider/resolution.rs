@@ -15,12 +15,22 @@ pub fn resolve(model_spec: &str, cfg: &Config) -> Result<(Box<dyn Provider>, Str
         crate::model::ProviderSelection::Anthropic => anthropic_provider(cfg, bare),
         crate::model::ProviderSelection::OpenAi => openai_provider(cfg, bare),
         crate::model::ProviderSelection::Codex => {
-            Ok((Box::new(codex::Codex::from_config(cfg)?), bare.to_string()))
+            Ok((
+                Box::new(codex::Codex::from_config(cfg)?.with_reasoning_effort(
+                    crate::model::effective_reasoning_effort(cfg, model_spec),
+                )),
+                bare.to_string(),
+            ))
         }
         crate::model::ProviderSelection::Custom {
             name,
             config: provider,
-        } => custom_provider(name, provider, bare),
+        } => custom_provider(
+            name,
+            provider,
+            bare,
+            crate::model::effective_reasoning_effort(cfg, model_spec),
+        ),
     }
 }
 
@@ -28,6 +38,7 @@ fn custom_provider(
     name: &str,
     provider: &crate::config::ProviderConfig,
     model: &str,
+    reasoning_effort: Option<&str>,
 ) -> Result<(Box<dyn Provider>, String), Error> {
     if provider.api != "openai-completions" {
         return Err(Error::Config(format!(
@@ -69,13 +80,16 @@ fn custom_provider(
         )));
     }
     Ok((
-        Box::new(openai::OpenAi::configured(
-            provider.base_url.clone(),
-            key,
-            provider.auth_header.unwrap_or(true),
-            headers,
-            compat,
-        )),
+        Box::new(
+            openai::OpenAi::configured(
+                provider.base_url.clone(),
+                key,
+                provider.auth_header.unwrap_or(true),
+                headers,
+                compat,
+            )
+            .with_reasoning_effort(reasoning_effort),
+        ),
         model.to_string(),
     ))
 }

@@ -13,7 +13,7 @@ use super::commands::{
     promote_queued, unqueue,
 };
 use super::completion::handle_completion_key;
-use super::events::{Event, EventReader, Key, MouseEvent};
+use super::events::{Event, EventReader, Key, MouseEvent, MouseKind};
 use super::input::{EditAction, Editor, Submission};
 use super::picker::{
     ActivePickers, PickerAction, SettingsCategory, SettingsItem, SettingsLocation,
@@ -21,8 +21,8 @@ use super::picker::{
     take_picker_action, web_search_provider_picker,
 };
 use super::state::{
-    COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, scroll,
-    toggle_tool_expansion,
+    COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, handle_tool_click,
+    scroll, toggle_tool_expansion,
 };
 use super::terminal::Terminal;
 
@@ -534,7 +534,25 @@ pub(super) fn handle_mouse_selection(
     event: MouseEvent,
 ) -> Result<(), Error> {
     if handle_scroll_bar_mouse(state, event) {
+        state.tool_click_press = None;
         return Ok(());
+    }
+    match event.kind {
+        MouseKind::Press => {
+            state.tool_click_press = Some(event);
+        }
+        MouseKind::Release => {
+            let press = state.tool_click_press.take();
+            let clicked = press.is_some_and(|press| handle_tool_click(state, press, event));
+            // Always let the terminal clear its pending selection so a click
+            // never leaves a stale highlight behind.
+            let copied = terminal.handle_mouse(event)?;
+            if copied && !clicked {
+                state.copy_toast_ticks = COPY_TOAST_TICKS;
+            }
+            return Ok(());
+        }
+        MouseKind::Drag | MouseKind::Move => {}
     }
     if terminal.handle_mouse(event)? {
         state.copy_toast_ticks = COPY_TOAST_TICKS;

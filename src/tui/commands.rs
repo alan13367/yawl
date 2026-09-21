@@ -98,7 +98,8 @@ Keyboard shortcuts
 | | `Enter` | Open full-screen viewer |
 | | `y` | Copy selected block |
 | | `Escape`, `Ctrl+C` | Return to editor |
-| | `Ctrl+O` | Expand / collapse tool output |
+| | `Ctrl+O` | Expand / collapse all tool output |
+| | Click | Expand / collapse that tool card only |
 | | `Ctrl+F` | Search: Enter next, Up prev, Esc closes |
 | | `PgUp`/`PgDn`, Wheel | Scroll; drag scroll bar to jump |
 | | Drag (left button) | Select text; release copies to clipboard |
@@ -511,6 +512,23 @@ pub(super) fn handle_queue_picker_action(
     }
 }
 
+/// Switches the session model and follows up with the reasoning picker for
+/// Codex models. The switch is recorded in the session log so a later resume
+/// keeps using it.
+pub(super) fn switch_model(agent: &mut Agent, model: String, state: &mut ViewState) {
+    match agent.switch_model(model) {
+        Ok(()) => {
+            refresh_model_selection(agent, state);
+            if crate::model::is_codex(agent.config(), agent.model()) {
+                open_reasoning_picker(agent, state, false);
+            } else {
+                state.notice(format!("Switched to {}.", agent.model()));
+            }
+        }
+        Err(error) => state.notice(format!("Could not switch model: {error}")),
+    }
+}
+
 pub(super) fn activate_picker_action(
     agent: &mut Agent,
     state: &mut ViewState,
@@ -530,15 +548,7 @@ pub(super) fn activate_picker_action(
         return;
     };
     match action {
-        PickerAction::SwitchModel(model) => {
-            agent.switch_model(model);
-            refresh_model_selection(agent, state);
-            if crate::model::is_codex(agent.config(), agent.model()) {
-                open_reasoning_picker(agent, state, false);
-            } else {
-                state.notice(format!("Switched to {}.", agent.model()));
-            }
-        }
+        PickerAction::SwitchModel(model) => switch_model(agent, model, state),
         PickerAction::SaveModel(model) => {
             if settings(agent, &format!("model {model}"), state) {
                 if crate::model::is_codex(agent.config(), agent.model()) {
@@ -664,11 +674,19 @@ pub(super) fn activate_picker_action(
                     for effect in effects {
                         notice_config_effect(agent.config(), effect, state);
                     }
-                    if let Some(model) = session_model {
-                        agent.switch_model(model);
-                    }
+                    let switch_error = session_model
+                        .map(|model| agent.switch_model(model))
+                        .transpose()
+                        .err();
                     refresh_model_selection(agent, state);
-                    state.notice(format!("{} connection saved.", plan.provider_label));
+                    if let Some(error) = switch_error {
+                        state.notice(format!(
+                            "{} connection saved, but could not switch model: {error}.",
+                            plan.provider_label
+                        ));
+                    } else {
+                        state.notice(format!("{} connection saved.", plan.provider_label));
+                    }
                 }
                 Err(error) => state.notice(format!("Could not save connection: {error}")),
             }
@@ -774,6 +792,8 @@ pub(super) fn activate_picker_action(
         | PickerAction::ConnectChooseProvider(_)
         | PickerAction::ConnectCredential(_)
         | PickerAction::ConnectChooseModel(_)
+        | PickerAction::ConnectToggleReasoning(_)
+        | PickerAction::ConnectConfirmReasoning
         | PickerAction::ConnectRetry
         | PickerAction::ConnectCancelJob
         | PickerAction::CloseConnect
@@ -973,6 +993,7 @@ pub(super) fn resume(agent: &mut Agent, selector: &str, state: &mut ViewState) {
 }
 
 pub(super) fn load_session(agent: &mut Agent, id: &str, state: &mut ViewState) {
+    let previous_model = agent.model().to_string();
     match agent.load_session(id) {
         Ok(()) => {
             let queued_inputs = std::mem::take(&mut state.queued_inputs);
@@ -980,7 +1001,12 @@ pub(super) fn load_session(agent: &mut Agent, id: &str, state: &mut ViewState) {
             *state = ViewState::from_agent(agent);
             state.queued_inputs = queued_inputs;
             state.pending_actions = pending_actions;
-            state.notice(format!("Resumed session {id}."));
+            let model = agent.model().to_string();
+            state.notice(if model == previous_model {
+                format!("Resumed session {id}.")
+            } else {
+                format!("Resumed session {id} with {model}.")
+            });
         }
         Err(error) => state.notice(format!("Could not resume '{id}': {error}")),
     }

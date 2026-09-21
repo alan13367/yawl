@@ -472,12 +472,43 @@ fn configure_entry_with(
         return Ok(None);
     };
     let default_model = format!("{name}:{model}");
+    let supported = crate::model::saved_reasoning_efforts(config, &default_model);
+    let efforts = crate::config::REASONING_EFFORTS;
+    let choices = efforts
+        .iter()
+        .map(|effort| Choice::new(*effort, ""))
+        .collect::<Vec<_>>();
+    let initial = initial_reasoning_selection(supported.as_deref(), efforts.len());
+    println!("Select the reasoning levels this model accepts. Leave all clear for none.");
+    let Some(selected) = select::select_many("Supported reasoning efforts", &choices, &initial)?
+    else {
+        return Ok(None);
+    };
+    let reasoning_efforts = selected
+        .into_iter()
+        .map(|index| efforts[index].to_string())
+        .collect::<Vec<_>>();
+    summary.push(format!(
+        "supported reasoning efforts: {}",
+        if reasoning_efforts.is_empty() {
+            "none".into()
+        } else {
+            reasoning_efforts.join(", ")
+        }
+    ));
     summary.push(format!("default model: {default_model}"));
-    let changes = vec![ConfigChange::Provider {
-        name: name.to_string(),
-        base_url: url,
-        api_key: authentication.config_value().map(str::to_string),
-    }];
+    let changes = vec![
+        ConfigChange::Provider {
+            name: name.to_string(),
+            base_url: url,
+            api_key: authentication.config_value().map(str::to_string),
+        },
+        ConfigChange::ProviderModel {
+            name: name.to_string(),
+            model,
+            reasoning_efforts,
+        },
+    ];
     Ok(Some(SetupPlan {
         changes,
         summary,
@@ -549,6 +580,21 @@ fn resolve_model_selection(
     }
 }
 
+/// Initial checkboxes for the reasoning-levels screen. `None` (typically a
+/// fresh provider or an unlisted model) is assumed to support every level;
+/// `Some(vec![])` is the explicit "send no effort" choice and stays clear so
+/// it survives reconfiguration. `count` is the total level count.
+fn initial_reasoning_selection(supported: Option<&[&str]>, count: usize) -> Vec<usize> {
+    match supported {
+        None => (0..count).collect(),
+        Some(list) => crate::config::REASONING_EFFORTS
+            .iter()
+            .enumerate()
+            .filter_map(|(index, effort)| list.contains(effort).then_some(index))
+            .collect(),
+    }
+}
+
 fn prompt_model_id() -> Result<String, Error> {
     loop {
         let value = terminal::prompt("Model ID")?;
@@ -609,5 +655,19 @@ mod tests {
             .expect("canceling selection should succeed");
 
         assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn reasoning_selection_defaults_to_all_levels_for_unknown_models() {
+        let all = crate::config::REASONING_EFFORTS.len();
+        let initial = initial_reasoning_selection(None, all);
+        assert_eq!(initial, (0..all).collect::<Vec<_>>());
+
+        let saved = ["low", "ultra"];
+        let initial = initial_reasoning_selection(Some(&saved), all);
+        assert_eq!(initial, vec![1, 6]); // low and ultra hold their positions
+
+        let explicit_none = initial_reasoning_selection(Some(&[]), all);
+        assert!(explicit_none.is_empty());
     }
 }

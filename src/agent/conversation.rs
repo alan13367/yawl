@@ -74,7 +74,6 @@ struct PersistentState {
     subagents: SubagentManager,
     checkpoints: Checkpoints,
     background: BackgroundProcessManager,
-    active_goal: Option<String>,
 }
 
 struct ChildState {
@@ -127,7 +126,6 @@ impl Conversation {
     ) -> Self {
         let subagents = SubagentManager::new(session.id.clone(), config.max_subagents);
         let checkpoints = Checkpoints::open(&config.home_dir, &session.id, work_tree);
-        let active_goal = session.active_goal().map(str::to_string);
         let context_usage = session
             .context()
             .filter(|usage| usage.model == model && usage.messages <= messages.len())
@@ -141,7 +139,6 @@ impl Conversation {
                 subagents,
                 checkpoints,
                 background: BackgroundProcessManager::default(),
-                active_goal,
             }),
             context_tokens: context_usage.as_ref().map_or(0, |usage| usage.tokens),
             context_usage,
@@ -257,7 +254,7 @@ impl Conversation {
     }
 
     pub(crate) fn active_goal(&self) -> Option<&str> {
-        self.persistent_state().active_goal.as_deref()
+        self.persistent_state().session.active_goal()
     }
 
     pub(crate) fn plan_state(&self) -> Option<&PlanState> {
@@ -293,18 +290,15 @@ impl Conversation {
             .session
             .append_goal_start(&goal, &message)?;
         self.messages.push(message);
-        self.persistent_mut().active_goal = Some(goal);
         Ok(warning)
     }
 
     pub(crate) fn cancel_goal(&mut self) -> Result<bool, Error> {
         self.recover_history()?;
-        if self.persistent_state().active_goal.is_none() {
+        if self.persistent_state().session.active_goal().is_none() {
             return Ok(false);
         }
-        let state = self.persistent_mut();
-        state.session.append_goal_cancel()?;
-        state.active_goal = None;
+        self.persistent_mut().session.append_goal_cancel()?;
         Ok(true)
     }
 
@@ -370,10 +364,20 @@ impl Conversation {
         Ok(())
     }
 
-    pub(crate) fn switch_model(&mut self, model: String) {
+    pub(crate) fn switch_model(&mut self, model: String) -> Result<(), Error> {
+        self.adopt_model(model)
+    }
+
+    /// Uses `model` for later requests and records it in the session log, so
+    /// resuming this session continues with the last used model.
+    fn adopt_model(&mut self, model: String) -> Result<(), Error> {
+        if let ConversationKind::Persistent(state) = &mut self.kind {
+            state.session.append_model_switch(&model)?;
+        }
         self.model = model;
         self.context_tokens = 0;
         self.context_usage = None;
+        Ok(())
     }
 
     pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
@@ -405,7 +409,6 @@ impl Conversation {
             subagents: SubagentManager::new(session_id.clone(), self.config.max_subagents),
             checkpoints: Checkpoints::open(&self.config.home_dir, &session_id, cwd),
             background: BackgroundProcessManager::default(),
-            active_goal: None,
         });
         self.messages.clear();
         self.context_tokens = 0;
@@ -455,7 +458,9 @@ impl Conversation {
         let cwd = crate::config::working_dir();
         let (session, messages) =
             Session::open_searching(&self.config.session_dirs(&cwd).search, id)?;
-        let active_goal = session.active_goal().map(str::to_string);
+        // Continue with the model the session last used, unless its provider is
+        // gone from the config.
+        let model = session.resumed_model(&self.config, &self.model);
         self.persistent_state().subagents.shutdown_and_discard();
         self.persistent_state().background.shutdown_and_discard();
         let session_id = session.id.clone();
@@ -464,9 +469,9 @@ impl Conversation {
             subagents: SubagentManager::new(session_id.clone(), self.config.max_subagents),
             checkpoints: Checkpoints::open(&self.config.home_dir, &session_id, cwd),
             background: BackgroundProcessManager::default(),
-            active_goal,
         });
         self.messages = messages;
+        self.model = model;
         self.context_usage = self
             .persistent_state()
             .session
@@ -519,12 +524,12 @@ impl Conversation {
             state.subagents.set_limit(self.config.max_subagents);
         }
         if changes_model {
-            self.model = self
+            let model = self
                 .config
                 .model
                 .clone()
                 .ok_or_else(|| Error::Config("no model configured".into()))?;
-            self.context_tokens = 0;
+            self.adopt_model(model)?;
         }
         Ok(outcome.effect)
     }
@@ -542,12 +547,12 @@ impl Conversation {
             state.subagents.set_limit(self.config.max_subagents);
         }
         if changes_model {
-            self.model = self
+            let model = self
                 .config
                 .model
                 .clone()
                 .ok_or_else(|| Error::Config("no model configured".into()))?;
-            self.context_tokens = 0;
+            self.adopt_model(model)?;
         }
         Ok(outcome.effects)
     }

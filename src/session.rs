@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::Config;
 use crate::error::Error;
 use crate::provider::{Message, Role, TokenUsage, UsageSummary};
 
@@ -61,11 +62,17 @@ enum SessionEvent {
         created_unix: u64,
         /// Canonical working directory the session belongs to.
         cwd: String,
-        /// Model active when the session started.
+        /// Model active when the session started; `model_switch` events
+        /// replace it.
         model: String,
     },
     Message {
         message: Message,
+    },
+    /// The user switched the active model mid-session; replays adopt the most
+    /// recent switch so resuming continues with the last used model.
+    ModelSwitch {
+        model: String,
     },
     /// `replaced` messages beginning at `start` (at that point in replay)
     /// were folded into `summary`. Older logs omit `start` and default to the
@@ -148,6 +155,9 @@ pub struct Session {
     rollback_to: Option<u64>,
     #[cfg(test)]
     fail_after_appends: Option<usize>,
+    /// Last model used in this log: the header model unless a later switch
+    /// event exists.
+    model: String,
     active_goal: Option<String>,
     active_plan: Option<PlanState>,
     plan_before_turn: Option<PlanState>,
@@ -158,6 +168,7 @@ pub struct Session {
 
 struct ReplayedSession {
     messages: Vec<Message>,
+    model: String,
     active_goal: Option<String>,
     active_plan: Option<PlanState>,
     plan_before_turn: Option<PlanState>,
@@ -201,6 +212,7 @@ impl Session {
             rollback_to: None,
             #[cfg(test)]
             fail_after_appends: None,
+            model: model.to_string(),
             active_goal: None,
             active_plan: None,
             plan_before_turn: None,
@@ -238,6 +250,7 @@ impl Session {
             rollback_to: None,
             #[cfg(test)]
             fail_after_appends: None,
+            model: replayed.model,
             active_goal: replayed.active_goal,
             active_plan: replayed.active_plan,
             plan_before_turn: replayed.plan_before_turn,
@@ -284,6 +297,33 @@ impl Session {
         found
             .map(|(_, session)| session)
             .ok_or_else(|| Error::Config(format!("session '{id}' not found")))
+    }
+
+    /// The model recorded at creation, replaced by the most recent switch.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The model to continue a resumed session with: the last one it used,
+    /// unless its provider is no longer configured, in which case `fallback`
+    /// stays in effect.
+    pub fn resumed_model(&self, config: &Config, fallback: &str) -> String {
+        if self.model.is_empty() || !crate::model::is_resolvable(config, &self.model) {
+            return fallback.to_string();
+        }
+        self.model.clone()
+    }
+
+    /// Records a mid-session model change so later resumes adopt it.
+    pub fn append_model_switch(&mut self, model: &str) -> Result<(), Error> {
+        if model == self.model {
+            return Ok(());
+        }
+        self.append(&SessionEvent::ModelSwitch {
+            model: model.to_string(),
+        })?;
+        self.model = model.to_string();
+        Ok(())
     }
 
     pub fn append_message(&mut self, message: &Message) -> Result<(), Error> {
@@ -552,6 +592,7 @@ fn validate_id(id: &str) -> Result<(), Error> {
 fn replay(path: &Path) -> Result<ReplayedSession, Error> {
     let file = File::open(path)?;
     let mut messages: Vec<Message> = Vec::new();
+    let mut model = String::new();
     let mut active_goal = None;
     let mut active_plan = None;
     let mut plan_before_turn = None;
@@ -566,8 +607,12 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
         }
         if !has_meta {
             match serde_json::from_str::<SessionEvent>(&line)? {
-                SessionEvent::Meta { .. } => {
+                SessionEvent::Meta {
+                    model: header_model,
+                    ..
+                } => {
                     has_meta = true;
+                    model = header_model;
                     continue;
                 }
                 _ => {
@@ -584,6 +629,7 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
         };
         match event {
             SessionEvent::Meta { .. } => {}
+            SessionEvent::ModelSwitch { model: switched } => model = switched,
             SessionEvent::UndoStarted { undo } => pending_undo = Some(Box::new(undo)),
             SessionEvent::UndoFinished => pending_undo = None,
             SessionEvent::Context { context: value } => context = Some(value),
@@ -691,6 +737,7 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
     }
     Ok(ReplayedSession {
         messages,
+        model,
         active_goal,
         active_plan,
         plan_before_turn,
@@ -707,7 +754,7 @@ pub struct SessionInfo {
     pub preview: String,
     /// Canonical working directory recorded at session creation.
     pub cwd: String,
-    /// Model recorded at session creation.
+    /// Last model used in the session: created with, then any `/model` switch.
     pub model: String,
 }
 
@@ -761,6 +808,12 @@ struct SessionHeader {
     has_message: bool,
 }
 
+/// Cheap guard so listing many large logs stays fast: only lines that could
+/// carry a model switch are parsed once the preview is known. The scan still
+/// reads the whole file so a late switch is not missed, but after the preview
+/// it reuses one byte buffer and skips serde unless the marker bytes match.
+const MODEL_SWITCH_MARKER: &str = "\"type\":\"model_switch\"";
+
 fn read_header(path: &Path) -> SessionHeader {
     let mut header = SessionHeader {
         cwd: String::new(),
@@ -771,31 +824,44 @@ fn read_header(path: &Path) -> SessionHeader {
     let Ok(file) = File::open(path) else {
         return header;
     };
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            break;
-        };
-        match serde_json::from_str::<SessionEvent>(&line) {
+    let mut reader = BufReader::new(file);
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        // After the preview is found, only later model switches matter.
+        if !header.preview.is_empty() {
+            if std::str::from_utf8(&buf).is_ok_and(|line| line.contains(MODEL_SWITCH_MARKER))
+                && let Ok(SessionEvent::ModelSwitch { model }) = serde_json::from_slice(&buf)
+            {
+                header.model = model;
+            }
+            continue;
+        }
+        match serde_json::from_slice::<SessionEvent>(&buf) {
             Ok(SessionEvent::Meta { cwd, model, .. }) => {
                 header.cwd = cwd;
                 header.model = model;
             }
+            Ok(SessionEvent::ModelSwitch { model }) => header.model = model,
             Ok(SessionEvent::Message { message }) => {
                 header.has_message = true;
-                if message.role == Role::User && header.preview.is_empty() {
+                if message.role == Role::User {
                     let first = message.content.lines().next().unwrap_or("");
                     header.preview = crate::error::truncate(first, 60);
-                    return header;
                 }
             }
             Ok(
                 SessionEvent::GoalStart { message, .. } | SessionEvent::PlanStart { message, .. },
             ) => {
                 header.has_message = true;
-                if message.role == Role::User && header.preview.is_empty() {
+                if message.role == Role::User {
                     let first = message.content.lines().next().unwrap_or("");
                     header.preview = crate::error::truncate(first, 60);
-                    return header;
                 }
             }
             Ok(SessionEvent::GoalComplete { .. }) => {
@@ -1211,6 +1277,57 @@ mod tests {
         assert_eq!(infos[0].model, "glm-5.3");
         assert_eq!(infos[0].preview, "hello there");
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn model_switches_survive_replay_and_listing() -> Result<(), Error> {
+        let root = temp_root("model-switch");
+        let dir = root.join("sessions");
+        let mut session = Session::create(&dir, Path::new("/projects/yawl"), "first-model")?;
+        let id = session.id.clone();
+        session.append_message(&Message::user("hello there"))?;
+        assert_eq!(session.model(), "first-model");
+        // A switch to the current model writes nothing.
+        session.append_model_switch("first-model")?;
+        session.append_model_switch("second-model")?;
+        session.append_message(&Message::assistant("answer".into(), vec![]))?;
+        session.append_model_switch("third-model")?;
+        assert_eq!(session.model(), "third-model");
+        drop(session);
+
+        let (session, messages) = Session::open(&dir, &id)?;
+        assert_eq!(session.model(), "third-model");
+        assert_eq!(messages.len(), 2);
+
+        let infos = list(&dir)?;
+        assert_eq!(infos[0].model, "third-model");
+        assert_eq!(infos[0].preview, "hello there");
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_model_prefers_the_last_switch_when_it_resolves() -> Result<(), Error> {
+        let dir = temp_root("resumed-model");
+        let config = Config::test_default();
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "first-model")?;
+        session.append_message(&Message::user("hi"))?;
+        assert_eq!(session.resumed_model(&config, "configured"), "first-model");
+
+        session.append_model_switch("openai-codex:gpt-5.6-sol")?;
+        assert_eq!(
+            session.resumed_model(&config, "configured"),
+            "openai-codex:gpt-5.6-sol"
+        );
+
+        // An unknown custom provider cannot route, so the fallback stays.
+        session.append_model_switch("removed-provider:some-model")?;
+        assert_eq!(session.resumed_model(&config, "configured"), "configured");
+
+        let (reopened, _) = Session::open(&dir, &session.id)?;
+        assert_eq!(reopened.model(), "removed-provider:some-model");
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 

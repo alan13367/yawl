@@ -20,8 +20,8 @@ pub(crate) use schema::validate_file_shape;
 pub(crate) use storage::{read_json_object, resolve_config_value, write_json_object};
 pub use types::{ModelConfig, OpenAiCompatibility, ProviderConfig, WebSearchProvider};
 pub(crate) use types::{
-    StatusBarConfig, StatusBarFormat, StatusBarItemConfig, StatusBarKind, StatusBarStyle,
-    StatusBarVisibility, UiColor,
+    REASONING_EFFORTS, StatusBarConfig, StatusBarFormat, StatusBarItemConfig, StatusBarKind,
+    StatusBarStyle, StatusBarVisibility, UiColor,
 };
 
 use storage::{object_field, validate_provider_name};
@@ -48,7 +48,7 @@ pub struct Config {
     pub anthropic_base_url: String,
     pub openai_base_url: String,
     pub max_tokens: u32,
-    /// Reasoning effort sent to OpenAI Codex (`minimal` through `max`).
+    /// Reasoning effort sent when supported by the active model (`minimal` through `ultra`).
     /// `None` leaves the provider default unchanged.
     pub reasoning_effort: Option<String>,
     pub hide_reasoning: bool,

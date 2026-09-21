@@ -92,6 +92,13 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     })?;
     project_trust::resolve(&mut config, cli.trust_project, stdin_is_terminal)?;
     let (session, messages) = open_session(&config, &cli, &model)?;
+    // An explicit `-m` wins; otherwise a resumed session continues with the
+    // model it last used.
+    let model = if cli.model.is_some() {
+        model
+    } else {
+        session.resumed_model(&config, &model)
+    };
     let mut agent = Agent::new(config, model, session, messages);
 
     if cli.prompt.is_empty() && stdin_is_terminal {

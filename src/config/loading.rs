@@ -110,7 +110,7 @@ impl Config {
         if let Some(value) = file.reasoning_effort {
             match value.as_str() {
                 "default" | "off" => self.reasoning_effort = None,
-                level @ ("minimal" | "low" | "medium" | "high" | "xhigh" | "max") => {
+                level if super::REASONING_EFFORTS.contains(&level) => {
                     self.reasoning_effort = Some(level.to_string());
                 }
                 _ => return Err(Error::Config("unsupported reasoning effort".into())),
@@ -315,11 +315,11 @@ fn default_local_providers() -> HashMap<String, ProviderConfig> {
     providers
 }
 
-/// Valid OpenAI Codex reasoning efforts. `default` and `off` omit the
+/// Valid reasoning efforts. `default` and `off` omit the
 /// request field and let the service choose its default behavior.
 pub fn normalize_reasoning_effort(value: &str) -> Option<&str> {
     match value {
-        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(value),
+        level if super::REASONING_EFFORTS.contains(&level) => Some(value),
         "default" | "off" => None,
         _ => None,
     }
@@ -410,6 +410,11 @@ mod tests {
     #[test]
     fn reasoning_effort_accepts_levels_and_default() -> Result<(), Error> {
         let mut cfg = test_config();
+        for effort in super::super::REASONING_EFFORTS {
+            cfg.apply(serde_json::from_value(json!({"reasoning_effort": effort}))?)?;
+            assert_eq!(cfg.reasoning_effort.as_deref(), Some(*effort));
+            assert_eq!(normalize_reasoning_effort(effort), Some(*effort));
+        }
         cfg.apply(serde_json::from_value(json!({"reasoning_effort": "high"}))?)?;
         assert_eq!(cfg.reasoning_effort.as_deref(), Some("high"));
 

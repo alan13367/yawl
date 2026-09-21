@@ -134,8 +134,8 @@ impl Agent {
         self.conversation.set_print_mode();
     }
 
-    pub(crate) fn switch_model(&mut self, model: String) {
-        self.conversation.switch_model(model);
+    pub(crate) fn switch_model(&mut self, model: String) -> Result<(), Error> {
+        self.conversation.switch_model(model)
     }
 
     pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {

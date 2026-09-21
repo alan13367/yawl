@@ -70,6 +70,8 @@ fn display_settings_apply_during_an_active_turn() {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,

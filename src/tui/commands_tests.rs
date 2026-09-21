@@ -195,6 +195,8 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
         scroll_bar_drag: None,
+        transcript_row_entries: Vec::new(),
+        tool_click_press: None,
         copy_toast_ticks: 0,
         spinner_tick: 0,
         turn_started: None,
@@ -297,6 +299,10 @@ fn resume_picker_is_scoped_but_explicit_ids_search_other_projects() {
     session
         .append_message(&crate::provider::Message::user("fix the bug"))
         .expect("message should append");
+    // A mid-session switch is what the picker and resume must report.
+    session
+        .append_model_switch("openai-codex:gpt-5.6-sol")
+        .expect("model switch should append");
     let other_dir = config.sessions_dir().join("projects/other");
     std::fs::create_dir_all(&other_dir).expect("other project directory should be created");
     std::fs::write(
@@ -314,11 +320,14 @@ fn resume_picker_is_scoped_but_explicit_ids_search_other_projects() {
     assert_eq!(picker.items[0].label, "fix the bug");
     assert_eq!(
         picker.items[0].description,
-        format!("claude · {session_id}")
+        format!("openai-codex:gpt-5.6-sol · {session_id}")
     );
 
     resume(&mut agent, "other-session", &mut state);
     assert_eq!(agent.session_id(), "other-session");
+    // The other log never switched, so its header model is restored.
+    assert_eq!(agent.model(), "claude");
+    assert_eq!(state.model, "claude");
 
     let _ = std::fs::remove_dir_all(&root);
 }

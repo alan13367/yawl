@@ -16,6 +16,9 @@ const STANDARD_REASONING: &[&str] = &["minimal", "low", "medium", "high"];
 const XHIGH_REASONING: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
 const MAX_REASONING: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
 
+/// Provider prefixes that route without a `providers` entry.
+const BUILTIN_MODEL_PREFIXES: &[&str] = &["anthropic", "openai", "openai-codex"];
+
 const OPENAI_IMAGE_MODEL_PREFIXES: &[&str] = &[
     "chatgpt-4o",
     "gpt-4-turbo",
@@ -147,15 +150,34 @@ impl<'a> ModelTarget<'a> {
             .map_or(config.max_tokens, |limit| config.max_tokens.min(limit))
     }
 
-    fn reasoning_efforts(&self) -> &'static [&'static str] {
+    fn reasoning_efforts(&self) -> Vec<&'static str> {
+        if let Some(model) = self.configured_model() {
+            return crate::config::REASONING_EFFORTS
+                .iter()
+                .copied()
+                .filter(|effort| model.reasoning_efforts.iter().any(|value| value == effort))
+                .collect();
+        }
         if !self.is_codex() {
-            return &[];
+            return Vec::new();
         }
         match self.model {
             "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" => MAX_REASONING,
             "gpt-5.3-codex-spark" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5" => XHIGH_REASONING,
             _ => STANDARD_REASONING,
         }
+        .to_vec()
+    }
+
+    fn saved_reasoning_efforts(&self) -> Option<Vec<&'static str>> {
+        let model = self.configured_model()?;
+        Some(
+            crate::config::REASONING_EFFORTS
+                .iter()
+                .copied()
+                .filter(|effort| model.reasoning_efforts.iter().any(|value| value == effort))
+                .collect(),
+        )
     }
 
     fn supports_images(&self) -> bool {
@@ -191,6 +213,18 @@ fn openai_supports_images(model: &str) -> bool {
         .any(|prefix| model.starts_with(prefix))
 }
 
+/// Whether a model spec still routes to a provider that exists. A spec with a
+/// provider prefix names a provider; anything else falls back to the built-in
+/// Anthropic/OpenAI routing, which needs no configuration.
+pub(crate) fn is_resolvable(config: &Config, spec: &str) -> bool {
+    match spec.split_once(':') {
+        Some((name, _)) if !BUILTIN_MODEL_PREFIXES.contains(&name) => {
+            config.providers.contains_key(name)
+        }
+        _ => true,
+    }
+}
+
 pub(crate) fn context_window(config: &Config, spec: &str) -> u64 {
     ModelTarget::parse(spec, config).context_window(config)
 }
@@ -203,8 +237,16 @@ pub(crate) fn is_codex(config: &Config, spec: &str) -> bool {
     ModelTarget::parse(spec, config).is_codex()
 }
 
-pub(crate) fn reasoning_efforts(config: &Config, spec: &str) -> &'static [&'static str] {
+pub(crate) fn reasoning_efforts(config: &Config, spec: &str) -> Vec<&'static str> {
     ModelTarget::parse(spec, config).reasoning_efforts()
+}
+
+/// Saved reasoning levels for a custom provider model, or `None` when the
+/// spec is not a listed custom model. `Some(vec![])` is the explicit "send no
+/// effort" choice and must be preserved; `None` (unknown provider or unlisted
+/// model) defaults to every level in setup UI.
+pub(crate) fn saved_reasoning_efforts(config: &Config, spec: &str) -> Option<Vec<&'static str>> {
+    ModelTarget::parse(spec, config).saved_reasoning_efforts()
 }
 
 pub(crate) fn effective_reasoning_effort<'a>(config: &'a Config, spec: &str) -> Option<&'a str> {
@@ -263,6 +305,7 @@ mod tests {
                     context_window: Some(65_536),
                     max_tokens: Some(4096),
                     input: vec!["text".into(), "image".into()],
+                    reasoning_efforts: Vec::new(),
                     compat: OpenAiCompatibility::default(),
                 }],
                 compat: OpenAiCompatibility::default(),
@@ -298,6 +341,54 @@ mod tests {
         assert!(reasoning_efforts(&config, "openai-codex:gpt-5.4").contains(&"xhigh"));
         assert!(!reasoning_efforts(&config, "openai-codex:gpt-5.4").contains(&"max"));
         assert!(reasoning_efforts(&config, "openai-codex:gpt-5.6-sol").contains(&"max"));
+    }
+
+    #[test]
+    fn custom_reasoning_uses_only_configured_levels_in_selector_order() {
+        let mut config = config();
+        config.providers.get_mut("local").unwrap().models[0].reasoning_efforts =
+            vec!["ultra".into(), "low".into(), "low".into()];
+        assert_eq!(
+            reasoning_efforts(&config, "local:family:model"),
+            ["low", "ultra"]
+        );
+        config.reasoning_effort = Some("ultra".into());
+        assert_eq!(
+            effective_reasoning_effort(&config, "local:family:model"),
+            Some("ultra")
+        );
+        assert_eq!(effective_reasoning_effort(&config, "local:unlisted"), None);
+        assert_eq!(
+            effective_reasoning_effort(&config, "openai-codex:gpt-5.6-sol"),
+            None
+        );
+        config.reasoning_effort = Some("high".into());
+        assert_eq!(
+            effective_reasoning_effort(&config, "local:family:model"),
+            None
+        );
+        config.reasoning_effort = None;
+        assert_eq!(
+            effective_reasoning_effort(&config, "local:family:model"),
+            None
+        );
+    }
+
+    #[test]
+    fn saved_reasoning_distinguishes_unknown_from_explicit_none() {
+        let mut config = config();
+        assert_eq!(saved_reasoning_efforts(&config, "missing:model"), None);
+        assert_eq!(saved_reasoning_efforts(&config, "local:unlisted"), None);
+        assert_eq!(
+            saved_reasoning_efforts(&config, "local:family:model"),
+            Some(vec![])
+        );
+
+        config.providers.get_mut("local").unwrap().models[0].reasoning_efforts = vec!["low".into()];
+        assert_eq!(
+            saved_reasoning_efforts(&config, "local:family:model"),
+            Some(vec!["low"])
+        );
     }
 
     #[test]

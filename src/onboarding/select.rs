@@ -75,9 +75,124 @@ fn select_interactive(title: &str, choices: &[Choice]) -> Result<Option<usize>, 
                 cursor = (cursor + 1) % choices.len();
                 redraw(&mut out, choices, cursor, visible)?;
             }
-            Key::Other => {}
+            Key::Space | Key::Other => {}
         }
     }
+}
+
+/// Selects any number of options with Space, then confirms with Enter.
+pub(super) fn select_many(
+    title: &str,
+    choices: &[Choice],
+    initial: &[usize],
+) -> Result<Option<Vec<usize>>, Error> {
+    if choices.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut selected = (0..choices.len())
+        .map(|index| initial.contains(&index))
+        .collect::<Vec<_>>();
+    if !io::stdin().is_terminal() {
+        loop {
+            println!("{title}");
+            for (index, choice) in checked_choices(choices, &selected).iter().enumerate() {
+                println!("  {}. {}", index + 1, choice.label);
+            }
+            let answer = terminal::prompt(
+                "Numbers separated by spaces, Enter to keep, 'none' to clear, or 'q' to cancel",
+            )?;
+            match answer.as_str() {
+                "q" => return Ok(None),
+                "" => return Ok(Some(selected_indices(&selected))),
+                "none" => return Ok(Some(Vec::new())),
+                _ => {}
+            }
+            let indices = answer
+                .split_whitespace()
+                .map(|part| {
+                    part.parse::<usize>()
+                        .ok()
+                        .and_then(|number| number.checked_sub(1))
+                        .filter(|index| *index < choices.len())
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(indices) = indices {
+                return Ok(Some(
+                    (0..choices.len())
+                        .filter(|index| indices.contains(index))
+                        .collect(),
+                ));
+            }
+            println!("Enter numbers from 1 through {}.", choices.len());
+        }
+    }
+    println!("↑/↓ move  Space toggle  Enter confirm  Esc back");
+    let mut out = io::stdout();
+    let _raw = crate::terminal_mode::RawMode::enter()?;
+    let visible = choices.len().min(MAX_VISIBLE);
+    let mut cursor = 0;
+    draw_initial(
+        &mut out,
+        title,
+        &checked_choices(choices, &selected),
+        cursor,
+        visible,
+    )?;
+    loop {
+        match read_key()? {
+            Key::Enter => {
+                let indices = selected_indices(&selected);
+                let labels = indices
+                    .iter()
+                    .map(|index| choices[*index].label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                collapse(
+                    &mut out,
+                    visible + 1,
+                    visible,
+                    title,
+                    &Choice::new(if labels.is_empty() { "none" } else { &labels }, ""),
+                )?;
+                return Ok(Some(indices));
+            }
+            Key::Cancel => {
+                clear_block(&mut out, visible + 1, visible)?;
+                return Ok(None);
+            }
+            Key::Up => cursor = (cursor + choices.len() - 1) % choices.len(),
+            Key::Down => cursor = (cursor + 1) % choices.len(),
+            Key::Space => selected[cursor] = !selected[cursor],
+            Key::Other => continue,
+        }
+        redraw(
+            &mut out,
+            &checked_choices(choices, &selected),
+            cursor,
+            visible,
+        )?;
+    }
+}
+
+fn selected_indices(selected: &[bool]) -> Vec<usize> {
+    selected
+        .iter()
+        .enumerate()
+        .filter_map(|(index, checked)| checked.then_some(index))
+        .collect()
+}
+
+fn checked_choices(choices: &[Choice], selected: &[bool]) -> Vec<Choice> {
+    choices
+        .iter()
+        .zip(selected)
+        .map(|(choice, checked)| {
+            Choice::new(
+                format!("[{}] {}", if *checked { "x" } else { " " }, choice.label),
+                choice.hint.clone(),
+            )
+        })
+        .collect()
 }
 
 fn draw_initial(
@@ -176,6 +291,7 @@ enum Key {
     Up,
     Down,
     Enter,
+    Space,
     Cancel,
     Other,
 }
@@ -201,6 +317,7 @@ fn read_key() -> Result<Key, Error> {
 fn decode(byte: u8) -> Result<Key, Error> {
     match byte {
         b'\r' | b'\n' => Ok(Key::Enter),
+        b' ' => Ok(Key::Space),
         b'j' => Ok(Key::Down),
         b'k' => Ok(Key::Up),
         b'q' => Ok(Key::Cancel),
@@ -261,6 +378,18 @@ mod tests {
         assert_eq!(visible_window(9, 30, 10), 0..10);
         assert_eq!(visible_window(10, 30, 10), 1..11);
         assert_eq!(visible_window(29, 30, 10), 20..30);
+    }
+
+    #[test]
+    fn multi_selection_marks_checks_and_decodes_space_separately_from_enter() {
+        let choices = [Choice::new("low", ""), Choice::new("ultra", "")];
+        let checked = checked_choices(&choices, &[false, true]);
+        assert_eq!(checked[0].label, "[ ] low");
+        assert_eq!(checked[1].label, "[x] ultra");
+        assert_eq!(selected_indices(&[false, true]), [1]);
+        assert!(selected_indices(&[false, false]).is_empty());
+        assert!(matches!(decode(b' ').unwrap(), Key::Space));
+        assert!(matches!(decode(b'\r').unwrap(), Key::Enter));
     }
 
     #[test]

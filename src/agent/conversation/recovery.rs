@@ -65,7 +65,6 @@ impl Conversation {
             )?;
             self.messages
                 .truncate(self.messages.len().saturating_sub(undo.dropped));
-            state.active_goal = state.session.active_goal().map(str::to_string);
             self.context_tokens = 0;
             self.context_usage = None;
             self.latest_turn_result.clear();

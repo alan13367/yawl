@@ -119,7 +119,7 @@ pub(in crate::tui) fn settings(agent: &mut Agent, argument: &str, state: &mut Vi
         }
         "reasoning_effort" => one_value(
             &mut parts,
-            "usage: /settings reasoning_effort default|minimal|low|medium|high|xhigh|max",
+            "usage: /settings reasoning_effort default|minimal|low|medium|high|xhigh|max|ultra",
         )
         .and_then(reasoning_effort_change),
         "hide_reasoning" => one_value(&mut parts, "usage: /settings hide_reasoning on|off")
@@ -336,7 +336,7 @@ pub(in crate::tui) fn notice_config_effect(
 fn reasoning_effort_change(value: &str) -> Result<ConfigChange, Error> {
     let effective = match value {
         "default" | "off" => None,
-        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(value.to_string()),
+        level if crate::config::REASONING_EFFORTS.contains(&level) => Some(value.to_string()),
         _ => return Err(Error::Config("unsupported reasoning effort".into())),
     };
     Ok(ConfigChange::ReasoningEffort {
@@ -439,7 +439,7 @@ pub(in crate::tui) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings bell on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max|ultra`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings bell on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);

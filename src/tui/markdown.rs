@@ -1,11 +1,17 @@
-//! Terminal markdown renderer with ANSI styling, wrapping, box-drawing
-//! tables, and fenced-code highlighting.
+//! Terminal markdown renderer with ANSI styling, box-drawing tables, and
+//! chrome-free fenced-code highlighting (code renders as background-shaded
+//! highlighted lines so terminal drag-select copies clean commands).
 
 use super::highlight;
 use unicode_width::UnicodeWidthChar;
 
 const RESET: &str = "\x1b[0m";
 const INLINE_CODE: &str = "\x1b[38;2;155;188;198m";
+/// Dark warm gray for fenced code blocks. Deliberately distinct from the cool
+/// user-prompt panel (`48;2;52;53;64`), the green tool cards, and the purple
+/// skill cards. Background ANSI never survives `strip_ansi`, so drag-select
+/// copies stay clean.
+const CODE_BACKGROUND: &str = "\x1b[48;2;36;34;30m";
 
 pub fn render(markdown: &str, width: usize) -> Vec<String> {
     let width = width.max(8);
@@ -19,7 +25,6 @@ pub fn render(markdown: &str, width: usize) -> Vec<String> {
         let trimmed = line.trim_start();
         if let Some(language) = &code_language {
             if trimmed.starts_with("```") {
-                output.push(fit_width("\x1b[2m└─\x1b[0m", width));
                 code_language = None;
             } else {
                 render_code_line(language, line, width, &mut output);
@@ -29,12 +34,6 @@ pub fn render(markdown: &str, width: usize) -> Vec<String> {
         }
         if let Some(info) = trimmed.strip_prefix("```") {
             let language = info.split_whitespace().next().unwrap_or("").to_string();
-            let label = if language.is_empty() {
-                "\x1b[2m┌─ code\x1b[0m".to_string()
-            } else {
-                format!("\x1b[2m┌─ {}\x1b[0m", sanitize(&language))
-            };
-            output.push(fit_width(&label, width));
             code_language = Some(language);
             index += 1;
             continue;
@@ -99,9 +98,6 @@ pub fn render(markdown: &str, width: usize) -> Vec<String> {
         index += 1;
     }
 
-    if code_language.is_some() {
-        output.push(fit_width("\x1b[2m└─\x1b[0m", width));
-    }
     if output.is_empty() {
         output.push(String::new());
     }
@@ -149,16 +145,20 @@ fn is_rule(line: &str) -> bool {
 }
 
 fn render_code_line(language: &str, line: &str, width: usize, output: &mut Vec<String>) {
-    let available = width.saturating_sub(2).max(1);
     let plain = sanitize(line).replace('\t', "    ");
-    let chunks = split_chars(&plain, available);
+    let chunks = split_chars(&plain, width.max(1));
     if chunks.is_empty() {
-        output.push("\x1b[2m│\x1b[0m ".to_string());
+        output.push(format!(
+            "{CODE_BACKGROUND}{path}{RESET}",
+            path = " ".repeat(width)
+        ));
     } else {
         for chunk in chunks {
+            let highlighted = highlight::render_line(language, &chunk);
+            let padded = fit_width(&highlighted, width);
             output.push(format!(
-                "\x1b[2m│\x1b[0m {}",
-                highlight::render_line(language, &chunk)
+                "{CODE_BACKGROUND}{}{RESET}",
+                padded.replace(RESET, &format!("{RESET}{CODE_BACKGROUND}"))
             ));
         }
     }
@@ -1024,6 +1024,67 @@ mod tests {
     fn highlights_fenced_rust() {
         let lines = render("```rust\nfn main() {}\n```", 40);
         assert!(lines.join("\n").contains("\x1b[1;34mfn\x1b[0m"));
+    }
+
+    #[test]
+    fn fenced_code_renders_without_copy_chrome() {
+        let lines = render(
+            "```bash\nhf download foo/bar model.gguf \\\n  --local-dir ~/models\n\n# comment\n```",
+            80,
+        );
+        // Drag-select strips ANSI and trims line ends, so trimmed plain text
+        // is what lands on the clipboard.
+        let plain = lines
+            .iter()
+            .map(|line| strip_ansi(line).trim_end().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            plain,
+            [
+                "hf download foo/bar model.gguf \\",
+                "  --local-dir ~/models",
+                "",
+                "# comment",
+            ]
+        );
+        for line in &plain {
+            assert!(!line.contains('│'));
+            assert!(!line.contains("┌─"));
+            assert!(!line.contains("└─"));
+        }
+    }
+
+    #[test]
+    fn fenced_code_background_differs_from_user_and_tool_cards() {
+        let lines = render("```bash\necho hi\n```", 40);
+        assert!(!lines.is_empty());
+        for line in &lines {
+            assert!(
+                line.contains(CODE_BACKGROUND),
+                "code lines need the shaded background: {line:?}"
+            );
+            assert_eq!(visible_width(line), 40);
+        }
+        // Warm dark gray must stay distinct from the cool user-prompt panel
+        // and the green/red/purple tool cards.
+        assert_ne!(CODE_BACKGROUND, super::super::USER_BACKGROUND);
+        for other in [
+            "\x1b[48;2;42;50;41m",
+            "\x1b[48;2;50;42;42m",
+            "\x1b[48;2;54;44;82m",
+        ] {
+            assert_ne!(CODE_BACKGROUND, other);
+        }
+    }
+
+    #[test]
+    fn unclosed_fence_renders_without_copy_chrome() {
+        let lines = render("```bash\necho hi", 80);
+        let plain = lines
+            .iter()
+            .map(|line| strip_ansi(line).trim_end().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(plain, ["echo hi"]);
     }
 
     #[test]

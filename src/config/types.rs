@@ -433,6 +433,25 @@ impl OpenAiCompatibility {
     }
 }
 
+pub(crate) const REASONING_EFFORTS: &[&str] =
+    &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+fn deserialize_reasoning_efforts<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let efforts = Vec::<String>::deserialize(deserializer)?;
+    for effort in &efforts {
+        if !REASONING_EFFORTS.contains(&effort.as_str()) {
+            return Err(de::Error::custom(format!(
+                "unsupported reasoning effort '{effort}'; expected {}",
+                REASONING_EFFORTS.join(", ")
+            )));
+        }
+    }
+    Ok(efforts)
+}
+
 /// Optional metadata for a model exposed by a custom provider.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
@@ -446,6 +465,13 @@ pub struct ModelConfig {
     /// Input kinds accepted by this model, such as `text` and `image`.
     #[serde(default)]
     pub input: Vec<String>,
+    /// Reasoning levels accepted by this model. Empty means no effort is sent.
+    #[serde(
+        default,
+        alias = "reasoningEfforts",
+        deserialize_with = "deserialize_reasoning_efforts"
+    )]
+    pub reasoning_efforts: Vec<String>,
     #[serde(default)]
     pub compat: OpenAiCompatibility,
 }
@@ -505,6 +531,30 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn model_reasoning_levels_accept_known_values_and_reject_typos() {
+        for key in ["reasoning_efforts", "reasoningEfforts"] {
+            let model: ModelConfig =
+                serde_json::from_value(json!({"id": "custom", key: REASONING_EFFORTS}))
+                    .expect("all levels should load");
+            assert_eq!(model.reasoning_efforts, REASONING_EFFORTS);
+            for invalid in [
+                json!(["extreme"]),
+                json!(["default"]),
+                json!("high"),
+                json!(null),
+            ] {
+                assert!(
+                    serde_json::from_value::<ModelConfig>(json!({"id": "custom", key: invalid}))
+                        .is_err()
+                );
+            }
+        }
+        let legacy: ModelConfig =
+            serde_json::from_value(json!({"id": "custom"})).expect("old model config should load");
+        assert!(legacy.reasoning_efforts.is_empty());
+    }
 
     #[test]
     fn status_bar_defaults_match_the_original_item_order() {
