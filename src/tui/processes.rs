@@ -694,6 +694,7 @@ mod tests {
             scroll_offset: 0,
             queued_inputs: VecDeque::new(),
             pending_steers: VecDeque::new(),
+            queue_paused: false,
             active_goal: None,
             goal_running: false,
             active_plan: None,

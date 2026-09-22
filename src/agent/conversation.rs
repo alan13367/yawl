@@ -70,7 +70,7 @@ pub(crate) fn last_undoable_user_index(messages: &[Message]) -> Option<usize> {
 }
 
 struct PersistentState {
-    session: Session,
+    session: Box<Session>,
     subagents: SubagentManager,
     checkpoints: Checkpoints,
     background: BackgroundProcessManager,
@@ -135,7 +135,7 @@ impl Conversation {
             model,
             messages,
             kind: ConversationKind::Persistent(PersistentState {
-                session,
+                session: Box::new(session),
                 subagents,
                 checkpoints,
                 background: BackgroundProcessManager::default(),
@@ -405,7 +405,7 @@ impl Conversation {
         self.persistent_state().background.shutdown_and_discard();
         let session_id = session.id.clone();
         self.kind = ConversationKind::Persistent(PersistentState {
-            session,
+            session: Box::new(session),
             subagents: SubagentManager::new(session_id.clone(), self.config.max_subagents),
             checkpoints: Checkpoints::open(&self.config.home_dir, &session_id, cwd),
             background: BackgroundProcessManager::default(),
@@ -465,7 +465,7 @@ impl Conversation {
         self.persistent_state().background.shutdown_and_discard();
         let session_id = session.id.clone();
         self.kind = ConversationKind::Persistent(PersistentState {
-            session,
+            session: Box::new(session),
             subagents: SubagentManager::new(session_id.clone(), self.config.max_subagents),
             checkpoints: Checkpoints::open(&self.config.home_dir, &session_id, cwd),
             background: BackgroundProcessManager::default(),

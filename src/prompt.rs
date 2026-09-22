@@ -6,6 +6,7 @@ use std::path::Path;
 use crate::skills::Skill;
 
 #[derive(Clone, Copy)]
+/// Completed-plan variants carry an absolute Markdown path; Draft carries the objective.
 pub(crate) enum PlanPrompt<'a> {
     Active(&'a str),
     Draft(&'a str),
@@ -107,6 +108,7 @@ fn append_plan_prompt(prompt: &mut String, plan: Option<PlanPrompt<'_>>) {
     let Some(plan) = plan else {
         return;
     };
+    let saved_plan = !matches!(plan, PlanPrompt::Draft(_));
     let (phase, content, instructions) = match plan {
         PlanPrompt::Active(plan) => (
             "active",
@@ -116,12 +118,12 @@ fn append_plan_prompt(prompt: &mut String, plan: Option<PlanPrompt<'_>>) {
         PlanPrompt::Draft(objective) => (
             "planning",
             objective,
-            "Inspect only with the available read-focused tools. Before plan_complete, call request_user_input at least once with exactly three meaningful questions. Ask further three-question batches only when material choices remain. plan_complete must be the only tool call in its step and contain the full Markdown implementation plan. A text reply does not finish planning.",
+            "Inspect only with the available read-focused tools. Before plan_complete, call request_user_input at least once with exactly three meaningful questions. Ask further three-question batches only when material choices remain. plan_complete must be the only tool call in its step and contain a self-contained Markdown implementation plan with agreed requirements, constraints, implementation decisions, relevant code locations, and acceptance checks. A text reply does not finish planning.",
         ),
         PlanPrompt::Revise(plan) => (
             "revision",
             plan,
-            "Revise this plan from the user's latest request using only read-focused tools. Before plan_complete, call request_user_input at least once with exactly three meaningful questions. plan_complete must be the only tool call in its step and contain the full revised Markdown plan. A text reply does not finish revision.",
+            "Revise this plan from the user's latest request using only read-focused tools. Before plan_complete, call request_user_input at least once with exactly three meaningful questions. plan_complete must be the only tool call in its step and contain a self-contained revised Markdown plan with agreed requirements, constraints, implementation decisions, relevant code locations, and acceptance checks. A text reply does not finish revision.",
         ),
         PlanPrompt::FollowUp(plan) => (
             "follow_up",
@@ -137,9 +139,15 @@ fn append_plan_prompt(prompt: &mut String, plan: Option<PlanPrompt<'_>>) {
     prompt.push_str("\n<active_plan phase=\"");
     prompt.push_str(phase);
     prompt.push_str("\">\n");
+    if saved_plan {
+        prompt.push_str("Saved plan file: ");
+    }
     prompt.push_str(content);
     prompt.push_str("\n\n");
     prompt.push_str(instructions);
+    if saved_plan {
+        prompt.push_str("\nIf the plan contents are absent from context, read the saved plan file before acting on it. The file is a recoverable session artifact; revise plans through plan_complete, not by editing this file.");
+    }
     prompt.push_str("\n</active_plan>\n");
 }
 
@@ -193,7 +201,7 @@ Tools:
     );
     if !options.is_subagent {
         prompt.push_str(
-            "- Run long commands with shell background=true; use shell_output, shell_list, and shell_stop with the returned bg-N ID.\n",
+            "- Run long commands/servers with shell background=true, not &/nohup. Use shell_output, shell_list, shell_stop for bg-N IDs.\n",
         );
     }
     if options.web_browsing {
@@ -379,7 +387,7 @@ mod tests {
             false,
             &[],
             MainPromptState {
-                plan: Some(PlanPrompt::FollowUp("# Plan")),
+                plan: Some(PlanPrompt::FollowUp("/session/plans/1.md")),
                 ..MainPromptState::default()
             },
         );

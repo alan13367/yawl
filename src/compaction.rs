@@ -1,6 +1,6 @@
 //! Auto-compaction: when the context is ~85% full (estimated from
 //! provider-reported usage), the same model summarizes older messages while
-//! retaining the last ~10 verbatim. The latest undoable user prompt is also
+//! retaining up to ~10 recent messages within an estimated token budget. The latest undoable user prompt is also
 //! retained so `/undo` keeps its checkpoint anchor. The session JSONL keeps
 //! the full original history; compaction is recorded as an event.
 
@@ -10,8 +10,9 @@ use std::ops::Range;
 use crate::error::Error;
 use crate::provider::{Message, Provider, Request, Role, StreamNotice, TokenUsage, stream_turn};
 
-/// How many trailing messages survive compaction verbatim.
+/// Maximum ordinary tail length before applying the estimated token budget.
 pub const KEEP_TAIL: usize = 10;
+const TAIL_TOKEN_BUDGET: u64 = 8_000;
 
 const SUMMARY_MARKER: &str = "[conversation summary]";
 
@@ -49,11 +50,32 @@ pub fn split_point(messages: &[Message]) -> usize {
     while split > 0 && messages[split].role == Role::Tool {
         split -= 1;
     }
+    let mut tail_tokens = messages[split..]
+        .iter()
+        .map(Message::estimated_tokens)
+        .sum::<u64>();
+    while tail_tokens > TAIL_TOKEN_BUDGET {
+        let mut next = split.saturating_add(1);
+        while next < messages.len() && messages[next].role == Role::Tool {
+            next += 1;
+        }
+        // Always retain the latest complete exchange, even if it is oversized.
+        if next >= messages.len() {
+            break;
+        }
+        tail_tokens = tail_tokens.saturating_sub(
+            messages[split..next]
+                .iter()
+                .map(Message::estimated_tokens)
+                .sum(),
+        );
+        split = next;
+    }
     split
 }
 
 /// Selects a contiguous range to summarize without removing `protected`.
-/// Prefer the larger side of the protected prompt so compaction still frees
+/// Prefer the side with more estimated tokens so compaction still frees
 /// useful space during a long-running turn.
 pub(crate) fn compaction_range(messages: &[Message], protected: Option<usize>) -> Range<usize> {
     let split = split_point(messages);
@@ -62,7 +84,16 @@ pub(crate) fn compaction_range(messages: &[Message], protected: Option<usize>) -
     };
     let before = 0..protected;
     let after = protected.saturating_add(1)..split;
-    if !after.is_empty() && after.len() >= before.len() {
+    if !after.is_empty()
+        && messages[after.clone()]
+            .iter()
+            .map(Message::estimated_tokens)
+            .sum::<u64>()
+            >= messages[before.clone()]
+                .iter()
+                .map(Message::estimated_tokens)
+                .sum::<u64>()
+    {
         after
     } else {
         before
@@ -70,7 +101,7 @@ pub(crate) fn compaction_range(messages: &[Message], protected: Option<usize>) -
 }
 
 /// Renders messages as a plain transcript for the summarizer.
-fn transcript(messages: &[Message]) -> String {
+pub(crate) fn transcript(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
         match m.role {
@@ -89,7 +120,11 @@ fn transcript(messages: &[Message]) -> String {
                         out,
                         "\n[called tool {} with {}]",
                         tc.name,
-                        crate::error::truncate(&tc.arguments, 400)
+                        if tc.name == crate::tools::USER_INPUT_TOOL_NAME {
+                            tc.arguments.clone()
+                        } else {
+                            crate::error::truncate(&tc.arguments, 400)
+                        }
                     )
                     .expect("writing to a String cannot fail");
                 }
@@ -102,7 +137,11 @@ fn transcript(messages: &[Message]) -> String {
                     if m.is_error { ", error" } else { "" }
                 )
                 .expect("writing to a String cannot fail");
-                out.push_str(&crate::error::truncate(&m.content, 2_000));
+                if m.tool_name.as_deref() == Some(crate::tools::USER_INPUT_TOOL_NAME) {
+                    out.push_str(&m.content);
+                } else {
+                    out.push_str(&crate::error::truncate(&m.content, 2_000));
+                }
             }
         }
         out.push_str("\n\n");
@@ -202,6 +241,67 @@ pub(crate) fn apply_summary_range_with_provider_data(
 mod tests {
     use super::*;
     use crate::provider::{Event, ToolCall};
+
+    #[test]
+    fn questions_and_user_answers_are_never_truncated_for_summaries() {
+        let arguments = format!("{} final question", "q".repeat(3000));
+        let answer = format!("{} essential constraint", "answer ".repeat(1000));
+        let messages = vec![
+            Message::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "q".into(),
+                    name: crate::tools::USER_INPUT_TOOL_NAME.into(),
+                    arguments: arguments.clone(),
+                }],
+            ),
+            Message::tool_result(
+                "q",
+                crate::tools::USER_INPUT_TOOL_NAME,
+                answer.clone(),
+                false,
+            ),
+        ];
+        let rendered = transcript(&messages);
+        assert!(rendered.contains(&arguments));
+        assert!(rendered.contains(&answer));
+    }
+
+    #[test]
+    fn large_recent_results_compact_even_with_fewer_than_ten_messages() {
+        let messages = vec![
+            Message::user("Keep this undo anchor"),
+            Message::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "big".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("big", "shell", "x".repeat(60_000), false),
+            Message::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "small".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("small", "shell", "done".into(), false),
+        ];
+        assert_eq!(compaction_range(&messages, Some(0)), 1..3);
+        assert_eq!(split_point(&messages), 3);
+        assert!(crate::session::missing_tool_results(&messages[3..]).is_none());
+    }
+
+    #[test]
+    fn compaction_prefers_the_larger_token_range_over_more_messages() {
+        let mut messages = vec![Message::assistant("x".repeat(60_000), vec![])];
+        messages.push(Message::user("anchor"));
+        messages.extend((0..20).map(|_| Message::user("short")));
+        assert_eq!(compaction_range(&messages, Some(1)), 0..1);
+    }
 
     struct SummaryProvider;
 

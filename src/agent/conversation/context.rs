@@ -9,24 +9,7 @@ fn text_tokens(text: &str) -> u64 {
 }
 
 pub(super) fn message_tokens(message: &Message) -> u64 {
-    let mut tokens = 8u64.saturating_add(text_tokens(&message.content));
-    for call in &message.tool_calls {
-        tokens = tokens
-            .saturating_add(text_tokens(&call.arguments))
-            .saturating_add(text_tokens(&call.name))
-            .saturating_add(16);
-    }
-    for reasoning in &message.reasoning {
-        tokens = tokens.saturating_add(text_tokens(&reasoning.content));
-    }
-    for result in &message.subagent_results {
-        tokens = tokens
-            .saturating_add(text_tokens(&result.content))
-            .saturating_add(32);
-    }
-    // Image costs vary with provider and resolution. Avoid treating them as free
-    // or charging every byte of their base64 encoding as text.
-    tokens.saturating_add((message.images.len() as u64).saturating_mul(4096))
+    message.estimated_tokens()
 }
 
 pub(super) fn prompt_tokens(system: &str, tools: &[ToolSpec]) -> u64 {
@@ -50,6 +33,7 @@ impl Conversation {
                 (
                     usage
                         .tokens
+                        .saturating_sub(usage.overhead.saturating_sub(overhead))
                         .saturating_add(overhead.saturating_sub(usage.overhead)),
                     usage.messages
                         + usize::from(self.messages.get(usage.messages).is_some_and(|message| {
@@ -108,6 +92,37 @@ pub(super) fn is_context_limit(error: &Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_does_not_double_count_subagent_report_text() {
+        let message = Message::subagent_results(vec![crate::provider::SubagentResult {
+            id: "a".into(),
+            name: "worker".into(),
+            status: "done".into(),
+            run_number: 1,
+            content: "large report ".repeat(1000),
+        }]);
+        let plain = Message::user(message.content.clone());
+        assert_eq!(message_tokens(&message), message_tokens(&plain));
+    }
+
+    #[test]
+    fn estimates_follow_growing_and_shrinking_prompt_overhead() {
+        let mut conversation = Conversation::memory(
+            crate::config::Config::test_default(),
+            "test".into(),
+            "child".into(),
+        );
+        conversation.context_tokens = 5000;
+        conversation.context_usage = Some(ContextUsage {
+            tokens: 5000,
+            messages: 0,
+            model: "test".into(),
+            overhead: 2000,
+        });
+        assert_eq!(conversation.estimated_context(1000), 4000);
+        assert_eq!(conversation.estimated_context(3000), 6000);
+    }
 
     #[test]
     fn only_explicit_context_errors_trigger_recovery() {

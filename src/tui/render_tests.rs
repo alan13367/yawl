@@ -76,6 +76,7 @@ fn frame_keeps_input_and_status_pinned() {
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -468,6 +469,7 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -540,6 +542,7 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -669,6 +672,7 @@ fn loading_state_ignores_status_activity() {
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -746,6 +750,7 @@ fn overflow_state() -> ViewState {
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -1058,6 +1063,7 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -1251,6 +1257,7 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -1415,6 +1422,7 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -1838,8 +1846,13 @@ fn question_options_wrap_without_losing_their_descriptions() {
 
     let (frame, _) = build_frame(&mut state, &Editor::default(), 64, 20);
     let plain = markdown::strip_ansi(&frame.join("\n"));
-    assert!(plain.contains("keyboard support"));
-    assert!(plain.contains("current interaction model"));
+    let readable = plain
+        .lines()
+        .map(|line| line.trim_matches('│').trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(readable.contains("keyboard support"));
+    assert!(readable.contains("current interaction model"));
     assert!(frame.iter().all(|line| markdown::visible_width(line) <= 64));
 }
 
@@ -1977,6 +1990,7 @@ fn empty_session_state() -> ViewState {
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,

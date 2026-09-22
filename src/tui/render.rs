@@ -5,6 +5,7 @@
 //! the entry points here.
 
 mod cache;
+mod questions;
 mod welcome;
 
 pub(super) use cache::{
@@ -261,7 +262,7 @@ pub(super) fn build_frame_with_images(
     let (input_lines, cursor_input_row, cursor_input_col, hide_input_cursor) =
         if let Some(question) = &state.question {
             let (lines, cursor, focus_row) =
-                render_question_input(question, inner_width, state.selection_color, rows <= 10);
+                questions::render_input(question, inner_width, state.selection_color, rows <= 10);
             let (lines, cursor) = bounded_input_view(lines, cursor, focus_row, max_question_lines);
             let (cursor_row, cursor_col) = cursor.unwrap_or((0, 0));
             (lines, cursor_row, cursor_col, cursor.is_none())
@@ -431,7 +432,9 @@ pub(super) fn build_frame_with_images(
         ));
     }
     let text_box_color = foreground_color(state.accent_color);
-    let composer_label = if plan_handoff {
+    let composer_label = if state.question.is_some() {
+        Some("Your input")
+    } else if plan_handoff {
         Some("Plan ready")
     } else if state.turn_started.is_some() && !state.goal_running && state.plan_draft {
         Some("Planning")
@@ -556,102 +559,6 @@ fn render_plan_handoff_input(
         ));
     }
     (lines, focus_row)
-}
-
-fn render_question_input(
-    active: &super::state::ActiveQuestion,
-    width: usize,
-    selection_color: UiColor,
-    compact: bool,
-) -> (Vec<String>, Option<(usize, usize)>, usize) {
-    let snapshot = &active.snapshot;
-    let countdown = snapshot
-        .remaining
-        .map(|remaining| format!(" · {}s", remaining.as_secs().saturating_add(1)))
-        .unwrap_or_default();
-    let heading = if compact {
-        format!(
-            "{}/{}{countdown} · {}",
-            snapshot.question_index + 1,
-            snapshot.question_count,
-            snapshot.question.question
-        )
-    } else {
-        format!(
-            "Question {}/{}{countdown}",
-            snapshot.question_index + 1,
-            snapshot.question_count
-        )
-    };
-    let mut lines = markdown::wrapped_plain_lines(&heading, width);
-    if !compact {
-        lines.extend(markdown::wrapped_plain_lines(
-            &snapshot.question.question,
-            width,
-        ));
-    }
-
-    if let super::state::QuestionInput::Custom(editor) = &active.input {
-        if !compact {
-            lines.push(String::new());
-            lines.push(markdown::fit_width(" Your answer", width));
-        }
-        let layout = editor.layout(width);
-        let answer_start = lines.len();
-        let cursor = (answer_start + layout.cursor_row, layout.cursor_col);
-        lines.extend(
-            layout
-                .lines
-                .into_iter()
-                .map(|line| markdown::fit_width(&line, width)),
-        );
-        if !compact {
-            lines.push(markdown::fit_width(
-                " Enter submit · Shift+Enter newline · Esc choices · Ctrl+C cancel",
-                width,
-            ));
-            lines.push(String::new());
-        }
-        return (lines, Some(cursor), cursor.0);
-    }
-
-    let mut focus_row = lines.len();
-    for (index, option) in snapshot.question.options.iter().enumerate() {
-        if index == active.selected {
-            focus_row = lines.len();
-        }
-        lines.extend(render_choice_lines(
-            index,
-            &option.label,
-            if compact { "" } else { &option.description },
-            index == snapshot.question.recommended,
-            index == active.selected,
-            width,
-            selection_color,
-        ));
-    }
-    let other_index = snapshot.question.options.len();
-    if other_index == active.selected {
-        focus_row = lines.len();
-    }
-    lines.extend(render_choice_lines(
-        other_index,
-        "Other…",
-        if compact { "" } else { "Write your own answer" },
-        false,
-        other_index == active.selected,
-        width,
-        selection_color,
-    ));
-    if !compact {
-        let option_count = snapshot.question.options.len() + 1;
-        lines.push(markdown::fit_width(
-            &format!(" ↑/↓ choose · 1–{option_count} select · Enter confirm · Esc cancel"),
-            width,
-        ));
-        lines.push(String::new());
-    }
-    (lines, None, focus_row)
 }
 
 fn bounded_input_view(

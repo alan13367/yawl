@@ -18,6 +18,8 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::provider::{Message, Role, TokenUsage, UsageSummary};
 
+mod index;
+mod plans;
 mod recovery;
 pub(crate) use recovery::{PendingUndo, missing_tool_results};
 
@@ -32,13 +34,15 @@ pub(crate) enum PlanState {
     },
     Ready {
         plan: String,
+        #[serde(default)]
+        revision: usize,
     },
 }
 
 impl PlanState {
     pub(crate) fn ready(&self) -> Option<&str> {
         match self {
-            Self::Ready { plan } => Some(plan),
+            Self::Ready { plan, .. } => Some(plan),
             Self::Draft { .. } => None,
         }
     }
@@ -78,6 +82,8 @@ enum SessionEvent {
     /// were folded into `summary`. Older logs omit `start` and default to the
     /// original prefix-compaction behavior.
     Compaction {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_revision: Option<usize>,
         summary: String,
         #[serde(default)]
         start: usize,
@@ -152,6 +158,9 @@ pub(crate) struct ContextUsage {
 pub struct Session {
     pub id: String,
     file: File,
+    directory: PathBuf,
+    plan_revision_count: usize,
+    plan_handoffs: std::collections::HashSet<usize>,
     rollback_to: Option<u64>,
     #[cfg(test)]
     fail_after_appends: Option<usize>,
@@ -167,6 +176,8 @@ pub struct Session {
 }
 
 struct ReplayedSession {
+    plan_revision_count: usize,
+    plan_handoffs: std::collections::HashSet<usize>,
     messages: Vec<Message>,
     model: String,
     active_goal: Option<String>,
@@ -207,6 +218,9 @@ impl Session {
             .transpose()?
             .ok_or_else(|| Error::Config("could not allocate a session id".into()))?;
         let mut session = Session {
+            directory: fs::canonicalize(dir)?,
+            plan_revision_count: 0,
+            plan_handoffs: std::collections::HashSet::new(),
             id: id.clone(),
             file,
             rollback_to: None,
@@ -245,6 +259,9 @@ impl Session {
             }
         }
         let mut session = Session {
+            directory: fs::canonicalize(dir)?,
+            plan_revision_count: replayed.plan_revision_count,
+            plan_handoffs: replayed.plan_handoffs,
             id: id.to_string(),
             file,
             rollback_to: None,
@@ -361,6 +378,7 @@ impl Session {
         provider_data_model: Option<&str>,
     ) -> Result<(), Error> {
         self.append(&SessionEvent::Compaction {
+            plan_revision: None,
             summary: summary.to_string(),
             start,
             replaced,
@@ -475,17 +493,6 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) fn append_plan_ready(&mut self, plan: &str, message: &Message) -> Result<(), Error> {
-        self.append(&SessionEvent::PlanReady {
-            plan: plan.to_string(),
-            message: message.clone(),
-        })?;
-        self.active_plan = Some(PlanState::Ready {
-            plan: plan.to_string(),
-        });
-        Ok(())
-    }
-
     pub(crate) fn append_plan_implemented(&mut self, message: &Message) -> Result<(), Error> {
         self.append(&SessionEvent::PlanImplemented {
             message: message.clone(),
@@ -524,6 +531,11 @@ impl Session {
         validate_id(id)?;
         let path = dir.join(format!("{id}.jsonl"));
         match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+        match fs::remove_dir_all(dir.join(id)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(Error::Io(error)),
@@ -599,6 +611,8 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
     let mut usage = UsageSummary::default();
     let mut pending_undo: Option<Box<PendingUndo>> = None;
     let mut context = None;
+    let mut plan_revisions = Vec::new();
+    let mut plan_handoffs = std::collections::HashSet::new();
     let mut has_meta = false;
     for line in BufReader::new(file).lines() {
         let line = line?;
@@ -630,7 +644,10 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
         match event {
             SessionEvent::Meta { .. } => {}
             SessionEvent::ModelSwitch { model: switched } => model = switched,
-            SessionEvent::UndoStarted { undo } => pending_undo = Some(Box::new(undo)),
+            SessionEvent::UndoStarted { mut undo } => {
+                undo.plan_state = plans::restore_revision(undo.plan_state, &plan_revisions);
+                pending_undo = Some(Box::new(undo));
+            }
             SessionEvent::UndoFinished => pending_undo = None,
             SessionEvent::Context { context: value } => context = Some(value),
             SessionEvent::ToolResultsRecovered { index, results } => {
@@ -648,12 +665,16 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
                 messages.push(message);
             }
             SessionEvent::Compaction {
+                plan_revision,
                 summary,
                 start,
                 replaced,
                 provider_data,
                 provider_data_model,
             } => {
+                if let Some(revision) = plan_revision {
+                    plan_handoffs.insert(revision);
+                }
                 let start = start.min(messages.len());
                 let end = start.saturating_add(replaced).min(messages.len());
                 drop(messages.splice(
@@ -677,7 +698,7 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
                 if clear_goal {
                     active_goal = None;
                 }
-                active_plan = plan_state;
+                active_plan = plans::restore_revision(plan_state, &plan_revisions);
                 plan_before_turn = None;
                 context = None;
                 if let Some(undo) = &mut pending_undo {
@@ -700,7 +721,7 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
                 message,
                 previous,
             } => {
-                plan_before_turn = previous;
+                plan_before_turn = plans::restore_revision(previous, &plan_revisions);
                 active_plan = Some(PlanState::Draft {
                     objective,
                     questions_asked: false,
@@ -708,7 +729,11 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
                 messages.push(message);
             }
             SessionEvent::PlanReady { plan, message } => {
-                active_plan = Some(PlanState::Ready { plan });
+                plan_revisions.push(plan.clone());
+                active_plan = Some(PlanState::Ready {
+                    plan,
+                    revision: plan_revisions.len(),
+                });
                 messages.push(message);
             }
             SessionEvent::PlanQuestionsAsked => {
@@ -736,6 +761,8 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
         return Err(Error::Protocol("session log is missing metadata".into()));
     }
     Ok(ReplayedSession {
+        plan_revision_count: plan_revisions.len(),
+        plan_handoffs,
         messages,
         model,
         active_goal,
@@ -783,7 +810,7 @@ pub fn list(dir: &Path) -> Result<Vec<SessionInfo>, Error> {
             .metadata()
             .and_then(|m| m.modified())
             .unwrap_or(UNIX_EPOCH);
-        let header = read_header(&path);
+        let header = index::header(&path);
         // Meta-only logs (opened then quit with no turn) are not resumable.
         if !header.has_message {
             continue;
@@ -801,6 +828,7 @@ pub fn list(dir: &Path) -> Result<Vec<SessionInfo>, Error> {
 }
 
 /// Header metadata and preview extracted from a session log in one pass.
+#[derive(Clone)]
 struct SessionHeader {
     cwd: String,
     model: String,
@@ -1146,7 +1174,8 @@ mod tests {
         assert_eq!(
             session.active_plan(),
             Some(&PlanState::Ready {
-                plan: "# Plan".into()
+                plan: "# Plan".into(),
+                revision: 1,
             })
         );
         session.append_plan_cancel()?;

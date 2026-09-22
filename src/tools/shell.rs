@@ -29,7 +29,7 @@ pub(super) fn entry(background: bool) -> ToolEntry {
             "maxLength": 80,
             "description": "Optional /ps label"
         });
-        "Run `sh -c` in the working directory. Use background=true for long commands, then shell_output, shell_list, or shell_stop."
+        "Run `sh -c` in the working directory. Use background=true for dev servers, watchers, and long commands, then shell_output, shell_list, or shell_stop. Do not detach with & or nohup; use the tracked background mode. Bound readiness checks with timeouts."
     } else {
         "Run foreground `sh -c` in the working directory; return stdout or the failure."
     };

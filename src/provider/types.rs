@@ -135,7 +135,28 @@ pub struct Message {
     pub control: Option<MessageControl>,
 }
 
+fn estimate_text_tokens(text: &str) -> u64 {
+    (text.len() as u64).div_ceil(3)
+}
+
 impl Message {
+    /// Approximate context cost; subagent metadata is already rendered in content.
+    pub(crate) fn estimated_tokens(&self) -> u64 {
+        let mut tokens = 8u64.saturating_add(estimate_text_tokens(&self.content));
+        for call in &self.tool_calls {
+            tokens = tokens
+                .saturating_add(estimate_text_tokens(&call.arguments))
+                .saturating_add(estimate_text_tokens(&call.name))
+                .saturating_add(16);
+        }
+        for reasoning in &self.reasoning {
+            tokens = tokens.saturating_add(estimate_text_tokens(&reasoning.content));
+        }
+        // Image costs vary with provider and resolution. Avoid treating them as free
+        // or charging every byte of their base64 encoding as text.
+        tokens.saturating_add((self.images.len() as u64).saturating_mul(4096))
+    }
+
     pub fn user(content: impl Into<String>) -> Message {
         Message {
             role: Role::User,

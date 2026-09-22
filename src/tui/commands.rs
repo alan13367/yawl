@@ -222,7 +222,7 @@ fn notice_plan_status(agent: &Agent, state: &mut ViewState) {
         Some(crate::session::PlanState::Draft { objective, .. }) => state.notice(format!(
             "Draft plan for:\n{objective}\n\n/plan resume continues it. /plan cancel clears it."
         )),
-        Some(crate::session::PlanState::Ready { plan }) => state.notice(format!(
+        Some(crate::session::PlanState::Ready { plan, .. }) => state.notice(format!(
             "Active plan:\n\n{plan}\n\nEnter a prompt to revise or implement it. /plan cancel clears it."
         )),
         None => state.notice("No active plan. Start one with /plan TEXT."),
@@ -414,6 +414,9 @@ pub(super) fn open_queue_picker(state: &mut ViewState) {
 
 pub(super) fn remove_queued(state: &mut ViewState, index: usize) -> bool {
     if state.queued_inputs.remove(index).is_some() {
+        if state.queued_inputs.is_empty() {
+            state.queue_paused = false;
+        }
         state.activity = format!("removed queued message {}", index + 1);
         state.scroll_offset = 0;
         true
@@ -426,6 +429,7 @@ pub(super) fn remove_queued(state: &mut ViewState, index: usize) -> bool {
 pub(super) fn clear_queued(state: &mut ViewState) {
     let count = state.queued_inputs.len();
     state.queued_inputs.clear();
+    state.queue_paused = false;
     state.activity = match count {
         0 => "no queued messages".into(),
         1 => "removed 1 queued message".into(),
@@ -458,6 +462,7 @@ pub(super) fn promote_queued(state: &mut ViewState, index: usize) -> bool {
     if index >= state.queued_inputs.len() {
         return false;
     }
+    state.queue_paused = false;
     let _ = move_queued(state, index, -(index as isize));
     state.activity = "stopping the active turn to send queued message".into();
     true

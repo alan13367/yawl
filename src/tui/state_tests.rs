@@ -59,6 +59,7 @@ fn state_with(geometry: Option<ScrollGeometry>) -> ViewState {
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -418,4 +419,19 @@ fn ctrl_o_expands_all_after_a_single_click_then_collapses_all() {
     assert!(!state.tools_expanded);
     assert!(!state.transcript.entry_expanded(0, state.tools_expanded));
     assert!(!state.transcript.entry_expanded(1, state.tools_expanded));
+}
+
+#[test]
+fn cancel_pauses_waiting_messages_until_explicit_delivery() {
+    let mut state = state_with(None);
+    state.queued_inputs.push_back("queued instruction".into());
+    state.pending_steers.push_back("waiting steer".into());
+    let token = crate::cancellation::CancellationToken::default();
+    super::worker::cancel_worker(super::worker::native_thread_id(), &token, &mut state);
+    assert!(token.is_canceled());
+    assert!(state.queue_paused);
+    assert_eq!(state.queued_inputs[0].text, "queued instruction");
+    assert_eq!(state.pending_steers[0].text, "waiting steer");
+    assert!(super::commands::promote_queued(&mut state, 0));
+    assert!(!state.queue_paused);
 }

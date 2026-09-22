@@ -82,6 +82,7 @@ fn display_settings_apply_during_an_active_turn() {
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,

@@ -13,7 +13,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use serde::Deserialize;
 
@@ -235,31 +240,53 @@ pub fn run_with_timeout(
     }
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
-    let out_handle = std::thread::spawn(move || drain(stdout));
-    let err_handle = std::thread::spawn(move || drain(stderr));
+    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
+        kill_and_reap(&mut child);
+        return Err(error);
+    }
+    let stop_readers = Arc::new(AtomicBool::new(false));
+    let stop_out = Arc::clone(&stop_readers);
+    let stop_err = Arc::clone(&stop_readers);
+    let out_handle = std::thread::spawn(move || drain(stdout, &stop_out));
+    let err_handle = std::thread::spawn(move || drain(stderr, &stop_err));
 
     let deadline = Instant::now().checked_add(timeout);
     let mut timed_out = false;
     let mut interrupted = false;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
+    // The shell can exit while a background descendant still owns a pipe.
+    // Completion includes EOF on both pipes, so cancellation and the deadline
+    // remain active during output collection as well as process execution.
+    let mut status = None;
+    let wait_result = (|| -> std::io::Result<()> {
+        loop {
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            if status.is_some() && out_handle.is_finished() && err_handle.is_finished() {
+                return Ok(());
+            }
+            if crate::cancellation::interrupted() {
+                interrupted = true;
+                return Ok(());
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                timed_out = true;
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(30));
         }
-        if crate::cancellation::interrupted() {
-            interrupted = true;
-            kill_and_reap(&mut child);
-            break None;
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            timed_out = true;
-            kill_and_reap(&mut child);
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(30));
-    };
+    })();
+    if interrupted || timed_out || wait_result.is_err() {
+        kill_and_reap(&mut child);
+        // An escaped descendant may be outside our process group. Do not
+        // wait indefinitely for it to close an inherited pipe.
+        stop_readers.store(true, Ordering::Release);
+        status = None;
+    }
 
     let stdout = out_handle.join().unwrap_or_default();
     let stderr = err_handle.join().unwrap_or_default();
+    wait_result?;
     Ok(ExecResult {
         status: status.and_then(|s| s.code()),
         stdout,
@@ -283,12 +310,31 @@ fn kill_and_reap(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn drain(mut reader: impl Read) -> String {
+fn set_nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
+    // SAFETY: the borrowed pipe owns a valid descriptor throughout both calls.
+    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL updates flags on that same live descriptor, preserving
+    // its existing flags and adding only nonblocking reads.
+    if unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn drain(mut reader: impl Read, stop: &AtomicBool) -> String {
     let mut captured = Vec::with_capacity(MAX_CAPTURE_BYTES);
     let mut chunk = [0u8; 8 * 1024];
     let mut truncated = false;
-    loop {
+    while !stop.load(Ordering::Acquire) {
         let read = match reader.read(&mut chunk) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             Ok(0) | Err(_) => break,
             Ok(read) => read,
         };
@@ -306,6 +352,72 @@ fn drain(mut reader: impl Read) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_stops_descendants_holding_pipes_after_shell_exit() {
+        let token = crate::cancellation::CancellationToken::default();
+        let trigger = token.clone();
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let result = crate::cancellation::scope(&token, || {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 2 & printf ready"]);
+            run_with_timeout(cmd, None, Duration::from_secs(5)).unwrap()
+        });
+        cancel.join().unwrap();
+        assert!(
+            result.interrupted,
+            "cancellation was ignored after the shell exited"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn timeout_covers_descendants_holding_pipes_after_shell_exit() {
+        let started = Instant::now();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 2 & printf ready"]);
+        let result = run_with_timeout(cmd, None, Duration::from_millis(150)).unwrap();
+        assert!(
+            result.timed_out,
+            "timeout was ignored after the shell exited"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn successful_shell_collects_late_descendant_output() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "(sleep 0.1; printf late) & printf early"]);
+        let result = run_with_timeout(cmd, None, Duration::from_secs(2)).unwrap();
+        assert_eq!(result.status, Some(0));
+        assert_eq!(result.stdout, "earlylate");
+        assert!(!result.timed_out);
+        assert!(!result.interrupted);
+    }
+
+    #[test]
+    fn output_reader_can_stop_without_waiting_for_eof() {
+        let (reader, _writer_kept_open) = std::os::unix::net::UnixStream::pair().unwrap();
+        set_nonblocking(&reader).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || drain(reader, &reader_stop));
+        std::thread::sleep(Duration::from_millis(40));
+        stop.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            handle.is_finished(),
+            "reader still waits for a surviving descendant"
+        );
+        assert_eq!(handle.join().unwrap(), "");
+    }
 
     #[test]
     fn run_with_timeout_captures_output_and_exit_code() -> std::io::Result<()> {

@@ -297,6 +297,7 @@ pub(super) fn pump_events<R: Read, T>(
                                 if promote_queued(state, index) {
                                     worker.questions.cancel_pending();
                                     cancel_worker(worker.thread, &worker.cancellation, state);
+                                    state.queue_paused = false;
                                 }
                             } else {
                                 activate_picker_action_while_busy(
@@ -569,6 +570,7 @@ pub(super) fn cancel_worker(
     cancellation: &CancellationToken,
     state: &mut ViewState,
 ) {
+    state.queue_paused = !state.queued_inputs.is_empty() || !state.pending_steers.is_empty();
     cancellation.cancel();
     interrupt_thread(thread);
     state.activity = "canceling turn".into();
@@ -583,6 +585,9 @@ fn recover_unaccepted_steers(agent: &Agent, state: &mut ViewState) {
         }
     }
     state.queued_inputs.extend(recovered);
+    if state.queue_paused && !state.queued_inputs.is_empty() {
+        state.notice("Waiting messages paused. Use /unqueue and Enter to send them when ready.");
+    }
 }
 
 fn handle_steering_while_busy(

@@ -25,7 +25,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tui/picker/settings.rs`, `picker/status_bar.rs`: settings/color/provider picker construction and status-bar editor construction
 - `src/tui/completion.rs`, `files.rs`, `state.rs`, `worker.rs`: TUI behavior and state
 - `src/tui/render.rs`: frame-composition facade and coordinator
-- `src/tui/render/cache.rs`, `render/welcome.rs`: transcript cache with entry rendering and transcript windows, plus the welcome animation
+- `src/tui/render/cache.rs`, `render/welcome.rs`, `render/questions.rs`: transcript cache with entry rendering and transcript windows, plus the welcome animation and question composer
 - `src/tui/terminal.rs`, `events.rs`, `input.rs`, `transcript.rs`: terminal lifecycle, input decoding/editing, and transcript reduction
 - `src/tui/markdown.rs`, `highlight.rs`, `status_bar.rs`: sanitized Markdown, syntax highlighting, and configurable status rendering
 - `src/tui/tool_view.rs`: generic tool-card rendering facade
@@ -37,6 +37,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
 - `src/tools/`: builtin registry and executable-tool discovery
+- `src/tools/output.rs`: bounded excerpts and saved artifacts for verbose command and web output
 - `src/tools/shell.rs`: foreground/background shell schemas and execution
 - `src/tools/files.rs`: bounded native file listing, literal text search, and paged UTF-8 reads
 - `src/tools/git.rs`: fixed read-only Git inspection for restricted children
@@ -48,7 +49,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/background.rs`, `src/subagent/`, `src/cancellation.rs`: session-bound shell processes, parallel subagents, and interrupt tokens
 - `src/terminal_mode.rs`: shared raw-terminal lifecycle for the TUI and onboarding selector
 - `src/skills.rs`, `src/trust.rs`, `src/image.rs`: skill discovery, project skill trust, and image input
-- `src/session.rs`, `src/session/recovery.rs`, `src/compaction.rs`, `src/checkpoint.rs`: append-only sessions, recovery records, context compaction, and `/undo` working-tree snapshots
+- `src/session.rs`, `src/session/recovery.rs`, `src/session/plans.rs`, `src/session/index.rs`, `src/compaction.rs`, `src/checkpoint.rs`: append-only sessions, recovery records, saved plan revisions and implementation handoffs, session-list metadata caching, context compaction, and `/undo` working-tree snapshots
 - `README.md`: user-facing behavior, contracts, and a concise architecture map
 
 Most tests live in `#[cfg(test)]` modules beside their implementation. TUI cross-module tests use focused `*_tests.rs` modules under `src/tui/` so production visibility stays narrow. Git unit tests follow their owning child modules; `src/tui/git/test_support.rs` contains shared test-only repository helpers, and `src/tui/git_tests.rs` covers dashboard behavior across children.

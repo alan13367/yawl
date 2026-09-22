@@ -160,6 +160,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
             continue;
         }
         if state.picker.is_none()
+            && !state.queue_paused
             && let Some(input) = state.queued_inputs.pop_front()
         {
             if handle_submission(

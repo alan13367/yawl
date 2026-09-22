@@ -207,6 +207,7 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         scroll_offset: 0,
         queued_inputs: ["first".into(), "second".into()].into(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -271,7 +272,9 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
     let PickerAction::SendQueued(index) = send else {
         panic!("queue Enter should request immediate delivery");
     };
+    state.queue_paused = true;
     assert!(super::commands::promote_queued(&mut state, index));
+    assert!(!state.queue_paused);
     assert_eq!(state.queued_inputs[0].text, "edited second");
 }
 

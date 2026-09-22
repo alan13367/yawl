@@ -22,24 +22,21 @@ enum TurnMode {
     PlanImplement,
 }
 
-fn plan_prompt(
-    state: Option<&crate::session::PlanState>,
+fn plan_prompt<'a>(
+    state: Option<&'a crate::session::PlanState>,
+    path: Option<&'a str>,
     mode: TurnMode,
-) -> Option<crate::prompt::PlanPrompt<'_>> {
+) -> Option<crate::prompt::PlanPrompt<'a>> {
     use crate::prompt::PlanPrompt;
     use crate::session::PlanState;
     match (mode, state) {
         (TurnMode::Plan, Some(PlanState::Draft { objective, .. })) => {
             Some(PlanPrompt::Draft(objective))
         }
-        (TurnMode::PlanRevise, Some(PlanState::Ready { plan })) => Some(PlanPrompt::Revise(plan)),
-        (TurnMode::PlanFollowUp, Some(PlanState::Ready { plan })) => {
-            Some(PlanPrompt::FollowUp(plan))
-        }
-        (TurnMode::PlanImplement, Some(PlanState::Ready { plan })) => {
-            Some(PlanPrompt::Implement(plan))
-        }
-        (_, Some(PlanState::Ready { plan })) => Some(PlanPrompt::Active(plan)),
+        (TurnMode::PlanRevise, Some(PlanState::Ready { .. })) => path.map(PlanPrompt::Revise),
+        (TurnMode::PlanFollowUp, Some(PlanState::Ready { .. })) => path.map(PlanPrompt::FollowUp),
+        (TurnMode::PlanImplement, Some(PlanState::Ready { .. })) => path.map(PlanPrompt::Implement),
+        (_, Some(PlanState::Ready { .. })) => path.map(PlanPrompt::Active),
         _ => None,
     }
 }
@@ -453,6 +450,11 @@ impl Conversation {
                     return Ok(false);
                 }
             }
+            if mode == TurnMode::PlanImplement {
+                self.prepare_plan_handoff(sink, resolve_provider)?;
+            }
+            let plan_path = self.plan_file_reference()?;
+
             // Rescan every iteration so a tool the model just wrote is
             // available on its very next step.
             let mut registry = self.scan_tools();
@@ -481,7 +483,7 @@ impl Conversation {
                         goal: (mode == TurnMode::Goal)
                             .then_some(state.session.active_goal())
                             .flatten(),
-                        plan: plan_prompt(state.session.active_plan(), mode),
+                        plan: plan_prompt(state.session.active_plan(), plan_path.as_deref(), mode),
                         interactive_questions: self.questions.is_enabled(),
                         init: mode == TurnMode::Init,
                     },
@@ -990,16 +992,19 @@ impl Conversation {
         plan: String,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<(), Error> {
-        if assistant.content.is_empty() {
-            sink(TurnEvent::TextDelta(&plan));
-        } else if assistant.content != plan {
-            sink(TurnEvent::AssistantReplace(&plan));
-        }
-        assistant.content.clone_from(&plan);
+        let streamed = std::mem::replace(&mut assistant.content, plan.clone());
         assistant.tool_calls.clear();
-        self.persistent_mut()
+        let path = self
+            .persistent_mut()
             .session
             .append_plan_ready(&plan, &assistant)?;
+        let location = format!("\n\nSaved plan: {}", path.display());
+        if streamed.is_empty() {
+            sink(TurnEvent::TextDelta(&plan));
+        } else if streamed != plan {
+            sink(TurnEvent::AssistantReplace(&plan));
+        }
+        sink(TurnEvent::TextDelta(&location));
         self.messages.push(assistant);
         self.latest_turn_result.clone_from(&plan);
         self.plan_ready_this_turn = true;
@@ -1132,6 +1137,7 @@ impl Conversation {
     {
         self.recover_history()?;
         sink(TurnEvent::Compacting);
+        let plan_path = self.plan_file_reference()?;
         let registry = self.scan_tools();
         let specs = registry.specs();
         let system = match &self.kind {
@@ -1143,11 +1149,7 @@ impl Conversation {
                 registry.skills(),
                 crate::prompt::MainPromptState {
                     goal: state.session.active_goal(),
-                    plan: state
-                        .session
-                        .active_plan()
-                        .and_then(crate::session::PlanState::ready)
-                        .map(crate::prompt::PlanPrompt::Active),
+                    plan: plan_path.as_deref().map(crate::prompt::PlanPrompt::Active),
                     interactive_questions: self.questions.is_enabled(),
                     init: false,
                 },

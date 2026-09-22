@@ -32,6 +32,7 @@ fn completion_state(commands: &[&str]) -> ViewState {
         scroll_offset: 0,
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
+        queue_paused: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,

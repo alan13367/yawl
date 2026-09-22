@@ -7,6 +7,7 @@
 pub mod exec;
 mod files;
 mod git;
+mod output;
 mod planning_shell;
 mod shell;
 mod user_input;
@@ -113,6 +114,7 @@ impl ToolOutcome {
 }
 
 pub struct Registry {
+    output_directory: std::path::PathBuf,
     entries: Vec<ToolEntry>,
     pub warnings: Vec<String>,
     skills: Vec<Skill>,
@@ -165,6 +167,7 @@ impl Registry {
         background: Option<BackgroundProcessManager>,
     ) -> Registry {
         let mut registry = Registry {
+            output_directory: config.home_dir.join("artifacts/tool-output"),
             entries: builtins(background.is_some()),
             warnings: Vec::new(),
             skills: Vec::new(),
@@ -424,7 +427,18 @@ impl Registry {
             }
             ToolImpl::Subagent(tool) => self.execute_subagent(*tool, &args),
         };
-        truncate_result(&mut outcome.content);
+        let save_output = matches!(
+            entry.imp,
+            ToolImpl::Exec(_) | ToolImpl::WebFetch | ToolImpl::PlanningShell
+        ) || (matches!(entry.imp, ToolImpl::Shell)
+            && args.get("background").and_then(Value::as_bool) != Some(true));
+        if save_output {
+            output::prepare(&self.output_directory, &mut outcome.content);
+        }
+        // User answers are requirements, not disposable command output.
+        if !matches!(entry.imp, ToolImpl::UserInput(_)) {
+            truncate_result(&mut outcome.content);
+        }
         if outcome.content.is_empty() {
             outcome.content = if outcome.is_error {
                 "(no output)".to_string()

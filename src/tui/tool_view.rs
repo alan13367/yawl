@@ -120,21 +120,11 @@ pub(super) fn render_labeled(
     } else {
         None
     };
-    let mut lines = if name == crate::tools::USER_INPUT_TOOL_NAME && !running && !is_error {
-        render_question_answers(parsed.as_ref(), output).unwrap_or_else(|| {
-            render_call(
-                name,
-                parsed.as_ref(),
-                args,
-                background_start,
-                background_details.as_ref(),
-                running,
-                elapsed,
-                is_error,
-                labels,
-                expanded,
-            )
-        })
+    let mut lines = if name == crate::tools::USER_INPUT_TOOL_NAME && (running || is_error) {
+        question_call(parsed.as_ref(), running, is_error, expanded)
+    } else if name == crate::tools::USER_INPUT_TOOL_NAME && !running && !is_error {
+        render_question_answers(parsed.as_ref(), output)
+            .unwrap_or_else(|| question_call(parsed.as_ref(), false, false, expanded))
     } else {
         render_call(
             name,
@@ -207,6 +197,8 @@ pub(super) fn render_labeled(
         ERROR_BACKGROUND
     } else if name == "read_skill" {
         SKILL_BACKGROUND
+    } else if name == crate::tools::USER_INPUT_TOOL_NAME {
+        "\x1b[48;2;40;44;52m"
     } else if running {
         "\x1b[48;5;58m"
     } else {
@@ -484,6 +476,37 @@ fn should_show_output(name: &str, output: &str, is_error: bool) -> bool {
         )
 }
 
+fn question_call(
+    args: Option<&Value>,
+    running: bool,
+    is_error: bool,
+    expanded: bool,
+) -> Vec<ToolLine> {
+    let questions = args
+        .and_then(|args| args.get("questions"))
+        .and_then(Value::as_array);
+    let title = if is_error {
+        "Questions · needs attention"
+    } else if running {
+        "Awaiting your answers"
+    } else {
+        "Questions"
+    };
+    let count = questions.map_or(String::new(), |questions| {
+        format!(" · {} questions", questions.len())
+    });
+    let mut lines = vec![ToolLine::new(format!("{title}{count}"), Tone::Header).wrapping()];
+    if expanded && let Some(questions) = questions {
+        for (index, question) in questions.iter().enumerate() {
+            if let Some(text) = question.get("question").and_then(Value::as_str) {
+                lines
+                    .push(ToolLine::new(format!("{}. {text}", index + 1), Tone::Output).wrapping());
+            }
+        }
+    }
+    lines
+}
+
 fn render_question_answers(args: Option<&Value>, output: &str) -> Option<Vec<ToolLine>> {
     let questions = args?.get("questions")?.as_array()?;
     let result: Value = serde_json::from_str(output).ok()?;
@@ -519,10 +542,7 @@ fn render_question_answers(args: Option<&Value>, output: &str) -> Option<Vec<Too
             .and_then(Value::as_str)
             .filter(|source| *source == "timeout")
             .map_or("", |_| " [timeout]");
-        lines.push(ToolLine::new(
-            format!("{prompt} → {label}{timeout}"),
-            Tone::Output,
-        ));
+        lines.push(ToolLine::new(format!("{prompt} → {label}{timeout}"), Tone::Output).wrapping());
     }
     Some(lines)
 }
@@ -865,6 +885,37 @@ mod tests {
         let plain = markdown::strip_ansi(&rendered.join("\n"));
         assert!(plain.contains("Which scope? → Only update keyboard navigation"));
         assert!(!plain.contains("→ Other"));
+    }
+
+    #[test]
+    fn active_and_invalid_question_cards_never_expose_argument_json() {
+        for args in [
+            r#"{"questions":[{"question":"What should we build?"}]}"#,
+            r#"{"questions":[{"quest"#,
+        ] {
+            for error in [false, true] {
+                for width in [16, 80] {
+                    let rendered = render(
+                        crate::tools::USER_INPUT_TOOL_NAME,
+                        args,
+                        "",
+                        error,
+                        true,
+                        None,
+                        width,
+                        true,
+                    );
+                    let plain = markdown::strip_ansi(&rendered.join("\n"));
+                    assert!(!plain.contains("request_user_input"));
+                    assert!(!plain.contains("{\"questions\""));
+                    assert!(
+                        rendered
+                            .iter()
+                            .all(|line| markdown::visible_width(line) <= width)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

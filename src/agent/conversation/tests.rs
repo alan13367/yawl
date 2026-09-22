@@ -1304,6 +1304,12 @@ fn plan_implementation_receives_deferred_subagent_results() {
         input_tokens: 10,
         output_tokens: 2,
     }])));
+    steps.borrow_mut().push_front(ProviderStep::Output {
+        text: "Implement the agreed feature.",
+        tool_calls: vec![],
+        input_tokens: 10,
+        output_tokens: 2,
+    });
     let mut resolve = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
 
     assert!(
@@ -1832,4 +1838,292 @@ fn deferred_delivery_is_restored_after_a_partial_append_failure() {
     reopen_test_agent(&mut test);
     assert_eq!(test.agent.messages.len(), 2);
     assert_eq!(test.agent.messages[0].subagent_results.len(), 1);
+}
+
+type HandoffRequests = Rc<RefCell<Vec<(String, Vec<Message>)>>>;
+
+struct HandoffProvider {
+    requests: HandoffRequests,
+    classify: bool,
+}
+
+impl Provider for HandoffProvider {
+    fn stream_once(
+        &self,
+        request: &Request<'_>,
+        sink: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), Error> {
+        self.requests
+            .borrow_mut()
+            .push((request.system.into(), request.messages.to_vec()));
+        if request.tools.is_empty() {
+            sink(ProviderEvent::TextDelta(
+                "Keep the public API stable. Earlier checks passed.".into(),
+            ));
+        } else if self.classify && request.system.contains("phase=\"follow_up\"") {
+            sink(ProviderEvent::ToolCall(ToolCall {
+                id: "classify".into(),
+                name: crate::tools::PLAN_ACTION_TOOL_NAME.into(),
+                arguments: r#"{"action":"implement"}"#.into(),
+            }));
+        } else {
+            sink(ProviderEvent::ToolCall(ToolCall {
+                id: "implemented".into(),
+                name: crate::tools::PLAN_IMPLEMENTED_TOOL_NAME.into(),
+                arguments: r#"{"result":"Done."}"#.into(),
+            }));
+        }
+        sink(ProviderEvent::Usage(TokenUsage {
+            input_tokens: 25,
+            output_tokens: 10,
+            ..TokenUsage::default()
+        }));
+        sink(ProviderEvent::Done);
+        Ok(())
+    }
+}
+
+fn ready_handoff_fixture(name: &str) -> TestAgent {
+    let mut test = TestAgent::new(name);
+    test.agent
+        .start_plan("Keep the public API stable".to_string().into())
+        .unwrap();
+    let investigation = Message::assistant("large investigation output ".repeat(4000), vec![]);
+    test.agent.persist_message(&investigation).unwrap();
+    test.agent.messages.push(investigation);
+    let plan = "# Unique implementation plan\n\nUpdate parsing and run checks.";
+    let ready = Message::assistant(plan.into(), vec![]);
+    test.agent
+        .persistent_mut()
+        .session
+        .append_plan_ready(plan, &ready)
+        .unwrap();
+    test.agent.messages.push(ready);
+    test
+}
+
+#[test]
+fn plan_handoff_reduces_requests_for_picker_and_classified_follow_up() -> Result<(), Error> {
+    for classify in [false, true] {
+        let mut test = ready_handoff_fixture("handoff-requests");
+        let before = test
+            .agent
+            .messages
+            .iter()
+            .map(super::context::message_tokens)
+            .sum::<u64>();
+        let captures = Rc::new(RefCell::new(Vec::new()));
+        let mut resolve = |_: &str, _: &Config| -> Result<(Box<dyn Provider>, String), Error> {
+            Ok((
+                Box::new(HandoffProvider {
+                    requests: captures.clone(),
+                    classify,
+                }),
+                "test".into(),
+            ))
+        };
+        if classify {
+            test.agent.run_plan_follow_up_with(
+                "Implement, preserving compatibility".to_string().into(),
+                &mut |_| {},
+                &mut resolve,
+            )?;
+        } else {
+            test.agent
+                .run_plan_implementation_with(None, &mut |_| {}, &mut resolve)?;
+        }
+        let requests = captures.borrow();
+        assert_eq!(requests.len(), if classify { 3 } else { 2 });
+        let (system, messages) = requests.last().unwrap();
+        assert!(!system.contains("# Unique implementation plan"));
+        assert!(system.contains("read the saved plan file"));
+        let text = messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text.matches("# Unique implementation plan").count(), 1);
+        assert!(text.contains("Keep the public API stable"));
+        assert!(!text.contains("large investigation output"));
+        assert!(text.contains(if classify {
+            "Implement, preserving compatibility"
+        } else {
+            "Implement the active plan now."
+        }));
+        assert!(
+            messages
+                .iter()
+                .map(super::context::message_tokens)
+                .sum::<u64>()
+                < before / 10
+        );
+        assert!(crate::session::missing_tool_results(messages).is_none());
+        if classify {
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.tool_call_id.as_deref() == Some("classify"))
+            );
+        }
+        drop(requests);
+        // Undo implementation retains the compact handoff and its ready plan.
+        test.agent.undo_last_turn()?;
+        assert!(test.agent.active_plan().is_some());
+        assert!(test.agent.persistent_state().session.plan_has_handoff(1));
+        let id = test.agent.session_id().to_string();
+        let (session, messages) = Session::open(&test.sessions_dir, &id)?;
+        *test.agent.persistent_mut().session = session;
+        test.agent.messages = messages;
+        captures.borrow_mut().clear();
+        test.agent
+            .run_plan_implementation_with(None, &mut |_| {}, &mut resolve)?;
+        assert_eq!(
+            captures.borrow().len(),
+            1,
+            "resume after undo must not summarize again"
+        );
+        let log = std::fs::read_to_string(test.sessions_dir.join(format!("{id}.jsonl")))?;
+        assert!(
+            log.contains("large investigation output"),
+            "original history remains on disk"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn failed_plan_handoff_preserves_history_and_retries() -> Result<(), Error> {
+    for fail_storage in [false, true] {
+        let mut test = ready_handoff_fixture("handoff-failure");
+        test.agent
+            .append_input_message(Message::user("Implement with care"))?;
+        let before = serde_json::to_value(&test.agent.messages)?;
+        let captures = Rc::new(RefCell::new(Vec::new()));
+        let mut resolve = |_: &str, _: &Config| -> Result<(Box<dyn Provider>, String), Error> {
+            Ok((
+                Box::new(HandoffProvider {
+                    requests: captures.clone(),
+                    classify: false,
+                }),
+                "test".into(),
+            ))
+        };
+        if fail_storage {
+            // Usage is saved first; then the compaction append fails.
+            test.agent.persistent_mut().session.fail_append_after(1);
+            assert!(
+                test.agent
+                    .prepare_plan_handoff(&mut |_| {}, &mut resolve)
+                    .is_err()
+            );
+        } else {
+            let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Fail])));
+            let mut failed = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
+            assert!(
+                test.agent
+                    .prepare_plan_handoff(&mut |_| {}, &mut failed)
+                    .is_err()
+            );
+        }
+        assert_eq!(serde_json::to_value(&test.agent.messages)?, before);
+        assert!(!test.agent.persistent_state().session.plan_has_handoff(1));
+        assert!(test.agent.active_plan().is_some());
+        test.agent.prepare_plan_handoff(&mut |_| {}, &mut resolve)?;
+        assert_eq!(test.agent.messages.len(), 2);
+        assert!(test.agent.persistent_state().session.plan_has_handoff(1));
+    }
+    Ok(())
+}
+
+#[test]
+fn plan_handoff_survives_compaction_and_new_revision_gets_a_new_handoff() -> Result<(), Error> {
+    let mut test = ready_handoff_fixture("handoff-revision");
+    test.agent
+        .append_input_message(Message::user("Implement"))?;
+    let captures = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = |_: &str, _: &Config| -> Result<(Box<dyn Provider>, String), Error> {
+        Ok((
+            Box::new(HandoffProvider {
+                requests: captures.clone(),
+                classify: false,
+            }),
+            "test".into(),
+        ))
+    };
+    test.agent.prepare_plan_handoff(&mut |_| {}, &mut resolve)?;
+    test.agent.persist_compaction(
+        "Implementation progress; consult saved plan.",
+        0,
+        1,
+        &[],
+        None,
+    )?;
+    compaction::apply_summary(
+        &mut test.agent.messages,
+        "Implementation progress; consult saved plan.",
+        1,
+    );
+    let path = test.agent.plan_file_reference()?.unwrap();
+    std::fs::remove_file(&path)?;
+    test.agent.prepare_plan_handoff(&mut |_| {}, &mut resolve)?;
+    assert_eq!(captures.borrow().len(), 1);
+    assert_eq!(
+        test.agent.plan_file_reference()?.as_deref(),
+        Some(path.as_str())
+    );
+    assert!(std::fs::read_to_string(&path)?.contains("# Unique implementation plan"));
+
+    let plan = "# Revised implementation plan";
+    let ready = Message::assistant(plan.into(), vec![]);
+    test.agent
+        .persistent_mut()
+        .session
+        .append_plan_ready(plan, &ready)?;
+    test.agent.messages.push(ready);
+    test.agent
+        .append_input_message(Message::user("Implement the revised plan"))?;
+    test.agent.prepare_plan_handoff(&mut |_| {}, &mut resolve)?;
+    assert_eq!(captures.borrow().len(), 2);
+    assert!(test.agent.messages[0].content.contains(plan));
+    assert!(
+        !test.agent.messages[0]
+            .content
+            .contains("# Unique implementation plan")
+    );
+    assert!(test.agent.persistent_state().session.plan_has_handoff(2));
+    assert_ne!(test.agent.plan_file_reference()?.unwrap(), path);
+    Ok(())
+}
+
+#[test]
+fn canceled_handoff_keeps_the_original_context() -> Result<(), Error> {
+    struct CancelSummary(crate::cancellation::CancellationToken);
+    impl Provider for CancelSummary {
+        fn stream_once(
+            &self,
+            _: &Request<'_>,
+            sink: &mut dyn FnMut(ProviderEvent),
+        ) -> Result<(), Error> {
+            sink(ProviderEvent::TextDelta("partial summary".into()));
+            self.0.cancel();
+            sink(ProviderEvent::Done);
+            Ok(())
+        }
+    }
+    let mut test = ready_handoff_fixture("handoff-cancel");
+    test.agent
+        .append_input_message(Message::user("Implement"))?;
+    let before = serde_json::to_value(&test.agent.messages)?;
+    let token = test.agent.cancellation.clone();
+    let mut resolve = |_: &str, _: &Config| -> Result<(Box<dyn Provider>, String), Error> {
+        Ok((Box::new(CancelSummary(token.clone())), "test".into()))
+    };
+    let result = crate::cancellation::scope(&token, || {
+        test.agent.prepare_plan_handoff(&mut |_| {}, &mut resolve)
+    });
+    assert!(matches!(result, Err(Error::Interrupted)));
+    assert_eq!(serde_json::to_value(&test.agent.messages)?, before);
+    assert!(!test.agent.persistent_state().session.plan_has_handoff(1));
+    token.clear();
+    Ok(())
 }
