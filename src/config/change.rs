@@ -661,6 +661,13 @@ mod tests {
             r#"{"providers":{"local":{"models":[{"id":"m","reasoning_efforts":[]}]}}}"#,
         )
         .unwrap();
+        // Provider definitions in a project config apply only once the project
+        // is trusted; without trust the global change would stay effective.
+        let mut config = config;
+        config.set_project_skills_trusted(true);
+        config
+            .apply_project_trusted_config()
+            .expect("trusted project config should apply");
         let outcome = config.change_global(change).unwrap();
         assert_eq!(outcome.effect, ConfigChangeEffect::Overridden);
         assert!(

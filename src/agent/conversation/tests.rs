@@ -185,7 +185,7 @@ fn tool_allowlist_filters_child_tool_scans() {
         .scan_tools()
         .specs()
         .into_iter()
-        .map(|spec| spec.name)
+        .map(|spec| spec.name.clone())
         .collect::<Vec<_>>();
     names.sort();
     assert_eq!(

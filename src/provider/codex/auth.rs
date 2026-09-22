@@ -410,7 +410,7 @@ pub fn credential_status(config: &Config) -> CodexLoginStatus {
     }
 }
 
-fn load_credential(config: &Config) -> Result<Option<CodexCredential>, Error> {
+pub(super) fn load_credential(config: &Config) -> Result<Option<CodexCredential>, Error> {
     let path = auth_path(config);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,

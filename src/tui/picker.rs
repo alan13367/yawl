@@ -22,6 +22,7 @@ use crate::config::{
     Config, StatusBarFormat, StatusBarKind, StatusBarStyle, StatusBarVisibility, UiColor,
     WebSearchProvider,
 };
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use super::ViewState;
 use super::connection::{ConnectEditField, ConnectStep};
@@ -301,8 +302,6 @@ pub(super) enum PickerEdit {
 }
 
 pub(super) struct ActivePickers {
-    pub(super) model: Picker,
-    pub(super) default_model: Picker,
     pub(super) settings: Picker,
     pub(super) settings_categories: Vec<(SettingsCategory, Picker)>,
     pub(super) reasoning: Picker,
@@ -311,11 +310,16 @@ pub(super) struct ActivePickers {
     pub(super) selection_color: Picker,
 }
 
+pub(super) struct ModelRefreshJob {
+    receiver: Receiver<Result<(), crate::error::Error>>,
+    config: Config,
+    selected_model: String,
+    save: bool,
+}
+
 impl ActivePickers {
     pub(super) fn from_agent(agent: &Agent) -> Self {
         Self {
-            model: model_picker(agent, false),
-            default_model: model_picker(agent, true),
             settings: settings_picker(agent),
             settings_categories: SettingsCategory::ALL
                 .into_iter()
@@ -348,16 +352,122 @@ impl ActivePickers {
 }
 
 pub(super) fn open_model_picker(agent: &Agent, state: &mut ViewState, save: bool) {
-    state.picker = Some(model_picker(agent, save));
-}
-
-pub(super) fn model_picker(agent: &Agent, save: bool) -> Picker {
     let selected_model = if save {
         agent.config().model.as_deref().unwrap_or(agent.model())
     } else {
         agent.model()
     };
-    let mut models = crate::model::available_models(agent.config());
+    open_model_picker_from_config(agent.config(), selected_model, state, save);
+}
+
+pub(super) fn open_model_picker_from_config(
+    config: &Config,
+    selected_model: &str,
+    state: &mut ViewState,
+    save: bool,
+) {
+    state.picker = Some(model_picker(config, selected_model, save));
+    state.model_refresh = None;
+    if crate::provider::codex::credential_status(config)
+        != crate::provider::codex::CodexLoginStatus::LoggedIn
+    {
+        return;
+    }
+    if let Some(picker) = state.picker.as_mut() {
+        picker.hint = "Refreshing Codex models…  ↑/↓ move  Enter select  Esc cancel".into();
+    }
+    let config_for_worker = config.clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = crate::provider::codex::refresh_catalog(&config_for_worker).map(|_| ());
+        let _ = sender.send(result);
+    });
+    state.model_refresh = Some(ModelRefreshJob {
+        receiver,
+        config: config.clone(),
+        selected_model: selected_model.to_string(),
+        save,
+    });
+}
+
+pub(super) fn poll_model_picker(state: &mut ViewState) -> bool {
+    let Some(job) = state.model_refresh.take() else {
+        return false;
+    };
+    let expected_title = if job.save {
+        "Default model"
+    } else {
+        "Choose model"
+    };
+    let Some(picker) = state
+        .picker
+        .as_ref()
+        .filter(|picker| picker.title == expected_title)
+    else {
+        return false;
+    };
+    match job.receiver.try_recv() {
+        Err(TryRecvError::Empty) => {
+            state.model_refresh = Some(job);
+            false
+        }
+        Ok(Ok(())) => {
+            if picker.editing.is_none() {
+                state.picker = Some(refreshed_model_picker(
+                    &job.config,
+                    &job.selected_model,
+                    job.save,
+                    picker,
+                ));
+                true
+            } else {
+                if let Some(picker) = state.picker.as_mut() {
+                    picker.hint = "↑/↓ move  Enter select  Esc cancel".into();
+                }
+                true
+            }
+        }
+        Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+            state.notice("Could not refresh Codex models. Showing the saved catalog.");
+            if let Some(picker) = state.picker.as_mut() {
+                picker.hint = "↑/↓ move  Enter select  Esc cancel".into();
+            }
+            true
+        }
+    }
+}
+
+pub(super) fn refreshed_model_picker(
+    config: &Config,
+    selected_model: &str,
+    save: bool,
+    previous: &Picker,
+) -> Picker {
+    let selected = previous
+        .items
+        .get(previous.selected)
+        .map(|item| &item.action);
+    let mut updated = model_picker(config, selected_model, save);
+    if let Some(index) = updated
+        .items
+        .iter()
+        .position(|item| match (selected, &item.action) {
+            (Some(PickerAction::SaveModel(old)), PickerAction::SaveModel(new))
+            | (Some(PickerAction::SwitchModel(old)), PickerAction::SwitchModel(new)) => old == new,
+            (
+                Some(PickerAction::EditModel { save: old, .. }),
+                PickerAction::EditModel { save: new, .. },
+            ) => old == new,
+            _ => false,
+        })
+    {
+        updated.selected = index;
+    }
+    updated
+}
+
+pub(super) fn model_picker(config: &Config, selected_model: &str, save: bool) -> Picker {
+    let mut models = crate::model::available_models(config);
     if !models.iter().any(|(model, _)| model == selected_model) {
         models.push((
             selected_model.to_string(),
@@ -368,7 +478,6 @@ pub(super) fn model_picker(agent: &Agent, save: bool) -> Picker {
             }
             .into(),
         ));
-        models.sort_by(|left, right| left.0.cmp(&right.0));
     }
     let mut items = models
         .into_iter()

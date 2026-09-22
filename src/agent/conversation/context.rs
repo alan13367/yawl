@@ -1,6 +1,6 @@
 use super::{Conversation, ConversationKind};
 use crate::error::Error;
-use crate::provider::{Message, ToolSpec};
+use crate::provider::Message;
 use crate::session::ContextUsage;
 
 fn text_tokens(text: &str) -> u64 {
@@ -12,14 +12,9 @@ pub(super) fn message_tokens(message: &Message) -> u64 {
     message.estimated_tokens()
 }
 
-pub(super) fn prompt_tokens(system: &str, tools: &[ToolSpec]) -> u64 {
-    tools.iter().fold(text_tokens(system), |tokens, tool| {
-        tokens
-            .saturating_add(text_tokens(&tool.name))
-            .saturating_add(text_tokens(&tool.description))
-            .saturating_add(text_tokens(&tool.input_schema.to_string()))
-            .saturating_add(16)
-    })
+/// System prompt plus the registry's cached estimate of its tool schemas.
+pub(super) fn prompt_tokens(system: &str, tool_tokens: u64) -> u64 {
+    text_tokens(system).saturating_add(tool_tokens)
 }
 
 impl Conversation {

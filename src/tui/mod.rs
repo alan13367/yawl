@@ -55,7 +55,7 @@ use self::events::{Event, EventReader, Key};
 use self::input::{EditAction, Editor, Submission};
 use self::picker::{
     open_model_picker, open_settings_picker, picker_is_editing, picker_is_plan_handoff,
-    take_picker_action,
+    poll_model_picker, take_picker_action,
 };
 use self::state::{Update, ViewState, advance_ticks, scroll, toggle_tool_expansion};
 use self::subagents::open_dashboard as open_subagent_dashboard;
@@ -250,6 +250,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                     Event::Tick => {
                         needs_draw |= advance_ticks(&mut state);
                         needs_draw |= connection::poll(&mut state);
+                        needs_draw |= poll_model_picker(&mut state);
                     }
                     Event::MouseScroll(_)
                     | Event::Paste(_)
@@ -262,6 +263,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                 Event::Tick => {
                     needs_draw |= advance_ticks(&mut state);
                     needs_draw |= connection::poll(&mut state);
+                    needs_draw |= poll_model_picker(&mut state);
                 }
                 Event::FocusGained | Event::FocusLost => {}
                 Event::MouseScroll(amount) => scroll(&mut state, amount),

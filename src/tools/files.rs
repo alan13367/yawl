@@ -1,4 +1,5 @@
-//! Bounded, read-only file discovery and paged text reads. No shell execution.
+//! Bounded file tools: recursive listing and literal search, paged UTF-8
+//! reads, bounded read/write/edit, and image reads. No shell execution.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -15,8 +16,61 @@ const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SCAN_BYTES: usize = 32 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 const MAX_PAGE_BYTES: usize = 32 * 1024;
+/// Cap on `read_file` input size. Anything larger truncates to the result cap
+/// anyway, so reading it in full only wastes memory.
+const MAX_READ_FILE_BYTES: u64 = 1024 * 1024;
+/// Cap on `edit_file` input size. The whole file is read and rewritten, so a
+/// pathologically large file would balloon memory before the match check.
+const MAX_EDIT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules"];
 
+/// The `read_file`, `write_file`, and `edit_file` entries.
+pub(super) fn builtin_entries() -> Vec<super::ToolEntry> {
+    vec![
+        super::ToolEntry::new(crate::provider::ToolSpec {
+                name: "read_file".into(),
+                description: "Read a UTF-8 text file or a PNG, JPEG, GIF, or WebP image.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path (absolute or relative to cwd)"},
+                        "offset": {"type": "integer", "minimum": 0, "description": "Optional byte offset for a paged UTF-8 text read; use returned next_offset to continue."},
+                        "limit": {"type": "integer", "minimum": 4, "maximum": 32768, "description": "Page size in bytes; default 16384 when paging. Omit offset and limit for normal text/image reads."}
+                    },
+                    "required": ["path"]
+                }),
+            }, super::ToolImpl::ReadFile),
+        super::ToolEntry::new(crate::provider::ToolSpec {
+                name: "write_file".into(),
+                description:
+                    "Write a file, creating parent directories; replaces existing content.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"]
+                }),
+            }, super::ToolImpl::WriteFile),
+        super::ToolEntry::new(crate::provider::ToolSpec {
+                name: "edit_file".into(),
+                description: "Replace one exact `old_string` occurrence; include enough context for uniqueness."
+                    .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"}
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }),
+            }, super::ToolImpl::EditFile),
+    ]
+}
+
+/// The allowlisted `list_files` and `search_files` entries.
 pub(super) fn entries() -> Vec<super::ToolEntry> {
     [("list_files", false), ("search_files", true)]
         .into_iter()
@@ -30,8 +84,7 @@ pub(super) fn entries() -> Vec<super::ToolEntry> {
             if search {
                 properties["query"] = json!({"type": "string", "description": "Nonempty, case-sensitive literal text; not a regex."});
             }
-            super::ToolEntry {
-                spec: crate::provider::ToolSpec {
+            super::ToolEntry::new(crate::provider::ToolSpec {
                     name: name.into(),
                     description: format!(
                         "{}. Read-only, bounded recursion; skips hidden entries, symlinks, target and node_modules by default. Does not interpret ignore files. Narrow path when truncated.",
@@ -41,9 +94,7 @@ pub(super) fn entries() -> Vec<super::ToolEntry> {
                         "type": "object", "properties": properties,
                         "required": if search { vec!["query"] } else { vec![] }
                     }),
-                },
-                imp: if search { super::ToolImpl::SearchFiles } else { super::ToolImpl::ListFiles },
-            }
+                }, if search { super::ToolImpl::SearchFiles } else { super::ToolImpl::ListFiles })
         })
         .collect()
 }
@@ -392,6 +443,141 @@ fn page(args: &Value) -> Result<Value, String> {
         "next_offset": (end < total).then_some(end), "content": text}))
 }
 
+pub(super) fn read_file_for_model(args: &Value, supports_images: bool) -> ToolOutcome {
+    if args.get("offset").is_some() || args.get("limit").is_some() {
+        return read_page(args);
+    }
+    let path = match str_arg(args, "path") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match std::fs::File::open(path) {
+        Ok(file) => read_bounded_file(path, file, supports_images),
+        Err(e) => ToolOutcome::error(format!("cannot read {path}: {e}")),
+    }
+}
+
+fn read_bounded_file(path: &str, mut reader: impl Read, supports_images: bool) -> ToolOutcome {
+    const IMAGE_SIGNATURE_BYTES: usize = 12;
+    let mut prefix = Vec::with_capacity(IMAGE_SIGNATURE_BYTES);
+    if let Err(error) = reader.by_ref().take(12).read_to_end(&mut prefix) {
+        return ToolOutcome::error(format!("cannot read {path}: {error}"));
+    }
+    let media_type = crate::image::media_type(&prefix);
+    let reader = std::io::Cursor::new(prefix).chain(reader);
+    let Some(media_type) = media_type else {
+        return read_bounded_utf8(path, reader);
+    };
+    if !supports_images {
+        return ToolOutcome::error("the selected model does not accept image input");
+    }
+
+    let mut bytes = Vec::new();
+    if let Err(error) = reader
+        .take(crate::image::MAX_IMAGE_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+    {
+        return ToolOutcome::error(format!("cannot read {path}: {error}"));
+    }
+    if bytes.len() > crate::image::MAX_IMAGE_BYTES {
+        return ToolOutcome::error(format!(
+            "{path} exceeds the {}-byte image limit",
+            crate::image::MAX_IMAGE_BYTES
+        ));
+    }
+    let size = bytes.len();
+    ToolOutcome::image(
+        format!("read {media_type} image from {path} ({size} bytes)"),
+        crate::image::encode(media_type, &bytes),
+    )
+}
+
+fn read_bounded_utf8(path: &str, reader: impl Read) -> ToolOutcome {
+    let mut bytes = Vec::new();
+    if let Err(error) = reader
+        .take(MAX_READ_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+    {
+        return ToolOutcome::error(format!("cannot read {path}: {error}"));
+    }
+    if bytes.len() > MAX_READ_FILE_BYTES as usize {
+        return ToolOutcome::error(format!(
+            "{path} exceeds the {MAX_READ_FILE_BYTES}-byte read limit; \
+             use shell tools to read portions"
+        ));
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => ToolOutcome::ok(text),
+        Err(_) => ToolOutcome::error(format!("{path} is not valid UTF-8 (binary file?)")),
+    }
+}
+
+pub(super) fn write_file(args: &Value) -> ToolOutcome {
+    let path = match str_arg(args, "path") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let content = match str_arg(args, "content") {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return ToolOutcome::error(format!("cannot create {}: {e}", parent.display()));
+    }
+    match std::fs::write(path, content) {
+        Ok(()) => ToolOutcome::ok(format!("wrote {} bytes to {path}", content.len())),
+        Err(e) => ToolOutcome::error(format!("cannot write {path}: {e}")),
+    }
+}
+
+pub(super) fn edit_file(args: &Value) -> ToolOutcome {
+    let path = match str_arg(args, "path") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let old_string = match str_arg(args, "old_string") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let new_string = match str_arg(args, "new_string") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if old_string.is_empty() {
+        return ToolOutcome::error("old_string must not be empty");
+    }
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > MAX_EDIT_FILE_BYTES => {
+            return ToolOutcome::error(format!(
+                "{path} exceeds the {MAX_EDIT_FILE_BYTES}-byte edit limit; use shell tools to edit it"
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => return ToolOutcome::error(format!("cannot read {path}: {e}")),
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => return ToolOutcome::error(format!("cannot read {path}: {e}")),
+    };
+    let count = text.matches(old_string).count();
+    match count {
+        0 => ToolOutcome::error(format!("old_string not found in {path}")),
+        1 => {
+            let updated = text.replacen(old_string, new_string, 1);
+            match std::fs::write(path, updated) {
+                Ok(()) => ToolOutcome::ok(format!("edited {path}")),
+                Err(e) => ToolOutcome::error(format!("cannot write {path}: {e}")),
+            }
+        }
+        n => ToolOutcome::error(format!(
+            "old_string appears {n} times in {path}; add surrounding context to make it unique"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
@@ -424,6 +610,119 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("yawl-tools-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn edit_file_requires_unique_match() -> std::io::Result<()> {
+        let path = temp_path("edit.txt");
+        std::fs::write(&path, "aaa bbb aaa")?;
+        let p = path.to_string_lossy();
+
+        let dup = edit_file(&json!({"path": &p, "old_string": "aaa", "new_string": "x"}));
+        assert!(dup.is_error);
+        assert!(dup.content.contains("2 times"));
+
+        let ok = edit_file(&json!({"path": &p, "old_string": "bbb", "new_string": "yyy"}));
+        assert!(!ok.is_error);
+        assert_eq!(std::fs::read_to_string(&path)?, "aaa yyy aaa");
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn edit_file_rejects_files_over_the_edit_limit() -> std::io::Result<()> {
+        let path = temp_path("too-large-to-edit.txt");
+        let file = std::fs::File::create(&path)?;
+        file.set_len(MAX_EDIT_FILE_BYTES + 1)?;
+        drop(file);
+
+        let out = edit_file(&serde_json::json!({
+            "path": path.to_string_lossy(),
+            "old_string": "a",
+            "new_string": "b"
+        }));
+        assert!(out.is_error);
+        assert!(out.content.contains("edit limit"));
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn write_file_creates_parent_dirs() -> std::io::Result<()> {
+        let dir = temp_path("nested");
+        let file = dir.join("a/b.txt");
+        let out = write_file(&json!({"path": file.to_string_lossy(), "content": "hi"}));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&file)?, "hi");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn read_file_rejects_files_over_the_size_limit() -> std::io::Result<()> {
+        let path = temp_path("large.bin");
+        std::fs::write(&path, vec![b'a'; MAX_READ_FILE_BYTES as usize + 1])?;
+
+        let out = read_file_for_model(&json!({"path": path.to_string_lossy()}), false);
+
+        assert!(out.is_error);
+        assert!(out.content.contains("read limit"));
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn read_file_bounds_streams_without_relying_on_metadata() {
+        let out = read_bounded_utf8("endless", std::io::repeat(b'a'));
+
+        assert!(out.is_error);
+        assert!(out.content.contains("read limit"));
+    }
+
+    #[test]
+    fn read_file_keeps_non_images_at_the_text_read_limit() {
+        struct CountingRepeat(std::rc::Rc<std::cell::Cell<usize>>);
+
+        impl Read for CountingRepeat {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                buffer.fill(b'a');
+                self.0.set(self.0.get().saturating_add(buffer.len()));
+                Ok(buffer.len())
+            }
+        }
+
+        let bytes_read = std::rc::Rc::new(std::cell::Cell::new(0));
+        let out = read_bounded_file("endless", CountingRepeat(bytes_read.clone()), false);
+
+        assert!(out.is_error);
+        assert!(out.content.contains("read limit"));
+        assert_eq!(
+            bytes_read.get(),
+            MAX_READ_FILE_BYTES as usize + 1,
+            "text detection must not read up to the larger image limit"
+        );
+    }
+
+    #[test]
+    fn read_file_returns_images_only_for_capable_models() -> std::io::Result<()> {
+        let path = temp_path("read-image.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\npayload")?;
+        let args = json!({"path": path.to_string_lossy()});
+
+        let supported = read_file_for_model(&args, true);
+        assert!(!supported.is_error, "{}", supported.content);
+        assert_eq!(supported.images.len(), 1);
+        assert_eq!(supported.images[0].media_type, "image/png");
+
+        let unsupported = read_file_for_model(&args, false);
+        assert!(unsupported.is_error);
+        assert!(unsupported.images.is_empty());
+        let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
@@ -624,7 +923,7 @@ mod tests {
     fn paged_output_preserves_text_and_stays_below_the_output_cap() {
         let root = TestDir::new();
         let path = root.write("controls", "\0".repeat(MAX_PAGE_BYTES));
-        let outcome = super::super::read_file_for_model(
+        let outcome = read_file_for_model(
             &json!({"path": path, "offset": 0, "limit": MAX_PAGE_BYTES}),
             false,
         );

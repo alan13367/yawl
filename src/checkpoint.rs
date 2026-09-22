@@ -411,10 +411,7 @@ fn git_root(work_tree: &Path) -> Result<PathBuf, Error> {
 
 fn prepare_user_head_restore(work_tree: &Path, sha: &str) -> Result<(), Error> {
     let root = git_root(work_tree)?;
-    user_git(
-        &root,
-        &["-c", "core.hooksPath=/dev/null", "reset", "--soft", sha],
-    )?;
+    user_git(&root, &["reset", "--soft", sha])?;
     user_git(&root, &["reset", "--", "."])?;
     Ok(())
 }
@@ -424,18 +421,37 @@ fn restore_staged_paths(work_tree: &Path, staged: &[String]) -> Result<(), Error
         return Ok(());
     }
     let root = git_root(work_tree)?;
-    run_git(
-        Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["add", "--"])
-            .args(staged),
-    )?;
+    let mut command = git_command(&root);
+    command.args(["add", "--"]).args(staged);
+    run_git(&mut command)?;
     Ok(())
 }
 
 fn user_git(work_tree: &Path, args: &[&str]) -> Result<String, Error> {
-    run_git(Command::new("git").arg("-C").arg(work_tree).args(args))
+    let mut command = git_command(work_tree);
+    command.args(args);
+    run_git(&mut command)
+}
+
+/// Builds a `git` command for the working tree with repository command hooks
+/// and the fsmonitor disabled, and with inherited `GIT_*` routing removed so
+/// the invocation cannot be aimed at a different repository. The user's own
+/// global config is still honored because these are the user's repositories.
+fn git_command(work_tree: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(work_tree);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command.args([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+    ]);
+    command
 }
 
 fn run_git(cmd: &mut Command) -> Result<String, Error> {

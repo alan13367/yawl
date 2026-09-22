@@ -1,10 +1,27 @@
 //! Focused tests for the corresponding TUI responsibility.
 
 use super::picker::{
-    SettingsCategory, SettingsItem, settings_category_picker, settings_picker,
-    status_bar_add_picker, status_bar_editor_picker, web_search_provider_picker,
+    SettingsCategory, SettingsItem, model_picker, refreshed_model_picker, settings_category_picker,
+    settings_picker, status_bar_add_picker, status_bar_editor_picker, web_search_provider_picker,
 };
 use super::*;
+
+#[test]
+fn model_refresh_keeps_manual_model_entry_selected() {
+    let config = test_agent().config().clone();
+    for save in [false, true] {
+        let mut picker = model_picker(&config, "test", save);
+        picker.selected = picker.items.len() - 1;
+
+        let refreshed = refreshed_model_picker(&config, "test", save, &picker);
+
+        assert_eq!(refreshed.selected, refreshed.items.len() - 1);
+        assert!(matches!(
+            refreshed.items[refreshed.selected].action,
+            PickerAction::EditModel { save: selected, .. } if selected == save
+        ));
+    }
+}
 
 #[test]
 fn picker_is_bounded_and_highlights_selection() {
@@ -456,6 +473,7 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
             parent: None,
         }),
         connection: None,
+        model_refresh: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,
@@ -548,6 +566,7 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
             parent: None,
         }),
         connection: None,
+        model_refresh: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,

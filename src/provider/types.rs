@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -398,7 +399,7 @@ pub struct Request<'a> {
     pub model: &'a str,
     pub system: &'a str,
     pub messages: &'a [Message],
-    pub tools: &'a [ToolSpec],
+    pub tools: &'a [Arc<ToolSpec>],
     pub max_tokens: u32,
     /// Whether this request's selected model accepts image inputs.
     pub supports_images: bool,

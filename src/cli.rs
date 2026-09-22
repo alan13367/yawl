@@ -11,7 +11,7 @@ Options:
   -c, --continue              Resume the most recent session
       --session ID            Resume a session by id
       --list-tools            List builtin and discovered exec tools
-      --trust-project         Allow project skill sources for this invocation
+      --trust-project         Trust project skills and provider settings for this invocation
       --login PROVIDER        Log into a subscription provider
       --setup                 Run provider and model onboarding again
       --doctor                Diagnose and repair the configuration
@@ -85,7 +85,7 @@ pub(super) fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, 
             || cli.continue_latest
             || cli.session_id.is_some()
             || cli.list_tools
-            || cli.trust_project
+            || (cli.login.is_some() || cli.doctor) && cli.trust_project
             || !cli.prompt.is_empty()
             || cli.login.is_some() && (cli.setup || cli.doctor)
             || cli.setup && cli.doctor)
@@ -137,8 +137,18 @@ mod tests {
         let cli = parse(&["--login", "openai-codex"]).expect("login should parse");
         assert_eq!(cli.login.as_deref(), Some("openai-codex"));
         assert!(parse(&["--login", "openai-codex", "prompt"]).is_err());
-        assert!(parse(&["--setup"]).is_ok());
+        assert!(parse(&["--login", "openai-codex", "--trust-project"]).is_err());
         assert!(parse(&["--setup", "--login", "openai-codex"]).is_err());
+    }
+
+    #[test]
+    fn setup_accepts_project_trust_override_but_no_other_turn_options() {
+        let cli = parse(&["--setup", "--trust-project"]).expect("setup can trust the project");
+        assert!(cli.setup);
+        assert!(cli.trust_project);
+        assert!(parse(&["--trust-project", "--setup"]).is_ok());
+        assert!(parse(&["--setup", "prompt"]).is_err());
+        assert!(parse(&["--setup", "-m", "openai:gpt-4o"]).is_err());
     }
 
     #[test]

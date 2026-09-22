@@ -4,7 +4,8 @@
 //! allowlist, and an extra role instruction so `subagent_spawn` can request
 //! a specialist instead of a generic child.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::Deserialize;
 
@@ -53,35 +54,114 @@ pub(crate) fn bundled() -> Vec<AgentPreset> {
     }]
 }
 
+/// Reuses a preset set while every source file keeps its size and
+/// modification time. The tool registry rescans on every model step; without
+/// this cache each scan re-read and re-parsed every preset file.
+#[derive(Debug, Default)]
+pub(crate) struct DiscoveryCache {
+    fingerprint: Option<Vec<Source>>,
+    result: Option<(Vec<AgentPreset>, Vec<String>)>,
+    generation: u64,
+}
+
+impl DiscoveryCache {
+    /// Increases whenever the cached preset set was rebuilt.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Source {
+    dir: PathBuf,
+    error: Option<String>,
+    files: Vec<(PathBuf, Option<SystemTime>, u64)>,
+}
+
 /// Loads bundled presets, then every `NAME.json` under the agent
 /// directories in scan order (later directories override earlier ones on
 /// name collisions, so project presets win). Malformed files produce
-/// warnings instead of failing the spawn path.
+/// warnings instead of failing the spawn path. The uncached reference
+/// adapter; production scans go through [`discover_cached`].
+#[cfg(test)]
 pub(crate) fn discover(config: &Config) -> (Vec<AgentPreset>, Vec<String>) {
+    load(&sources(config))
+}
+
+/// Like [`discover`], reusing `cache` while the preset files are unchanged.
+pub(crate) fn discover_cached(
+    config: &Config,
+    cache: &mut DiscoveryCache,
+) -> (Vec<AgentPreset>, Vec<String>) {
+    let fingerprint = sources(config);
+    if cache.fingerprint.as_ref() == Some(&fingerprint)
+        && let Some(result) = &cache.result
+    {
+        return result.clone();
+    }
+    let result = load(&fingerprint);
+    cache.fingerprint = Some(fingerprint);
+    cache.result = Some(result.clone());
+    cache.generation = cache.generation.saturating_add(1);
+    result
+}
+
+fn sources(config: &Config) -> Vec<Source> {
+    let mut sources = Vec::new();
+    for dir in config.agent_dirs() {
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => {
+                let mut files = entries
+                    .filter_map(std::result::Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.is_file() && path.extension().is_some_and(|ext| ext == "json")
+                    })
+                    .map(|path| {
+                        let (modified, len) = std::fs::metadata(&path)
+                            .map_or((None, 0), |metadata| {
+                                (metadata.modified().ok(), metadata.len())
+                            });
+                        (path, modified, len)
+                    })
+                    .collect::<Vec<_>>();
+                files.sort_by(|left, right| left.0.cmp(&right.0));
+                sources.push(Source {
+                    dir,
+                    error: None,
+                    files,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => sources.push(Source {
+                dir,
+                error: None,
+                files: Vec::new(),
+            }),
+            Err(error) => sources.push(Source {
+                dir,
+                error: Some(error.to_string()),
+                files: Vec::new(),
+            }),
+        }
+    }
+    sources
+}
+
+fn load(sources: &[Source]) -> (Vec<AgentPreset>, Vec<String>) {
     let mut presets = bundled();
     let mut warnings = Vec::new();
-    for dir in config.agent_dirs() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                warnings.push(format!("{}: {error}", dir.display()));
-                continue;
-            }
-        };
-        let mut paths = entries
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "json"))
-            .collect::<Vec<_>>();
-        paths.sort();
-        for path in paths {
+    for source in sources {
+        if let Some(error) = &source.error {
+            warnings.push(format!("{}: {error}", source.dir.display()));
+            continue;
+        }
+        for (path, _, _) in &source.files {
             let name = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .unwrap_or_default()
                 .to_string();
-            match load_preset(&path, &name) {
+            match load_preset(path, &name) {
                 Ok(Some(preset)) => {
                     if let Some(existing) = presets.iter().position(|p| p.name == preset.name) {
                         presets[existing] = preset;
@@ -210,6 +290,62 @@ mod tests {
         assert_eq!(reviewer.prompt.as_deref(), Some("review code"));
         assert_eq!(warnings.len(), 1, "malformed files warn, not fail");
         assert!(warnings[0].contains("broken.json"), "{warnings:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cached_discovery_reuses_and_refreshes_preset_files() {
+        let root = std::env::temp_dir().join(format!("yawl-presets-cache-{}", std::process::id()));
+        let home = root.join("home/.yawl");
+        let project = root.join("project/.yawl");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(home.join("agents")).expect("home agents dir");
+        std::fs::write(
+            home.join("agents/reviewer.json"),
+            r#"{"description":"home reviewer"}"#,
+        )
+        .expect("preset");
+        let config = test_config(&home, &project);
+        let mut cache = DiscoveryCache::default();
+
+        let first = discover_cached(&config, &mut cache);
+        assert_eq!(cache.generation(), 1);
+        assert_eq!(first.0, discover(&config).0);
+
+        let reused = discover_cached(&config, &mut cache);
+        assert_eq!(
+            cache.generation(),
+            1,
+            "unchanged sources reuse the cached presets"
+        );
+        assert_eq!(reused.0, first.0);
+
+        // A new project preset overrides the home one by name.
+        std::fs::create_dir_all(project.join("agents")).expect("project agents dir");
+        std::fs::write(
+            project.join("agents/reviewer.json"),
+            r#"{"description":"project reviewer"}"#,
+        )
+        .expect("override");
+        let changed = discover_cached(&config, &mut cache);
+        assert_eq!(cache.generation(), 2);
+        let reviewer = changed
+            .0
+            .iter()
+            .find(|preset| preset.name == "reviewer")
+            .expect("reviewer preset");
+        assert_eq!(reviewer.description, "project reviewer");
+
+        // A malformed edit surfaces as a warning instead of stale state.
+        std::fs::write(project.join("agents/broken.json"), "{ not json").expect("broken preset");
+        let broken = discover_cached(&config, &mut cache);
+        assert!(
+            broken
+                .1
+                .iter()
+                .any(|warning| warning.contains("broken.json"))
+        );
+        assert_eq!(discover(&config).0, broken.0);
         let _ = std::fs::remove_dir_all(&root);
     }
 

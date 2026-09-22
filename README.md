@@ -44,7 +44,7 @@ yawl -m openai:gpt-4o "Release note"  # pick a model for one run
 yawl --list-tools                     # show the current tool registry
 ```
 
-Project skills stay disabled until you trust the repository. `yawl --trust-project` trusts them for a single noninteractive run without changing the saved decision. `yawl --help` has the full reference.
+Project skills stay disabled until you trust the repository. `yawl --trust-project` trusts them for one invocation without changing the saved decision, and can be used with `yawl --setup`. The same decision gates provider endpoints, base URLs, and credentials from `./.yawl/config.json`: a cloned repository cannot repoint model traffic or resolve `$ENV_VAR` references into headers until you trust it. Setup and first-run onboarding resolve trust before listing project providers. `yawl --help` has the full reference.
 
 ## Terminal controls
 
@@ -121,7 +121,7 @@ Every field is optional and validated on load. An out-of-range value fails start
 
 ### Custom providers
 
-`openai-codex:` uses a ChatGPT Plus or Pro subscription through device-code login (`yawl --login openai-codex`), with the credential stored in `~/.yawl/auth.json`. Other OpenAI-compatible endpoints go under `providers`, using the same field names as pi's `models.json`:
+`openai-codex:` uses a ChatGPT Plus or Pro subscription through device-code login (`yawl --login openai-codex`), with the credential stored in `~/.yawl/auth.json`. `/model`, `--setup`, and `/connect` refresh the account's Codex model catalog from OpenAI. Yawl saves the visible model IDs and their context, image, and reasoning metadata in `~/.yawl/codex-models.json` for use when the service is unavailable. A manual model ID remains available if discovery fails. Other OpenAI-compatible endpoints go under `providers`, using the same field names as pi's `models.json`:
 
 ```json
 {
@@ -157,7 +157,7 @@ Before each request Yawl combines saved, model-specific token usage with estimat
 
 ## Web browsing
 
-Off by default. Enable with `/settings web_browsing on` or Settings > Web. `web_search` returns up to five DuckDuckGo results and is free and keyless; Brave and Firecrawl need `BRAVE_API_KEY` or `FIRECRAWL_API_KEY`. `web_fetch` makes a direct HTTP(S) request with a five-redirect and 10 MiB body cap, runs no JavaScript, and returns cleaned text. Search results and fetched pages are marked untrusted, so page content is never treated as agent instructions.
+Off by default. Enable with `/settings web_browsing on` or Settings > Web. `web_search` returns up to five DuckDuckGo results and is free and keyless; Brave and Firecrawl need `BRAVE_API_KEY` or `FIRECRAWL_API_KEY`. `web_fetch` makes a direct HTTP(S) request with a five-redirect and 10 MiB body cap, runs no JavaScript, and returns cleaned text. Search results and fetched pages are marked untrusted, so page content is never treated as agent instructions. This is a content-trust boundary, not a network sandbox: `web_fetch` accepts any http(s) URL, including loopback and private addresses, because the model can already reach the network through `shell`. Run Yawl only where the agent's own network access is acceptable.
 
 ## Subagents
 
@@ -175,7 +175,7 @@ Results longer than 2 KiB are saved in `~/.yawl/artifacts/subagents/`. Waits, st
 - `git_inspect` is available to restricted child presets such as `scout`. It accepts only `status`, `unstaged_diff`, or `staged_diff`, plus an optional literal relative `path` filter. It uses the working directory, disables external diff/text conversion and filesystem-monitor hooks, refuses repositories configured with clean or process filters, avoids optional index writes and lazy fetches, ignores submodule changes, and caps execution at 15 seconds with bounded output. Untracked file contents need `read_file`. This is a restricted tool interface, not an OS sandbox.
 - Restricted child presets such as `scout` can opt into `list_files` and `search_files`. They are not exposed to the main agent or unrestricted children, which use `shell` with `rg` or Git. `list_files` returns one path per line; `search_files` returns `path:line:column: snippet` for case-sensitive literal matches. Both accept `path`, `path_contains`, and a result `limit` of 1–200. They skip non-UTF-8 filenames, hidden entries, symlinks, and nested `.git`, `target`, and `node_modules` directories, without interpreting ignore files. Use an explicit hidden path or `include_hidden: true` when needed. Traversal stops at 20,000 entries or depth 32; search skips files over 2 MiB and reads at most 32 MiB per call. Output indicates truncation and skipped files so the model can narrow its scope.
 - `write_file` writes a file and creates missing parent directories.
-- `edit_file` performs one exact string replacement and rejects missing or repeated matches.
+- `edit_file` performs one exact string replacement and rejects missing or repeated matches. It reads the whole file, so it rejects files over 16 MiB; use `shell` for larger files.
 
 Foreground shell, planning-shell, executable-tool, and web-fetch output above 16 KiB is saved under `~/.yawl/artifacts/tool-output/`; model history receives a file path plus roughly 2 KiB each from the beginning and end. Read the captured output with paged `read_file`. These artifacts persist until manually removed; process capture limits still apply. File reads and structured background-tool responses keep their existing output format. Other tool output is capped at 60,000 characters, except user answers, which remain complete. Start dev servers and watchers with `shell` using `background=true`, rather than shell `&` or `nohup`, so Yawl can track and stop them. Escape/Ctrl+C and foreground timeouts remain active while collecting output, even after the shell exits with descendants still holding its pipes open. Steering is applied at the next safe boundary; cancel a blocked foreground call to return control. Up to 8 background commands are tracked per session; stopping one sends `SIGTERM` to its process group, then `SIGKILL` after two seconds.
 
@@ -217,7 +217,7 @@ description: Review a code change for correctness, regressions, and missing test
 Read the implementation and tests before reporting findings.
 ```
 
-Descriptions go into the system-prompt catalog and the model loads full instructions with `read_skill`, rendered as a purple `Skill NAME` card. `disable-model-invocation: true` keeps a skill out of the catalog but leaves `/skill:NAME [ARGS]` working. Project skill sources prompt for trust on first use, stored in `~/.yawl/trust.json`; piped runs never prompt, so use `--trust-project` there. `/settings skills add DIR` and `remove DIR` manage search directories.
+Descriptions go into the system-prompt catalog and the model loads full instructions with `read_skill`, rendered as a purple `Skill NAME` card. `disable-model-invocation: true` keeps a skill out of the catalog but leaves `/skill:NAME [ARGS]` working. Project skill sources — and project provider endpoints, base URLs, and credentials — prompt for trust on first use, stored in `~/.yawl/trust.json`; piped runs never prompt, so use `--trust-project` there. `/settings skills add DIR` and `remove DIR` manage search directories.
 
 ## Project instructions
 

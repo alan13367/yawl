@@ -221,6 +221,7 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
         connection: None,
+        model_refresh: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,

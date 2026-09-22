@@ -112,6 +112,9 @@ pub struct Config {
     pub home_dir: PathBuf,
     /// `./.yawl`.
     pub project_dir: PathBuf,
+    /// True when `./.yawl/config.json` set a trust-gated field (provider
+    /// endpoint, base URL, or credential) that has not been applied yet.
+    pub(crate) project_config_restricted: bool,
 }
 
 impl Config {
@@ -121,6 +124,12 @@ impl Config {
 
     pub fn project_skills_trusted(&self) -> bool {
         self.project_skills_trusted
+    }
+
+    /// True when the project config set provider endpoints, base URLs, or
+    /// credentials that are withheld until the project is trusted.
+    pub fn project_config_restricted(&self) -> bool {
+        self.project_config_restricted
     }
 
     pub(crate) fn has_project_skill_override(&self) -> bool {
@@ -296,6 +305,7 @@ impl Config {
             openai_api_key: None,
             home_dir: PathBuf::new(),
             project_dir: PathBuf::new(),
+            project_config_restricted: false,
         }
     }
 }

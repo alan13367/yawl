@@ -244,11 +244,14 @@ fn configure_codex(config: &Config) -> Result<Option<SetupPlan>, Error> {
         summary.push("login: saved to ~/.yawl/auth.json".into());
     }
 
+    if crate::provider::codex::refresh_catalog(config).is_err() {
+        println!("Could not refresh Codex models. Showing the saved catalog, if available.");
+    }
     let models: Vec<(String, String)> = crate::model::available_models(config)
         .into_iter()
         .filter(|(spec, _)| spec.starts_with("openai-codex:"))
         .collect();
-    let choices = models
+    let mut choices = models
         .iter()
         .map(|(spec, name)| {
             Choice::new(
@@ -257,14 +260,23 @@ fn configure_codex(config: &Config) -> Result<Option<SetupPlan>, Error> {
             )
         })
         .collect::<Vec<_>>();
+    let manual = choices.len();
+    choices.push(Choice::new(
+        "Enter a model ID manually",
+        "use an exact Codex model ID",
+    ));
     let Some(index) = select::select("Codex model", &choices)? else {
         return Ok(None);
     };
-    let model = models[index]
-        .0
-        .strip_prefix("openai-codex:")
-        .unwrap_or(&models[index].0)
-        .to_string();
+    let model = if index == manual {
+        prompt_model_id()?
+    } else {
+        models[index]
+            .0
+            .strip_prefix("openai-codex:")
+            .unwrap_or(&models[index].0)
+            .to_string()
+    };
     let default_model = format!("openai-codex:{model}");
     summary.push(format!("default model: {default_model}"));
     Ok(Some(SetupPlan {
@@ -619,6 +631,44 @@ fn prompt_url(label: &str, default: &str) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_project_providers_appear_in_setup_catalog() -> Result<(), Error> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "yawl-setup-project-provider-{}-{nonce}",
+            std::process::id()
+        ));
+        let project = root.join("project/.yawl");
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(
+            project.join("config.json"),
+            r#"{"providers":{"project-llm":{"base_url":"https://example.test/v1","models":[{"id":"demo"}]}}}"#,
+        )?;
+        let mut config = Config::load_from(root.join("home/.yawl"), project)?;
+        let project_provider = ProviderId::Compatible("project-llm".into());
+        assert!(
+            !provider::provider_catalog(&config)
+                .iter()
+                .any(|entry| entry.id == project_provider)
+        );
+
+        config.apply_project_trusted_config()?;
+        assert!(
+            provider::provider_catalog(&config)
+                .iter()
+                .any(|entry| entry.id == project_provider)
+        );
+        assert_eq!(
+            config.providers["project-llm"].base_url,
+            "https://example.test/v1"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
 
     #[test]
     fn local_base_url_uses_effective_config_then_builtin_default() {

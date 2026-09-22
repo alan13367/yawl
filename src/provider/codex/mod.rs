@@ -2,11 +2,13 @@
 //! SSE endpoint. The OAuth and wire behavior follow OpenAI's Codex CLI flow.
 
 mod auth;
+mod catalog;
 mod compaction;
 mod responses;
 
 pub use auth::{CodexLoginStatus, credential_status, login};
 pub(crate) use auth::{DeviceLoginPrompt, login_with_callback};
+pub(crate) use catalog::{cached_models, refresh_catalog};
 
 use super::http_agent;
 use crate::config::Config;

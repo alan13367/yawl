@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::config::{Config, working_dir};
 
@@ -15,12 +16,39 @@ pub struct Skill {
     pub disable_model_invocation: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Catalog {
     pub skills: Vec<Skill>,
     pub warnings: Vec<String>,
     pub directories: Vec<PathBuf>,
 }
+
+/// Reuses a catalog while every skill source keeps its size and modification
+/// time. The tool registry rescans on every model step; without this cache
+/// each scan re-read and re-parsed every `SKILL.md`. Cache hits share the
+/// catalog through an `Arc` instead of cloning instruction bodies.
+#[derive(Debug, Default)]
+pub struct DiscoveryCache {
+    fingerprint: Option<Fingerprint>,
+    catalog: Option<std::sync::Arc<Catalog>>,
+    generation: u64,
+}
+
+impl DiscoveryCache {
+    /// Increases whenever the cached catalog was rebuilt.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Fingerprint {
+    roots: Vec<PathBuf>,
+    files: Vec<FileStamp>,
+    walk_warnings: Vec<String>,
+}
+
+type FileStamp = (PathBuf, Option<SystemTime>, u64);
 
 /// Scans every active skill source. Global roots are always active. Project
 /// roots are added only after the invocation trusts the project.
@@ -28,38 +56,122 @@ pub fn discover(config: &Config) -> Catalog {
     discover_from(config, &working_dir())
 }
 
-fn discover_from(config: &Config, cwd: &Path) -> Catalog {
-    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let mut catalog = Catalog::default();
-    let mut skills = BTreeMap::new();
-
-    let (global_roots, project_roots) = config.skill_dir_sources();
-    for root in global_roots {
-        scan_root(root, &mut skills, &mut catalog.warnings);
-        catalog.directories.push(root.clone());
+/// Like [`discover`], sharing `cache`'s catalog while the source files are
+/// unchanged.
+pub fn discover_cached(config: &Config, cache: &mut DiscoveryCache) -> std::sync::Arc<Catalog> {
+    let sources = Sources::collect(config, &working_dir());
+    let fingerprint = sources.fingerprint();
+    if cache.fingerprint.as_ref() == Some(&fingerprint)
+        && let Some(catalog) = &cache.catalog
+    {
+        return std::sync::Arc::clone(catalog);
     }
+    let catalog = std::sync::Arc::new(sources.load());
+    cache.fingerprint = Some(fingerprint);
+    cache.catalog = Some(std::sync::Arc::clone(&catalog));
+    cache.generation = cache.generation.saturating_add(1);
+    catalog
+}
 
-    if config.project_skills_trusted {
-        if let Some(roots) = project_roots {
-            for root in roots {
-                scan_root(root, &mut skills, &mut catalog.warnings);
-                catalog.directories.push(root.clone());
+fn discover_from(config: &Config, cwd: &Path) -> Catalog {
+    Sources::collect(config, cwd).load()
+}
+
+struct Sources {
+    sources: Vec<Source>,
+}
+
+struct Source {
+    root: PathBuf,
+    candidates: Vec<PathBuf>,
+    warnings: Vec<String>,
+}
+
+impl Sources {
+    fn collect(config: &Config, cwd: &Path) -> Sources {
+        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let mut sources = Sources {
+            sources: Vec::new(),
+        };
+
+        let (global_roots, project_roots) = config.skill_dir_sources();
+        for root in global_roots {
+            sources.add_root(root);
+        }
+
+        if config.project_skills_trusted {
+            if let Some(roots) = project_roots {
+                for root in roots {
+                    sources.add_root(root);
+                }
+            }
+
+            sources.add_root(&cwd.join(".yawl/skills"));
+            for root in agent_skill_roots(&cwd) {
+                sources.add_root(&root);
             }
         }
 
-        let yawl = cwd.join(".yawl/skills");
-        scan_root(&yawl, &mut skills, &mut catalog.warnings);
-        catalog.directories.push(yawl);
+        sources
+    }
 
-        for root in agent_skill_roots(&cwd) {
-            scan_root(&root, &mut skills, &mut catalog.warnings);
-            catalog.directories.push(root);
+    fn add_root(&mut self, root: &Path) {
+        let mut candidates = Vec::new();
+        let mut visited = HashSet::new();
+        let mut warnings = Vec::new();
+        collect_candidates(root, root, &mut candidates, &mut visited, &mut warnings);
+        candidates.sort();
+        self.sources.push(Source {
+            root: root.to_path_buf(),
+            candidates,
+            warnings,
+        });
+    }
+
+    fn fingerprint(&self) -> Fingerprint {
+        Fingerprint {
+            roots: self.sources.iter().map(|s| s.root.clone()).collect(),
+            files: self
+                .sources
+                .iter()
+                .flat_map(|s| s.candidates.iter().map(|path| file_stamp(path)))
+                .collect(),
+            walk_warnings: self
+                .sources
+                .iter()
+                .flat_map(|s| s.warnings.iter().cloned())
+                .collect(),
         }
     }
 
-    catalog.directories.dedup();
-    catalog.skills = skills.into_values().collect();
-    catalog
+    fn load(self) -> Catalog {
+        let mut catalog = Catalog::default();
+        let mut skills = BTreeMap::new();
+        for source in self.sources {
+            catalog.warnings.extend(source.warnings);
+            for path in source.candidates {
+                match load_skill(&path) {
+                    Ok(skill) => {
+                        skills.insert(skill.name.clone(), skill);
+                    }
+                    Err(reason) => catalog
+                        .warnings
+                        .push(format!("{}: {reason}", path.display())),
+                }
+            }
+            catalog.directories.push(source.root);
+        }
+        catalog.directories.dedup();
+        catalog.skills = skills.into_values().collect();
+        catalog
+    }
+}
+
+fn file_stamp(path: &Path) -> FileStamp {
+    let (modified, len) = std::fs::metadata(path).map_or((None, 0), |metadata| {
+        (metadata.modified().ok(), metadata.len())
+    });
+    (path.to_path_buf(), modified, len)
 }
 
 /// Compatibility helper for explicit `/skill:NAME` callers.
@@ -118,21 +230,6 @@ fn agent_skill_roots(cwd: &Path) -> Vec<PathBuf> {
         .into_iter()
         .map(|path| path.join(".agents/skills"))
         .collect()
-}
-
-fn scan_root(root: &Path, skills: &mut BTreeMap<String, Skill>, warnings: &mut Vec<String>) {
-    let mut candidates = Vec::new();
-    let mut visited = HashSet::new();
-    collect_candidates(root, root, &mut candidates, &mut visited, warnings);
-    candidates.sort();
-    for path in candidates {
-        match load_skill(&path) {
-            Ok(skill) => {
-                skills.insert(skill.name.clone(), skill);
-            }
-            Err(reason) => warnings.push(format!("{}: {reason}", path.display())),
-        }
-    }
 }
 
 fn collect_candidates(
@@ -337,6 +434,78 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["format", "review"]
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_discovery_matches_uncached_and_tracks_changes() {
+        let root = std::env::temp_dir().join(format!("yawl-skills-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("global/review")).unwrap();
+        let skill_path = root.join("global/review/SKILL.md");
+        std::fs::write(
+            &skill_path,
+            skill("review", "Review changes", "Check the patch."),
+        )
+        .unwrap();
+        let config = test_config(&root);
+        let mut cache = DiscoveryCache::default();
+
+        let first = discover_cached(&config, &mut cache);
+        assert_eq!(first.skills.len(), 1);
+        assert_eq!(first.skills[0].instructions, "Check the patch.");
+
+        let reused = discover_cached(&config, &mut cache);
+        assert_eq!(reused.skills[0].instructions, "Check the patch.");
+        assert_eq!(reused.directories, first.directories);
+
+        // An edit is recognized from the file's new mtime, not directory mtime.
+        std::fs::write(
+            &skill_path,
+            skill("review", "Review changes", "Check the diff."),
+        )
+        .unwrap();
+        let touched = std::fs::File::options()
+            .write(true)
+            .open(&skill_path)
+            .unwrap();
+        touched
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000)),
+            )
+            .unwrap();
+        let refreshed = discover_cached(&config, &mut cache);
+        assert_eq!(refreshed.skills[0].instructions, "Check the diff.");
+
+        // New and removed files change the catalog too.
+        std::fs::create_dir_all(root.join("global/format")).unwrap();
+        std::fs::write(
+            root.join("global/format/SKILL.md"),
+            skill("format", "Format code", "Run the formatter."),
+        )
+        .unwrap();
+        let added = discover_cached(&config, &mut cache);
+        assert_eq!(
+            added
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["format", "review"]
+        );
+
+        std::fs::remove_file(&skill_path).unwrap();
+        let removed = discover_cached(&config, &mut cache);
+        assert_eq!(
+            removed
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["format"]
+        );
+        assert_eq!(discover(&config).skills.len(), removed.skills.len());
         let _ = std::fs::remove_dir_all(root);
     }
 

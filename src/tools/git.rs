@@ -9,8 +9,7 @@ use serde_json::{Value, json};
 use super::{ToolEntry, ToolImpl, ToolOutcome};
 
 pub(super) fn entry() -> ToolEntry {
-    ToolEntry {
-        spec: crate::provider::ToolSpec {
+    ToolEntry::new(crate::provider::ToolSpec {
             name: "git_inspect".into(),
             description: "Read Git status or staged/unstaged diffs in the working directory. Fixed read-only operations; no shell. Untracked contents require read_file. Output is bounded; narrow path when truncated.".into(),
             input_schema: json!({
@@ -23,8 +22,8 @@ pub(super) fn entry() -> ToolEntry {
                 "additionalProperties": false
             }),
         },
-        imp: ToolImpl::GitInspect,
-    }
+        ToolImpl::GitInspect,
+    )
 }
 
 pub(super) fn inspect(args: &Value) -> ToolOutcome {

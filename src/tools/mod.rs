@@ -4,27 +4,30 @@
 //! just wrote is usable on its next turn. On name collisions the last scan
 //! wins (builtins < `~/.yawl/tools` < `./.yawl/tools`).
 
+mod catalog;
 pub mod exec;
 mod files;
 mod git;
+mod mode;
+mod orchestration;
 mod output;
 mod planning_shell;
 mod shell;
+mod skills;
 mod user_input;
 mod web;
 
-use std::io::Read;
-use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::background::BackgroundProcessManager;
 use crate::config::Config;
 use crate::provider::ToolSpec;
 use crate::skills::Skill;
-use crate::subagent::presets::discover as discover_presets;
-use crate::subagent::{AgentPreset, RunOrigin, SubagentManager};
+use crate::subagent::SubagentManager;
 
+pub use catalog::CatalogCache;
 pub use exec::DescribeCache;
 pub(crate) use user_input::{QuestionBroker, QuestionSnapshot};
 #[cfg(test)]
@@ -32,9 +35,6 @@ pub(crate) use user_input::{QuestionOption, UserQuestion};
 
 /// Cap on tool result size fed back to the model.
 const MAX_RESULT_CHARS: usize = 60_000;
-/// Cap on `read_file` input size. Anything larger truncates to
-/// `MAX_RESULT_CHARS` anyway, so reading it in full only wastes memory.
-const MAX_READ_FILE_BYTES: u64 = 1024 * 1024;
 
 enum ToolImpl {
     Shell,
@@ -57,28 +57,41 @@ enum ToolImpl {
     PlanAction,
     PlanImplemented,
     Exec(exec::ExecTool),
-    Subagent(SubagentTool),
-}
-
-#[derive(Clone, Copy)]
-enum SubagentTool {
-    Spawn,
-    Send,
-    Wait,
-    Cancel,
-    List,
-}
-
-struct SubagentContext {
-    manager: SubagentManager,
-    config: Config,
-    parent_model: String,
-    presets: Vec<AgentPreset>,
+    Subagent(orchestration::SubagentTool),
 }
 
 struct ToolEntry {
-    spec: ToolSpec,
+    spec: Arc<ToolSpec>,
     imp: ToolImpl,
+    tokens: OnceLock<u64>,
+}
+
+impl ToolEntry {
+    fn new(spec: ToolSpec, imp: ToolImpl) -> Self {
+        Self {
+            spec: Arc::new(spec),
+            imp,
+            tokens: OnceLock::new(),
+        }
+    }
+
+    /// Estimated prompt tokens this entry contributes, computed once per
+    /// entry so repeated scans do not re-serialize schemas.
+    fn prompt_tokens(&self) -> u64 {
+        *self.tokens.get_or_init(|| spec_tokens(&self.spec))
+    }
+}
+
+/// Mirrors the byte-based prompt estimate in
+/// `agent::conversation::context`, for one tool spec.
+fn spec_tokens(spec: &ToolSpec) -> u64 {
+    fn text_tokens(text: &str) -> u64 {
+        (text.len() as u64).div_ceil(3)
+    }
+    text_tokens(&spec.name)
+        .saturating_add(text_tokens(&spec.description))
+        .saturating_add(text_tokens(&spec.input_schema.to_string()))
+        .saturating_add(16)
 }
 
 pub struct ToolOutcome {
@@ -115,18 +128,18 @@ impl ToolOutcome {
 
 pub struct Registry {
     output_directory: std::path::PathBuf,
-    entries: Vec<ToolEntry>,
+    entries: Vec<Arc<ToolEntry>>,
     pub warnings: Vec<String>,
-    skills: Vec<Skill>,
-    subagents: Option<SubagentContext>,
+    skills: Arc<Vec<Skill>>,
+    subagents: Option<orchestration::SubagentContext>,
     background: Option<BackgroundProcessManager>,
     web: Option<web::WebTools>,
 }
 
 impl Registry {
     /// Scans builtins + exec tool directories. Called every loop iteration;
-    /// `cache` avoids respawning `--describe` for unchanged tools.
-    pub fn scan(config: &Config, cache: &mut DescribeCache) -> Registry {
+    /// `cache` reuses unchanged filesystem catalogs and `--describe` results.
+    pub fn scan(config: &Config, cache: &mut CatalogCache) -> Registry {
         Self::scan_inner(config, cache, None)
     }
 
@@ -134,13 +147,15 @@ impl Registry {
     /// preset allowlist. Main agents and unrestricted children use shell.
     pub(crate) fn scan_for_child(
         config: &Config,
-        cache: &mut DescribeCache,
+        cache: &mut CatalogCache,
         allowlist: Option<&[String]>,
     ) -> Registry {
         let mut registry = Self::scan(config, cache);
         if let Some(allowed) = allowlist {
-            registry.entries.extend(files::entries());
-            registry.entries.push(git::entry());
+            registry
+                .entries
+                .extend(files::entries().into_iter().map(Arc::new));
+            registry.entries.push(Arc::new(git::entry()));
             registry.retain_names(allowed);
         }
         registry
@@ -148,53 +163,43 @@ impl Registry {
 
     /// Scans the tools advertised by the persistent main agent without
     /// creating a live process manager. Used by `yawl --list-tools`.
-    pub fn scan_for_main_listing(config: &Config, cache: &mut DescribeCache) -> Registry {
+    pub fn scan_for_main_listing(config: &Config, cache: &mut CatalogCache) -> Registry {
         let mut registry = Self::scan(config, cache);
         if let Some(shell) = registry
             .entries
             .iter_mut()
             .find(|entry| entry.spec.name == "shell" && matches!(&entry.imp, ToolImpl::Shell))
         {
-            *shell = shell::entry(true);
+            *shell = Arc::new(shell::entry(true));
         }
-        registry.entries.extend(shell::background_entries());
+        registry
+            .entries
+            .extend(shell::background_entries().into_iter().map(Arc::new));
         registry
     }
 
     fn scan_inner(
         config: &Config,
-        cache: &mut DescribeCache,
+        cache: &mut CatalogCache,
         background: Option<BackgroundProcessManager>,
     ) -> Registry {
         let mut registry = Registry {
             output_directory: config.home_dir.join("artifacts/tool-output"),
-            entries: builtins(background.is_some()),
+            entries: cache.builtins(config, background.is_some()),
             warnings: Vec::new(),
-            skills: Vec::new(),
+            skills: Arc::default(),
             subagents: None,
             background,
             web: config.web_browsing.then(|| web::WebTools::new(config)),
         };
-        if config.web_browsing {
-            registry
-                .entries
-                .extend(web_entries(config.web_search_provider));
-        }
-        if registry.background.is_some() {
-            registry.entries.extend(shell::background_entries());
-        }
-        let catalog = crate::skills::discover(config);
-        registry.warnings.extend(catalog.warnings);
-        registry.skills = catalog
-            .skills
-            .into_iter()
-            .filter(|skill| !skill.disable_model_invocation)
-            .collect();
+        let (skills, warnings) = cache.skills(config);
+        registry.warnings.extend(warnings);
+        registry.skills = skills;
         if !registry.skills.is_empty() {
-            registry.entries.push(read_skill_entry());
+            registry.insert(skills::entry());
         }
         for dir in config.tool_dirs() {
-            let (tools, warnings) = exec::scan_dir(&dir, cache);
+            let (tools, warnings) = exec::scan_dir(&dir, cache.describe());
             registry.warnings.extend(warnings);
             for tool in tools {
                 if reserved_tool_name(config, &tool.spec.name) {
@@ -205,10 +210,7 @@ impl Registry {
                     ));
                     continue;
                 }
-                registry.insert(ToolEntry {
-                    spec: tool.spec.clone(),
-                    imp: ToolImpl::Exec(tool),
-                });
+                registry.insert(ToolEntry::new(tool.spec.clone(), ToolImpl::Exec(tool)));
             }
         }
         registry
@@ -217,30 +219,18 @@ impl Registry {
     #[cfg(test)]
     pub(crate) fn scan_with_subagents(
         config: &Config,
-        cache: &mut DescribeCache,
+        cache: &mut CatalogCache,
         manager: SubagentManager,
         parent_model: &str,
     ) -> Registry {
         let mut registry = Self::scan(config, cache);
-        registry.enable_subagents(config, manager, parent_model);
+        registry.enable_subagents(config, cache, manager, parent_model);
         registry
-    }
-
-    fn enable_subagents(&mut self, config: &Config, manager: SubagentManager, parent_model: &str) {
-        let (presets, warnings) = discover_presets(config);
-        self.warnings.extend(warnings);
-        self.entries.extend(subagent_tools(&presets));
-        self.subagents = Some(SubagentContext {
-            manager,
-            config: config.clone(),
-            parent_model: parent_model.to_string(),
-            presets,
-        });
     }
 
     pub(crate) fn scan_with_background(
         config: &Config,
-        cache: &mut DescribeCache,
+        cache: &mut CatalogCache,
         background: BackgroundProcessManager,
     ) -> Registry {
         Self::scan_inner(config, cache, Some(background))
@@ -248,13 +238,13 @@ impl Registry {
 
     pub(crate) fn scan_with_subagents_and_background(
         config: &Config,
-        cache: &mut DescribeCache,
+        cache: &mut CatalogCache,
         manager: SubagentManager,
         parent_model: &str,
         background: BackgroundProcessManager,
     ) -> Registry {
         let mut registry = Self::scan_inner(config, cache, Some(background));
-        registry.enable_subagents(config, manager, parent_model);
+        registry.enable_subagents(config, cache, manager, parent_model);
         registry
     }
 
@@ -264,11 +254,12 @@ impl Registry {
         self.entries
             .retain(|entry| names.contains(&entry.spec.name));
         if !names.iter().any(|name| name == "read_skill") {
-            self.skills.clear();
+            self.skills = Arc::default();
         }
     }
 
     fn insert(&mut self, entry: ToolEntry) {
+        let entry = Arc::new(entry);
         if let Some(existing) = self
             .entries
             .iter_mut()
@@ -280,28 +271,36 @@ impl Registry {
         }
     }
 
-    pub fn specs(&self) -> Vec<ToolSpec> {
-        self.entries.iter().map(|e| e.spec.clone()).collect()
+    pub fn specs(&self) -> Vec<Arc<ToolSpec>> {
+        self.entries.iter().map(|e| Arc::clone(&e.spec)).collect()
+    }
+
+    /// Total estimated prompt cost of the advertised tools. Entries cached
+    /// across scans compute this once instead of re-serializing schemas.
+    pub(crate) fn tool_tokens(&self) -> u64 {
+        self.entries.iter().fold(0, |tokens, entry| {
+            tokens.saturating_add(entry.prompt_tokens())
+        })
     }
 
     pub(crate) fn advertise_goal_complete(&mut self) {
-        self.insert(goal_complete_entry());
+        self.insert(mode::goal_complete_entry());
     }
 
     pub(crate) fn advertise_user_input(&mut self, broker: QuestionBroker) {
-        self.insert(user_input_entry(broker));
+        self.insert(user_input::entry(broker));
     }
 
     pub(crate) fn advertise_plan_complete(&mut self) {
-        self.insert(plan_complete_entry());
+        self.insert(mode::plan_complete_entry());
     }
 
     pub(crate) fn advertise_plan_action(&mut self) {
-        self.insert(plan_action_entry());
+        self.insert(mode::plan_action_entry());
     }
 
     pub(crate) fn advertise_plan_implemented(&mut self) {
-        self.insert(plan_implemented_entry());
+        self.insert(mode::plan_implemented_entry());
     }
 
     /// Keeps only read tools and replaces the unrestricted shell with its
@@ -322,11 +321,11 @@ impl Registry {
                     | ToolImpl::PlanComplete
             )
         });
-        self.insert(planning_shell_entry());
+        self.insert(planning_shell::entry());
     }
 
     pub(crate) fn skills(&self) -> &[Skill] {
-        &self.skills
+        self.skills.as_slice()
     }
 
     pub(crate) fn has_web_tools(&self) -> bool {
@@ -390,16 +389,16 @@ impl Registry {
             ToolImpl::ShellList => shell::list(self.background.as_ref()),
             ToolImpl::ShellOutput => shell::output(self.background.as_ref(), &args),
             ToolImpl::ShellStop => shell::stop(self.background.as_ref(), &args),
-            ToolImpl::ReadFile => read_file_for_model(&args, supports_images),
+            ToolImpl::ReadFile => files::read_file_for_model(&args, supports_images),
             ToolImpl::ListFiles => files::discover(&args, false),
             ToolImpl::SearchFiles => files::discover(&args, true),
             ToolImpl::GitInspect => git::inspect(&args),
-            ToolImpl::ReadSkill => read_skill(&self.skills, &args),
-            ToolImpl::WriteFile => write_file(&args),
-            ToolImpl::EditFile => edit_file(&args),
-            ToolImpl::WebSearch => self.execute_web(&args, true),
-            ToolImpl::WebFetch => self.execute_web(&args, false),
-            ToolImpl::GoalComplete => non_empty_arg(&args, "result", GOAL_COMPLETE_TOOL_NAME),
+            ToolImpl::ReadSkill => skills::read(&self.skills, &args),
+            ToolImpl::WriteFile => files::write_file(&args),
+            ToolImpl::EditFile => files::edit_file(&args),
+            ToolImpl::WebSearch => web::execute(self.web.as_ref(), &args, true),
+            ToolImpl::WebFetch => web::execute(self.web.as_ref(), &args, false),
+            ToolImpl::GoalComplete => mode::non_empty_arg(&args, "result", GOAL_COMPLETE_TOOL_NAME),
             ToolImpl::PlanningShell => match planning_shell::prepare(&args) {
                 Ok(args) => shell::execute_with_path(
                     &args,
@@ -414,9 +413,11 @@ impl Registry {
                 Ok(content) => ToolOutcome::ok(content),
                 Err(error) => ToolOutcome::error(error),
             },
-            ToolImpl::PlanComplete => non_empty_arg(&args, "plan", PLAN_COMPLETE_TOOL_NAME),
-            ToolImpl::PlanAction => plan_action_outcome(&args),
-            ToolImpl::PlanImplemented => non_empty_arg(&args, "result", PLAN_IMPLEMENTED_TOOL_NAME),
+            ToolImpl::PlanComplete => mode::non_empty_arg(&args, "plan", PLAN_COMPLETE_TOOL_NAME),
+            ToolImpl::PlanAction => mode::plan_action_outcome(&args),
+            ToolImpl::PlanImplemented => {
+                mode::non_empty_arg(&args, "result", PLAN_IMPLEMENTED_TOOL_NAME)
+            }
             ToolImpl::Exec(tool) => {
                 let (content, is_error) = exec::invoke(tool, args_json, session_id);
                 ToolOutcome {
@@ -425,7 +426,9 @@ impl Registry {
                     is_error,
                 }
             }
-            ToolImpl::Subagent(tool) => self.execute_subagent(*tool, &args),
+            ToolImpl::Subagent(tool) => {
+                orchestration::execute(self.subagents.as_ref(), *tool, &args)
+            }
         };
         let save_output = matches!(
             entry.imp,
@@ -447,122 +450,6 @@ impl Registry {
             };
         }
         outcome
-    }
-
-    fn execute_web(&self, args: &Value, search: bool) -> ToolOutcome {
-        let Some(web) = &self.web else {
-            return ToolOutcome::error("web browsing is disabled");
-        };
-        let result = if search {
-            str_arg(args, "query").and_then(|query| web.search(query).map_err(ToolOutcome::error))
-        } else {
-            str_arg(args, "url").and_then(|url| web.fetch(url).map_err(ToolOutcome::error))
-        };
-        match result {
-            Ok(content) => ToolOutcome::ok(content),
-            Err(error) => error,
-        }
-    }
-
-    fn execute_subagent(&self, tool: SubagentTool, args: &Value) -> ToolOutcome {
-        let Some(context) = &self.subagents else {
-            return ToolOutcome::error("subagent orchestration is not available");
-        };
-        let result = match tool {
-            SubagentTool::Spawn => {
-                if args.get("model").is_some() {
-                    return ToolOutcome::error(
-                        "'model' is not accepted; subagents use the configured model or inherit the active parent model",
-                    );
-                }
-                let prompt = str_arg(args, "prompt").map_err(|error| error.content);
-                let required_tools = string_array(args, "required_tools");
-                let name = match args.get("name") {
-                    Some(value) => value
-                        .as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| "'name' must be a string when provided".to_string()),
-                    None => Ok(String::new()),
-                };
-                prompt.and_then(|prompt| {
-                    required_tools.and_then(|required_tools| {
-                        name.and_then(|name| {
-                            let preset: Option<&AgentPreset> = match args.get("agent") {
-                                Some(value) => {
-                                    let agent = value.as_str().ok_or_else(|| {
-                                        "'agent' must be a string when provided".to_string()
-                                    })?;
-                                    Some(
-                                        context
-                                            .presets
-                                            .iter()
-                                            .find(|preset| preset.name == agent)
-                                            .ok_or_else(|| {
-                                                format!(
-                                                    "unknown agent '{agent}'; available: {}",
-                                                    context
-                                                        .presets
-                                                        .iter()
-                                                        .map(|preset| preset.name.as_str())
-                                                        .collect::<Vec<_>>()
-                                                        .join(", ")
-                                                )
-                                            })?,
-                                    )
-                                }
-                                None => None,
-                            };
-                            if let Some(preset) = preset {
-                                validate_preset_capabilities(preset, &required_tools)?;
-                            }
-                            let supplied_name = (!name.trim().is_empty()).then_some(name.as_str());
-                            context
-                                .manager
-                                .spawn(
-                                    context.config.clone(),
-                                    &context.parent_model,
-                                    supplied_name,
-                                    prompt,
-                                    preset,
-                                )
-                                .map(|id| format!("started {id}"))
-                        })
-                    })
-                })
-            }
-            SubagentTool::Send => {
-                let id = str_arg(args, "id").map_err(|error| error.content);
-                let message = str_arg(args, "message").map_err(|error| error.content);
-                id.and_then(|id| {
-                    message.and_then(|message| context.manager.send(id, message, RunOrigin::Model))
-                })
-            }
-            SubagentTool::Wait => string_array(args, "ids").and_then(|ids| {
-                let timeout = match args.get("timeout_secs") {
-                    Some(value) => Some(
-                        value
-                            .as_u64()
-                            .ok_or_else(|| "'timeout_secs' must be an integer".to_string())?,
-                    ),
-                    None => None,
-                };
-                context.manager.wait(&ids, timeout)
-            }),
-            SubagentTool::Cancel => {
-                string_array(args, "ids").and_then(|ids| context.manager.cancel(&ids, false))
-            }
-            SubagentTool::List => match args.get("id") {
-                Some(value) => value
-                    .as_str()
-                    .ok_or_else(|| "'id' must be a string".to_string())
-                    .and_then(|id| context.manager.list(Some(id))),
-                None => context.manager.list(None),
-            },
-        };
-        match result {
-            Ok(content) => ToolOutcome::ok(content),
-            Err(error) => ToolOutcome::error(error),
-        }
     }
 }
 
@@ -622,393 +509,11 @@ fn reserved_tool_name(config: &Config, name: &str) -> bool {
     RESERVED_TOOL_NAMES.contains(&name) || (config.web_browsing && WEB_TOOL_NAMES.contains(&name))
 }
 
-fn read_skill_entry() -> ToolEntry {
-    ToolEntry {
-        spec: ToolSpec {
-            name: "read_skill".into(),
-            description: "Load full instructions for an advertised skill.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Exact advertised skill name"}
-                },
-                "required": ["name"]
-            }),
-        },
-        imp: ToolImpl::ReadSkill,
-    }
-}
-
-fn goal_complete_entry() -> ToolEntry {
-    ToolEntry {
-        spec: ToolSpec {
-            name: GOAL_COMPLETE_TOOL_NAME.into(),
-            description: "Finish the active goal with the final user-facing answer. This must be the only tool call in that step.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "result": {
-                        "type": "string",
-                        "description": "Final user-facing answer for the completed goal"
-                    }
-                },
-                "required": ["result"]
-            }),
-        },
-        imp: ToolImpl::GoalComplete,
-    }
-}
-
-fn planning_shell_entry() -> ToolEntry {
-    ToolEntry {
-        spec: ToolSpec {
-            name: "shell".into(),
-            description: "Run a read-only repository inspection command. Pipelines are allowed between: basename, cat, cut, dirname, du, git, grep, head, ls, pwd, readlink, realpath, rg, sed, stat, tail, tr, and wc. Git is limited to read-only subcommands, sed to print-only ranges, and rg cannot use preprocessors. Redirection, chaining, expansion, background execution, and other commands are rejected."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "timeout_secs": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Seconds; defaults to 120."
-                    }
-                },
-                "required": ["command"]
-            }),
-        },
-        imp: ToolImpl::PlanningShell,
-    }
-}
-
-fn user_input_entry(broker: QuestionBroker) -> ToolEntry {
-    ToolEntry {
-        spec: ToolSpec {
-            name: USER_INPUT_TOOL_NAME.into(),
-            description: "Ask the user one to three multiple-choice questions. Each question needs 2 or 3 options and one recommended option. Yawl adds an open-answer choice automatically; custom replies have a null option_index and their text in answer. Set the recommendation with the recommended index; do not add '(Recommended)' to an option label. This must be the only tool call in its step. If the result says timed_out, do not ask again in this turn.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "questions": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 3,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {"type": "string"},
-                                "question": {"type": "string"},
-                                "options": {
-                                    "type": "array",
-                                    "minItems": 2,
-                                    "maxItems": 3,
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "label": {
-                                                "type": "string",
-                                                "description": "Short answer label without a recommendation marker"
-                                            },
-                                            "description": {"type": "string"}
-                                        },
-                                        "required": ["label", "description"]
-                                    }
-                                },
-                                "recommended": {"type": "integer", "minimum": 0, "maximum": 2}
-                            },
-                            "required": ["id", "question", "options", "recommended"]
-                        }
-                    }
-                },
-                "required": ["questions"]
-            }),
-        },
-        imp: ToolImpl::UserInput(broker),
-    }
-}
-
-fn plan_complete_entry() -> ToolEntry {
-    ToolEntry {
-        spec: ToolSpec {
-            name: PLAN_COMPLETE_TOOL_NAME.into(),
-            description: "Finish planning with the complete Markdown plan. This must be the only tool call in its step.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {"plan": {"type": "string"}},
-                "required": ["plan"]
-            }),
-        },
-        imp: ToolImpl::PlanComplete,
-    }
-}
-
-fn plan_action_entry() -> ToolEntry {
-    ToolEntry {
-        spec: ToolSpec {
-            name: PLAN_ACTION_TOOL_NAME.into(),
-            description: "Classify the user's latest request against the active plan. Use unrelated to continue the request as a normal turn with the full tool set. This must be the only tool call in its step.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {"action": {"type": "string", "enum": ["revise", "implement", "unrelated"]}},
-                "required": ["action"]
-            }),
-        },
-        imp: ToolImpl::PlanAction,
-    }
-}
-
-fn plan_implemented_entry() -> ToolEntry {
-    ToolEntry {
-        spec: ToolSpec {
-            name: PLAN_IMPLEMENTED_TOOL_NAME.into(),
-            description: "Finish implementation of the active plan with the final user-facing result. This must be the only tool call in its step.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {"result": {"type": "string"}},
-                "required": ["result"]
-            }),
-        },
-        imp: ToolImpl::PlanImplemented,
-    }
-}
-
-fn plan_action_outcome(args: &Value) -> ToolOutcome {
-    match args.get("action").and_then(Value::as_str) {
-        Some(action @ ("revise" | "implement" | "unrelated")) => ToolOutcome::ok(action.into()),
-        _ => {
-            ToolOutcome::error("plan_action requires action 'revise', 'implement', or 'unrelated'")
-        }
-    }
-}
-
-fn non_empty_arg(args: &Value, key: &str, tool: &str) -> ToolOutcome {
-    match args.get(key).and_then(Value::as_str).map(str::trim) {
-        Some(value) if !value.is_empty() => ToolOutcome::ok(value.to_string()),
-        _ => ToolOutcome::error(format!("{tool} requires a non-empty string '{key}'")),
-    }
-}
-
-fn subagent_tools(presets: &[AgentPreset]) -> Vec<ToolEntry> {
-    let tool = |name: &str, description: &str, input_schema: Value, imp| ToolEntry {
-        spec: ToolSpec {
-            name: name.into(),
-            description: description.into(),
-            input_schema,
-        },
-        imp: ToolImpl::Subagent(imp),
-    };
-    let available_agents = presets
-        .iter()
-        .map(|preset| {
-            let tools = preset
-                .tools
-                .as_ref()
-                .map_or_else(|| "all tools".to_string(), |tools| tools.join("+"));
-            format!("{} ({}): {}", preset.name, tools, preset.description)
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    let agent_names = presets
-        .iter()
-        .map(|preset| preset.name.clone())
-        .collect::<Vec<_>>();
-    let spawn_description = format!(
-        "Start a background subagent and return its ID. Prompt contract: # Target (paths, \
-         ownership, non-goals), # Change, # Acceptance. Declare all required tools; omit agent for \
-         writes, commands, or unsupported tools. scout is read-only. Never set a model. Agents: \
-         {available_agents}."
-    );
-    vec![
-        tool(
-            "subagent_spawn",
-            &spawn_description,
-            json!({
-                "type": "object",
-                "properties": {
-                    "prompt": {"type": "string"},
-                    "required_tools": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "maxItems": 64,
-                        "description": "All tools the child needs; [] only for a tool-free answer."
-                    },
-                    "name": {"type": "string"},
-                    "agent": {
-                        "type": "string",
-                        "enum": agent_names,
-                        "description": "Optional preset. Omit for the default agent. Scout is read-only."
-                    }
-                },
-                "required": ["prompt", "required_tools"]
-            }),
-            SubagentTool::Spawn,
-        ),
-        tool(
-            "subagent_send",
-            "Send another turn to a subagent; restart it if settled.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "message": {"type": "string"}
-                },
-                "required": ["id", "message"]
-            }),
-            SubagentTool::Send,
-        ),
-        tool(
-            "subagent_wait",
-            "Wait for every ID to finish or fail. Omit timeout_secs to block; set it only for a \
-             bounded status check. Long results include an excerpt and a full report path.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64},
-                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 300, "description": "Optional bounded wait; omit to block until every ID settles."}
-                },
-                "required": ["ids"]
-            }),
-            SubagentTool::Wait,
-        ),
-        tool(
-            "subagent_cancel",
-            "Cancel runs and queued work for the IDs, retaining partial transcripts. Use only when \
-             the work is no longer needed.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64}
-                },
-                "required": ["ids"]
-            }),
-            SubagentTool::Cancel,
-        ),
-        tool(
-            "subagent_list",
-            "List all subagents, or status and result for one ID; long results link to full reports.",
-            json!({
-                "type": "object",
-                "properties": {"id": {"type": "string"}}
-            }),
-            SubagentTool::List,
-        ),
-    ]
-}
-
-fn validate_preset_capabilities(
-    preset: &AgentPreset,
-    required_tools: &[String],
-) -> Result<(), String> {
-    let Some(allowed_tools) = &preset.tools else {
-        return Ok(());
-    };
-    let missing = required_tools
-        .iter()
-        .filter(|required| !allowed_tools.contains(required))
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "agent '{}' does not provide required tool(s): {}; omit 'agent' to use the default agent or choose a compatible preset",
-            preset.name,
-            missing.join(", ")
-        ))
-    }
-}
-
-fn string_array(args: &Value, key: &str) -> Result<Vec<String>, String> {
-    let values = args
-        .get(key)
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("missing required array argument '{key}'"))?;
-    values
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| format!("'{key}' must contain only strings"))
-        })
-        .collect()
-}
-
 fn truncate_result(content: &mut String) {
     if let Some((cut, _)) = content.char_indices().nth(MAX_RESULT_CHARS) {
         content.truncate(cut);
         content.push_str("\n[output truncated]");
     }
-}
-
-fn builtins(background: bool) -> Vec<ToolEntry> {
-    vec![
-        shell::entry(background),
-        ToolEntry {
-            spec: ToolSpec {
-                name: "read_file".into(),
-                description: "Read a UTF-8 text file or a PNG, JPEG, GIF, or WebP image.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "File path (absolute or relative to cwd)"},
-                        "offset": {"type": "integer", "minimum": 0, "description": "Optional byte offset for a paged UTF-8 text read; use returned next_offset to continue."},
-                        "limit": {"type": "integer", "minimum": 4, "maximum": 32768, "description": "Page size in bytes; default 16384 when paging. Omit offset and limit for normal text/image reads."}
-                    },
-                    "required": ["path"]
-                }),
-            },
-            imp: ToolImpl::ReadFile,
-        },
-        ToolEntry {
-            spec: ToolSpec {
-                name: "write_file".into(),
-                description:
-                    "Write a file, creating parent directories; replaces existing content.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"}
-                    },
-                    "required": ["path", "content"]
-                }),
-            },
-            imp: ToolImpl::WriteFile,
-        },
-        ToolEntry {
-            spec: ToolSpec {
-                name: "edit_file".into(),
-                description: "Replace one exact `old_string` occurrence; include enough context for uniqueness."
-                    .into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "old_string": {"type": "string"},
-                        "new_string": {"type": "string"}
-                    },
-                    "required": ["path", "old_string", "new_string"]
-                }),
-            },
-            imp: ToolImpl::EditFile,
-        },
-    ]
-}
-
-fn web_entries(provider: crate::config::WebSearchProvider) -> Vec<ToolEntry> {
-    web::WebTools::specs(provider)
-        .into_iter()
-        .map(|spec| {
-            let imp = match spec.name.as_str() {
-                "web_search" => ToolImpl::WebSearch,
-                "web_fetch" => ToolImpl::WebFetch,
-                _ => unreachable!("web module returned an unknown builtin"),
-            };
-            ToolEntry { spec, imp }
-        })
-        .collect()
 }
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolOutcome> {
@@ -1017,148 +522,10 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolOutcome> {
         .ok_or_else(|| ToolOutcome::error(format!("missing required string argument '{key}'")))
 }
 
-fn read_file_for_model(args: &Value, supports_images: bool) -> ToolOutcome {
-    if args.get("offset").is_some() || args.get("limit").is_some() {
-        return files::read_page(args);
-    }
-    let path = match str_arg(args, "path") {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    match std::fs::File::open(path) {
-        Ok(file) => read_bounded_file(path, file, supports_images),
-        Err(e) => ToolOutcome::error(format!("cannot read {path}: {e}")),
-    }
-}
-
-fn read_bounded_file(path: &str, mut reader: impl Read, supports_images: bool) -> ToolOutcome {
-    const IMAGE_SIGNATURE_BYTES: usize = 12;
-    let mut prefix = Vec::with_capacity(IMAGE_SIGNATURE_BYTES);
-    if let Err(error) = reader.by_ref().take(12).read_to_end(&mut prefix) {
-        return ToolOutcome::error(format!("cannot read {path}: {error}"));
-    }
-    let media_type = crate::image::media_type(&prefix);
-    let reader = std::io::Cursor::new(prefix).chain(reader);
-    let Some(media_type) = media_type else {
-        return read_bounded_utf8(path, reader);
-    };
-    if !supports_images {
-        return ToolOutcome::error("the selected model does not accept image input");
-    }
-
-    let mut bytes = Vec::new();
-    if let Err(error) = reader
-        .take(crate::image::MAX_IMAGE_BYTES.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-    {
-        return ToolOutcome::error(format!("cannot read {path}: {error}"));
-    }
-    if bytes.len() > crate::image::MAX_IMAGE_BYTES {
-        return ToolOutcome::error(format!(
-            "{path} exceeds the {}-byte image limit",
-            crate::image::MAX_IMAGE_BYTES
-        ));
-    }
-    let size = bytes.len();
-    ToolOutcome::image(
-        format!("read {media_type} image from {path} ({size} bytes)"),
-        crate::image::encode(media_type, &bytes),
-    )
-}
-
-fn read_skill(skills: &[Skill], args: &Value) -> ToolOutcome {
-    let name = match str_arg(args, "name") {
-        Ok(name) => name,
-        Err(error) => return error,
-    };
-    let Some(skill) = skills.iter().find(|skill| skill.name == name) else {
-        return ToolOutcome::error(format!(
-            "skill '{name}' is not available for model invocation"
-        ));
-    };
-    ToolOutcome::ok(crate::skills::tool_result(skill))
-}
-
-fn read_bounded_utf8(path: &str, reader: impl Read) -> ToolOutcome {
-    let mut bytes = Vec::new();
-    if let Err(error) = reader
-        .take(MAX_READ_FILE_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-    {
-        return ToolOutcome::error(format!("cannot read {path}: {error}"));
-    }
-    if bytes.len() > MAX_READ_FILE_BYTES as usize {
-        return ToolOutcome::error(format!(
-            "{path} exceeds the {MAX_READ_FILE_BYTES}-byte read limit; \
-             use shell tools to read portions"
-        ));
-    }
-    match String::from_utf8(bytes) {
-        Ok(text) => ToolOutcome::ok(text),
-        Err(_) => ToolOutcome::error(format!("{path} is not valid UTF-8 (binary file?)")),
-    }
-}
-
-fn write_file(args: &Value) -> ToolOutcome {
-    let path = match str_arg(args, "path") {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    let content = match str_arg(args, "content") {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
-    if let Some(parent) = Path::new(path).parent()
-        && !parent.as_os_str().is_empty()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        return ToolOutcome::error(format!("cannot create {}: {e}", parent.display()));
-    }
-    match std::fs::write(path, content) {
-        Ok(()) => ToolOutcome::ok(format!("wrote {} bytes to {path}", content.len())),
-        Err(e) => ToolOutcome::error(format!("cannot write {path}: {e}")),
-    }
-}
-
-fn edit_file(args: &Value) -> ToolOutcome {
-    let path = match str_arg(args, "path") {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    let old_string = match str_arg(args, "old_string") {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let new_string = match str_arg(args, "new_string") {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    if old_string.is_empty() {
-        return ToolOutcome::error("old_string must not be empty");
-    }
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) => return ToolOutcome::error(format!("cannot read {path}: {e}")),
-    };
-    let count = text.matches(old_string).count();
-    match count {
-        0 => ToolOutcome::error(format!("old_string not found in {path}")),
-        1 => {
-            let updated = text.replacen(old_string, new_string, 1);
-            match std::fs::write(path, updated) {
-                Ok(()) => ToolOutcome::ok(format!("edited {path}")),
-                Err(e) => ToolOutcome::error(format!("cannot write {path}: {e}")),
-            }
-        }
-        n => ToolOutcome::error(format!(
-            "old_string appears {n} times in {path}; add surrounding context to make it unique"
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1176,37 +543,31 @@ mod tests {
     }
 
     #[test]
-    fn edit_file_requires_unique_match() -> std::io::Result<()> {
-        let path = temp_path("edit.txt");
-        std::fs::write(&path, "aaa bbb aaa")?;
-        let p = path.to_string_lossy();
+    fn repeated_scans_share_specs_and_tool_token_estimates() {
+        let root = temp_path("catalog-shared-specs");
+        let config = registry_config(root.join("home"), root.join("project"));
+        let mut cache = CatalogCache::default();
 
-        let dup = edit_file(&json!({"path": &p, "old_string": "aaa", "new_string": "x"}));
-        assert!(dup.is_error);
-        assert!(dup.content.contains("2 times"));
+        let first = Registry::scan(&config, &mut cache);
+        let second = Registry::scan(&config, &mut cache);
 
-        let ok = edit_file(&json!({"path": &p, "old_string": "bbb", "new_string": "yyy"}));
-        assert!(!ok.is_error);
-        assert_eq!(std::fs::read_to_string(&path)?, "aaa yyy aaa");
-        let _ = std::fs::remove_file(&path);
-        Ok(())
-    }
-
-    #[test]
-    fn write_file_creates_parent_dirs() -> std::io::Result<()> {
-        let dir = temp_path("nested");
-        let file = dir.join("a/b.txt");
-        let out = write_file(&json!({"path": file.to_string_lossy(), "content": "hi"}));
-        assert!(!out.is_error, "{}", out.content);
-        assert_eq!(std::fs::read_to_string(&file)?, "hi");
-        let _ = std::fs::remove_dir_all(&dir);
-        Ok(())
+        let first_specs = first.specs();
+        let second_specs = second.specs();
+        assert!(!first_specs.is_empty());
+        for (left, right) in first_specs.iter().zip(&second_specs) {
+            assert!(
+                Arc::ptr_eq(left, right),
+                "unchanged scans must share tool schemas"
+            );
+        }
+        assert!(first.tool_tokens() > 0);
+        assert_eq!(first.tool_tokens(), second.tool_tokens());
     }
 
     #[test]
     fn web_tools_are_advertised_only_when_enabled() {
         let mut config = registry_config(temp_path("web-home"), temp_path("web-project"));
-        let mut cache = DescribeCache::default();
+        let mut cache = CatalogCache::default();
         let disabled = Registry::scan(&config, &mut cache);
         assert!(
             disabled
@@ -1222,7 +583,7 @@ mod tests {
         let names = enabled
             .specs()
             .into_iter()
-            .map(|spec| spec.name)
+            .map(|spec| spec.name.clone())
             .collect::<Vec<_>>();
         assert!(names.contains(&"web_search".to_string()));
         assert!(names.contains(&"web_fetch".to_string()));
@@ -1258,7 +619,7 @@ fi
         std::fs::set_permissions(&tool_path, permissions)?;
 
         let mut config = registry_config(home_dir, project_dir);
-        let mut cache = DescribeCache::default();
+        let mut cache = CatalogCache::default();
         let disabled = Registry::scan(&config, &mut cache);
         assert!(
             disabled.describe_all().iter().any(
@@ -1287,12 +648,12 @@ fi
     fn background_tools_are_main_agent_only() {
         let root = temp_path("background-registry");
         let config = registry_config(root.join("home"), root.join("project"));
-        let mut cache = DescribeCache::default();
+        let mut cache = CatalogCache::default();
         let child = Registry::scan(&config, &mut cache);
         let child_names = child
             .specs()
             .into_iter()
-            .map(|spec| spec.name)
+            .map(|spec| spec.name.clone())
             .collect::<Vec<_>>();
         assert!(!child_names.iter().any(|name| name == "shell_output"));
         let child_shell = child
@@ -1311,7 +672,7 @@ fi
         let main_names = main
             .specs()
             .into_iter()
-            .map(|spec| spec.name)
+            .map(|spec| spec.name.clone())
             .collect::<Vec<_>>();
         assert!(
             ["shell_list", "shell_output", "shell_stop"]
@@ -1337,7 +698,7 @@ fi
         let config = registry_config(root.join("home"), root.join("project"));
         let manager = BackgroundProcessManager::default();
         let registry =
-            Registry::scan_with_background(&config, &mut DescribeCache::default(), manager.clone());
+            Registry::scan_with_background(&config, &mut CatalogCache::default(), manager.clone());
         let started = registry.execute(
             "shell",
             r#"{"command":"printf ready; trap 'exit 0' TERM; while :; do sleep 1; done","background":true,"name":"dev"}"#,
@@ -1384,7 +745,7 @@ printf '%s:%s' "$YAWL_SESSION_ID" "$input"
         std::fs::set_permissions(&tool_path, permissions)?;
 
         let config = registry_config(home_dir, project_dir);
-        let mut cache = DescribeCache::default();
+        let mut cache = CatalogCache::default();
         let registry = Registry::scan(&config, &mut cache);
         assert!(
             registry
@@ -1419,7 +780,7 @@ fi
         permissions.set_mode(0o755);
         std::fs::set_permissions(&tool_path, permissions)?;
         let mut config = registry_config(home_dir, project_dir);
-        let mut cache = DescribeCache::default();
+        let mut cache = CatalogCache::default();
 
         let disabled = Registry::scan(&config, &mut cache);
         assert!(
@@ -1441,7 +802,7 @@ fi
         let names = enabled
             .specs()
             .into_iter()
-            .map(|spec| spec.name)
+            .map(|spec| spec.name.clone())
             .collect::<Vec<_>>();
         assert!(
             RESERVED_TOOL_NAMES
@@ -1454,64 +815,6 @@ fi
     }
 
     #[test]
-    fn spawn_tool_lists_presets_and_takes_an_optional_agent() {
-        let root = temp_path("preset-spawn-tool");
-        let config = registry_config(root.join("home"), root.join("project"));
-        let manager = SubagentManager::new("session".into(), config.max_subagents);
-        let registry =
-            Registry::scan_with_subagents(&config, &mut DescribeCache::default(), manager, "test");
-
-        let specs = registry.specs();
-        let orchestration_chars = specs
-            .iter()
-            .filter(|spec| spec.name.starts_with("subagent_"))
-            .map(|spec| spec.description.len() + spec.input_schema.to_string().len())
-            .sum::<usize>();
-        assert!(
-            orchestration_chars < 2_000,
-            "orchestration schemas should stay compact; got {orchestration_chars} bytes"
-        );
-        let spawn = specs
-            .into_iter()
-            .find(|spec| spec.name == "subagent_spawn")
-            .expect("spawn tool present");
-        assert!(
-            spawn
-                .description
-                .contains("scout (read_file+read_skill+list_files+search_files+git_inspect)"),
-            "the description should advertise bundled presets; got:\n{}",
-            spawn.description
-        );
-        assert!(spawn.description.contains("# Target"));
-        let required = spawn.input_schema.get("required").expect("required list");
-        assert_eq!(
-            required,
-            &json!(["prompt", "required_tools"]),
-            "name and agent are optional, but capability planning is required"
-        );
-        assert!(
-            spawn
-                .description
-                .contains("omit agent for writes, commands")
-        );
-        let properties = spawn
-            .input_schema
-            .get("properties")
-            .expect("properties object");
-        assert!(properties.get("agent").is_some());
-        assert!(properties.get("required_tools").is_some());
-        assert!(
-            properties.get("model").is_none(),
-            "the orchestrator must not override the configured child model"
-        );
-        assert!(
-            properties["agent"]["description"]
-                .as_str()
-                .is_some_and(|text| text.contains("Scout is read-only"))
-        );
-    }
-
-    #[test]
     fn spawn_without_model_inherits_the_active_parent() {
         let root = temp_path("spawn-model-inherit");
         let mut config = registry_config(root.join("home"), root.join("project"));
@@ -1519,7 +822,7 @@ fi
         let manager = SubagentManager::new("session".into(), config.max_subagents);
         let registry = Registry::scan_with_subagents(
             &config,
-            &mut DescribeCache::default(),
+            &mut CatalogCache::default(),
             manager.clone(),
             "openai:active-parent",
         );
@@ -1536,42 +839,13 @@ fi
     }
 
     #[test]
-    fn spawn_rejects_model_overrides_from_the_orchestrator() {
-        let root = temp_path("spawn-model-override");
-        let config = registry_config(root.join("home"), root.join("project"));
-        let manager = SubagentManager::new("session".into(), config.max_subagents);
-        let registry = Registry::scan_with_subagents(
-            &config,
-            &mut DescribeCache::default(),
-            manager.clone(),
-            "openai-codex:parent",
-        );
-        let args = json!({
-            "prompt": "Inspect the requested file.",
-            "required_tools": ["read_file"],
-            "model": "gpt-4.1-mini"
-        });
-
-        let outcome = registry.execute("subagent_spawn", &args.to_string(), "session");
-
-        assert!(outcome.is_error, "unexpected outcome: {}", outcome.content);
-        assert!(
-            outcome.content.contains("not accepted"),
-            "{}",
-            outcome.content
-        );
-        assert!(manager.snapshots().is_empty());
-        manager.shutdown_and_discard();
-    }
-
-    #[test]
     fn scout_rejects_spawn_tasks_that_require_file_writes() {
         let root = temp_path("scout-write-capability");
         let config = registry_config(root.join("home"), root.join("project"));
         let manager = SubagentManager::new("session".into(), config.max_subagents);
         let registry = Registry::scan_with_subagents(
             &config,
-            &mut DescribeCache::default(),
+            &mut CatalogCache::default(),
             manager.clone(),
             "test",
         );
@@ -1597,14 +871,14 @@ fi
     fn retain_names_filters_the_registry_for_preset_children() {
         let root = temp_path("preset-allowlist");
         let config = registry_config(root.join("home"), root.join("project"));
-        let mut registry = Registry::scan(&config, &mut DescribeCache::default());
+        let mut registry = Registry::scan(&config, &mut CatalogCache::default());
 
         registry.retain_names(&["read_file".to_string(), "shell".to_string()]);
 
         let mut names = registry
             .specs()
             .into_iter()
-            .map(|spec| spec.name)
+            .map(|spec| spec.name.clone())
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, ["read_file", "shell"]);
@@ -1616,12 +890,12 @@ fi
         let config = registry_config(root.join("home"), root.join("project"));
         let manager = SubagentManager::new("main".into(), 1);
         let registries = [
-            Registry::scan(&config, &mut DescribeCache::default()),
-            Registry::scan_for_child(&config, &mut DescribeCache::default(), None),
-            Registry::scan_for_main_listing(&config, &mut DescribeCache::default()),
+            Registry::scan(&config, &mut CatalogCache::default()),
+            Registry::scan_for_child(&config, &mut CatalogCache::default(), None),
+            Registry::scan_for_main_listing(&config, &mut CatalogCache::default()),
             Registry::scan_with_subagents(
                 &config,
-                &mut DescribeCache::default(),
+                &mut CatalogCache::default(),
                 manager.clone(),
                 "test",
             ),
@@ -1630,7 +904,7 @@ fi
             let names = registry
                 .specs()
                 .into_iter()
-                .map(|spec| spec.name)
+                .map(|spec| spec.name.clone())
                 .collect::<Vec<_>>();
             assert!(names.iter().any(|name| name == "shell"));
             for name in ["list_files", "search_files", "git_inspect"] {
@@ -1722,7 +996,7 @@ fi
         let manager = SubagentManager::new("session".into(), config.max_subagents);
         let mut registry = Registry::scan_with_subagents_and_background(
             &config,
-            &mut DescribeCache::default(),
+            &mut CatalogCache::default(),
             manager.clone(),
             "test",
             BackgroundProcessManager::default(),
@@ -1737,7 +1011,7 @@ fi
         let names = registry
             .specs()
             .into_iter()
-            .map(|spec| spec.name)
+            .map(|spec| spec.name.clone())
             .collect::<std::collections::HashSet<_>>();
         for required in [
             "shell",
@@ -1802,7 +1076,7 @@ fi
         config.skill_dirs = vec![skills.clone()];
         config.global_skill_dirs = vec![skills];
 
-        let mut registry = Registry::scan(&config, &mut DescribeCache::default());
+        let mut registry = Registry::scan(&config, &mut CatalogCache::default());
         assert_eq!(
             registry
                 .skills()
@@ -1833,69 +1107,6 @@ fi
                 .all(|spec| spec.name != "read_skill")
         );
         let _ = std::fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn read_file_rejects_files_over_the_size_limit() -> std::io::Result<()> {
-        let path = temp_path("large.bin");
-        std::fs::write(&path, vec![b'a'; MAX_READ_FILE_BYTES as usize + 1])?;
-
-        let out = read_file_for_model(&json!({"path": path.to_string_lossy()}), false);
-
-        assert!(out.is_error);
-        assert!(out.content.contains("read limit"));
-        let _ = std::fs::remove_file(&path);
-        Ok(())
-    }
-
-    #[test]
-    fn read_file_bounds_streams_without_relying_on_metadata() {
-        let out = read_bounded_utf8("endless", std::io::repeat(b'a'));
-
-        assert!(out.is_error);
-        assert!(out.content.contains("read limit"));
-    }
-
-    #[test]
-    fn read_file_keeps_non_images_at_the_text_read_limit() {
-        struct CountingRepeat(std::rc::Rc<std::cell::Cell<usize>>);
-
-        impl Read for CountingRepeat {
-            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-                buffer.fill(b'a');
-                self.0.set(self.0.get().saturating_add(buffer.len()));
-                Ok(buffer.len())
-            }
-        }
-
-        let bytes_read = std::rc::Rc::new(std::cell::Cell::new(0));
-        let out = read_bounded_file("endless", CountingRepeat(bytes_read.clone()), false);
-
-        assert!(out.is_error);
-        assert!(out.content.contains("read limit"));
-        assert_eq!(
-            bytes_read.get(),
-            MAX_READ_FILE_BYTES as usize + 1,
-            "text detection must not read up to the larger image limit"
-        );
-    }
-
-    #[test]
-    fn read_file_returns_images_only_for_capable_models() -> std::io::Result<()> {
-        let path = temp_path("read-image.png");
-        std::fs::write(&path, b"\x89PNG\r\n\x1a\npayload")?;
-        let args = json!({"path": path.to_string_lossy()});
-
-        let supported = read_file_for_model(&args, true);
-        assert!(!supported.is_error, "{}", supported.content);
-        assert_eq!(supported.images.len(), 1);
-        assert_eq!(supported.images[0].media_type, "image/png");
-
-        let unsupported = read_file_for_model(&args, false);
-        assert!(unsupported.is_error);
-        assert!(unsupported.images.is_empty());
-        let _ = std::fs::remove_file(path);
         Ok(())
     }
 

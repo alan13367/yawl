@@ -257,17 +257,18 @@ fn truncate_message(message: &Value, mut remaining_chars: usize) -> Option<Value
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::sync::Arc;
 
     use super::*;
     use crate::provider::{SseReader, ToolSpec};
 
     #[test]
     fn request_appends_trigger_and_mirrors_turn_settings() {
-        let tools = [ToolSpec {
+        let tools = [Arc::new(ToolSpec {
             name: "shell".into(),
             description: "run a command".into(),
             input_schema: json!({"type": "object"}),
-        }];
+        })];
         let request = Request {
             model: "gpt-5.6-sol",
             system: "system",

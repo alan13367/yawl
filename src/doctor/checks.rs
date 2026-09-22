@@ -708,7 +708,7 @@ fn cross_checks(
     let Some(home_dir) = paths.global.parent().map(Path::to_path_buf) else {
         return;
     };
-    let Ok(config) = Config::load_from(
+    let Ok(mut config) = Config::load_from(
         home_dir,
         paths
             .project
@@ -718,6 +718,18 @@ fn cross_checks(
     ) else {
         return;
     };
+    if config.project_config_restricted() {
+        findings.push(info(
+            "project config",
+            "project provider endpoints, base URLs, and credentials apply only after the project \
+             is trusted; run with --trust-project or answer the trust prompt"
+                .into(),
+        ));
+        // Diagnose routing as a trusted run would see it.
+        if let Err(error) = config.apply_project_trusted_config() {
+            findings.push(warning("project config", error.to_string(), None));
+        }
+    }
     if config.setup_skipped {
         let path = if project_map.contains_key("setup") {
             paths.project.clone()

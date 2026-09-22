@@ -131,7 +131,13 @@ pub(super) fn handle_action(state: &mut ViewState, action: PickerAction) -> Opti
         }
         PickerAction::ConnectRetry => {
             if flow.provider == Some(ProviderId::Codex) {
-                start_login(&mut flow, state);
+                if crate::provider::codex::credential_status(&flow.config)
+                    == CodexLoginStatus::LoggedIn
+                {
+                    start_codex_discovery(&mut flow, state);
+                } else {
+                    start_login(&mut flow, state);
+                }
             } else {
                 start_discovery(&mut flow, state);
             }
@@ -225,7 +231,7 @@ fn choose_provider(flow: &mut ConnectFlow, provider: ProviderId, state: &mut Vie
     flow.provider = Some(provider.clone());
     if provider == ProviderId::Codex {
         if crate::provider::codex::credential_status(&flow.config) == CodexLoginStatus::LoggedIn {
-            show_models(flow, codex_models(&flow.config), state);
+            start_codex_discovery(flow, state);
         } else {
             start_login(flow, state);
         }
@@ -474,6 +480,37 @@ fn start_discovery(flow: &mut ConnectFlow, state: &mut ViewState) {
     ));
 }
 
+fn start_codex_discovery(flow: &mut ConnectFlow, state: &mut ViewState) {
+    let config = flow.config.clone();
+    let cancellation = CancellationToken::default();
+    let worker_cancellation = cancellation.clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = crate::cancellation::scope(&worker_cancellation, || {
+            if worker_cancellation.is_canceled() {
+                return Err(Error::Interrupted);
+            }
+            let models = crate::provider::codex::refresh_catalog(&config)?;
+            if worker_cancellation.is_canceled() {
+                Err(Error::Interrupted)
+            } else {
+                Ok(models.into_iter().map(|model| model.slug).collect())
+            }
+        });
+        let _ = sender.send(result);
+    });
+    flow.step = ConnectStep::Discovery;
+    flow.job = Some(ConnectJob::Discovery {
+        receiver,
+        cancellation,
+    });
+    state.picker = Some(waiting_picker(
+        "Discovering Codex models",
+        "Fetching models for this account",
+        PickerAction::ConnectCancelJob,
+    ));
+}
+
 fn start_login(flow: &mut ConnectFlow, state: &mut ViewState) {
     let config = flow.config.clone();
     let cancellation = CancellationToken::default();
@@ -591,7 +628,20 @@ pub(super) fn poll(state: &mut ViewState) -> bool {
         }
         PollEvent::DiscoveryFailure(message) => {
             flow.job = None;
-            show_recovery(&mut flow, message, state);
+            let cached = if flow.provider == Some(ProviderId::Codex) {
+                crate::provider::codex::cached_models(&flow.config)
+                    .into_iter()
+                    .map(|model| model.slug)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if cached.is_empty() {
+                show_recovery(&mut flow, message, state);
+            } else {
+                state.notice("Could not refresh Codex models. Showing the saved catalog.");
+                show_models(&mut flow, cached, state);
+            }
             true
         }
         PollEvent::LoginPrompt(prompt) => {
@@ -600,8 +650,7 @@ pub(super) fn poll(state: &mut ViewState) -> bool {
         }
         PollEvent::LoginDone => {
             flow.job = None;
-            let models = codex_models(&flow.config);
-            show_models(&mut flow, models, state);
+            start_codex_discovery(&mut flow, state);
             true
         }
         PollEvent::LoginFailure => {
@@ -614,13 +663,6 @@ pub(super) fn poll(state: &mut ViewState) -> bool {
     changed
 }
 
-fn codex_models(config: &Config) -> Vec<String> {
-    crate::model::available_models(config)
-        .into_iter()
-        .filter_map(|(model, _)| model.strip_prefix("openai-codex:").map(str::to_string))
-        .collect()
-}
-
 fn show_models(flow: &mut ConnectFlow, models: Vec<String>, state: &mut ViewState) {
     flow.step = ConnectStep::Models;
     flow.models = models.clone();
@@ -628,12 +670,26 @@ fn show_models(flow: &mut ConnectFlow, models: Vec<String>, state: &mut ViewStat
 }
 
 fn models_picker(flow: &ConnectFlow, models: &[String]) -> Picker {
+    let codex = if flow.provider == Some(ProviderId::Codex) {
+        crate::provider::codex::cached_models(&flow.config)
+    } else {
+        Vec::new()
+    };
     let mut items = models
         .iter()
         .cloned()
         .map(|model| PickerItem {
-            label: model.clone(),
-            description: "Available from this provider".into(),
+            label: codex
+                .iter()
+                .find(|entry| entry.slug == model)
+                .map(|entry| entry.display_name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| model.clone()),
+            description: if codex.is_empty() {
+                "Available from this provider".into()
+            } else {
+                model.clone()
+            },
             action: PickerAction::ConnectChooseModel(model),
         })
         .collect::<Vec<_>>();

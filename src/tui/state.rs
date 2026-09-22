@@ -115,6 +115,7 @@ pub(super) struct ViewState {
     pub(super) file_index: super::files::FileIndex,
     pub(super) picker: Option<Picker>,
     pub(super) connection: Option<super::connection::ConnectFlow>,
+    pub(super) model_refresh: Option<super::picker::ModelRefreshJob>,
     /// Whether subagent orchestration is enabled, mirrored from the config
     /// so busy-path commands can answer without the agent.
     pub(super) subagents_enabled: bool,
@@ -186,6 +187,7 @@ impl ViewState {
             file_index: super::files::FileIndex::default(),
             picker: None,
             connection: None,
+            model_refresh: None,
             subagents_enabled: agent.config().subagents,
             subagent_manager: agent.subagents(),
             subagent_snapshots: agent.subagents().display_snapshots(None).0,

@@ -496,7 +496,7 @@ impl Conversation {
                 ),
             };
 
-            let overhead = context::prompt_tokens(&system, &specs);
+            let overhead = context::prompt_tokens(&system, registry.tool_tokens());
             self.maybe_compact(overhead, sink, resolve_provider)?;
 
             let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;

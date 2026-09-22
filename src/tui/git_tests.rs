@@ -100,6 +100,7 @@ fn test_state() -> ViewState {
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
         connection: None,
+        model_refresh: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,

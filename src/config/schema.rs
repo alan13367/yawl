@@ -7,6 +7,10 @@ use super::{ModelConfig, OpenAiCompatibility, StatusBarConfig, UiColor};
 
 /// On-disk shape of `config.json`. All fields are optional so the project
 /// file can override only the keys it cares about.
+///
+/// The fields covered by [`ConfigFile::has_trust_gated_fields`] can redirect
+/// provider traffic or expose credentials, so a project file may only supply
+/// them once the project is trusted.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub(super) struct ConfigFile {
@@ -56,6 +60,51 @@ pub(super) struct ConfigFile {
     /// Stored built-in API keys, used when the matching env var is unset.
     pub(super) anthropic_api_key: Option<String>,
     pub(super) openai_api_key: Option<String>,
+}
+
+impl ConfigFile {
+    /// True when the file sets a key that can route model or search traffic
+    /// or carry a credential. A project file may only set these once the
+    /// project is trusted, so a cloned repository cannot point Yawl at its
+    /// own endpoint or resolve `$ENV` references into its headers.
+    pub(super) fn has_trust_gated_fields(&self) -> bool {
+        self.anthropic_base_url.is_some()
+            || self.openai_base_url.is_some()
+            || self.anthropic_api_key.is_some()
+            || self.openai_api_key.is_some()
+            || self.brave_api_key.is_some()
+            || self.firecrawl_api_key.is_some()
+            || self.providers.is_some()
+    }
+
+    /// The same file with every trust-gated field cleared, for the first pass
+    /// over an untrusted project file.
+    pub(super) fn without_trust_gated(mut self) -> ConfigFile {
+        self.anthropic_base_url = None;
+        self.openai_base_url = None;
+        self.anthropic_api_key = None;
+        self.openai_api_key = None;
+        self.brave_api_key = None;
+        self.firecrawl_api_key = None;
+        self.providers = None;
+        self
+    }
+
+    /// Only the trust-gated fields, for the second pass once a project is
+    /// trusted. Every other field stays at its default so re-applying is
+    /// idempotent.
+    pub(super) fn trust_gated_only(mut self) -> ConfigFile {
+        ConfigFile {
+            anthropic_base_url: self.anthropic_base_url.take(),
+            openai_base_url: self.openai_base_url.take(),
+            anthropic_api_key: self.anthropic_api_key.take(),
+            openai_api_key: self.openai_api_key.take(),
+            brave_api_key: self.brave_api_key.take(),
+            firecrawl_api_key: self.firecrawl_api_key.take(),
+            providers: self.providers.take(),
+            ..ConfigFile::default()
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

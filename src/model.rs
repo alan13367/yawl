@@ -131,10 +131,17 @@ impl<'a> ModelTarget<'a> {
         {
             return window;
         }
-        if self.is_codex()
-            && let Some((_, _, window)) = CODEX_MODELS.iter().find(|(id, _, _)| *id == self.model)
-        {
-            return *window;
+        if self.is_codex() {
+            if let Some(window) = crate::provider::codex::cached_models(config)
+                .iter()
+                .find(|model| model.slug == self.model)
+                .and_then(|model| model.context_window)
+            {
+                return window;
+            }
+            if let Some((_, _, window)) = CODEX_MODELS.iter().find(|(id, _, _)| *id == self.model) {
+                return *window;
+            }
         }
         if self.model.starts_with("claude") {
             200_000
@@ -150,7 +157,7 @@ impl<'a> ModelTarget<'a> {
             .map_or(config.max_tokens, |limit| config.max_tokens.min(limit))
     }
 
-    fn reasoning_efforts(&self) -> Vec<&'static str> {
+    fn reasoning_efforts(&self, config: &Config) -> Vec<&'static str> {
         if let Some(model) = self.configured_model() {
             return crate::config::REASONING_EFFORTS
                 .iter()
@@ -160,6 +167,21 @@ impl<'a> ModelTarget<'a> {
         }
         if !self.is_codex() {
             return Vec::new();
+        }
+        if let Some(model) = crate::provider::codex::cached_models(config)
+            .into_iter()
+            .find(|model| model.slug == self.model)
+        {
+            return crate::config::REASONING_EFFORTS
+                .iter()
+                .copied()
+                .filter(|effort| {
+                    model
+                        .supported_reasoning_levels
+                        .iter()
+                        .any(|level| level.effort == *effort)
+                })
+                .collect();
         }
         match self.model {
             "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" => MAX_REASONING,
@@ -180,11 +202,17 @@ impl<'a> ModelTarget<'a> {
         )
     }
 
-    fn supports_images(&self) -> bool {
+    fn supports_images(&self, config: &Config) -> bool {
         match self.provider {
             ProviderSelection::Anthropic => anthropic_supports_images(self.model),
             ProviderSelection::OpenAi => openai_supports_images(self.model),
-            ProviderSelection::Codex => CODEX_MODELS.iter().any(|(id, _, _)| *id == self.model),
+            ProviderSelection::Codex => crate::provider::codex::cached_models(config)
+                .into_iter()
+                .find(|model| model.slug == self.model)
+                .map_or_else(
+                    || CODEX_MODELS.iter().any(|(id, _, _)| *id == self.model),
+                    |model| model.input_modalities.iter().any(|input| input == "image"),
+                ),
             ProviderSelection::Custom { .. } => self
                 .configured_model()
                 .is_some_and(|model| model.input.iter().any(|input| input == "image")),
@@ -238,7 +266,7 @@ pub(crate) fn is_codex(config: &Config, spec: &str) -> bool {
 }
 
 pub(crate) fn reasoning_efforts(config: &Config, spec: &str) -> Vec<&'static str> {
-    ModelTarget::parse(spec, config).reasoning_efforts()
+    ModelTarget::parse(spec, config).reasoning_efforts(config)
 }
 
 /// Saved reasoning levels for a custom provider model, or `None` when the
@@ -257,7 +285,7 @@ pub(crate) fn effective_reasoning_effort<'a>(config: &'a Config, spec: &str) -> 
 }
 
 pub(crate) fn supports_images(config: &Config, spec: &str) -> bool {
-    ModelTarget::parse(spec, config).supports_images()
+    ModelTarget::parse(spec, config).supports_images(config)
 }
 
 pub(crate) fn available_models(config: &Config) -> Vec<(String, String)> {
@@ -273,18 +301,26 @@ pub(crate) fn available_models(config: &Config) -> Vec<(String, String)> {
             })
         })
         .collect::<Vec<_>>();
-    models.extend(
-        CODEX_MODELS
-            .iter()
-            .map(|(id, name, _)| (format!("openai-codex:{id}"), (*name).to_string())),
-    );
     models.sort_by(|left, right| left.0.cmp(&right.0));
+    models.extend(
+        crate::provider::codex::cached_models(config)
+            .into_iter()
+            .map(|model| {
+                let name = if model.display_name.is_empty() {
+                    model.slug.clone()
+                } else {
+                    model.display_name
+                };
+                (format!("openai-codex:{}", model.slug), name)
+            }),
+    );
     models
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::config::OpenAiCompatibility;
@@ -318,6 +354,36 @@ mod tests {
     }
 
     #[test]
+    fn available_codex_models_follow_the_saved_catalog() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = config();
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        config.home_dir =
+            std::env::temp_dir().join(format!("yawl-model-catalog-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&config.home_dir)?;
+        std::fs::write(
+            config.home_dir.join("auth.json"),
+            r#"{"openai-codex":{"type":"oauth","access":"test","refresh":"test","expires":9999999999999,"accountId":"test-account"}}"#,
+        )?;
+        std::fs::write(
+            config.home_dir.join("codex-models.json"),
+            r#"{"account_id":"test-account","models":[{"slug":"gpt-6-sol","display_name":"GPT-6 Sol","visibility":"list","supported_in_api":true,"context_window":272000,"input_modalities":["text","image"],"supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}]},{"slug":"internal","display_name":"Internal","visibility":"hide","supported_in_api":true}]}"#,
+        )?;
+
+        let models = available_models(&config);
+        assert!(models.contains(&("openai-codex:gpt-6-sol".into(), "GPT-6 Sol".into())));
+        assert!(!models.iter().any(|(id, _)| id == "openai-codex:internal"));
+        assert!(!models.iter().any(|(id, _)| id == "openai-codex:gpt-5.4"));
+        assert_eq!(context_window(&config, "openai-codex:gpt-6-sol"), 272_000);
+        assert_eq!(
+            reasoning_efforts(&config, "openai-codex:gpt-6-sol"),
+            ["low", "ultra"]
+        );
+        assert!(supports_images(&config, "openai-codex:gpt-6-sol"));
+        std::fs::remove_dir_all(&config.home_dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn one_target_keeps_provider_model_and_capabilities_consistent() {
         let config = config();
         let target = ModelTarget::parse("local:family:model", &config);
@@ -329,8 +395,8 @@ mod tests {
         assert_eq!(target.model(), "family:model");
         assert_eq!(target.context_window(&config), 65_536);
         assert_eq!(target.max_tokens(&config), 4096);
-        assert!(target.reasoning_efforts().is_empty());
-        assert!(target.supports_images());
+        assert!(target.reasoning_efforts(&config).is_empty());
+        assert!(target.supports_images(&config));
     }
 
     #[test]

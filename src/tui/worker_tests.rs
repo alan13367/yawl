@@ -44,8 +44,6 @@ fn display_settings_apply_during_an_active_turn() {
         ..picker.clone()
     };
     let mut active_pickers = ActivePickers {
-        model: picker.clone(),
-        default_model: picker.clone(),
         settings,
         settings_categories: Vec::new(),
         reasoning: picker.clone(),
@@ -96,6 +94,7 @@ fn display_settings_apply_during_an_active_turn() {
         file_index: crate::tui::files::FileIndex::default(),
         picker: None,
         connection: None,
+        model_refresh: None,
         subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
         subagent_snapshots: Vec::new(),
         subagent_tokens: 0,

@@ -1,11 +1,36 @@
 //! Conservative command gate for read-only planning inspection.
 
-use serde_json::Value;
+use serde_json::{Value, json};
+
+use super::{ToolEntry, ToolImpl};
+use crate::provider::ToolSpec;
 
 const ALLOWED_COMMANDS: &[&str] = &[
     "basename", "cat", "cut", "dirname", "du", "git", "grep", "head", "ls", "pwd", "readlink",
     "realpath", "rg", "sed", "stat", "tail", "tr", "wc",
 ];
+
+/// The read-only replacement for the unrestricted `shell` tool.
+pub(super) fn entry() -> ToolEntry {
+    ToolEntry::new(ToolSpec {
+            name: "shell".into(),
+            description: "Run a read-only repository inspection command. Pipelines are allowed between: basename, cat, cut, dirname, du, git, grep, head, ls, pwd, readlink, realpath, rg, sed, stat, tail, tr, and wc. Git is limited to read-only subcommands, sed to print-only ranges, and rg cannot use preprocessors. Redirection, chaining, expansion, background execution, and other commands are rejected."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Seconds; defaults to 120."
+                    }
+                },
+                "required": ["command"]
+            }),
+        }, ToolImpl::PlanningShell,
+    )
+}
 
 pub(super) fn prepare(args: &Value) -> Result<Value, String> {
     if args.get("background").is_some() || args.get("name").is_some() {

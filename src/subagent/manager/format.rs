@@ -5,10 +5,10 @@
 
 use std::time::{Duration, Instant};
 
-use super::super::types::{
+use super::DeferredResult;
+use crate::subagent::types::{
     MAX_FINAL_RESULT_BYTES, RunOutcome, SubagentSnapshot, SubagentTranscriptItem, bounded,
 };
-use super::DeferredResult;
 
 const SALVAGE_SNIPPET_BYTES: usize = 500;
 
@@ -146,8 +146,8 @@ pub(super) fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::types::{MAX_TRACKED_SUBAGENTS, SubagentId, SubagentStatus};
     use super::*;
+    use crate::subagent::types::{MAX_TRACKED_SUBAGENTS, SubagentId, SubagentStatus};
 
     #[test]
     fn wait_format_reports_every_id_with_complete_results() {

@@ -33,8 +33,8 @@ pub(super) fn entry(background: bool) -> ToolEntry {
     } else {
         "Run foreground `sh -c` in the working directory; return stdout or the failure."
     };
-    ToolEntry {
-        spec: ToolSpec {
+    ToolEntry::new(
+        ToolSpec {
             name: "shell".into(),
             description: description.into(),
             input_schema: json!({
@@ -43,22 +43,18 @@ pub(super) fn entry(background: bool) -> ToolEntry {
                 "required": ["command"]
             }),
         },
-        imp: ToolImpl::Shell,
-    }
+        ToolImpl::Shell,
+    )
 }
 
 pub(super) fn background_entries() -> Vec<ToolEntry> {
     vec![
-        ToolEntry {
-            spec: ToolSpec {
+        ToolEntry::new(ToolSpec {
                 name: "shell_list".into(),
                 description: "List background commands with ID, status, PID, elapsed time, label, and command.".into(),
                 input_schema: json!({"type": "object", "properties": {}}),
-            },
-            imp: ToolImpl::ShellList,
-        },
-        ToolEntry {
-            spec: ToolSpec {
+            }, ToolImpl::ShellList),
+        ToolEntry::new(ToolSpec {
                 name: "shell_output".into(),
                 description: "Read new background-command output. Reuse next_cursor; wait_secs may wait for output or completion.".into(),
                 input_schema: json!({
@@ -70,11 +66,8 @@ pub(super) fn background_entries() -> Vec<ToolEntry> {
                     },
                     "required": ["id"]
                 }),
-            },
-            imp: ToolImpl::ShellOutput,
-        },
-        ToolEntry {
-            spec: ToolSpec {
+            }, ToolImpl::ShellOutput),
+        ToolEntry::new(ToolSpec {
                 name: "shell_stop".into(),
                 description: "Gracefully stop a background process group; settled commands return status.".into(),
                 input_schema: json!({
@@ -82,9 +75,7 @@ pub(super) fn background_entries() -> Vec<ToolEntry> {
                     "properties": {"id": {"type": "string", "description": "bg-N ID"}},
                     "required": ["id"]
                 }),
-            },
-            imp: ToolImpl::ShellStop,
-        },
+            }, ToolImpl::ShellStop),
     ]
 }
 

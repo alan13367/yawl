@@ -18,7 +18,7 @@ use crate::error::Error;
 use crate::provider::{Message, MessageControl, TokenUsage, TurnInput, UsageSummary};
 use crate::session::{PlanState, Session};
 use crate::subagent::SubagentManager;
-use crate::tools::{DescribeCache, QuestionBroker, Registry};
+use crate::tools::{CatalogCache, QuestionBroker, Registry};
 
 pub(crate) use steer::SteerInbox;
 
@@ -109,7 +109,7 @@ pub(crate) struct Conversation {
     /// Set when a turn ends through plan_complete so the TUI can offer the
     /// implement/revise handoff only for freshly finished plans.
     plan_ready_this_turn: bool,
-    describe_cache: DescribeCache,
+    catalog_cache: CatalogCache,
     cancellation: CancellationToken,
     print_mode: bool,
     steers: SteerInbox,
@@ -145,7 +145,7 @@ impl Conversation {
             pending_tool_results: Default::default(),
             latest_turn_result: String::new(),
             plan_ready_this_turn: false,
-            describe_cache: DescribeCache::default(),
+            catalog_cache: CatalogCache::default(),
             cancellation: CancellationToken::default(),
             print_mode: false,
             steers: SteerInbox::default(),
@@ -172,7 +172,7 @@ impl Conversation {
             pending_tool_results: Default::default(),
             latest_turn_result: String::new(),
             plan_ready_this_turn: false,
-            describe_cache: DescribeCache::default(),
+            catalog_cache: CatalogCache::default(),
             cancellation: CancellationToken::default(),
             print_mode: false,
             steers: SteerInbox::default(),
@@ -490,7 +490,7 @@ impl Conversation {
             ConversationKind::Persistent(state) if self.config.subagents => {
                 Registry::scan_with_subagents_and_background(
                     &self.config,
-                    &mut self.describe_cache,
+                    &mut self.catalog_cache,
                     state.subagents.clone(),
                     &self.model,
                     state.background.clone(),
@@ -498,12 +498,12 @@ impl Conversation {
             }
             ConversationKind::Persistent(state) => Registry::scan_with_background(
                 &self.config,
-                &mut self.describe_cache,
+                &mut self.catalog_cache,
                 state.background.clone(),
             ),
             ConversationKind::Child(state) => Registry::scan_for_child(
                 &self.config,
-                &mut self.describe_cache,
+                &mut self.catalog_cache,
                 state.tool_allowlist.as_deref(),
             ),
         };

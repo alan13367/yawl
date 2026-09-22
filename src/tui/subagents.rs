@@ -978,6 +978,7 @@ mod tests {
             file_index: crate::tui::files::FileIndex::default(),
             picker: None,
             connection: None,
+            model_refresh: None,
             subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
             subagent_tokens: 0,
             subagent_snapshots: vec![snapshot()],

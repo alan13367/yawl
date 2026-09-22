@@ -80,6 +80,7 @@ impl PrintSink {
             TurnEvent::TextDelta(text) | TurnEvent::AssistantReplace(text) => {
                 print_reasoning(&mut self.pending_reasoning);
                 if self.output_error.is_none() {
+                    let text = sanitize_terminal(text);
                     match self
                         .stdout
                         .write_all(text.as_bytes())
@@ -95,7 +96,7 @@ impl PrintSink {
             }
             TurnEvent::ReasoningDelta { kind, text } => {
                 if !self.hide_reasoning {
-                    append_reasoning(&mut self.pending_reasoning, kind, text);
+                    append_reasoning(&mut self.pending_reasoning, kind, &sanitize_terminal(text));
                 }
             }
             TurnEvent::RetryReset => {
@@ -133,6 +134,31 @@ impl PrintSink {
             | TurnEvent::ToolEnd { .. }
             | TurnEvent::Usage { .. } => {}
         }
+    }
+}
+
+/// Replaces every control character that could steer the terminal with a
+/// replacement glyph, preserving the newlines and tabs that make up plain
+/// output. The TUI applies the same rule through its renderer; print mode
+/// writes straight to the stream, so it has to sanitize here.
+fn sanitize_terminal(text: &str) -> std::borrow::Cow<'_, str> {
+    if text
+        .chars()
+        .all(|character| matches!(character, '\n' | '\t') || !character.is_control())
+    {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(
+            text.chars()
+                .map(|character| {
+                    if matches!(character, '\n' | '\t') || !character.is_control() {
+                        character
+                    } else {
+                        char::REPLACEMENT_CHARACTER
+                    }
+                })
+                .collect(),
+        )
     }
 }
 
@@ -182,4 +208,27 @@ fn reasoning_summary_parts(content: &str) -> Vec<String> {
         parts.push(current);
     }
     parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_sanitization_keeps_text_and_drops_control_sequences() {
+        let clean = "hello\nworld\t!";
+        assert!(matches!(
+            sanitize_terminal(clean),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(sanitize_terminal(clean), clean);
+
+        let hostile = "safe\x1b]0;pwned\x07\rtext";
+        let sanitized = sanitize_terminal(hostile);
+        assert!(!sanitized.contains('\x1b'));
+        assert!(!sanitized.contains('\x07'));
+        assert!(!sanitized.contains('\r'));
+        assert!(sanitized.contains("safe"));
+        assert!(sanitized.contains("text"));
+    }
 }

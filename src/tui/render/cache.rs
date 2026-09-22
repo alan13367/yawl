@@ -185,8 +185,21 @@ impl CacheSlot {
         screen_offset: usize,
     ) -> Vec<super::FrameImage> {
         let mut images = Vec::new();
-        for (index, entry) in self.entries.iter().enumerate() {
-            let Some(entry) = entry else {
+        if visible.is_empty() {
+            return images;
+        }
+        // Entries are laid out in `entry_starts` order, so binary-search the
+        // window instead of scanning the whole transcript every frame.
+        let first = self
+            .entry_starts
+            .partition_point(|start| *start <= visible.start)
+            .saturating_sub(1);
+        let end = self
+            .entry_starts
+            .partition_point(|start| *start < visible.end)
+            .min(self.entries.len());
+        for index in first..end {
+            let Some(entry) = &self.entries[index] else {
                 continue;
             };
             let entry_start = self.entry_starts[index];
@@ -726,4 +739,75 @@ pub(in crate::tui) fn render_loading_state(state: &ViewState, width: usize) -> O
     let accent = foreground_color(state.accent_color);
     let rendered = format!(" {accent}{frame}\x1b[0m \x1b[2m{label}\x1b[0m");
     Some(markdown::fit_width(&rendered, width))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preview(rows: usize) -> CachedImage {
+        CachedImage {
+            start_line: 0,
+            columns: 4,
+            rows,
+            content: Arc::new(ImageContent {
+                media_type: "image/png".into(),
+                data: String::new(),
+            }),
+        }
+    }
+
+    fn slot_with_images() -> CacheSlot {
+        let mut slot = CacheSlot::new(RenderSettings {
+            width: 80,
+            tools_expanded: false,
+            hide_reasoning: false,
+            image_support: ImageSupport::None,
+            accent_color: UiColor::WHITE,
+        });
+        slot.entries = vec![
+            Some(RenderedEntry {
+                lines: vec![String::new(); 3],
+                images: vec![preview(2)],
+            }),
+            None,
+            Some(RenderedEntry {
+                lines: vec![String::new(); 5],
+                images: vec![preview(3)],
+            }),
+            Some(RenderedEntry {
+                lines: vec![String::new(); 2],
+                images: vec![preview(1)],
+            }),
+        ];
+        let mut starts = vec![0];
+        for entry in &slot.entries {
+            let height = entry.as_ref().map_or(0, |entry| entry.lines.len() + 1);
+            let last = *starts.last().expect("start");
+            starts.push(last + height);
+        }
+        slot.entry_starts = starts;
+        slot
+    }
+
+    #[test]
+    fn images_are_collected_only_from_entries_intersecting_the_window() {
+        let slot = slot_with_images();
+        assert_eq!(slot.entry_starts, [0, 4, 4, 10, 13]);
+
+        let all = slot.images_in(0..13, 0);
+        assert_eq!(all.len(), 3);
+
+        let middle = slot.images_in(4..10, 2);
+        assert_eq!(middle.len(), 1, "only the second rendered entry intersects");
+        assert_eq!(middle[0].row, 3);
+        assert_eq!(middle[0].rows, 3);
+
+        let first = slot.images_in(0..4, 0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].row, 1);
+
+        assert!(slot.images_in(13..20, 0).is_empty());
+        assert!(slot.images_in(6..6, 0).is_empty());
+    }
 }

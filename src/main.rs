@@ -11,7 +11,7 @@ use yawl::agent::Agent;
 use yawl::config::{Config, SessionDirs};
 use yawl::error::Error;
 use yawl::session::Session;
-use yawl::tools::{DescribeCache, Registry};
+use yawl::tools::{CatalogCache, Registry};
 
 fn main() {
     match run() {
@@ -64,6 +64,10 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         }
         return Ok(0);
     }
+    let stdin_is_terminal = io::stdin().is_terminal();
+    // Setup also reads project provider definitions, so resolve trust before
+    // either explicit setup or first-run onboarding can use the config.
+    project_trust::resolve(&mut config, cli.trust_project, stdin_is_terminal)?;
     if cli.setup {
         yawl::install_interrupt_handler()?;
         yawl::onboarding::run(&config)?;
@@ -72,9 +76,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     if let Some(model) = &cli.model {
         config.model = Some(model.clone());
     }
-    let stdin_is_terminal = io::stdin().is_terminal();
     if cli.list_tools {
-        project_trust::resolve(&mut config, cli.trust_project, stdin_is_terminal)?;
         list_tools(&config);
         return Ok(0);
     }
@@ -90,7 +92,6 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let model = config.model.clone().ok_or_else(|| {
         Error::Config("no model configured; run 'yawl --setup' or pass --model".into())
     })?;
-    project_trust::resolve(&mut config, cli.trust_project, stdin_is_terminal)?;
     let (session, messages) = open_session(&config, &cli, &model)?;
     // An explicit `-m` wins; otherwise a resumed session continues with the
     // model it last used.
@@ -143,7 +144,7 @@ fn select_session(
 }
 
 fn list_tools(config: &Config) {
-    let mut cache = DescribeCache::default();
+    let mut cache = CatalogCache::default();
     let registry = Registry::scan_for_main_listing(config, &mut cache);
     for (name, description, origin) in registry.describe_all() {
         println!("{name}\t{origin}\n  {description}");

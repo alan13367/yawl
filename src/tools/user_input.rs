@@ -5,9 +5,56 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::{ToolEntry, ToolImpl};
+use crate::provider::ToolSpec;
+
 pub(crate) const TOOL_NAME: &str = "request_user_input";
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const FOLLOW_UP_GRACE: Duration = Duration::from_secs(30);
+
+pub(super) fn entry(broker: QuestionBroker) -> ToolEntry {
+    ToolEntry::new(ToolSpec {
+            name: TOOL_NAME.into(),
+            description: "Ask the user one to three multiple-choice questions. Each question needs 2 or 3 options and one recommended option. Yawl adds an open-answer choice automatically; custom replies have a null option_index and their text in answer. Set the recommendation with the recommended index; do not add '(Recommended)' to an option label. This must be the only tool call in its step. If the result says timed_out, do not ask again in this turn.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "question": {"type": "string"},
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 3,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {
+                                                "type": "string",
+                                                "description": "Short answer label without a recommendation marker"
+                                            },
+                                            "description": {"type": "string"}
+                                        },
+                                        "required": ["label", "description"]
+                                    }
+                                },
+                                "recommended": {"type": "integer", "minimum": 0, "maximum": 2}
+                            },
+                            "required": ["id", "question", "options", "recommended"]
+                        }
+                    }
+                },
+                "required": ["questions"]
+            }),
+        }, ToolImpl::UserInput(broker),
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QuestionOption {

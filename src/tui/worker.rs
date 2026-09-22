@@ -17,8 +17,8 @@ use super::events::{Event, EventReader, Key, MouseEvent, MouseKind};
 use super::input::{EditAction, Editor, Submission};
 use super::picker::{
     ActivePickers, PickerAction, SettingsCategory, SettingsItem, SettingsLocation,
-    picker_is_editing, select_picker_item, settings_item_index, status_bar_editor_picker,
-    take_picker_action, web_search_provider_picker,
+    open_model_picker_from_config, picker_is_editing, poll_model_picker, select_picker_item,
+    settings_item_index, status_bar_editor_picker, take_picker_action, web_search_provider_picker,
 };
 use super::state::{
     COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, handle_tool_click,
@@ -314,6 +314,7 @@ pub(super) fn pump_events<R: Read, T>(
                     Event::Tick => {
                         needs_draw |= advance_ticks(state);
                         needs_draw |= super::connection::poll(state);
+                        needs_draw |= poll_model_picker(state);
                     }
                     Event::MouseScroll(_)
                     | Event::Paste(_)
@@ -326,6 +327,7 @@ pub(super) fn pump_events<R: Read, T>(
                 Event::Tick => {
                     needs_draw |= advance_ticks(state);
                     needs_draw |= super::connection::poll(state);
+                    needs_draw |= poll_model_picker(state);
                 }
                 Event::FocusGained | Event::FocusLost => {}
                 Event::MouseScroll(amount) => scroll(state, amount),
@@ -643,7 +645,10 @@ pub(super) fn handle_submission_while_busy(
 ) -> Result<(), Error> {
     match busy_command(&input.text) {
         Some(BusyCommand::Settings) => state.picker = Some(active_pickers.settings.clone()),
-        Some(BusyCommand::Model) => state.picker = Some(active_pickers.model.clone()),
+        Some(BusyCommand::Model) => {
+            let selected_model = state.model.clone();
+            open_model_picker_from_config(active_config, &selected_model, state, false);
+        }
         Some(BusyCommand::Connect) => super::connection::open(state, active_config, false),
         Some(BusyCommand::Unqueue(argument)) => unqueue(&argument, state),
         Some(BusyCommand::Subagents) => super::subagents::open_dashboard(state),
@@ -737,10 +742,16 @@ pub(super) fn activate_picker_action_while_busy(
     }
     match action {
         PickerAction::OpenModels { save: true } => {
-            state.picker = Some(active_pickers.default_model.clone());
+            let selected_model = active_config
+                .model
+                .as_deref()
+                .unwrap_or(&state.model)
+                .to_string();
+            open_model_picker_from_config(active_config, &selected_model, state, true);
         }
         PickerAction::OpenModels { save: false } => {
-            state.picker = Some(active_pickers.model.clone());
+            let selected_model = state.model.clone();
+            open_model_picker_from_config(active_config, &selected_model, state, false);
         }
         PickerAction::OpenReasoning { save: true } => {
             state.picker = Some(active_pickers.default_reasoning.clone());
