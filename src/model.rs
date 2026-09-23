@@ -2,14 +2,21 @@
 
 use crate::config::{Config, ModelConfig, ProviderConfig};
 
+const CODEX_DEFAULT_CONTEXT_WINDOW: u64 = 370_000;
+const CODEX_OLD_DEFAULT_CONTEXT_WINDOW: u64 = 272_000;
+
 const CODEX_MODELS: &[(&str, &str, u64)] = &[
     ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark", 128_000),
-    ("gpt-5.4", "GPT-5.4", 272_000),
-    ("gpt-5.4-mini", "GPT-5.4 mini", 272_000),
-    ("gpt-5.5", "GPT-5.5", 272_000),
-    ("gpt-5.6-luna", "GPT-5.6 Luna", 272_000),
-    ("gpt-5.6-sol", "GPT-5.6 Sol", 272_000),
-    ("gpt-5.6-terra", "GPT-5.6 Terra", 272_000),
+    ("gpt-5.4", "GPT-5.4", CODEX_DEFAULT_CONTEXT_WINDOW),
+    ("gpt-5.4-mini", "GPT-5.4 mini", CODEX_DEFAULT_CONTEXT_WINDOW),
+    ("gpt-5.5", "GPT-5.5", CODEX_DEFAULT_CONTEXT_WINDOW),
+    ("gpt-5.6-luna", "GPT-5.6 Luna", CODEX_DEFAULT_CONTEXT_WINDOW),
+    ("gpt-5.6-sol", "GPT-5.6 Sol", CODEX_DEFAULT_CONTEXT_WINDOW),
+    (
+        "gpt-5.6-terra",
+        "GPT-5.6 Terra",
+        CODEX_DEFAULT_CONTEXT_WINDOW,
+    ),
 ];
 
 const STANDARD_REASONING: &[&str] = &["minimal", "low", "medium", "high"];
@@ -137,11 +144,20 @@ impl<'a> ModelTarget<'a> {
                 .find(|model| model.slug == self.model)
                 .and_then(|model| model.context_window)
             {
-                return window;
+                // The catalog's old 272k default should not pin Codex models
+                // below the locally selected default. Preserve distinct limits.
+                return if window == CODEX_OLD_DEFAULT_CONTEXT_WINDOW
+                    && self.model != "gpt-5.3-codex-spark"
+                {
+                    CODEX_DEFAULT_CONTEXT_WINDOW
+                } else {
+                    window
+                };
             }
             if let Some((_, _, window)) = CODEX_MODELS.iter().find(|(id, _, _)| *id == self.model) {
                 return *window;
             }
+            return CODEX_DEFAULT_CONTEXT_WINDOW;
         }
         if self.model.starts_with("claude") {
             200_000
@@ -366,14 +382,23 @@ mod tests {
         )?;
         std::fs::write(
             config.home_dir.join("codex-models.json"),
-            r#"{"account_id":"test-account","models":[{"slug":"gpt-6-sol","display_name":"GPT-6 Sol","visibility":"list","supported_in_api":true,"context_window":272000,"input_modalities":["text","image"],"supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}]},{"slug":"internal","display_name":"Internal","visibility":"hide","supported_in_api":true}]}"#,
+            r#"{"account_id":"test-account","models":[{"slug":"gpt-6-sol","display_name":"GPT-6 Sol","visibility":"list","supported_in_api":true,"context_window":272000,"input_modalities":["text","image"],"supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}]},{"slug":"gpt-6-wide","display_name":"GPT-6 Wide","visibility":"list","supported_in_api":true,"context_window":400000},{"slug":"gpt-5.3-codex-spark","display_name":"Spark","visibility":"list","supported_in_api":true,"context_window":128000},{"slug":"internal","display_name":"Internal","visibility":"hide","supported_in_api":true}]}"#,
         )?;
 
         let models = available_models(&config);
         assert!(models.contains(&("openai-codex:gpt-6-sol".into(), "GPT-6 Sol".into())));
         assert!(!models.iter().any(|(id, _)| id == "openai-codex:internal"));
         assert!(!models.iter().any(|(id, _)| id == "openai-codex:gpt-5.4"));
-        assert_eq!(context_window(&config, "openai-codex:gpt-6-sol"), 272_000);
+        assert_eq!(context_window(&config, "openai-codex:gpt-6-sol"), 370_000);
+        assert_eq!(context_window(&config, "openai-codex:gpt-6-wide"), 400_000);
+        assert_eq!(
+            context_window(&config, "openai-codex:gpt-5.3-codex-spark"),
+            128_000
+        );
+        config
+            .context_windows
+            .insert("openai-codex:gpt-6-sol".into(), 256_000);
+        assert_eq!(context_window(&config, "openai-codex:gpt-6-sol"), 256_000);
         assert_eq!(
             reasoning_efforts(&config, "openai-codex:gpt-6-sol"),
             ["low", "ultra"]
@@ -403,7 +428,15 @@ mod tests {
     fn codex_capabilities_come_from_the_model_catalog() {
         let config = config();
 
-        assert_eq!(context_window(&config, "openai-codex:gpt-5.4"), 272_000);
+        assert_eq!(context_window(&config, "openai-codex:gpt-5.4"), 370_000);
+        assert_eq!(
+            context_window(&config, "openai-codex:gpt-5.3-codex-spark"),
+            128_000
+        );
+        assert_eq!(
+            context_window(&config, "openai-codex:future-model"),
+            370_000
+        );
         assert!(reasoning_efforts(&config, "openai-codex:gpt-5.4").contains(&"xhigh"));
         assert!(!reasoning_efforts(&config, "openai-codex:gpt-5.4").contains(&"max"));
         assert!(reasoning_efforts(&config, "openai-codex:gpt-5.6-sol").contains(&"max"));

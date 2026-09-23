@@ -145,7 +145,9 @@ Every field is optional and validated on load. An out-of-range value fails start
 
 For compatible providers, `--setup` and `/connect` ask which reasoning efforts the selected model accepts. Use arrows to move, Space to toggle, and Enter to confirm. Choices are `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. The selections are saved in `providers.NAME.models[].reasoning_efforts` in `~/.yawl/config.json`; you can edit the array manually, or override it through a provider's `models` array in `./.yawl/config.json`. `reasoningEfforts` is also accepted. An empty or omitted list disables explicit reasoning effort for that model.
 
-Use `/reasoning` to choose an effort for the session, or `/settings reasoning_effort high` to save a default in the top-level `reasoning_effort` field. Only levels listed for the active model are sent, using the Chat Completions `reasoning_effort` field. `default` or `off` lets the endpoint choose. After editing the config file, use `/settings reload` or restart Yawl.
+Codex models default to a 370,000-token context window when their catalog entry reports the older 272,000-token window. Spark keeps its smaller limit, other catalog limits remain unchanged, and `context_windows` can override any model.
+
+Use `/reasoning` to choose an effort for the session, even while a response is running. A change made during a response applies to the next model request, including a follow-up prompted by a steering message; it cannot alter a request already streaming. Yawl does not print a confirmation notice over the running response. Use `/settings reasoning_effort high` to save a default in the top-level `reasoning_effort` field. Only levels listed for the active model are sent, using the Chat Completions `reasoning_effort` field. `default` or `off` lets the endpoint choose. After editing the config file, use `/settings reload` or restart Yawl.
 
 ## Sessions, undo, and compaction
 

@@ -7,6 +7,14 @@ use super::*;
 fn settings_and_model_pickers_are_recognized_during_an_active_turn() {
     assert_eq!(busy_command(" /settings "), Some(BusyCommand::Settings));
     assert_eq!(busy_command("/model"), Some(BusyCommand::Model));
+    assert_eq!(
+        busy_command("/reasoning"),
+        Some(BusyCommand::Reasoning(String::new()))
+    );
+    assert_eq!(
+        busy_command("/reasoning HIGH"),
+        Some(BusyCommand::Reasoning("HIGH".into()))
+    );
     assert_eq!(busy_command("/connect"), Some(BusyCommand::Connect));
     assert_eq!(busy_command("/subagents"), Some(BusyCommand::Subagents));
     assert_eq!(busy_command("/git"), Some(BusyCommand::Git));
@@ -46,7 +54,6 @@ fn display_settings_apply_during_an_active_turn() {
     let mut active_pickers = ActivePickers {
         settings,
         settings_categories: Vec::new(),
-        reasoning: picker.clone(),
         default_reasoning: picker.clone(),
         accent_color: picker.clone(),
         selection_color: picker,
@@ -122,6 +129,39 @@ fn display_settings_apply_during_an_active_turn() {
         project_dir: root.join("project/.yawl"),
         ..Config::test_default()
     };
+    state.model = "openai-codex:gpt-5.4".into();
+    let notices_before = state.transcript.entries().len();
+    worker::set_reasoning_while_busy(&mut config, &mut state, "HIGH");
+    assert_eq!(state.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(state.transcript.entries().len(), notices_before);
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::OpenReasoning { save: false },
+        &mut active_pickers,
+        &mut config,
+    );
+    let picker = state.picker.as_ref().expect("reasoning picker should open");
+    assert!(matches!(
+        &picker.items[picker.selected].action,
+        PickerAction::SetReasoning { effort: Some(effort), save: false } if effort == "high"
+    ));
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::SetReasoning {
+            effort: None,
+            save: false,
+        },
+        &mut active_pickers,
+        &mut config,
+    );
+    assert!(config.reasoning_effort.is_none());
+    assert!(state.reasoning_effort.is_none());
+    assert!(state.pending_actions.is_empty());
+    assert_eq!(state.transcript.entries().len(), notices_before);
+    state.model = "test".into();
+    state.picker = None;
+
     active_pickers.settings_categories = [SettingsCategory::Interface]
         .into_iter()
         .map(|category| {

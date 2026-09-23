@@ -499,6 +499,9 @@ impl Conversation {
             let overhead = context::prompt_tokens(&system, registry.tool_tokens());
             self.maybe_compact(overhead, sink, resolve_provider)?;
 
+            if let Some(effort) = self.steers.take_reasoning_effort() {
+                self.config.reasoning_effort = effort;
+            }
             let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;
             let mut retried_context = false;
             let out = loop {
@@ -1161,6 +1164,9 @@ impl Conversation {
                 registry.skills(),
             ),
         };
+        if let Some(effort) = self.steers.take_reasoning_effort() {
+            self.config.reasoning_effort = effort;
+        }
         let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;
         let (summary, range, summary_usage) = compaction::summarize(
             provider.as_ref(),

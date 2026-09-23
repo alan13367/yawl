@@ -304,7 +304,6 @@ pub(super) enum PickerEdit {
 pub(super) struct ActivePickers {
     pub(super) settings: Picker,
     pub(super) settings_categories: Vec<(SettingsCategory, Picker)>,
-    pub(super) reasoning: Picker,
     pub(super) default_reasoning: Picker,
     pub(super) accent_color: Picker,
     pub(super) selection_color: Picker,
@@ -325,7 +324,6 @@ impl ActivePickers {
                 .into_iter()
                 .map(|category| (category, settings_category_picker(agent, category, 0)))
                 .collect(),
-            reasoning: reasoning_picker(agent, false),
             default_reasoning: reasoning_picker(agent, true),
             accent_color: color_picker(agent.config().accent_color),
             selection_color: selection_color_picker(agent.config().selection_color),
@@ -525,16 +523,24 @@ pub(super) fn open_reasoning_picker(agent: &Agent, state: &mut ViewState, save: 
 }
 
 pub(super) fn reasoning_picker(agent: &Agent, save: bool) -> Picker {
-    let target = crate::model::ModelTarget::parse(agent.model(), agent.config());
+    reasoning_picker_from_config(agent.config(), agent.model(), save)
+}
+
+pub(super) fn reasoning_picker_from_config(
+    config: &Config,
+    model_spec: &str,
+    save: bool,
+) -> Picker {
+    let target = crate::model::ModelTarget::parse(model_spec, config);
     let model = target.model();
-    let current = agent.config().reasoning_effort.as_deref();
+    let current = config.reasoning_effort.as_deref();
     let mut items = vec![PickerItem {
         label: "Provider default".into(),
         description: "Do not request a specific effort".into(),
         action: PickerAction::SetReasoning { effort: None, save },
     }];
     items.extend(
-        crate::model::reasoning_efforts(agent.config(), agent.model())
+        crate::model::reasoning_efforts(config, model_spec)
             .iter()
             .map(|effort| PickerItem {
                 label: title_case_effort(effort),

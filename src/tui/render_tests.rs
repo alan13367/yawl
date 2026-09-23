@@ -399,6 +399,35 @@ fn codex_reasoning_summary_parts_render_on_separate_lines() {
         .collect::<Vec<_>>();
 
     assert_eq!(visible, ["Planning the change", "Delegating inspection"]);
+    assert_eq!(rendered.len(), 3); // No extra gap when two titles have no paragraph.
+}
+
+#[test]
+fn codex_reasoning_summary_parts_have_one_blank_row_between_paragraph_and_title() {
+    let summary = Entry::Reasoning {
+        kind: ReasoningKind::Summary,
+        content: "**Reviewing release notes**\n\nChecking the generated notes.\n\n**Summarizing features**\n\nReading the README.\n\n**Next step**".into(),
+    };
+
+    let rendered = render_entries(&[summary], 80, false, false);
+    let plain = rendered
+        .iter()
+        .map(|line| markdown::strip_ansi(line).trim_end().to_string())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        plain,
+        [
+            "Reviewing release notes",
+            "Checking the generated notes.",
+            "",
+            "Summarizing features",
+            "Reading the README.",
+            "",
+            "Next step",
+            "",
+        ]
+    );
 }
 
 #[test]

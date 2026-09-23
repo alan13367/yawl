@@ -265,6 +265,54 @@ fn print_mode_pump_with_no_active_subagents_returns_promptly() {
 }
 
 #[test]
+fn mid_turn_reasoning_change_reaches_the_next_model_request() {
+    let mut test = TestAgent::new("mid-turn-reasoning");
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        ProviderStep::Output {
+            text: "",
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: "shell".into(),
+                arguments: r#"{"command":"printf ok"}"#.into(),
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+        ProviderStep::Output {
+            text: "done",
+            tool_calls: Vec::new(),
+            input_tokens: 10,
+            output_tokens: 2,
+        },
+    ])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let steers = test.agent.steers.clone();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = |_: &str, config: &Config| {
+        let mut levels = seen.borrow_mut();
+        levels.push(config.reasoning_effort.clone());
+        if levels.len() == 1 {
+            steers.set_reasoning_effort(Some("high".into()));
+        }
+        Ok::<(Box<dyn Provider>, String), Error>((
+            Box::new(ScriptedProvider {
+                steps: Rc::clone(&steps),
+                requests: Rc::clone(&requests),
+                systems: None,
+            }),
+            "test".into(),
+        ))
+    };
+
+    assert!(
+        test.agent
+            .run_turn_with(Some("run it".into()), &mut |_| {}, &mut resolve)
+            .expect("scripted turn should complete")
+    );
+    assert_eq!(seen.borrow().as_slice(), &[None, Some("high".into())]);
+}
+
+#[test]
 fn conversation_transaction_persists_tool_loop_in_order() {
     let mut test = TestAgent::new("tool-loop");
     let steps = Rc::new(RefCell::new(VecDeque::from([

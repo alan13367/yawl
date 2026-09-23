@@ -509,11 +509,22 @@ pub(in crate::tui) fn render_reasoning(
     let continuation = format!("\x1b[0m{STYLE}");
     let style = |line: String| format!("{STYLE}{}\x1b[0m", line.replace("\x1b[0m", &continuation));
     match kind {
-        ReasoningKind::Summary => reasoning_summary_parts(content)
-            .into_iter()
-            .flat_map(|summary| markdown::render(&summary, width))
-            .map(style)
-            .collect(),
+        ReasoningKind::Summary => {
+            let mut lines = Vec::new();
+            let mut previous_was_title = false;
+            for summary in reasoning_summary_parts(content) {
+                let is_title = summary
+                    .strip_prefix("**")
+                    .and_then(|text| text.strip_suffix("**"))
+                    .is_some_and(|text| !text.is_empty() && !text.contains("**"));
+                if is_title && !previous_was_title && !lines.is_empty() {
+                    lines.push(String::new());
+                }
+                lines.extend(markdown::render(&summary, width).into_iter().map(style));
+                previous_was_title = is_title;
+            }
+            lines
+        }
         ReasoningKind::Full => markdown::render(content.trim(), width)
             .into_iter()
             .map(style)

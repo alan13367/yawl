@@ -17,8 +17,9 @@ use super::events::{Event, EventReader, Key, MouseEvent, MouseKind};
 use super::input::{EditAction, Editor, Submission};
 use super::picker::{
     ActivePickers, PickerAction, SettingsCategory, SettingsItem, SettingsLocation,
-    open_model_picker_from_config, picker_is_editing, poll_model_picker, select_picker_item,
-    settings_item_index, status_bar_editor_picker, take_picker_action, web_search_provider_picker,
+    open_model_picker_from_config, picker_is_editing, poll_model_picker,
+    reasoning_picker_from_config, select_picker_item, settings_item_index,
+    status_bar_editor_picker, take_picker_action, web_search_provider_picker,
 };
 use super::state::{
     COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, handle_tool_click,
@@ -156,6 +157,7 @@ where
     });
     recover_unaccepted_steers(agent, state);
     agent.sync_display_config(&active_config);
+    agent.set_reasoning_effort(active_config.reasoning_effort);
     result
 }
 
@@ -179,6 +181,7 @@ pub(super) fn pump_events<R: Read, T>(
     active_config: &mut Config,
 ) -> Result<T, Error> {
     let mut needs_draw = false;
+    let mut last_reasoning = active_config.reasoning_effort.clone();
     loop {
         needs_draw |= sync_question(terminal, state, &worker.questions);
         while let Ok(update) = worker.updates.try_recv() {
@@ -389,13 +392,32 @@ pub(super) fn pump_events<R: Read, T>(
                                 editor.handle_key(key)
                             } {
                                 EditAction::Steer(input) => {
-                                    handle_steering_while_busy(
-                                        input,
-                                        state,
-                                        editor,
-                                        &worker.steers,
-                                        active_config,
-                                    )?;
+                                    if matches!(
+                                        busy_command(&input.text),
+                                        Some(BusyCommand::Reasoning(_))
+                                    ) {
+                                        if input.has_images() {
+                                            state.notice("Images cannot accompany commands while a turn is running.");
+                                            editor.restore_submission(input);
+                                            continue;
+                                        }
+                                        handle_submission_while_busy(
+                                            input,
+                                            state,
+                                            active_pickers,
+                                            active_config,
+                                            &worker.background,
+                                            terminal,
+                                        )?;
+                                    } else {
+                                        handle_steering_while_busy(
+                                            input,
+                                            state,
+                                            editor,
+                                            &worker.steers,
+                                            active_config,
+                                        )?;
+                                    }
                                 }
                                 EditAction::Submit(input)
                                     if !input.text.trim().starts_with('/') =>
@@ -436,6 +458,10 @@ pub(super) fn pump_events<R: Read, T>(
                 break;
             }
             event = events.read_event()?;
+        }
+        if active_config.reasoning_effort != last_reasoning {
+            last_reasoning.clone_from(&active_config.reasoning_effort);
+            worker.steers.set_reasoning_effort(last_reasoning.clone());
         }
     }
 }
@@ -639,7 +665,7 @@ pub(super) fn handle_submission_while_busy(
     input: Submission,
     state: &mut ViewState,
     active_pickers: &ActivePickers,
-    active_config: &Config,
+    active_config: &mut Config,
     background: &crate::background::BackgroundProcessManager,
     terminal: &mut Terminal,
 ) -> Result<(), Error> {
@@ -648,6 +674,21 @@ pub(super) fn handle_submission_while_busy(
         Some(BusyCommand::Model) => {
             let selected_model = state.model.clone();
             open_model_picker_from_config(active_config, &selected_model, state, false);
+        }
+        Some(BusyCommand::Reasoning(argument)) => {
+            if argument.is_empty() {
+                if crate::model::reasoning_efforts(active_config, &state.model).is_empty() {
+                    state.notice(format!("{} does not expose reasoning levels.", state.model));
+                } else {
+                    state.picker = Some(reasoning_picker_from_config(
+                        active_config,
+                        &state.model,
+                        false,
+                    ));
+                }
+            } else {
+                set_reasoning_while_busy(active_config, state, &argument);
+            }
         }
         Some(BusyCommand::Connect) => super::connection::open(state, active_config, false),
         Some(BusyCommand::Unqueue(argument)) => unqueue(&argument, state),
@@ -667,10 +708,31 @@ pub(super) fn handle_submission_while_busy(
     Ok(())
 }
 
+pub(super) fn set_reasoning_while_busy(config: &mut Config, state: &mut ViewState, argument: &str) {
+    let supported = crate::model::reasoning_efforts(config, &state.model);
+    let effort = argument.to_ascii_lowercase();
+    if effort == "default" {
+        config.reasoning_effort = None;
+        state.reasoning_effort = None;
+    } else if supported.contains(&effort.as_str()) {
+        config.reasoning_effort = Some(effort.clone());
+        state.reasoning_effort = Some(effort);
+    } else if supported.is_empty() {
+        state.notice(format!("{} does not expose reasoning levels.", state.model));
+    } else {
+        state.notice(format!(
+            "{} supports default, {}.",
+            state.model,
+            supported.join(", ")
+        ));
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum BusyCommand {
     Settings,
     Model,
+    Reasoning(String),
     Connect,
     Unqueue(String),
     Subagents,
@@ -691,6 +753,7 @@ pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
     match name {
         "settings" if argument.is_empty() => Some(BusyCommand::Settings),
         "model" if argument.is_empty() => Some(BusyCommand::Model),
+        "reasoning" => Some(BusyCommand::Reasoning(argument.to_string())),
         "connect" if argument.is_empty() => Some(BusyCommand::Connect),
         "unqueue" => Some(BusyCommand::Unqueue(argument.to_string())),
         "subagents" if argument.is_empty() => Some(BusyCommand::Subagents),
@@ -757,7 +820,17 @@ pub(super) fn activate_picker_action_while_busy(
             state.picker = Some(active_pickers.default_reasoning.clone());
         }
         PickerAction::OpenReasoning { save: false } => {
-            state.picker = Some(active_pickers.reasoning.clone());
+            state.picker = Some(reasoning_picker_from_config(
+                active_config,
+                &state.model,
+                false,
+            ));
+        }
+        PickerAction::SetReasoning {
+            effort,
+            save: false,
+        } => {
+            set_reasoning_while_busy(active_config, state, effort.as_deref().unwrap_or("default"));
         }
         PickerAction::OpenAccentColor => {
             state.picker = Some(active_pickers.accent_color.clone());
