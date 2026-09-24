@@ -1,5 +1,9 @@
 use std::time::Duration;
+use std::time::Instant;
 
+#[cfg(test)]
+use super::types::reasoning_duration_ms;
+use super::types::reasoning_durations_data;
 use super::{Event, Provider, Reasoning, ReasoningKind, Request, TokenUsage};
 use crate::error::Error;
 
@@ -49,21 +53,61 @@ pub fn stream_turn(
     loop {
         attempt += 1;
         let mut out = TurnOutput::default();
+        // Open thinking segment: its index in `out.reasoning` plus the
+        // instant its first delta arrived. Scoped to the attempt so a retry
+        // discards timing along with the partial output.
+        let mut open_reasoning: Option<(usize, Instant)> = None;
+        let mut reasoning_durations_ms = Vec::new();
         let result = provider.stream_once(req, &mut |event| match event {
             Event::TextDelta(t) => {
+                close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
                 sink(StreamNotice::TextDelta(&t));
                 out.text.push_str(&t);
             }
             Event::ReasoningDelta { kind, text } => {
-                sink(StreamNotice::ReasoningDelta { kind, text: &text });
-                super::append_reasoning(&mut out.reasoning, kind, &text);
+                // Continuation requires a segment that is actually open: a
+                // text or tool boundary may have closed the last record even
+                // though its kind matches, and appending to it would merge
+                // separate segments and keep the stale duration.
+                let continuing = open_reasoning.is_some_and(|(index, _)| {
+                    out.reasoning
+                        .get(index)
+                        .is_some_and(|current| current.kind == kind)
+                });
+                if continuing {
+                    sink(StreamNotice::ReasoningDelta { kind, text: &text });
+                    super::append_reasoning(&mut out.reasoning, kind, &text);
+                } else {
+                    close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
+                    open_reasoning = Some((out.reasoning.len(), Instant::now()));
+                    sink(StreamNotice::ReasoningDelta { kind, text: &text });
+                    out.reasoning.push(Reasoning {
+                        kind,
+                        content: text,
+                    });
+                    reasoning_durations_ms.push(None);
+                }
             }
-            Event::ToolCallName(name) => sink(StreamNotice::ToolPreparing { name: &name }),
-            Event::ToolCall(tc) => out.tool_calls.push(tc),
+            Event::ToolCallName(name) => {
+                close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
+                sink(StreamNotice::ToolPreparing { name: &name });
+            }
+            Event::ToolCall(tc) => {
+                close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
+                out.tool_calls.push(tc);
+            }
             Event::Usage(usage) => out.usage = usage,
             Event::ProviderData(value) => out.provider_data.push(value),
-            Event::Done => {}
+            Event::Done => {
+                close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning)
+            }
         });
+        if result.is_ok() {
+            close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
+            if let Some(data) = reasoning_durations_data(&reasoning_durations_ms) {
+                out.provider_data.push(data);
+            }
+        }
         match result {
             Ok(()) => return Ok(out),
             Err(_) if crate::cancellation::interrupted() => return Err(Error::Interrupted),
@@ -95,6 +139,15 @@ pub(crate) fn append_reasoning(reasoning: &mut Vec<Reasoning>, kind: ReasoningKi
             kind,
             content: text.to_string(),
         });
+    }
+}
+
+/// Freezes the wall-clock duration of the open thinking segment, if any.
+fn close_reasoning_segment(durations_ms: &mut [Option<u64>], open: &mut Option<(usize, Instant)>) {
+    if let Some((index, started)) = open.take()
+        && let Some(duration_ms) = durations_ms.get_mut(index)
+    {
+        *duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
     }
 }
 
@@ -178,6 +231,10 @@ mod tests {
         assert_eq!(provider.calls.get(), 2);
         assert_eq!(output.text, "complete");
         assert_eq!(output.reasoning[0].content, "complete thought");
+        assert!(
+            reasoning_duration_ms(&output.provider_data, 0).is_some(),
+            "the text delta closes the thinking segment and freezes its duration"
+        );
         assert_eq!(output.usage.cached_input_tokens, 8);
         assert_eq!(
             notices,
@@ -195,5 +252,147 @@ mod tests {
             (output.usage.input_tokens, output.usage.output_tokens),
             (10, 2)
         );
+    }
+
+    #[test]
+    fn thinking_segments_freeze_durations_at_their_boundaries() {
+        crate::set_interrupted(false);
+        struct SegmentedProvider;
+        impl Provider for SegmentedProvider {
+            fn stream_once(
+                &self,
+                _req: &Request<'_>,
+                on_event: &mut dyn FnMut(Event),
+            ) -> Result<(), Error> {
+                on_event(Event::ReasoningDelta {
+                    kind: ReasoningKind::Summary,
+                    text: "summarizing".into(),
+                });
+                // A kind switch closes the summary segment and opens a new one.
+                on_event(Event::ReasoningDelta {
+                    kind: ReasoningKind::Full,
+                    text: "detail one".into(),
+                });
+                on_event(Event::ReasoningDelta {
+                    kind: ReasoningKind::Full,
+                    text: " detail two".into(),
+                });
+                // A tool call closes the full-thinking segment without text.
+                on_event(Event::ToolCallName("shell".into()));
+                on_event(Event::ToolCall(super::super::ToolCall {
+                    id: "c1".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                }));
+                on_event(Event::Done);
+                Ok(())
+            }
+        }
+
+        let request = Request {
+            model: "test",
+            system: "",
+            messages: &[],
+            tools: &[],
+            max_tokens: 10,
+            supports_images: false,
+            prompt_cache_control: true,
+            prompt_cache_key: None,
+        };
+
+        let output =
+            stream_turn(&SegmentedProvider, &request, &mut |_| {}).expect("stream should succeed");
+
+        assert_eq!(output.reasoning.len(), 2);
+        assert!(
+            reasoning_duration_ms(&output.provider_data, 0).is_some(),
+            "the kind switch freezes the summary segment"
+        );
+        assert!(
+            reasoning_duration_ms(&output.provider_data, 1).is_some(),
+            "the tool call freezes the full-thinking segment"
+        );
+    }
+
+    #[test]
+    fn a_resumed_same_kind_segment_after_a_boundary_stays_separate() {
+        crate::set_interrupted(false);
+        struct ResumeProvider;
+        impl Provider for ResumeProvider {
+            fn stream_once(
+                &self,
+                _req: &Request<'_>,
+                on_event: &mut dyn FnMut(Event),
+            ) -> Result<(), Error> {
+                on_event(Event::ReasoningDelta {
+                    kind: ReasoningKind::Full,
+                    text: "before".into(),
+                });
+                on_event(Event::TextDelta("answer".into()));
+                on_event(Event::ReasoningDelta {
+                    kind: ReasoningKind::Full,
+                    text: "after".into(),
+                });
+                on_event(Event::Done);
+                Ok(())
+            }
+        }
+
+        let request = Request {
+            model: "test",
+            system: "",
+            messages: &[],
+            tools: &[],
+            max_tokens: 10,
+            supports_images: false,
+            prompt_cache_control: true,
+            prompt_cache_key: None,
+        };
+
+        let output =
+            stream_turn(&ResumeProvider, &request, &mut |_| {}).expect("stream should succeed");
+
+        assert_eq!(output.reasoning.len(), 2, "the text delta is a boundary");
+        assert_eq!(output.reasoning[0].content, "before");
+        assert_eq!(output.reasoning[1].content, "after");
+        assert!(reasoning_duration_ms(&output.provider_data, 0).is_some());
+        assert!(
+            reasoning_duration_ms(&output.provider_data, 1).is_some(),
+            "the resumed segment gets its own timer"
+        );
+    }
+
+    #[test]
+    fn successful_stream_without_done_still_freezes_reasoning_duration() {
+        crate::set_interrupted(false);
+        struct NoDoneProvider;
+        impl Provider for NoDoneProvider {
+            fn stream_once(
+                &self,
+                _req: &Request<'_>,
+                on_event: &mut dyn FnMut(Event),
+            ) -> Result<(), Error> {
+                on_event(Event::ReasoningDelta {
+                    kind: ReasoningKind::Summary,
+                    text: "thinking".into(),
+                });
+                Ok(())
+            }
+        }
+
+        let request = Request {
+            model: "test",
+            system: "",
+            messages: &[],
+            tools: &[],
+            max_tokens: 10,
+            supports_images: false,
+            prompt_cache_control: true,
+            prompt_cache_key: None,
+        };
+        let output =
+            stream_turn(&NoDoneProvider, &request, &mut |_| {}).expect("stream should succeed");
+
+        assert!(reasoning_duration_ms(&output.provider_data, 0).is_some());
     }
 }

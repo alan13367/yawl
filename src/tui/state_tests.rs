@@ -2,12 +2,13 @@
 
 use super::events::{MouseEvent, MouseKind};
 use super::state::{
-    SCROLL_BAR_AUTO_HIDE_TICKS, ScrollGeometry, ViewState, advance_ticks, handle_scroll_bar_mouse,
-    handle_tool_click, scroll, scroll_bar_span, toggle_tool_entry, toggle_tool_expansion,
+    SCROLL_BAR_AUTO_HIDE_TICKS, ScrollGeometry, Update, ViewState, advance_ticks,
+    handle_scroll_bar_mouse, handle_tool_click, scroll, scroll_bar_span, toggle_tool_entry,
+    toggle_tool_expansion,
 };
-use super::transcript::Transcript;
+use super::transcript::{Entry, Transcript, TranscriptEvent};
 use crate::config::UiColor;
-use crate::provider::{Message, ToolCall};
+use crate::provider::{Message, ReasoningKind, ToolCall};
 
 fn mouse(kind: MouseKind, column: usize, row: usize) -> MouseEvent {
     MouseEvent { kind, column, row }
@@ -40,6 +41,7 @@ fn state_with(geometry: Option<ScrollGeometry>) -> ViewState {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -301,6 +303,10 @@ fn sync_scroll_bar_config_shows_the_bar_when_auto_hide_turns_off() {
     assert_eq!(state.scroll_bar_idle_ticks, 0);
 }
 
+fn owner(entry: usize, first: bool) -> super::render::LineOwner {
+    super::render::LineOwner { entry, first }
+}
+
 fn two_tool_state() -> ViewState {
     let assistant = Message::assistant(
         String::new(),
@@ -331,7 +337,13 @@ fn two_tool_state() -> ViewState {
 fn clicking_a_tool_toggles_only_that_entry() {
     let mut state = two_tool_state();
     // Two collapsed tool cards: rows 0-1 belong to the first, row 3 to the second.
-    state.transcript_row_entries = vec![Some(0), Some(0), None, Some(1), Some(1)];
+    state.transcript_row_entries = vec![
+        Some(owner(0, true)),
+        Some(owner(0, false)),
+        None,
+        Some(owner(1, true)),
+        Some(owner(1, false)),
+    ];
     assert!(!state.transcript.entry_expanded(0, state.tools_expanded));
     assert!(!state.transcript.entry_expanded(1, state.tools_expanded));
 
@@ -350,7 +362,7 @@ fn clicking_a_tool_toggles_only_that_entry() {
 #[test]
 fn clicking_the_second_tool_leaves_the_first_collapsed() {
     let mut state = two_tool_state();
-    state.transcript_row_entries = vec![Some(0), Some(1)];
+    state.transcript_row_entries = vec![Some(owner(0, true)), Some(owner(1, true))];
 
     assert!(handle_tool_click(
         &mut state,
@@ -364,7 +376,7 @@ fn clicking_the_second_tool_leaves_the_first_collapsed() {
 #[test]
 fn drags_and_non_tool_rows_never_toggle() {
     let mut state = two_tool_state();
-    state.transcript_row_entries = vec![Some(0), Some(0)];
+    state.transcript_row_entries = vec![Some(owner(0, true)), Some(owner(0, false))];
 
     // A drag across cells stays reserved for text selection.
     assert!(!handle_tool_click(
@@ -375,7 +387,7 @@ fn drags_and_non_tool_rows_never_toggle() {
     assert!(!state.transcript.entry_expanded(0, state.tools_expanded));
 
     // Separator rows and clicks outside the transcript do nothing.
-    state.transcript_row_entries = vec![Some(0), None];
+    state.transcript_row_entries = vec![Some(owner(0, true)), None];
     assert!(!handle_tool_click(
         &mut state,
         mouse(MouseKind::Press, 0, 1),
@@ -390,7 +402,7 @@ fn drags_and_non_tool_rows_never_toggle() {
     // Non-tool entries (prompts, replies) never toggle.
     let mut mixed = state_with(None);
     mixed.transcript = Transcript::from_messages(&[Message::user("hello"), Message::user("world")]);
-    mixed.transcript_row_entries = vec![Some(0), Some(1)];
+    mixed.transcript_row_entries = vec![Some(owner(0, true)), Some(owner(1, true))];
     assert!(!toggle_tool_entry(&mut mixed, 0));
     assert!(!toggle_tool_entry(&mut mixed, 7));
 }
@@ -398,7 +410,7 @@ fn drags_and_non_tool_rows_never_toggle() {
 #[test]
 fn ctrl_o_expands_all_after_a_single_click_then_collapses_all() {
     let mut state = two_tool_state();
-    state.transcript_row_entries = vec![Some(0), Some(1)];
+    state.transcript_row_entries = vec![Some(owner(0, true)), Some(owner(1, true))];
 
     // Click expands only the first card while the second stays collapsed.
     assert!(handle_tool_click(
@@ -420,6 +432,46 @@ fn ctrl_o_expands_all_after_a_single_click_then_collapses_all() {
     assert!(!state.tools_expanded);
     assert!(!state.transcript.entry_expanded(0, state.tools_expanded));
     assert!(!state.transcript.entry_expanded(1, state.tools_expanded));
+}
+
+fn reasoning_state() -> ViewState {
+    let mut state = state_with(None);
+    state.apply(Update::Transcript(TranscriptEvent::ReasoningDelta {
+        kind: ReasoningKind::Full,
+        text: "thought".into(),
+    }));
+    state
+}
+
+#[test]
+fn clicking_a_thinking_tag_expands_it_while_tool_output_is_expanded() {
+    let mut state = reasoning_state();
+    state.apply(Update::Transcript(TranscriptEvent::AssistantDone));
+    // Ctrl+O expands tool output; thinking tags default to collapsed.
+    toggle_tool_expansion(&mut state);
+    assert!(state.tools_expanded);
+    assert!(!state.transcript.entry_expanded(0, false));
+
+    // The click must use the reasoning default, not `tools_expanded`.
+    assert!(toggle_tool_entry(&mut state, 0));
+    assert!(state.transcript.entry_expanded(0, false));
+}
+
+#[test]
+fn tool_preparing_freezes_the_streaming_thinking_duration() {
+    let mut state = reasoning_state();
+    state.apply(Update::ToolPreparing {
+        name: "shell".into(),
+    });
+    match state.transcript.entry(0) {
+        Some(Entry::Reasoning {
+            started, duration, ..
+        }) => {
+            assert!(started.is_none(), "the tag stops ticking");
+            assert!(duration.is_some(), "the duration matches the record");
+        }
+        other => panic!("expected a reasoning entry, got {other:?}"),
+    }
 }
 
 #[test]

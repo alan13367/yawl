@@ -621,6 +621,44 @@ pub(super) fn picker_is_plan_handoff(picker: &Picker) -> bool {
     )
 }
 
+/// Whether this picker lists accent or selection colors.
+pub(super) fn picker_is_color_picker(picker: &Picker) -> bool {
+    picker.items.iter().any(|item| {
+        matches!(
+            item.action,
+            PickerAction::SetAccentColor(_) | PickerAction::SetSelectionColor(_)
+        )
+    })
+}
+
+/// Keeps the live color preview in step with the open picker: a color picker
+/// repaints the interface with its highlighted row, editing a custom value
+/// falls back to the committed colors, and any other picker ends the preview
+/// without reverting because the selected color is already applied.
+pub(super) fn sync_color_preview(state: &mut ViewState) {
+    if !state.picker.as_ref().is_some_and(picker_is_color_picker) {
+        state.commit_color_preview();
+        return;
+    }
+    if picker_is_editing(state) {
+        state.reset_color_preview();
+        return;
+    }
+    let Some(action) = state
+        .picker
+        .as_ref()
+        .and_then(|picker| picker.items.get(picker.selected))
+        .map(|item| item.action.clone())
+    else {
+        return;
+    };
+    match action {
+        PickerAction::SetAccentColor(color) => state.preview_accent_color(color),
+        PickerAction::SetSelectionColor(selection) => state.preview_selection_color(selection),
+        _ => state.reset_color_preview(),
+    }
+}
+
 pub(super) fn take_picker_action(
     state: &mut ViewState,
     editor: &mut Editor,
@@ -724,6 +762,10 @@ pub(super) fn take_picker_action(
         Key::Escape | Key::Ctrl('c') => {
             let cancel = picker_cancel_action(picker);
             state.picker = None;
+            // Unconditional: restoring committed colors is a no-op when no
+            // preview is live, and it keeps cancel correct if a picker that
+            // previews colors ever gains a different shape.
+            state.end_color_preview();
             return cancel;
         }
         Key::Up | Key::Char('k') => picker.selected = picker.selected.saturating_sub(1),

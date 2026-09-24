@@ -776,6 +776,37 @@ fn undo_last_turn_drops_the_prompt_and_restores_files() {
 }
 
 #[test]
+fn undo_does_not_persist_intent_when_checkpoint_store_cannot_be_read() {
+    let mut test = TestAgent::new("undo-unreadable");
+    test.agent
+        .append_input_message(Message::user("keep this prompt"))
+        .expect("user message");
+    let checkpoint_dir = test
+        .agent
+        .config
+        .home_dir
+        .join("checkpoints")
+        .join(test.agent.session_id());
+    std::fs::create_dir_all(checkpoint_dir.join("stack.json")).expect("unreadable stack");
+    reopen_test_agent(&mut test);
+
+    let error = test
+        .agent
+        .undo_last_turn()
+        .expect_err("undo should report the unreadable store");
+    assert!(error.to_string().contains("cannot load undo checkpoints"));
+    assert!(
+        test.agent
+            .persistent_state()
+            .session
+            .pending_undo()
+            .is_none()
+    );
+    assert_eq!(test.agent.messages[0].content, "keep this prompt");
+    assert!(checkpoint_dir.join("stack.json").is_dir());
+}
+
+#[test]
 fn undo_without_a_user_turn_is_a_no_op() {
     let mut test = TestAgent::new("undo-empty");
     let report = test.agent.undo_last_turn().expect("undo");

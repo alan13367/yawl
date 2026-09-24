@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use crate::provider::{ImageContent, Message, ReasoningKind, Role};
@@ -14,6 +15,12 @@ pub(super) enum Entry {
     Reasoning {
         kind: ReasoningKind,
         content: String,
+        /// Live start time of the streaming thinking segment. Always `None`
+        /// once the segment settles or on replay, mirroring `Tool::started`.
+        started: Option<Instant>,
+        /// Frozen thinking duration shown in the tag once the segment
+        /// settles. On replay it comes from persisted session metadata.
+        duration: Option<Duration>,
     },
     Tool {
         name: String,
@@ -105,11 +112,15 @@ impl Transcript {
                 }
                 Role::User => entries.push(Entry::User(message.content.clone())),
                 Role::Assistant => {
-                    for reasoning in &message.reasoning {
+                    for (index, reasoning) in message.reasoning.iter().enumerate() {
                         if !reasoning.content.is_empty() {
                             entries.push(Entry::Reasoning {
                                 kind: reasoning.kind,
                                 content: reasoning.content.clone(),
+                                started: None,
+                                duration: message
+                                    .reasoning_duration_ms(index)
+                                    .map(Duration::from_millis),
                             });
                         }
                     }
@@ -389,6 +400,31 @@ impl Transcript {
         self.running_tool
     }
 
+    /// Freezes the streaming thinking segment's duration so the tag stops
+    /// ticking. Called when the reasoning phase ends: text arrives, a new
+    /// segment opens, a tool is prepared or starts, or the response
+    /// completes.
+    pub(super) fn close_streaming_reasoning(&mut self) {
+        let Some((_, index)) = self.streaming_reasoning.take() else {
+            return;
+        };
+        if let Some(Entry::Reasoning {
+            started, duration, ..
+        }) = self.entries.get_mut(index)
+        {
+            *duration = started.take().map(|started| started.elapsed());
+        }
+    }
+
+    /// Settles all stream-only state after a response succeeds, fails, or is
+    /// canceled. Without this cleanup, the next turn can append to an old
+    /// reasoning segment or reset the transcript to an earlier turn.
+    pub(super) fn finish_streaming_response(&mut self) {
+        self.streaming_entries_start = None;
+        self.streaming_assistant = None;
+        self.close_streaming_reasoning();
+    }
+
     pub(super) fn push_user(&mut self, content: String) {
         self.entries.push(Entry::User(content));
         if self.focused {
@@ -419,7 +455,7 @@ impl Transcript {
             TranscriptEvent::TextDelta(text) => {
                 self.streaming_entries_start
                     .get_or_insert(self.entries.len());
-                self.streaming_reasoning = None;
+                self.close_streaming_reasoning();
                 let index = match self.streaming_assistant {
                     Some(index) => index,
                     None => {
@@ -440,9 +476,12 @@ impl Transcript {
                 let index = match self.streaming_reasoning {
                     Some((current_kind, index)) if current_kind == kind => index,
                     _ => {
+                        self.close_streaming_reasoning();
                         self.entries.push(Entry::Reasoning {
                             kind,
                             content: String::new(),
+                            started: Some(Instant::now()),
+                            duration: None,
                         });
                         let index = self.entries.len() - 1;
                         self.streaming_reasoning = Some((kind, index));
@@ -463,11 +502,7 @@ impl Transcript {
                 self.expansion_overrides
                     .retain(|index, _| *index < self.entries.len());
             }
-            TranscriptEvent::AssistantDone => {
-                self.streaming_entries_start = None;
-                self.streaming_assistant = None;
-                self.streaming_reasoning = None;
-            }
+            TranscriptEvent::AssistantDone => self.finish_streaming_response(),
             TranscriptEvent::AssistantReplace(text) => {
                 if let Some(index) = self.streaming_assistant
                     && let Some(Entry::Assistant(content)) = self.entries.get_mut(index)
@@ -476,6 +511,7 @@ impl Transcript {
                 }
             }
             TranscriptEvent::ToolStart { name, args } => {
+                self.close_streaming_reasoning();
                 self.entries.push(Entry::Tool {
                     name,
                     args,
@@ -570,7 +606,7 @@ impl Entry {
             Self::User(_) => "Prompt",
             Self::Steer(_) => "Steer",
             Self::Assistant(_) => "Reply",
-            Self::Reasoning { .. } => "Reasoning",
+            Self::Reasoning { .. } => "Thinking",
             Self::Tool { name, .. } => name,
             Self::Notice(_) => "Notice",
             Self::Diff { .. } => "Diff",
@@ -583,6 +619,29 @@ impl Entry {
 mod tests {
     use super::*;
     use crate::provider::{Reasoning, SubagentResult, ToolCall};
+
+    /// Strips live timing fields so live and replayed entries compare equal:
+    /// the live freeze and the persisted duration differ by channel latency.
+    fn without_timing(entries: &[Entry]) -> Vec<Entry> {
+        entries
+            .iter()
+            .cloned()
+            .map(|entry| match entry {
+                Entry::Reasoning {
+                    kind,
+                    content,
+                    started: _,
+                    duration: _,
+                } => Entry::Reasoning {
+                    kind,
+                    content,
+                    started: None,
+                    duration: None,
+                },
+                other => other,
+            })
+            .collect()
+    }
 
     #[test]
     fn diff_entries_carry_label_copy_and_search_text() {
@@ -648,7 +707,109 @@ mod tests {
             is_error: false,
         });
 
-        assert_eq!(live.entries(), replayed.entries());
+        assert_eq!(
+            without_timing(live.entries()),
+            without_timing(replayed.entries())
+        );
+        let live_reasoning = live.entries().iter().find_map(|entry| match entry {
+            Entry::Reasoning { duration, .. } => Some(duration),
+            _ => None,
+        });
+        assert!(
+            live_reasoning.is_some_and(Option::is_some),
+            "the text delta must freeze the live thinking duration"
+        );
+    }
+
+    #[test]
+    fn replayed_reasoning_carries_the_persisted_duration() {
+        let mut assistant = Message::assistant(String::new(), vec![]);
+        assistant.reasoning.push(Reasoning {
+            kind: ReasoningKind::Full,
+            content: "deliberating".into(),
+        });
+        assistant.set_reasoning_durations_ms(&[Some(1_250)]);
+
+        let transcript = Transcript::from_messages(&[assistant]);
+
+        assert_eq!(
+            transcript.entries(),
+            &[Entry::Reasoning {
+                kind: ReasoningKind::Full,
+                content: "deliberating".into(),
+                started: None,
+                duration: Some(Duration::from_millis(1_250)),
+            }]
+        );
+    }
+
+    #[test]
+    fn aborted_response_settles_reasoning_before_the_next_turn() {
+        let mut transcript = Transcript::from_messages(&[]);
+        transcript.apply(TranscriptEvent::ReasoningDelta {
+            kind: ReasoningKind::Summary,
+            text: "interrupted thought".into(),
+        });
+
+        transcript.finish_streaming_response();
+        transcript.push_user("try again".into());
+        transcript.apply(TranscriptEvent::ReasoningDelta {
+            kind: ReasoningKind::Summary,
+            text: "new thought".into(),
+        });
+
+        assert_eq!(transcript.entries().len(), 3);
+        assert!(matches!(
+            &transcript.entries()[0],
+            Entry::Reasoning {
+                content,
+                started: None,
+                duration: Some(_),
+                ..
+            } if content == "interrupted thought"
+        ));
+        assert!(matches!(
+            &transcript.entries()[2],
+            Entry::Reasoning { content, .. } if content == "new thought"
+        ));
+    }
+
+    #[test]
+    fn reasoning_freezes_when_a_tool_starts_or_the_response_completes() {
+        let mut transcript = Transcript::from_messages(&[]);
+        transcript.apply(TranscriptEvent::ReasoningDelta {
+            kind: ReasoningKind::Summary,
+            text: "picking a tool".into(),
+        });
+        transcript.apply(TranscriptEvent::ToolStart {
+            name: "shell".into(),
+            args: "{}".into(),
+        });
+
+        let Entry::Reasoning {
+            started, duration, ..
+        } = &transcript.entries()[0]
+        else {
+            panic!("reasoning entry expected");
+        };
+        assert!(started.is_none(), "the tool start closes the segment");
+        assert!(duration.is_some(), "the duration freezes instead");
+
+        let mut transcript = Transcript::from_messages(&[]);
+        transcript.apply(TranscriptEvent::ReasoningDelta {
+            kind: ReasoningKind::Full,
+            text: "thinking only".into(),
+        });
+        transcript.apply(TranscriptEvent::AssistantDone);
+
+        let Entry::Reasoning {
+            started, duration, ..
+        } = &transcript.entries()[0]
+        else {
+            panic!("reasoning entry expected");
+        };
+        assert!(started.is_none());
+        assert!(duration.is_some());
     }
 
     #[test]

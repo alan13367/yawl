@@ -52,7 +52,7 @@ Project skills stay disabled until you trust the repository. `yawl --trust-proje
 - `Shift+Enter`, `Alt+Enter`, and `Ctrl+J` insert newlines. Pastes over 400 characters or 8 lines appear as a `[Pasted #N]` marker in the editor; the model receives the full text.
 - `Ctrl+V` attaches a clipboard image, up to five PNG, JPEG, GIF, or WebP files of 5 MB each per prompt. On Linux this needs `wl-paste` or `xclip`.
 - `/` opens the command and skill menu. `@` tags a project file for the model.
-- `Tab` focuses the transcript when idle. Arrows move between blocks, `h`/`l` fold, `Enter` opens a viewer, `y` copies. `Ctrl+F` searches the transcript and `Ctrl+O` expands or collapses all tool output. Clicking a tool card expands or collapses only that card.
+- `Tab` focuses the transcript when idle. Arrows move between blocks, `h`/`l` fold, `Enter` opens a viewer, `y` copies. `Ctrl+F` searches the transcript and `Ctrl+O` expands or collapses all tool output. Clicking a tool card expands or collapses only that card; clicking a thinking tag toggles just that thinking block.
 - Drag to select text; releasing copies to the clipboard. The mouse wheel and `PageUp`/`PageDown` scroll.
 - `Escape` or `Ctrl+C` aborts the active model response or tool. Neither exits Yawl.
 - When the bell is on (the default), Yawl rings the terminal bell when a turn finishes and when the model asks a question, so an unfocused terminal window or tab announces activity. Turn it off with `/settings bell off` or Settings > Interface > Bell.
@@ -65,6 +65,8 @@ Project skills stay disabled until you trust the repository. `yawl --trust-proje
 - In `/git`, moving the mouse highlights file and history rows without changing keyboard selection. Click a file or a commit to open its diff; `Esc` closes the current diff and a second `Esc` closes `/git`. History fills the bottom of the panel and pages in older commits as you scroll, including when a diff is open. Scroll over the history rows to browse older commits. Diff and log scrolling stop at the bottom and reverse immediately. Clickable controls use a hand cursor in Kitty, Ghostty, and foot; other terminals retain their own cursor. Hover requires mouse-motion reporting support.
 
 The transcript renders Markdown with syntax highlighting for common languages. Tool calls use full-width cards: diffs for edits, image previews for `read_file` in terminals that support them.
+
+Model reasoning renders as a collapsible thinking block, collapsed by default while streaming and after it settles. During streaming the tag shows a spinner and `Thinking` with no timer; once it settles it becomes `+ Thought: 4.2s` in a softer, hue-shifted shade of the accent colour. Neutral accents use a blue-gray tint to distinguish tags from reply text. Click the tag (or unfold the selected block with `l`) to show the traces under a dimmed `- Thought: 4.2s` header. An open block keeps streaming new traces until it settles. Durations persist with the session, so resumed transcripts show them; blocks without a recorded duration show just `+ Thought`. The `hide_reasoning` setting removes thinking blocks entirely.
 
 ## Slash commands
 
@@ -94,7 +96,7 @@ The transcript renders Markdown with syntax highlighting for common languages. T
 | `/hotkeys` | Show every keyboard shortcut, grouped by area |
 | `/quit` | Exit and print the resumable `yawl --session ID` command |
 
-`/settings` groups model, interface, context, provider, web, subagent, and skill options in one picker and applies generation-affecting changes before the next queued message. The status bar is customizable under Settings > Interface > Status bar, with live preview, reordering (`K`/`J`), and custom labels.
+`/settings` groups model, interface, context, provider, web, subagent, and skill options in one picker and applies generation-affecting changes before the next queued message. The status bar is customizable under Settings > Interface > Status bar, with live preview, reordering (`K`/`J`), and custom labels. The accent and selection color pickers preview the highlighted color across the whole interface as you move, so the composer border, status bar, and menus repaint before you commit; `Enter` saves it and `Esc` restores the previous color.
 
 While a turn runs, `Enter` steers and `Tab` queues; queued messages show below the transcript. Canceling with Escape or Ctrl+C pauses waiting messages, including unaccepted steering, so they cannot immediately restart the turn. Use `/unqueue` and Enter to resume sending them. `/init` inspects the current directory and creates or curates `./AGENTS.md`; it keeps accurate project rules, removes stale or changelog-like material, and changes no other file. `/goal TEXT` keeps making model requests until the model calls an internal `goal_complete` tool; a plain reply does not finish it.
 
@@ -188,7 +190,7 @@ Yawl has no approval prompt or permission layer. Review the model and working di
 Before every model step Yawl scans `~/.yawl/tools/` and `./.yawl/tools/` and rescans after each tool batch, so the model can create a tool and call it in the same turn. Project tools override global tools with the same name. An executable implements two operations:
 
 1. `--describe` prints one JSON object with `name`, `description`, `input_schema`, and optional `timeout_secs`.
-2. A normal call reads JSON arguments from stdin and prints the result. A nonzero exit marks an error.
+2. A normal call reads JSON arguments from stdin and prints the result. A nonzero exit marks an error. Writing input is covered by the tool timeout and stops if the process exits or the call is interrupted.
 
 ```python
 #!/usr/bin/env python3
@@ -228,6 +230,19 @@ Yawl appends `~/.yawl/AGENTS.md` and then `./AGENTS.md` after its system prompt.
 ## Development
 
 One Cargo package. Facade modules (`main.rs`, `agent.rs`, `provider/mod.rs`, `config.rs`, `tui/mod.rs`, and friends) re-export stable public paths while private child modules own the implementation. `AGENTS.md` has the full module map.
+
+The transcript renderer separates presentation from caching under `src/tui/render/`:
+
+| File | Responsibility and main entry points |
+| --- | --- |
+| `../render.rs` | Compose the full frame with `build_frame_with_images`; expose stable entry points to the TUI. |
+| `cache.rs` | Reuse rendered entries with `RenderCache`, invalidate stale output, and index rows and image placements. No entry styling. |
+| `entries.rs` | Draw one entry with `render_entry`, lay out image previews, and render user, queued, and steer panels. |
+| `reasoning.rs` | Draw thinking tags with `render_thinking_tag` and traces with `render_reasoning`; own thinking colors and duration labels. |
+| `transcript.rs` | Assemble `render_transcript_window`, apply scrolling and selection reveal, and append loading and pending-input rows. |
+| `welcome.rs`, `questions.rs` | Draw the welcome animation and question composer. |
+
+The rendering flow is frame → transcript window → cache → entry renderer → reasoning/tool/Markdown renderer. `src/tui/transcript.rs` owns transcript data and events; `src/tui/render/transcript.rs` only presents that data. Rendering regression tests stay in `src/tui/render_tests.rs`, while private cache and color tests live beside their implementations.
 
 The Git dashboard follows the same structure. `src/tui/git.rs` owns shared state and coordinates refreshes; `git/repository.rs` loads repository data, `jobs.rs` and `operations.rs` handle background work, `input.rs` handles interaction, `init.rs` owns repository setup, and `render.rs` and `diff.rs` draw the dashboard. Unit tests stay with each responsibility, with dashboard regressions in `src/tui/git_tests.rs`.
 

@@ -552,7 +552,7 @@ impl Conversation {
             let mut assistant = Message::assistant(out.text, out.tool_calls.clone());
             assistant.reasoning = out.reasoning;
             assistant.provider_data = out.provider_data;
-            if !assistant.provider_data.is_empty() {
+            if assistant.has_provider_replay_data() {
                 assistant.provider_data_model = Some(bare_model.clone());
             }
 

@@ -599,9 +599,11 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::OpenAccentColor => {
+            state.begin_color_preview(agent.config().selection_color);
             state.picker = Some(color_picker(agent.config().accent_color));
         }
         PickerAction::OpenSelectionColor => {
+            state.begin_color_preview(agent.config().selection_color);
             state.picker = Some(selection_color_picker(agent.config().selection_color));
         }
         PickerAction::OpenWebSearchProviders => {

@@ -19,7 +19,7 @@ use super::picker::{
     ActivePickers, PickerAction, SettingsCategory, SettingsItem, SettingsLocation,
     open_model_picker_from_config, picker_is_editing, poll_model_picker,
     reasoning_picker_from_config, select_picker_item, settings_item_index,
-    status_bar_editor_picker, take_picker_action, web_search_provider_picker,
+    status_bar_editor_picker, sync_color_preview, take_picker_action, web_search_provider_picker,
 };
 use super::state::{
     COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, handle_tool_click,
@@ -310,6 +310,8 @@ pub(super) fn pump_events<R: Read, T>(
                                     active_config,
                                 );
                             }
+                        } else {
+                            sync_color_preview(state);
                         }
                     }
                     Event::Paste(text) if picker_is_editing(state) => editor.paste(&text),
@@ -798,6 +800,9 @@ pub(super) fn activate_picker_action_while_busy(
             return;
         }
         Err(error) => {
+            // A rejected color value never reaches `apply_display_config_while_busy`,
+            // so end the preview that the closed picker left behind.
+            state.end_color_preview();
             state.notice(format!("Could not change setting: {error}"));
             return;
         }
@@ -833,9 +838,11 @@ pub(super) fn activate_picker_action_while_busy(
             set_reasoning_while_busy(active_config, state, effort.as_deref().unwrap_or("default"));
         }
         PickerAction::OpenAccentColor => {
+            state.begin_color_preview(active_config.selection_color);
             state.picker = Some(active_pickers.accent_color.clone());
         }
         PickerAction::OpenSelectionColor => {
+            state.begin_color_preview(active_config.selection_color);
             state.picker = Some(active_pickers.selection_color.clone());
         }
         PickerAction::OpenWebSearchProviders => {
@@ -979,12 +986,19 @@ pub(super) fn apply_display_config_while_busy(
     change: ConfigChange,
     location: SettingsLocation,
 ) {
+    let color_change = matches!(
+        change,
+        ConfigChange::AccentColor(_) | ConfigChange::SelectionColor(_)
+    );
     match config.change_global(change) {
         Ok(outcome) => {
             *config = outcome.config;
             state.hide_reasoning = config.hide_reasoning;
             state.accent_color = config.accent_color;
             state.selection_color = config.effective_selection_color();
+            if color_change {
+                state.commit_color_preview();
+            }
             state.sync_scroll_bar_config(config);
             state.bell = config.bell;
             state.subagents_enabled = config.subagents;
@@ -1001,7 +1015,12 @@ pub(super) fn apply_display_config_while_busy(
                     picker
                 });
         }
-        Err(error) => state.notice(format!("Could not change setting: {error}")),
+        Err(error) => {
+            if color_change {
+                state.end_color_preview();
+            }
+            state.notice(format!("Could not change setting: {error}"));
+        }
     }
 }
 

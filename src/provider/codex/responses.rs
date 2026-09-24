@@ -34,7 +34,7 @@ pub(super) fn build_input(messages: &[Message], supports_images: bool, model: &s
                 .iter()
                 .any(|item| item["type"] == "compaction");
         if has_compaction {
-            input.extend(message.provider_data.iter().cloned());
+            input.extend(message.provider_replay_data().cloned());
             continue;
         }
         match message.role {
@@ -47,7 +47,7 @@ pub(super) fn build_input(messages: &[Message], supports_images: bool, model: &s
             }
             Role::Assistant => {
                 if provider_data_matches {
-                    input.extend(message.provider_data.iter().cloned());
+                    input.extend(message.provider_replay_data().cloned());
                 }
                 if !message.content.is_empty() {
                     input.push(json!({
@@ -161,7 +161,8 @@ fn cache_affinity_headers(cache_key: &str) -> [(&'static str, &str); 2] {
 struct Decoder {
     emitted_calls: HashSet<String>,
     reasoning_items: HashMap<String, Value>,
-    emitted_summary: bool,
+    summary_parts: HashMap<(String, u64), String>,
+    last_summary_part: Option<(String, u64)>,
 }
 
 impl Decoder {
@@ -179,21 +180,19 @@ impl Decoder {
                 }
             }
             "response.reasoning_summary_text.delta" => {
-                if let Some(delta) = value["delta"].as_str()
-                    && !delta.is_empty()
-                {
-                    self.emitted_summary = true;
-                    on_event(Event::ReasoningDelta {
-                        kind: ReasoningKind::Summary,
-                        text: delta.to_string(),
-                    });
+                if let Some(delta) = value["delta"].as_str() {
+                    self.summary_delta(summary_part_key(&value), delta, on_event);
                 }
             }
-            "response.reasoning_summary_part.done" if self.emitted_summary => {
-                on_event(Event::ReasoningDelta {
-                    kind: ReasoningKind::Summary,
-                    text: "\n\n".into(),
-                });
+            "response.reasoning_summary_text.done" => {
+                if let Some(text) = value["text"].as_str() {
+                    self.summary_done(summary_part_key(&value), text, on_event);
+                }
+            }
+            "response.reasoning_summary_part.done" => {
+                if let Some(text) = value["part"]["text"].as_str() {
+                    self.summary_done(summary_part_key(&value), text, on_event);
+                }
             }
             "response.output_item.added" if value["item"]["type"] == "function_call" => {
                 if let Some(name) = value["item"]["name"].as_str()
@@ -262,8 +261,50 @@ impl Decoder {
         } else if item["type"] == "reasoning"
             && let Some(id) = item["id"].as_str()
         {
-            emit_reasoning_summary(item, &mut self.emitted_summary, on_event);
+            if let Some(parts) = item["summary"].as_array() {
+                for (index, part) in parts.iter().enumerate() {
+                    if let Some(text) = part["text"].as_str() {
+                        self.summary_done((id.to_string(), index as u64), text, on_event);
+                    }
+                }
+            }
             self.reasoning_items.insert(id.to_string(), item.clone());
+        }
+    }
+
+    fn summary_delta(&mut self, key: (String, u64), delta: &str, on_event: &mut dyn FnMut(Event)) {
+        if delta.is_empty() {
+            return;
+        }
+        // Separate parts when their text arrives, not when a done event arrives.
+        // A done event may still supply the missing tail of the current part.
+        if self
+            .last_summary_part
+            .as_ref()
+            .is_some_and(|last| last != &key)
+        {
+            on_event(Event::ReasoningDelta {
+                kind: ReasoningKind::Summary,
+                text: "\n\n".into(),
+            });
+        }
+        self.summary_parts
+            .entry(key.clone())
+            .or_default()
+            .push_str(delta);
+        self.last_summary_part = Some(key);
+        on_event(Event::ReasoningDelta {
+            kind: ReasoningKind::Summary,
+            text: delta.to_string(),
+        });
+    }
+
+    fn summary_done(&mut self, key: (String, u64), text: &str, on_event: &mut dyn FnMut(Event)) {
+        let emitted = self.summary_parts.get(&key).map_or("", String::as_str);
+        // Completion snapshots repeat streamed text. Recover only the missing
+        // suffix; do not duplicate or append a conflicting replacement summary.
+        if let Some(suffix) = text.strip_prefix(emitted) {
+            self.summary_delta(key, suffix, on_event);
         }
     }
 }
@@ -323,26 +364,11 @@ impl Provider for Codex {
     }
 }
 
-fn emit_reasoning_summary(item: &Value, emitted: &mut bool, on_event: &mut dyn FnMut(Event)) {
-    if *emitted {
-        return;
-    }
-    let Some(parts) = item["summary"].as_array() else {
-        return;
-    };
-    let summary = parts
-        .iter()
-        .filter_map(|part| part["text"].as_str())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if !summary.is_empty() {
-        on_event(Event::ReasoningDelta {
-            kind: ReasoningKind::Summary,
-            text: summary,
-        });
-        *emitted = true;
-    }
+fn summary_part_key(event: &Value) -> (String, u64) {
+    (
+        event["item_id"].as_str().unwrap_or_default().to_string(),
+        event["summary_index"].as_u64().unwrap_or(0),
+    )
 }
 
 fn emit_tool_call(item: &Value, emitted: &mut HashSet<String>, on_event: &mut dyn FnMut(Event)) {
@@ -492,37 +518,132 @@ mod tests {
     }
 
     #[test]
+    fn decoder_recovers_summary_paragraph_after_streamed_headline() {
+        let item = json!({
+            "type": "reasoning", "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "**Inspecting the request**\n\nChecking the files now."}]
+        });
+        let events = [
+            json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "summary_index": 0, "delta": "**Inspecting the request**"}),
+            json!({"type": "response.output_item.done", "item": item}),
+            json!({"type": "response.completed", "response": {"output": [item]}}),
+        ];
+        assert_eq!(
+            decoded_summary(&events),
+            "**Inspecting the request**\n\nChecking the files now."
+        );
+    }
+
+    fn decoded_summary(events: &[Value]) -> String {
+        let fixture = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let mut decoder = Decoder::default();
+        let mut summary = String::new();
+        for event in SseReader::new(Cursor::new(fixture)) {
+            if decoder
+                .decode(event.unwrap(), &mut |event| {
+                    if let Event::ReasoningDelta { text, .. } = event {
+                        summary.push_str(&text);
+                    }
+                })
+                .unwrap()
+            {
+                break;
+            }
+        }
+        summary
+    }
+
+    #[test]
+    fn decoder_recovers_summary_from_each_completion_event_without_duplicates() {
+        let full = "**Vérification**\n\nChecking the files now.";
+        let item = json!({
+            "type": "reasoning", "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": full}]
+        });
+        let completions = [
+            json!({"type": "response.reasoning_summary_text.done", "item_id": "rs_1", "summary_index": 0, "text": full}),
+            json!({"type": "response.reasoning_summary_part.done", "item_id": "rs_1", "summary_index": 0, "part": {"type": "summary_text", "text": full}}),
+            json!({"type": "response.output_item.done", "item": item}),
+            json!({"type": "response.completed", "response": {"output": [item]}}),
+        ];
+        for prefix in ["", "**Vérification**", full] {
+            for completion in &completions {
+                let events = [
+                    json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "summary_index": 0, "delta": prefix}),
+                    completion.clone(),
+                    completion.clone(),
+                ];
+                assert_eq!(
+                    decoded_summary(&events),
+                    full,
+                    "{} after {prefix:?}",
+                    completion["type"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_keeps_distinct_summary_parts_and_items() {
+        let first = json!({
+            "type": "reasoning", "id": "rs_1",
+            "summary": [
+                {"type": "summary_text", "text": "**Inspecting**"},
+                {"type": "summary_text", "text": "Checking files."}
+            ]
+        });
+        let second = json!({
+            "type": "reasoning", "id": "rs_2",
+            "summary": [{"type": "summary_text", "text": "Checking files."}]
+        });
+        let events = [
+            json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "summary_index": 0, "delta": "**Inspecting**"}),
+            json!({"type": "response.reasoning_summary_part.done", "item_id": "rs_1", "summary_index": 0, "part": first["summary"][0]}),
+            json!({"type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "summary_index": 1, "delta": "Checking "}),
+            json!({"type": "response.output_item.done", "item": first}),
+            json!({"type": "response.output_item.done", "item": second}),
+            json!({"type": "response.completed", "response": {"output": [first, second]}}),
+        ];
+        assert_eq!(
+            decoded_summary(&events),
+            "**Inspecting**\n\nChecking files.\n\nChecking files."
+        );
+    }
+
+    #[test]
     fn completed_reasoning_item_emits_summary_once() {
         let item = json!({
             "type": "reasoning",
             "id": "rs_1",
             "summary": [{"type": "summary_text", "text": "Inspecting the request"}]
         });
-        let mut emitted = false;
+        let mut decoder = Decoder::default();
         let mut summaries = Vec::new();
-        emit_reasoning_summary(&item, &mut emitted, &mut |event| {
+        decoder.output_item(&item, &mut |event| {
             if let Event::ReasoningDelta { kind, text } = event {
                 summaries.push((kind, text));
             }
         });
-        emit_reasoning_summary(&item, &mut emitted, &mut |_| {});
+        decoder.output_item(&item, &mut |_| {});
 
         assert_eq!(
             summaries,
             [(ReasoningKind::Summary, "Inspecting the request".into())]
         );
-        assert!(emitted);
     }
 
     #[test]
     fn decoder_handles_deltas_deduplicates_items_and_preserves_reasoning() {
         let function_call = r#"{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}"#;
-        let reasoning = r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Inspecting"}],"encrypted_content":"secret"}"#;
+        let reasoning = r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"think"}],"encrypted_content":"secret"}"#;
         let fixture = format!(
             concat!(
                 "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}}\n\n",
-                "data: {{\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"think\"}}\n\n",
-                "data: {{\"type\":\"response.reasoning_summary_part.done\"}}\n\n",
+                "data: {{\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_1\",\"summary_index\":0,\"delta\":\"think\"}}\n\n",
+                "data: {{\"type\":\"response.reasoning_summary_part.done\",\"item_id\":\"rs_1\",\"summary_index\":0,\"part\":{{\"type\":\"summary_text\",\"text\":\"think\"}}}}\n\n",
                 "data: {{\"type\":\"response.output_item.added\",\"item\":{function_call}}}\n\n",
                 "data: {{\"type\":\"response.output_item.done\",\"item\":{function_call}}}\n\n",
                 "data: {{\"type\":\"response.output_item.done\",\"item\":{reasoning}}}\n\n",
@@ -552,23 +673,16 @@ mod tests {
                 text
             } if text == "think"
         ));
+        assert!(matches!(&events[2], Event::ToolCallName(name) if name == "shell"));
         assert!(matches!(
-            &events[2],
-            Event::ReasoningDelta {
-                kind: ReasoningKind::Summary,
-                text
-            } if text == "\n\n"
-        ));
-        assert!(matches!(&events[3], Event::ToolCallName(name) if name == "shell"));
-        assert!(matches!(
-            &events[4],
+            &events[3],
             Event::ToolCall(call)
                 if call.id == "call_1|fc_1"
                     && call.name == "shell"
                     && call.arguments == r#"{"command":"pwd"}"#
         ));
         assert!(matches!(
-            events[5],
+            events[4],
             Event::Usage(TokenUsage {
                 input_tokens: 13,
                 output_tokens: 6,
@@ -578,11 +692,11 @@ mod tests {
             })
         ));
         assert!(matches!(
-            &events[6],
+            &events[5],
             Event::ProviderData(item)
                 if item["id"] == "rs_1" && item["encrypted_content"] == "secret"
         ));
-        assert!(matches!(events[7], Event::Done));
+        assert!(matches!(events[6], Event::Done));
         assert_eq!(
             events
                 .iter()

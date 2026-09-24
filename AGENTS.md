@@ -25,7 +25,11 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tui/picker/settings.rs`, `picker/status_bar.rs`: settings/color/provider picker construction and status-bar editor construction
 - `src/tui/completion.rs`, `files.rs`, `state.rs`, `worker.rs`: TUI behavior and state
 - `src/tui/render.rs`: frame-composition facade and coordinator
-- `src/tui/render/cache.rs`, `render/welcome.rs`, `render/questions.rs`: transcript cache with entry rendering and transcript windows, plus the welcome animation and question composer
+- `src/tui/render/cache.rs`: rendered-entry reuse, invalidation, row indexing, and cached image lookup
+- `src/tui/render/entries.rs`: individual transcript entry rendering, image preview layout, and user/queued/steer panels
+- `src/tui/render/reasoning.rs`: thinking tags, accent-derived thinking colors, duration labels, and reasoning trace formatting
+- `src/tui/render/transcript.rs`: visible transcript windows, scrolling and selection reveal, pending inputs, and loading indicators
+- `src/tui/render/welcome.rs`, `render/questions.rs`: welcome animation and question composer
 - `src/tui/terminal.rs`, `events.rs`, `input.rs`, `transcript.rs`: terminal lifecycle, input decoding/editing, and transcript reduction
 - `src/tui/markdown.rs`, `highlight.rs`, `status_bar.rs`: sanitized Markdown, syntax highlighting, and configurable status rendering
 - `src/tui/tool_view.rs`: generic tool-card rendering facade

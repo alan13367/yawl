@@ -57,6 +57,17 @@ pub(super) struct ScrollGeometry {
     pub(super) thumb_length: usize,
 }
 
+/// Committed colors captured when an accent or selection color picker opens.
+/// The picker previews its highlighted row by overriding these for the whole
+/// interface, and Escape restores the captured values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ColorPreview {
+    pub(super) accent: UiColor,
+    /// `None` when the selection color followed the accent, so the preview
+    /// keeps following the previewed accent instead of freezing it.
+    pub(super) selection: Option<UiColor>,
+}
+
 pub(super) struct ViewState {
     pub(super) transcript: Transcript,
     pub(super) tools_expanded: bool,
@@ -70,6 +81,10 @@ pub(super) struct ViewState {
     pub(super) status_bar: StatusBarConfig,
     /// Unsaved layout shown while the status-bar editor is open.
     pub(super) status_bar_draft: Option<StatusBarConfig>,
+    /// Committed colors captured when a color picker opened. When set, the
+    /// picker's highlighted row overrides the accent and/or selection color
+    /// for the whole interface, and Escape restores these values.
+    pub(super) color_preview: Option<ColorPreview>,
     pub(super) show_scroll_bar: bool,
     /// Whether the config enables the scroll bar at all. Kept beside the
     /// effective `show_scroll_bar` so auto-hide can re-show it on activity.
@@ -83,7 +98,7 @@ pub(super) struct ViewState {
     /// Maps each transcript screen row (0..transcript height) to its owning
     /// transcript entry, captured each frame for click-to-expand hit-testing.
     /// `None` rows are padding, separators, or non-transcript content.
-    pub(super) transcript_row_entries: Vec<Option<usize>>,
+    pub(super) transcript_row_entries: Vec<Option<super::render::LineOwner>>,
     /// Pending mouse press for click (press+release on the same cell)
     /// detection. Drags select text instead of toggling expansion.
     pub(super) tool_click_press: Option<MouseEvent>,
@@ -151,6 +166,7 @@ impl ViewState {
             selection_color: agent.config().effective_selection_color(),
             status_bar: agent.config().status_bar.clone(),
             status_bar_draft: None,
+            color_preview: None,
             scroll_bar_enabled: agent.config().scroll_bar,
             scroll_bar_auto_hide: agent.config().scroll_bar_auto_hide,
             bell: agent.config().bell,
@@ -225,6 +241,62 @@ impl ViewState {
         }
     }
 
+    /// Starts previewing colors for the picker that is about to open,
+    /// capturing the committed values so Escape can restore them.
+    ///
+    /// `selection` is the raw `selection_color` config value: `None` means the
+    /// selection follows the accent, so previewing an accent keeps it in step.
+    pub(super) fn begin_color_preview(&mut self, selection: Option<UiColor>) {
+        self.color_preview = Some(ColorPreview {
+            accent: self.accent_color,
+            selection,
+        });
+    }
+
+    /// Repaints the interface with a previewed accent color.
+    pub(super) fn preview_accent_color(&mut self, accent: UiColor) {
+        self.accent_color = accent;
+        self.selection_color = self
+            .color_preview
+            .and_then(|preview| preview.selection)
+            .unwrap_or(accent);
+    }
+
+    /// Repaints the interface with a previewed selection color, where `None`
+    /// follows the accent color in effect.
+    pub(super) fn preview_selection_color(&mut self, selection: Option<UiColor>) {
+        self.selection_color = selection.unwrap_or(self.accent_color);
+    }
+
+    /// Repaints with the committed colors without ending the preview.
+    pub(super) fn reset_color_preview(&mut self) {
+        if let Some(preview) = self.color_preview {
+            self.preview_accent_color(preview.accent);
+        }
+    }
+
+    /// Restores the committed colors and stops previewing.
+    pub(super) fn end_color_preview(&mut self) {
+        if let Some(preview) = self.color_preview.take() {
+            self.accent_color = preview.accent;
+            self.selection_color = preview.selection.unwrap_or(preview.accent);
+        }
+    }
+
+    /// Stops previewing while keeping the colors currently on screen, which
+    /// are the ones just written to the configuration.
+    pub(super) fn commit_color_preview(&mut self) {
+        self.color_preview = None;
+    }
+
+    /// Accent color the transcript renders with. An active preview keeps the
+    /// committed accent so browsing the palette does not re-render the whole
+    /// transcript behind the open picker.
+    pub(super) fn transcript_accent_color(&self) -> UiColor {
+        self.color_preview
+            .map_or(self.accent_color, |preview| preview.accent)
+    }
+
     pub(super) fn notice(&mut self, text: impl Into<String>) {
         self.transcript.notice(text.into());
         self.scroll_offset = 0;
@@ -267,6 +339,10 @@ impl ViewState {
                 self.transcript.push_steer(text);
             }
             Update::ToolPreparing { name } => {
+                // The provider freezes the thinking duration when it names
+                // the tool, so close the live segment here too; otherwise
+                // the spinner keeps ticking until ToolStart.
+                self.transcript.close_streaming_reasoning();
                 if !crate::tools::is_private_tool_name(&name) {
                     self.activity = match name.as_str() {
                         "write_file" => "preparing write".into(),
@@ -544,19 +620,21 @@ pub(super) fn toggle_tool_expansion(state: &mut ViewState) {
     };
 }
 
-/// Toggles a single tool/diff card, leaving every other entry untouched.
-/// Returns true when `index` names a tool card whose expansion changed.
+/// Toggles a single tool/diff/thinking entry, leaving every other entry
+/// untouched. Returns true when `index` names a card whose expansion changed.
 pub(super) fn toggle_tool_entry(state: &mut ViewState, index: usize) -> bool {
     let Some(entry) = state.transcript.entry(index) else {
         return false;
     };
     if !matches!(
         entry,
-        super::transcript::Entry::Tool { .. } | super::transcript::Entry::Diff { .. }
+        super::transcript::Entry::Tool { .. }
+            | super::transcript::Entry::Diff { .. }
+            | super::transcript::Entry::Reasoning { .. }
     ) {
         return false;
     }
-    let default = state.tools_expanded;
+    let default = super::render::entry_default_expanded(entry, state.tools_expanded);
     if state.transcript.toggle_entry_expanded(index, default) {
         state.transcript.select_entry(index);
         state.tool_click_press = None;
@@ -567,13 +645,14 @@ pub(super) fn toggle_tool_entry(state: &mut ViewState, index: usize) -> bool {
     }
 }
 
-fn entry_at_mouse_row(state: &ViewState, row: usize) -> Option<usize> {
+fn entry_at_mouse_row(state: &ViewState, row: usize) -> Option<super::render::LineOwner> {
     state.transcript_row_entries.get(row).copied().flatten()
 }
 
 /// Click-to-expand hit-test: a press+release on the exact same cell toggles
-/// only that tool card. Drags (different cells) stay reserved for text
-/// selection and return false.
+/// only that entry. Tool and diff cards toggle from any row; thinking blocks
+/// only from their tag row, so clicks land on the reasoning text untouched.
+/// Drags (different cells) stay reserved for text selection and return false.
 pub(super) fn handle_tool_click(
     state: &mut ViewState,
     press: MouseEvent,
@@ -582,8 +661,15 @@ pub(super) fn handle_tool_click(
     if press.row != release.row || press.column != release.column {
         return false;
     }
-    let Some(index) = entry_at_mouse_row(state, release.row) else {
+    let Some(owner) = entry_at_mouse_row(state, release.row) else {
         return false;
     };
-    toggle_tool_entry(state, index)
+    if matches!(
+        state.transcript.entry(owner.entry),
+        Some(super::transcript::Entry::Reasoning { .. })
+    ) && !owner.first
+    {
+        return false;
+    }
+    toggle_tool_entry(state, owner.entry)
 }

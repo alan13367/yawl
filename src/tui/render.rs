@@ -1,19 +1,26 @@
 //! Full-screen frame composition and transcript presentation.
 //!
-//! This facade owns frame composition. Private children own the transcript
-//! cache with entry rendering and the welcome animation. TUI callers keep
-//! the entry points here.
+//! This facade owns frame composition. Private children separate cache reuse,
+//! entry presentation, reasoning blocks, transcript windows, and overlays.
+//! TUI callers keep the entry points here.
 
 mod cache;
+mod entries;
 mod questions;
+mod reasoning;
+mod transcript;
 mod welcome;
 
-pub(super) use cache::{
-    RenderCache, loading_label, render_reasoning, render_transcript_window, render_user_panel,
-};
-use cache::{label_refs, render_entry, subagent_labels};
+pub(super) use cache::{LineOwner, RenderCache};
+use entries::render_entry;
+pub(super) use entries::{entry_default_expanded, render_user_panel};
 #[cfg(test)]
-pub(super) use cache::{render_entries, render_loading_state, render_queued_panel};
+pub(super) use entries::{render_entries, render_expanded, render_queued_panel};
+pub(super) use reasoning::render_reasoning;
+#[cfg(test)]
+pub(super) use transcript::render_loading_state;
+use transcript::{label_refs, subagent_labels};
+pub(super) use transcript::{loading_label, render_transcript_window};
 pub(super) use welcome::WELCOME_ANIMATION_TICKS;
 use welcome::render_welcome;
 
@@ -29,6 +36,8 @@ use super::input::Editor;
 use super::picker::{Picker, PickerAction, picker_is_plan_handoff, render_picker};
 use super::state::{ScrollGeometry, scroll_bar_position, scroll_bar_span};
 use super::{ViewState, markdown};
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 const BACKGROUND_NOTICE_CYAN: UiColor = UiColor::new(116, 199, 213);
 const BACKGROUND_NOTICE_AMBER: UiColor = UiColor::new(232, 202, 118);
@@ -399,7 +408,7 @@ pub(super) fn build_frame_with_images(
         let focused = state.transcript.is_focused();
         region.extend(visible.iter().map(|(line, owner)| {
             let line = markdown::fit_width(line, transcript_width);
-            if focused && *owner == selected && transcript_width > 1 {
+            if focused && transcript_width > 1 && owner.map(|owner| owner.entry) == selected {
                 format!(
                     "{}▌\x1b[0m{}",
                     foreground_color(state.accent_color),
@@ -697,6 +706,7 @@ fn render_block_viewer(
         ImageSupport::None,
         state.accent_color,
         &label_refs,
+        state.spinner_tick,
     )
     .unwrap_or_default();
     let body = body.lines;

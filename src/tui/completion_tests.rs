@@ -13,6 +13,7 @@ fn completion_state(commands: &[&str]) -> ViewState {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,

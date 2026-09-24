@@ -572,6 +572,7 @@ impl Conversation {
         let Some(start) = last_undoable_user_index(&self.messages) else {
             return Ok(UndoReport::default());
         };
+        self.persistent_state().checkpoints.ensure_loaded()?;
         let undo = crate::session::PendingUndo {
             dropped: self.messages.len() - start,
             clear_goal: self.messages[start..].iter().any(Message::is_goal_start),

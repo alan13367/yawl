@@ -230,17 +230,18 @@ pub fn run_with_timeout(
     .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
 
-    if let Some(data) = stdin_data {
-        let mut stdin = child.stdin.take().expect("stdin was piped");
-        let data = data.to_vec();
-        // Ignore broken-pipe: the tool may not read stdin at all.
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(&data);
-        });
-    }
+    let mut stdin = child.stdin.take();
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
-    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
+    if let Err(error) = set_nonblocking(&stdout)
+        .and_then(|()| set_nonblocking(&stderr))
+        .and_then(|()| {
+            if let Some(stdin) = &stdin {
+                set_nonblocking(stdin)?;
+            }
+            Ok(())
+        })
+    {
         kill_and_reap(&mut child);
         return Err(error);
     }
@@ -257,6 +258,7 @@ pub fn run_with_timeout(
     // Completion includes EOF on both pipes, so cancellation and the deadline
     // remain active during output collection as well as process execution.
     let mut status = None;
+    let mut input_sent = 0;
     let wait_result = (|| -> std::io::Result<()> {
         loop {
             if status.is_none() {
@@ -272,6 +274,12 @@ pub fn run_with_timeout(
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 timed_out = true;
                 return Ok(());
+            }
+            if let (Some(pipe), Some(data)) = (stdin.as_mut(), stdin_data)
+                && write_available(pipe, data, &mut input_sent)
+            {
+                // EOF tells a reader that it has received the entire JSON input.
+                stdin = None;
             }
             std::thread::sleep(Duration::from_millis(30));
         }
@@ -308,6 +316,23 @@ fn kill_and_reap(child: &mut Child) {
         let _ = child.kill();
     }
     let _ = child.wait();
+}
+
+/// Attempts all available input without waiting for a reader. A closed or
+/// non-reading child must not outlive the command's timeout on a writer thread.
+fn write_available(writer: &mut impl Write, data: &[u8], sent: &mut usize) -> bool {
+    while *sent < data.len() {
+        match writer.write(&data[*sent..]) {
+            Ok(0) => return true,
+            Ok(count) => *sent += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return false,
+            // The tool may exit before it consumes stdin; treat broken pipes
+            // like the earlier best-effort writer did.
+            Err(_) => return true,
+        }
+    }
+    true
 }
 
 fn set_nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
@@ -385,6 +410,27 @@ mod tests {
             result.timed_out,
             "timeout was ignored after the shell exited"
         );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn nonblocking_stdin_writer_returns_when_peer_stops_reading() {
+        let (mut writer, _reader_kept_open) = std::os::unix::net::UnixStream::pair().unwrap();
+        set_nonblocking(&writer).unwrap();
+        let data = vec![b'x'; 4 * 1024 * 1024];
+        let mut sent = 0;
+        assert!(!write_available(&mut writer, &data, &mut sent));
+        assert!(sent > 0 && sent < data.len());
+    }
+
+    #[test]
+    fn timeout_stops_a_child_that_keeps_stdin_open_without_reading() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 2"]);
+        let data = vec![b'x'; 4 * 1024 * 1024];
+        let started = Instant::now();
+        let result = run_with_timeout(cmd, Some(&data), Duration::from_millis(150)).unwrap();
+        assert!(result.timed_out);
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 

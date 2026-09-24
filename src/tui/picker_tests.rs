@@ -137,6 +137,145 @@ fn selection_picker_defaults_to_following_the_accent() {
 }
 
 #[test]
+fn accent_picker_previews_the_highlighted_color_and_restores_on_cancel() {
+    let blue = UiColor::new(117, 169, 255);
+    let mut state = test_picker_state(color_picker(UiColor::WHITE));
+    state.accent_color = UiColor::WHITE;
+    state.selection_color = UiColor::WHITE;
+    state.begin_color_preview(None);
+
+    // Down moves the highlight from White to Gray, previewing it live.
+    assert!(take_picker_action(&mut state, &mut Editor::default(), Key::Down).is_none());
+    sync_color_preview(&mut state);
+    assert_eq!(state.accent_color, UiColor::new(148, 148, 158));
+    assert_eq!(
+        state.selection_color,
+        UiColor::new(148, 148, 158),
+        "a selection that follows the accent tracks the preview"
+    );
+
+    // Escape restores the committed colors instead of keeping the preview,
+    // then returns to the Interface settings page.
+    let cancel = take_picker_action(&mut state, &mut Editor::default(), Key::Escape);
+    assert!(matches!(
+        cancel,
+        Some(PickerAction::OpenSettingsCategory {
+            category: SettingsCategory::Interface,
+            ..
+        })
+    ));
+    assert_eq!(state.accent_color, UiColor::WHITE);
+    assert_eq!(state.selection_color, UiColor::WHITE);
+    assert!(state.color_preview.is_none());
+
+    // Selecting a row commits the color under the highlight.
+    let mut state = test_picker_state(color_picker(UiColor::WHITE));
+    state.accent_color = blue;
+    state.selection_color = blue;
+    state.begin_color_preview(Some(blue));
+    let selected = state
+        .picker
+        .as_ref()
+        .expect("picker should be open")
+        .items
+        .iter()
+        .position(
+            |item| matches!(item.action, PickerAction::SetAccentColor(color) if color == blue),
+        )
+        .expect("blue should be in the palette");
+    state.picker.as_mut().expect("picker").selected = selected;
+    sync_color_preview(&mut state);
+    assert_eq!(state.accent_color, blue);
+    assert_eq!(state.selection_color, blue);
+}
+
+#[test]
+fn selection_picker_previews_an_explicit_color_and_falls_back_while_editing() {
+    let green = UiColor::new(139, 213, 162);
+    let mut state = test_picker_state(selection_color_picker(None));
+    state.accent_color = UiColor::new(117, 169, 255);
+    state.selection_color = state.accent_color;
+    state.begin_color_preview(None);
+
+    let selected = state
+        .picker
+        .as_ref()
+        .expect("picker should be open")
+        .items
+        .iter()
+        .position(
+            |item| matches!(item.action, PickerAction::SetSelectionColor(Some(color)) if color == green),
+        )
+        .expect("green should be in the palette");
+    state.picker.as_mut().expect("picker").selected = selected;
+    sync_color_preview(&mut state);
+    assert_eq!(state.selection_color, green);
+    assert_eq!(
+        state.accent_color,
+        UiColor::new(117, 169, 255),
+        "a selection preview leaves the accent alone"
+    );
+
+    // The custom-entry row is an edit, not a color, so the preview reverts to
+    // the committed colors rather than showing a stale swatch.
+    let custom = state.picker.as_ref().expect("picker").items.len() - 1;
+    state.picker.as_mut().expect("picker").selected = custom;
+    sync_color_preview(&mut state);
+    assert_eq!(state.selection_color, UiColor::new(117, 169, 255));
+}
+
+#[test]
+fn closing_a_color_picker_keeps_the_applied_color() {
+    let blue = UiColor::new(117, 169, 255);
+    let mut state = test_picker_state(color_picker(UiColor::WHITE));
+    state.accent_color = blue;
+    state.selection_color = blue;
+    state.begin_color_preview(None);
+    state.picker = Some(settings_picker(&test_agent()));
+
+    sync_color_preview(&mut state);
+    assert!(state.color_preview.is_none());
+    assert_eq!(
+        state.accent_color, blue,
+        "leaving a color picker must not revert the applied color"
+    );
+}
+
+#[test]
+fn a_rejected_custom_color_ends_the_preview() {
+    let mut agent = test_agent();
+    let mut state = test_picker_state(color_picker(UiColor::WHITE));
+    state.accent_color = UiColor::WHITE;
+    state.selection_color = UiColor::WHITE;
+    state.begin_color_preview(agent.config().selection_color);
+
+    // Highlight "Custom RGB…", edit it, and submit a value that cannot parse.
+    let custom = state.picker.as_ref().expect("picker").items.len() - 1;
+    state.picker.as_mut().expect("picker").selected = custom;
+    let mut editor = Editor::default();
+    take_picker_action(&mut state, &mut editor, Key::Enter);
+    editor.clear();
+    editor.paste("not-a-color");
+    let action = take_picker_action(&mut state, &mut editor, Key::Enter);
+    let argument = match action.expect("a custom value submits a setting change") {
+        PickerAction::ApplySetting { argument, .. } => argument,
+        _ => panic!("expected a setting change"),
+    };
+    assert_eq!(argument, "accent_color not-a-color");
+
+    assert!(!super::commands::settings(
+        &mut agent, &argument, &mut state
+    ));
+    assert!(state.picker.is_none());
+    assert!(
+        state.color_preview.is_none(),
+        "a rejected value closes the picker, so nothing may keep previewing"
+    );
+    assert_eq!(state.accent_color, UiColor::WHITE);
+    assert_eq!(state.transcript_accent_color(), state.accent_color);
+}
+
+#[test]
 fn interface_settings_open_the_status_bar_editor() {
     let config = Config::test_default();
     let picker = super::picker::settings_category_picker_from(
@@ -425,6 +564,7 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -518,6 +658,7 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,

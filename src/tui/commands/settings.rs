@@ -279,6 +279,10 @@ pub(in crate::tui) fn settings(agent: &mut Agent, argument: &str, state: &mut Vi
     match change {
         Ok(change) => apply_config_change(agent, change, state),
         Err(error) => {
+            // A rejected value never reaches `apply_config_change`, so the
+            // picker that closed here would otherwise leave a live preview
+            // behind with nothing to commit or restore it.
+            state.end_color_preview();
             state.notice(format!("Could not change setting: {error}"));
             false
         }
@@ -290,6 +294,10 @@ pub(in crate::tui) fn apply_config_change(
     change: ConfigChange,
     state: &mut ViewState,
 ) -> bool {
+    let color_change = matches!(
+        change,
+        ConfigChange::AccentColor(_) | ConfigChange::SelectionColor(_)
+    );
     match agent.change_global_config(change) {
         Ok(effect) => {
             state.model = agent.model().to_string();
@@ -299,6 +307,9 @@ pub(in crate::tui) fn apply_config_change(
             state.hide_reasoning = agent.config().hide_reasoning;
             state.accent_color = agent.config().accent_color;
             state.selection_color = agent.config().effective_selection_color();
+            if color_change {
+                state.commit_color_preview();
+            }
             state.status_bar = agent.config().status_bar.clone();
             state.subagents_enabled = agent.config().subagents;
             state.sync_scroll_bar_config(agent.config());
@@ -308,6 +319,9 @@ pub(in crate::tui) fn apply_config_change(
             true
         }
         Err(error) => {
+            if color_change {
+                state.end_color_preview();
+            }
             state.notice(format!("Could not change setting: {error}"));
             false
         }

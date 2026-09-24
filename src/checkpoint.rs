@@ -78,24 +78,34 @@ pub struct Checkpoints {
     dir: PathBuf,
     work_tree: PathBuf,
     stack: Vec<TurnRecord>,
+    load_error: Option<Error>,
 }
 
 impl Checkpoints {
     pub fn open(home_dir: &Path, session_id: &str, work_tree: PathBuf) -> Self {
         let dir = home_dir.join("checkpoints").join(session_id);
-        let stack = match read_stack(&dir) {
-            Ok(Some(stack)) => stack,
-            Ok(None) if !dir.exists() => Vec::new(),
-            Ok(None) | Err(_) => {
-                let _ = fs::remove_dir_all(&dir);
-                Vec::new()
-            }
+        let (stack, load_error) = match read_stack(&dir) {
+            Ok(Some(stack)) => (stack, None),
+            Ok(None) if !dir.exists() => (Vec::new(), None),
+            Ok(None) => (Vec::new(), fs::remove_dir_all(&dir).err().map(Error::Io)),
+            Err(error) => (Vec::new(), Some(error)),
         };
         Self {
             dir,
             work_tree,
             stack,
+            load_error,
         }
+    }
+
+    pub(crate) fn ensure_loaded(&self) -> Result<(), Error> {
+        if let Some(error) = &self.load_error {
+            return Err(Error::Protocol(format!(
+                "cannot load undo checkpoints from {}: {error}",
+                self.dir.display()
+            )));
+        }
+        Ok(())
     }
 
     pub fn remove(home_dir: &Path, session_id: &str) {
@@ -108,6 +118,7 @@ impl Checkpoints {
     ///
     /// Returns I/O errors when the restore point cannot be written.
     pub fn snapshot(&mut self) -> Result<(), Error> {
+        self.ensure_loaded()?;
         fs::create_dir_all(&self.dir)?;
         let index = self.stack.len();
         let _ = fs::remove_dir_all(self.dir.join("overlays").join(index.to_string()));
@@ -127,6 +138,7 @@ impl Checkpoints {
     /// Returns I/O errors while reading or storing the pre-image, or a protocol
     /// error when the target is not a regular file or exceeds the size limit.
     pub fn remember_path(&mut self, path: &Path) -> Result<(), Error> {
+        self.ensure_loaded()?;
         let Some(index) = self.stack.len().checked_sub(1) else {
             return Ok(());
         };
@@ -221,6 +233,7 @@ impl Checkpoints {
 
     /// Restore without consuming the checkpoint until session history commits.
     pub(crate) fn restore_retained(&self, index: Option<usize>) -> Result<RestoreReport, Error> {
+        self.ensure_loaded()?;
         let Some(index) = index else {
             return Ok(RestoreReport::default());
         };
@@ -286,6 +299,7 @@ impl Checkpoints {
 
     /// Idempotent cleanup after the session's undo event has committed.
     pub(crate) fn discard_restored(&mut self, index: Option<usize>) -> Result<(), Error> {
+        self.ensure_loaded()?;
         let Some(index) = index else {
             return Ok(());
         };
@@ -318,7 +332,16 @@ fn read_stack(dir: &Path) -> Result<Option<Vec<TurnRecord>>, Error> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let stored: StoredCheckpoints = serde_json::from_slice(&bytes)?;
+    let stored: StoredCheckpoints = match serde_json::from_slice(&bytes) {
+        Ok(stored) => stored,
+        Err(_)
+            if serde_json::from_slice::<serde_json::Value>(&bytes)
+                .is_ok_and(|value| value.is_array()) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
     if stored.version != STORE_VERSION {
         return Err(Error::Protocol(format!(
             "unsupported checkpoint store version {}",
@@ -681,6 +704,49 @@ mod tests {
         assert!(checkpoints.stack.is_empty());
         assert!(!checkpoint_dir.exists());
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn open_preserves_unreadable_checkpoint_store() -> Result<(), Error> {
+        let root = temp_root("unreadable-store");
+        let home = root.join("home");
+        let work = root.join("work");
+        let checkpoint_dir = home.join("checkpoints/sess");
+        fs::create_dir_all(checkpoint_dir.join("stack.json"))?;
+        write(&checkpoint_dir.join("overlays/0/preimage"), "original");
+        fs::create_dir_all(&work)?;
+
+        let mut checkpoints = Checkpoints::open(&home, "sess", work);
+        assert!(checkpoint_dir.join("stack.json").is_dir());
+        assert!(checkpoint_dir.join("overlays/0/preimage").exists());
+        assert!(
+            checkpoints.snapshot().is_err(),
+            "must not overwrite an unreadable store"
+        );
+        assert!(checkpoint_dir.join("overlays/0/preimage").exists());
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn open_preserves_unsupported_and_corrupt_checkpoint_stores() -> Result<(), Error> {
+        let root = temp_root("invalid-store");
+        let home = root.join("home");
+        let work = root.join("work");
+        fs::create_dir_all(&work)?;
+        for (id, contents) in [
+            ("future", r#"{"version":999,"turns":[]}"#),
+            ("corrupt", "{not-json"),
+        ] {
+            let dir = home.join("checkpoints").join(id);
+            write(&dir.join("stack.json"), contents);
+            let mut checkpoints = Checkpoints::open(&home, id, work.clone());
+            assert!(checkpoints.snapshot().is_err());
+            assert_eq!(fs::read_to_string(dir.join("stack.json"))?, contents);
+        }
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 

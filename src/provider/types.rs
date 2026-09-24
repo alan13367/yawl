@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::error::Error;
 
@@ -119,8 +119,8 @@ pub struct Message {
     pub tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
-    /// Provider-specific replay data. Codex stores encrypted reasoning and
-    /// remote compaction items here so `store: false` requests remain valid.
+    /// Opaque replay and session metadata. Codex stores encrypted reasoning
+    /// and remote compaction items here so `store: false` requests remain valid.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_data: Vec<Value>,
     /// Model that produced `provider_data`. Older sessions omit this field;
@@ -136,11 +136,57 @@ pub struct Message {
     pub control: Option<MessageControl>,
 }
 
+const REASONING_DURATIONS_TYPE: &str = "yawl.reasoning_durations.v1";
+
+pub(super) fn reasoning_durations_data(durations_ms: &[Option<u64>]) -> Option<Value> {
+    durations_ms.iter().any(Option::is_some).then(|| {
+        json!({
+            "type": REASONING_DURATIONS_TYPE,
+            "durations_ms": durations_ms,
+        })
+    })
+}
+
+pub(super) fn reasoning_duration_ms(data: &[Value], index: usize) -> Option<u64> {
+    data.iter()
+        .rev()
+        .find(|value| value["type"] == REASONING_DURATIONS_TYPE)
+        .and_then(|value| value["durations_ms"].get(index))
+        .and_then(Value::as_u64)
+}
+
+fn is_internal_provider_data(value: &Value) -> bool {
+    value["type"] == REASONING_DURATIONS_TYPE
+}
+
 fn estimate_text_tokens(text: &str) -> u64 {
     (text.len() as u64).div_ceil(3)
 }
 
 impl Message {
+    pub(crate) fn reasoning_duration_ms(&self, index: usize) -> Option<u64> {
+        reasoning_duration_ms(&self.provider_data, index)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reasoning_durations_ms(&mut self, durations_ms: &[Option<u64>]) {
+        self.provider_data
+            .retain(|value| !is_internal_provider_data(value));
+        if let Some(data) = reasoning_durations_data(durations_ms) {
+            self.provider_data.push(data);
+        }
+    }
+
+    pub(crate) fn provider_replay_data(&self) -> impl Iterator<Item = &Value> {
+        self.provider_data
+            .iter()
+            .filter(|value| !is_internal_provider_data(value))
+    }
+
+    pub(crate) fn has_provider_replay_data(&self) -> bool {
+        self.provider_replay_data().next().is_some()
+    }
+
     /// Approximate context cost; subagent metadata is already rendered in content.
     pub(crate) fn estimated_tokens(&self) -> u64 {
         let mut tokens = 8u64.saturating_add(estimate_text_tokens(&self.content));
@@ -461,10 +507,30 @@ mod tests {
             kind: ReasoningKind::Summary,
             content: "Checked the result".into(),
         });
+        m.set_reasoning_durations_ms(&[Some(1_250)]);
         let text = serde_json::to_string(&m)?;
         let back: Message = serde_json::from_str(&text)?;
         assert_eq!(back.role, Role::Assistant);
         assert_eq!(back.reasoning, m.reasoning);
+        assert_eq!(
+            back.reasoning_duration_ms(0),
+            Some(1_250),
+            "durations must survive the session round trip"
+        );
+        assert!(
+            back.provider_replay_data().next().is_none(),
+            "session-only timing metadata must not be replayed to providers"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn old_reasoning_records_default_to_no_duration() -> Result<(), serde_json::Error> {
+        let message: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":"ok","reasoning":[{"kind":"summary","content":"thinking"}]}"#,
+        )?;
+        assert_eq!(message.reasoning.len(), 1);
+        assert_eq!(message.reasoning_duration_ms(0), None);
         Ok(())
     }
 

@@ -1,6 +1,8 @@
 //! Focused tests for the corresponding TUI responsibility.
 
-use super::render::{ImageSupport, build_frame_with_images};
+use super::render::{
+    ImageSupport, build_frame_with_images, foreground_color, render_expanded, render_reasoning,
+};
 use super::*;
 
 #[test]
@@ -57,6 +59,7 @@ fn frame_keeps_input_and_status_pinned() {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -363,20 +366,150 @@ fn image_tool_results_reserve_rows_below_their_tool_card() {
 }
 
 #[test]
-fn reasoning_summary_is_one_line_and_full_reasoning_is_not() {
-    let summary = Entry::Reasoning {
+fn reasoning_collapses_to_a_single_tinted_tag_by_default() {
+    let reasoning = Entry::Reasoning {
         kind: ReasoningKind::Summary,
         content: "Inspecting\n  the request".into(),
+        started: None,
+        duration: Some(std::time::Duration::from_millis(4_200)),
     };
-    let full = Entry::Reasoning {
+
+    let rendered = render_entries(&[reasoning], 80, false, false);
+
+    assert_eq!(rendered.len(), 2, "one tag row plus the entry separator");
+    let plain = markdown::strip_ansi(&rendered[0]).trim_end().to_string();
+    assert_eq!(plain, "+ Thought: 4.2s");
+    let accent = foreground_color(UiColor::WHITE);
+    assert!(
+        !rendered[0].starts_with(&accent),
+        "the tag must differ from the white accent and reply text"
+    );
+    assert!(!rendered[0].contains("\x1b[2m"), "collapsed is not dimmed");
+}
+
+#[test]
+fn clicked_codex_reasoning_streams_the_paragraph_after_its_headline() {
+    let mut state = empty_session_state();
+    let editor = Editor::default();
+    state.apply(Update::Transcript(TranscriptEvent::ReasoningDelta {
+        kind: ReasoningKind::Summary,
+        text: "**Inspecting the request**".into(),
+    }));
+
+    let (collapsed_frame, _) = build_frame(&mut state, &editor, 80, 20);
+    let collapsed = markdown::strip_ansi(&collapsed_frame.join("\n"));
+    assert!(collapsed.contains("Thinking"));
+    assert!(!collapsed.contains("Inspecting the request"));
+
+    let tag_row = state
+        .transcript_row_entries
+        .iter()
+        .position(|row| matches!(row, Some(owner) if owner.entry == 0 && owner.first))
+        .expect("thinking tag row");
+    let press = super::events::MouseEvent {
+        kind: super::events::MouseKind::Press,
+        column: 2,
+        row: tag_row,
+    };
+    let release = super::events::MouseEvent {
+        kind: super::events::MouseKind::Release,
+        column: 2,
+        row: tag_row,
+    };
+    assert!(super::state::handle_tool_click(&mut state, press, release));
+
+    state.apply(Update::Transcript(TranscriptEvent::ReasoningDelta {
+        kind: ReasoningKind::Summary,
+        text: "\n\nChecking the files now.".into(),
+    }));
+    let (expanded_frame, _) = build_frame(&mut state, &editor, 80, 20);
+    let expanded = markdown::strip_ansi(&expanded_frame.join("\n"));
+    assert!(expanded.contains("Inspecting the request"));
+    assert!(
+        expanded.contains("Checking the files now."),
+        "the paragraph following the headline should stream into the clicked-open block"
+    );
+}
+
+#[test]
+fn thinking_tag_shows_the_spinner_while_streaming_and_dashes_when_expanded() {
+    let streaming = Entry::Reasoning {
         kind: ReasoningKind::Full,
-        content: "First step\n\nSecond step".into(),
+        content: "deliberating".into(),
+        started: Some(std::time::Instant::now()),
+        duration: None,
+    };
+    let settled = Entry::Reasoning {
+        kind: ReasoningKind::Full,
+        content: "deliberating".into(),
+        started: None,
+        duration: Some(std::time::Duration::from_millis(400)),
+    };
+    let legacy = Entry::Reasoning {
+        kind: ReasoningKind::Summary,
+        content: "old session without persisted timing".into(),
+        started: None,
+        duration: None,
     };
 
-    let summary_lines = render_entries(&[summary], 80, false, false);
-    let full_lines = render_entries(&[full], 80, false, false);
+    let collapsed = render_entries(&[streaming], 80, false, false);
+    assert_eq!(
+        collapsed.len(),
+        2,
+        "live reasoning stays collapsed by default"
+    );
+    assert_eq!(
+        markdown::strip_ansi(&collapsed[0]).trim_end(),
+        "⠋ Thinking",
+        "the streaming tag carries the spinner and no timer"
+    );
+    assert!(!collapsed.join("\n").contains("deliberating"));
 
-    assert_eq!(summary_lines.len(), 2);
+    let expanded = render_expanded(&settled, 80);
+    let plain = markdown::strip_ansi(&expanded[0]).trim_end().to_string();
+    assert_eq!(plain, "- Thought: 0.4s");
+    assert!(
+        expanded[0].contains("\x1b[2m"),
+        "the expanded tag is dimmed"
+    );
+    assert_eq!(expanded[1], "", "a blank row separates tag and content");
+    assert!(markdown::strip_ansi(&expanded[2]).contains("deliberating"));
+
+    let no_duration = render_entries(&[legacy], 80, false, false);
+    assert_eq!(
+        markdown::strip_ansi(&no_duration[0]).trim_end(),
+        "+ Thought"
+    );
+}
+
+#[test]
+fn thinking_elapsed_stays_in_seconds_with_one_decimal() {
+    let at = |millis: u64| Entry::Reasoning {
+        kind: ReasoningKind::Full,
+        content: "thinking".into(),
+        started: None,
+        duration: Some(std::time::Duration::from_millis(millis)),
+    };
+
+    let sub_second = render_entries(&[at(420)], 80, false, false);
+    assert_eq!(
+        markdown::strip_ansi(&sub_second[0]).trim_end(),
+        "+ Thought: 0.4s"
+    );
+
+    let past_a_minute = render_entries(&[at(94_300)], 80, false, false);
+    assert_eq!(
+        markdown::strip_ansi(&past_a_minute[0]).trim_end(),
+        "+ Thought: 94.3s"
+    );
+}
+
+#[test]
+fn reasoning_summary_is_one_line_and_full_reasoning_is_not() {
+    let summary_lines = render_reasoning(ReasoningKind::Summary, "Inspecting\n  the request", 80);
+    let full_lines = render_reasoning(ReasoningKind::Full, "First step\n\nSecond step", 80);
+
+    assert_eq!(summary_lines.len(), 1);
     let summary_text = markdown::strip_ansi(&summary_lines[0]);
     assert!(summary_text.contains("Inspecting the request"));
     assert!(!summary_text.contains("Reasoning"));
@@ -386,12 +519,11 @@ fn reasoning_summary_is_one_line_and_full_reasoning_is_not() {
 
 #[test]
 fn codex_reasoning_summary_parts_render_on_separate_lines() {
-    let summary = Entry::Reasoning {
-        kind: ReasoningKind::Summary,
-        content: "**Planning the change**\n\n**Delegating inspection**".into(),
-    };
-
-    let rendered = render_entries(&[summary], 80, false, false);
+    let rendered = render_reasoning(
+        ReasoningKind::Summary,
+        "**Planning the change**\n\n**Delegating inspection**",
+        80,
+    );
     let visible = rendered
         .iter()
         .map(|line| markdown::strip_ansi(line).trim_end().to_string())
@@ -399,17 +531,16 @@ fn codex_reasoning_summary_parts_render_on_separate_lines() {
         .collect::<Vec<_>>();
 
     assert_eq!(visible, ["Planning the change", "Delegating inspection"]);
-    assert_eq!(rendered.len(), 3); // No extra gap when two titles have no paragraph.
+    assert_eq!(rendered.len(), 2); // No extra gap when two titles have no paragraph.
 }
 
 #[test]
 fn codex_reasoning_summary_parts_have_one_blank_row_between_paragraph_and_title() {
-    let summary = Entry::Reasoning {
-        kind: ReasoningKind::Summary,
-        content: "**Reviewing release notes**\n\nChecking the generated notes.\n\n**Summarizing features**\n\nReading the README.\n\n**Next step**".into(),
-    };
-
-    let rendered = render_entries(&[summary], 80, false, false);
+    let rendered = render_reasoning(
+        ReasoningKind::Summary,
+        "**Reviewing release notes**\n\nChecking the generated notes.\n\n**Summarizing features**\n\nReading the README.\n\n**Next step**",
+        80,
+    );
     let plain = rendered
         .iter()
         .map(|line| markdown::strip_ansi(line).trim_end().to_string())
@@ -425,7 +556,6 @@ fn codex_reasoning_summary_parts_have_one_blank_row_between_paragraph_and_title(
             "Reading the README.",
             "",
             "Next step",
-            "",
         ]
     );
 }
@@ -435,6 +565,8 @@ fn hidden_reasoning_is_removed_from_the_transcript() {
     let reasoning = Entry::Reasoning {
         kind: ReasoningKind::Full,
         content: "private thought".into(),
+        started: None,
+        duration: None,
     };
 
     assert!(render_entries(&[reasoning], 80, false, true).is_empty());
@@ -447,6 +579,8 @@ fn reasoning_has_one_blank_line_on_each_side() {
         Entry::Reasoning {
             kind: ReasoningKind::Full,
             content: "\nThinking\n\n".into(),
+            started: None,
+            duration: Some(std::time::Duration::from_millis(100)),
         },
         Entry::Tool {
             name: "shell".into(),
@@ -465,7 +599,10 @@ fn reasoning_has_one_blank_line_on_each_side() {
         .map(|line| markdown::strip_ansi(line).trim_end().to_string())
         .collect::<Vec<_>>();
 
-    assert_eq!(plain, ["Answer", "", "Thinking", "", "", " $ true", "", ""]);
+    assert_eq!(
+        plain,
+        ["Answer", "", "+ Thought: 0.1s", "", "", " $ true", "", ""]
+    );
 }
 
 #[test]
@@ -480,6 +617,7 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -554,6 +692,7 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -685,6 +824,7 @@ fn loading_state_ignores_status_activity() {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -764,6 +904,7 @@ fn overflow_state() -> ViewState {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -849,6 +990,13 @@ fn scroll_bar_overlays_reasoning_without_replacing_its_text() {
         kind: ReasoningKind::Full,
         text: "r".repeat(200),
     }));
+    let index = state
+        .transcript
+        .entries()
+        .iter()
+        .position(|entry| matches!(entry, Entry::Reasoning { .. }))
+        .expect("reasoning entry");
+    state.transcript.set_entry_expanded(index, true);
     let editor = Editor::default();
 
     let (with_thumb, _) = build_frame(&mut state, &editor, 40, 12);
@@ -1078,6 +1226,7 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: true,
         scroll_bar_enabled: true,
         scroll_bar_auto_hide: false,
@@ -1130,6 +1279,34 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
 
     assert!(!frame.join("\n").contains("\x1b[48;2;"));
     assert!(state.scroll_geometry.is_none());
+}
+
+#[test]
+fn accent_preview_repaints_the_frame_without_rerendering_the_transcript() {
+    let mut state = empty_session_state();
+    state.accent_color = UiColor::WHITE;
+    state.selection_color = UiColor::WHITE;
+    let editor = Editor::default();
+    let (before, _) = build_frame(&mut state, &editor, 80, 20);
+    assert!(before.join("\n").contains("38;2;238;238;238m┌"));
+
+    state.begin_color_preview(None);
+    state.preview_accent_color(UiColor::new(117, 169, 255));
+    let (after, _) = build_frame(&mut state, &editor, 80, 20);
+
+    assert!(
+        after.join("\n").contains("38;2;117;169;255m┌"),
+        "the composer border should preview the highlighted color"
+    );
+    assert_eq!(
+        state.transcript_accent_color(),
+        UiColor::WHITE,
+        "browsing the palette keeps the committed accent as the transcript cache key"
+    );
+
+    state.end_color_preview();
+    let (restored, _) = build_frame(&mut state, &editor, 80, 20);
+    assert!(restored.join("\n").contains("38;2;238;238;238m┌"));
 }
 
 #[test]
@@ -1222,6 +1399,7 @@ fn retry_reset_immediately_removes_partial_output_from_render_cache() {
         text: "partial reasoning".into(),
     });
     transcript.apply(TranscriptEvent::TextDelta("partial answer".into()));
+    transcript.set_entry_expanded(1, true);
 
     let partial = cache
         .get_or_render(&transcript, false, false, UiColor::WHITE, 80)
@@ -1273,6 +1451,7 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: false,
         scroll_bar_enabled: false,
         scroll_bar_auto_hide: false,
@@ -1439,6 +1618,7 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: false,
         scroll_bar_enabled: false,
         scroll_bar_auto_hide: false,
@@ -2008,6 +2188,7 @@ fn empty_session_state() -> ViewState {
         selection_color: UiColor::WHITE,
         status_bar: Default::default(),
         status_bar_draft: None,
+        color_preview: None,
         show_scroll_bar: false,
         scroll_bar_enabled: false,
         scroll_bar_auto_hide: false,
@@ -2274,19 +2455,20 @@ fn rendered_tool_rows_map_to_their_entries_for_click_to_expand() {
     let editor = Editor::default();
     let (_frame, _) = build_frame(&mut state, &editor, 40, 12);
 
+    let owns = |row: &Option<super::render::LineOwner>, entry: usize| matches!(row, Some(owner) if owner.entry == entry);
     assert!(
-        state.transcript_row_entries.contains(&Some(0)),
+        state.transcript_row_entries.iter().any(|row| owns(row, 0)),
         "first tool card must be clickable"
     );
     assert!(
-        state.transcript_row_entries.contains(&Some(1)),
+        state.transcript_row_entries.iter().any(|row| owns(row, 1)),
         "second tool card must be clickable"
     );
 
     let first_row = state
         .transcript_row_entries
         .iter()
-        .position(|row| *row == Some(0))
+        .position(|row| owns(row, 0))
         .expect("first tool row");
     let press = super::events::MouseEvent {
         kind: super::events::MouseKind::Press,
@@ -2301,4 +2483,74 @@ fn rendered_tool_rows_map_to_their_entries_for_click_to_expand() {
     assert!(super::state::handle_tool_click(&mut state, press, release));
     assert!(state.transcript.entry_expanded(0, state.tools_expanded));
     assert!(!state.transcript.entry_expanded(1, state.tools_expanded));
+}
+
+#[test]
+fn clicking_the_thinking_tag_toggles_but_the_traces_stay_inert() {
+    use crate::provider::{Message, Reasoning};
+
+    let mut assistant = Message::assistant(String::new(), vec![]);
+    assistant.reasoning.push(Reasoning {
+        kind: ReasoningKind::Full,
+        content: "step one\n\nstep two".into(),
+    });
+    assistant.set_reasoning_durations_ms(&[Some(900)]);
+    let mut state = empty_session_state();
+    state.transcript = Transcript::from_messages(&[assistant]);
+    let editor = Editor::default();
+    let (frame, _) = build_frame(&mut state, &editor, 40, 12);
+    assert!(
+        markdown::strip_ansi(&frame.join("\n")).contains("+ Thought: 0.9s"),
+        "the collapsed tag must be on screen"
+    );
+
+    fn click(state: &mut ViewState, row: usize) -> bool {
+        let press = super::events::MouseEvent {
+            kind: super::events::MouseKind::Press,
+            column: 2,
+            row,
+        };
+        let release = super::events::MouseEvent {
+            kind: super::events::MouseKind::Release,
+            column: 2,
+            row,
+        };
+        super::state::handle_tool_click(state, press, release)
+    }
+    let row_of = |state: &ViewState, first: bool| {
+        state
+            .transcript_row_entries
+            .iter()
+            .position(|row| matches!(row, Some(owner) if owner.first == first && owner.entry == 0))
+    };
+
+    let tag_row = row_of(&state, true).expect("thinking tag row");
+    assert!(
+        row_of(&state, false).is_none(),
+        "the collapsed block has no trace rows"
+    );
+    assert!(
+        click(&mut state, tag_row),
+        "clicking the tag expands the block"
+    );
+    assert!(state.transcript.entry_expanded(0, false));
+
+    let (expanded_frame, _) = build_frame(&mut state, &editor, 40, 24);
+    let plain = markdown::strip_ansi(&expanded_frame.join("\n"));
+    assert!(plain.contains("- Thought: 0.9s"));
+    assert!(plain.contains("step one"));
+
+    let content_row = row_of(&state, false).expect("expanded reasoning trace row");
+    assert!(
+        !click(&mut state, content_row),
+        "clicking the reasoning traces must not toggle"
+    );
+    assert!(state.transcript.entry_expanded(0, false), "still expanded");
+
+    let tag_row = row_of(&state, true).expect("thinking tag row");
+    assert!(
+        click(&mut state, tag_row),
+        "clicking the tag again collapses it"
+    );
+    assert!(!state.transcript.entry_expanded(0, false));
 }

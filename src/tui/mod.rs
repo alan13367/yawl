@@ -55,7 +55,7 @@ use self::events::{Event, EventReader, Key};
 use self::input::{EditAction, Editor, Submission};
 use self::picker::{
     open_model_picker, open_settings_picker, picker_is_editing, picker_is_plan_handoff,
-    poll_model_picker, take_picker_action,
+    poll_model_picker, sync_color_preview, take_picker_action,
 };
 use self::state::{Update, ViewState, advance_ticks, scroll, toggle_tool_expansion};
 use self::subagents::open_dashboard as open_subagent_dashboard;
@@ -240,6 +240,8 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                     Event::Key(key) => {
                         if let Some(action) = take_picker_action(&mut state, &mut editor, key) {
                             activate_picker_action(agent, &mut state, action);
+                        } else {
+                            sync_color_preview(&mut state);
                         }
                     }
                     Event::Paste(text) if picker_is_editing(&state) => editor.paste(&text),
@@ -682,18 +684,19 @@ fn run_agent_turn<R: Read>(
         TurnDispatch::PlanFollowUp(input) => Some(input),
         TurnDispatch::PlanImplement(input) => input,
     };
-    let completed =
-        match turn_interactive(agent, agent_input, kind, state, editor, terminal, events) {
-            Ok(true) => true,
-            Ok(false) | Err(Error::Interrupted) => {
-                state.notice("Turn interrupted.");
-                false
-            }
-            Err(error) => {
-                state.notice(format!("Request failed: {error}"));
-                false
-            }
-        };
+    let result = turn_interactive(agent, agent_input, kind, state, editor, terminal, events);
+    state.transcript.finish_streaming_response();
+    let completed = match result {
+        Ok(true) => true,
+        Ok(false) | Err(Error::Interrupted) => {
+            state.notice("Turn interrupted.");
+            false
+        }
+        Err(error) => {
+            state.notice(format!("Request failed: {error}"));
+            false
+        }
+    };
     crate::set_interrupted(false);
     state.activity.clear();
     state.turn_started = None;

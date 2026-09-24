@@ -4,11 +4,26 @@ use std::time::Duration;
 
 use crate::error::Error;
 
-fn read_line_interruptible(reader: &mut impl BufRead, line: &mut String) -> std::io::Result<usize> {
+fn read_line_interruptible(
+    reader: &mut impl BufRead,
+    line: &mut String,
+    limit: usize,
+) -> Result<usize, Error> {
     let mut bytes = Vec::new();
     loop {
+        if crate::cancellation::interrupted() {
+            return Err(Error::Interrupted);
+        }
         let (consumed, finished) = {
-            let available = reader.fill_buf()?;
+            let available = reader.fill_buf().map_err(|error| {
+                if error.kind() == std::io::ErrorKind::Interrupted
+                    && crate::cancellation::interrupted()
+                {
+                    Error::Interrupted
+                } else {
+                    Error::Io(error)
+                }
+            })?;
             if available.is_empty() {
                 break;
             }
@@ -16,6 +31,9 @@ fn read_line_interruptible(reader: &mut impl BufRead, line: &mut String) -> std:
                 .iter()
                 .position(|byte| *byte == b'\n')
                 .map_or(available.len(), |index| index + 1);
+            if bytes.len().saturating_add(consumed) > limit {
+                return Err(Error::Protocol(format!("SSE line exceeded {limit} bytes")));
+            }
             bytes.extend_from_slice(&available[..consumed]);
             (consumed, available[consumed - 1] == b'\n')
         };
@@ -24,9 +42,12 @@ fn read_line_interruptible(reader: &mut impl BufRead, line: &mut String) -> std:
             break;
         }
     }
+    if crate::cancellation::interrupted() {
+        return Err(Error::Interrupted);
+    }
     let read = bytes.len();
     let text = String::from_utf8(bytes)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        .map_err(|error| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)))?;
     line.push_str(&text);
     Ok(read)
 }
@@ -124,7 +145,11 @@ impl<R: BufRead> Iterator for SseReader<R> {
                 return Some(Err(Error::Interrupted));
             }
             line.clear();
-            match read_line_interruptible(&mut self.reader, &mut line) {
+            match read_line_interruptible(
+                &mut self.reader,
+                &mut line,
+                self.event_limit.saturating_add(128),
+            ) {
                 Ok(0) => {
                     // `Take` reports EOF at the byte ceiling; distinguish
                     // that from a genuine end of stream so oversized
@@ -141,13 +166,7 @@ impl<R: BufRead> Iterator for SseReader<R> {
                     };
                 }
                 Ok(_) => {}
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::Interrupted
-                        && crate::cancellation::interrupted() =>
-                {
-                    return Some(Err(Error::Interrupted));
-                }
-                Err(e) => return Some(Err(Error::Io(e))),
+                Err(error) => return Some(Err(error)),
             }
             let trimmed = line.trim_end_matches(['\r', '\n']);
             if trimmed.is_empty() {
@@ -161,7 +180,12 @@ impl<R: BufRead> Iterator for SseReader<R> {
                 saw_field = true;
             } else if let Some(rest) = trimmed.strip_prefix("data:") {
                 let rest = rest.strip_prefix(' ').unwrap_or(rest);
-                if data.len() + rest.len() > self.event_limit {
+                if data
+                    .len()
+                    .saturating_add(rest.len())
+                    .saturating_add(usize::from(!data.is_empty()))
+                    > self.event_limit
+                {
                     return Some(Err(Error::Protocol(format!(
                         "SSE event exceeded {} bytes",
                         self.event_limit
@@ -244,6 +268,48 @@ mod tests {
             panic!("oversized event should be a protocol error");
         };
         assert!(message.contains("SSE event"));
+    }
+
+    #[test]
+    fn sse_reader_counts_joined_newlines_toward_the_event_limit() {
+        let mut reader = SseReader::with_limits(Cursor::new("data: abc\ndata: def\n\n"), 6, 1024);
+        assert!(matches!(reader.next(), Some(Err(Error::Protocol(_)))));
+    }
+
+    #[test]
+    fn sse_reader_rejects_long_lines_before_the_response_limit() {
+        let input = format!("data: {}", "x".repeat(256));
+        let mut reader = SseReader::with_limits(Cursor::new(input), 16, 1024);
+        let error = reader.next().expect("long line should yield an error");
+        assert!(matches!(error, Err(Error::Protocol(message)) if message.contains("SSE line")));
+    }
+
+    #[test]
+    fn sse_reader_checks_cancellation_inside_an_unterminated_line() {
+        struct CancelAfterChunk {
+            token: crate::cancellation::CancellationToken,
+            chunks: usize,
+        }
+        impl Read for CancelAfterChunk {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.chunks == 1 {
+                    self.token.cancel();
+                }
+                self.chunks += 1;
+                let bytes = b"data: part";
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+        let token = crate::cancellation::CancellationToken::default();
+        crate::cancellation::scope(&token, || {
+            let source = std::io::BufReader::new(CancelAfterChunk {
+                token: token.clone(),
+                chunks: 0,
+            });
+            let mut reader = SseReader::with_limits(source, 1024, 4096);
+            assert!(matches!(reader.next(), Some(Err(Error::Interrupted))));
+        });
     }
 
     #[test]
