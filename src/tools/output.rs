@@ -32,7 +32,7 @@ pub(super) fn prepare(directory: &Path, content: &mut String) {
     );
 }
 
-fn save(directory: &Path, content: &str) -> std::io::Result<std::path::PathBuf> {
+pub(super) fn save(directory: &Path, content: &str) -> std::io::Result<std::path::PathBuf> {
     fs::create_dir_all(directory)?;
     let directory = fs::canonicalize(directory)?;
     let timestamp = std::time::SystemTime::now()

@@ -334,6 +334,12 @@ impl Registry {
             .any(|entry| matches!(&entry.imp, ToolImpl::WebSearch | ToolImpl::WebFetch))
     }
 
+    pub(crate) fn has_subagent_tools(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(&entry.imp, ToolImpl::Subagent(_)))
+    }
+
     /// Name, description, and origin for `/tools` and `--list-tools`.
     pub fn describe_all(&self) -> Vec<(String, String, String)> {
         self.entries
@@ -430,11 +436,11 @@ impl Registry {
                 orchestration::execute(self.subagents.as_ref(), *tool, &args)
             }
         };
-        let save_output = matches!(
-            entry.imp,
-            ToolImpl::Exec(_) | ToolImpl::WebFetch | ToolImpl::PlanningShell
-        ) || (matches!(entry.imp, ToolImpl::Shell)
-            && args.get("background").and_then(Value::as_bool) != Some(true));
+        // `web_fetch` returns up to its configured limit inline and saves
+        // longer pages itself.
+        let save_output = matches!(entry.imp, ToolImpl::Exec(_) | ToolImpl::PlanningShell)
+            || (matches!(entry.imp, ToolImpl::Shell)
+                && args.get("background").and_then(Value::as_bool) != Some(true));
         if save_output {
             output::prepare(&self.output_directory, &mut outcome.content);
         }
@@ -783,6 +789,7 @@ fi
         let mut cache = CatalogCache::default();
 
         let disabled = Registry::scan(&config, &mut cache);
+        assert!(!disabled.has_subagent_tools());
         assert!(
             disabled
                 .specs()
@@ -799,6 +806,7 @@ fi
         config.subagents = true;
         let manager = SubagentManager::new("session".into(), config.max_subagents);
         let enabled = Registry::scan_with_subagents(&config, &mut cache, manager, "test");
+        assert!(enabled.has_subagent_tools());
         let names = enabled
             .specs()
             .into_iter()
@@ -1004,9 +1012,11 @@ fi
         let broker = QuestionBroker::default();
         broker.enable();
         registry.advertise_user_input(broker);
+        assert!(registry.has_subagent_tools());
 
         registry.retain_for_planning();
         registry.advertise_plan_complete();
+        assert!(!registry.has_subagent_tools());
 
         let names = registry
             .specs()

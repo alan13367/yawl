@@ -128,6 +128,27 @@ impl CacheSlot {
                 spinner_tick,
             );
             changed_from = Some(changed_from.map_or(idx, |changed| changed.min(idx)));
+
+            // Notices raised mid-turn land after the in-flight entry and must
+            // show before that entry settles.
+            for (i, entry) in entries.iter().enumerate().skip(idx + 1) {
+                if self.entries[i].is_some() && transcript.running_tool_index() != Some(i) {
+                    continue;
+                }
+                let expanded =
+                    transcript.entry_expanded(i, entry_default_expanded(entry, tools_expanded));
+                self.entries[i] = render_entry(
+                    entry,
+                    self.width,
+                    expanded,
+                    hide_reasoning,
+                    self.image_support,
+                    self.accent_color,
+                    labels,
+                    spinner_tick,
+                );
+                changed_from = Some(changed_from.map_or(i, |changed| changed.min(i)));
+            }
         }
 
         if let Some(start) = changed_from {

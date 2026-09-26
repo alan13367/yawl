@@ -149,6 +149,7 @@ pub(super) fn render_labeled(
             expanded,
         )
     };
+    let call_rows = lines.len();
 
     if let Some(details) = background_details {
         lines.push(ToolLine::new("", Tone::Output));
@@ -194,28 +195,30 @@ pub(super) fn render_labeled(
         };
         let output = readable.as_deref().unwrap_or(output);
         let output_lines = text_lines(output, if is_error { Tone::Error } else { Tone::Output });
-        let keep_tail = name == "shell";
         lines.extend(preview_lines(
             output_lines,
             OUTPUT_PREVIEW_LINES,
             expanded,
-            keep_tail,
+            false,
         ));
     }
 
     if name == "shell" {
         // Command and output previews share one hint at the bottom of the card.
         let mut hints = Vec::new();
+        let mut output_truncated = false;
+        let mut row = 0;
         lines.retain(|line| {
-            if line.tone == Tone::Muted && line.text.contains("Ctrl+O or click to ") {
+            let is_hint = line.tone == Tone::Muted && line.text.contains("Ctrl+O or click to ");
+            if is_hint {
+                output_truncated |= row >= call_rows;
                 hints.push(line.text.clone());
-                false
-            } else {
-                true
             }
+            row += 1;
+            !is_hint
         });
         if let Some(hint) = hints.pop() {
-            let hint = if expanded || (hints.is_empty() && hint.contains("earlier lines")) {
+            let hint = if expanded || (hints.is_empty() && output_truncated) {
                 hint
             } else {
                 "... Ctrl+O or click to expand".to_string()
@@ -343,13 +346,17 @@ fn render_call(
             ),
             Tone::Header,
         )],
-        "read_file" => vec![ToolLine::new(
-            format!(
-                "read {}{status}",
-                display_path(string_arg(args, "path").unwrap_or("?"))
-            ),
-            Tone::Header,
-        )],
+        "read_file" => {
+            let path = display_path(string_arg(args, "path").unwrap_or("?"));
+            let from = args
+                .and_then(|args| args.get("start_line"))
+                .and_then(Value::as_u64)
+                .map_or_else(String::new, |line| format!(" from line {line}"));
+            vec![ToolLine::new(
+                format!("read {path}{from}{status}"),
+                Tone::Header,
+            )]
+        }
         "read_skill" => vec![ToolLine::new(
             format!("Skill {}{status}", string_arg(args, "name").unwrap_or("?")),
             Tone::Header,
@@ -384,7 +391,15 @@ fn render_call(
         }
         "edit_file" => {
             let path = display_path(string_arg(args, "path").unwrap_or("?"));
-            let mut call = vec![ToolLine::new(format!("edit {path}{status}"), Tone::Header)];
+            let all = if bool_arg(args, "replace_all") == Some(true) {
+                " (all occurrences)"
+            } else {
+                ""
+            };
+            let mut call = vec![ToolLine::new(
+                format!("edit {path}{all}{status}"),
+                Tone::Header,
+            )];
             let old = string_arg(args, "old_string");
             let new = string_arg(args, "new_string");
             if old.is_some() || new.is_some() {
@@ -1013,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_shell_preview_keeps_the_tail() {
+    fn compact_shell_preview_keeps_the_head() {
         let output = (1..=20)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
@@ -1029,13 +1044,15 @@ mod tests {
             false,
         );
         let plain = markdown::strip_ansi(&rendered.join("\n"));
-        assert!(plain.contains("10 earlier lines"));
-        assert!(!plain.contains("line 1 "));
-        assert!(plain.contains("line 20"));
+        assert!(plain.contains("10 more lines"));
+        assert!(plain.contains("line 1\n") || plain.contains("line 1 "));
+        assert!(plain.contains("line 10"));
+        assert!(!plain.contains("line 11"));
+        assert!(!plain.contains("line 20"));
     }
 
     #[test]
-    fn shell_output_preview_places_expand_hint_after_the_tail() {
+    fn shell_output_preview_places_expand_hint_after_the_head() {
         let output = (1..=20)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
@@ -1051,7 +1068,7 @@ mod tests {
             false,
         );
         let plain = markdown::strip_ansi(&rendered.join("\n"));
-        assert!(plain.find("line 20").unwrap() < plain.find("click to expand").unwrap());
+        assert!(plain.find("line 10").unwrap() < plain.find("click to expand").unwrap());
     }
 
     #[test]
@@ -1093,10 +1110,11 @@ mod tests {
 
         assert!(compact.contains("command-12"));
         assert!(!compact.contains("command-25"));
-        assert!(compact.contains("result-20"));
-        assert!(!compact.contains("result-1 "));
+        assert!(compact.contains("result-1 ") || compact.contains("result-1\n"));
+        assert!(compact.contains("result-10"));
+        assert!(!compact.contains("result-20"));
         assert_eq!(compact.matches("click to expand").count(), 1);
-        assert!(compact.find("result-20").unwrap() < compact.find("click to expand").unwrap());
+        assert!(compact.find("result-10").unwrap() < compact.find("click to expand").unwrap());
         assert!(expanded.contains("command-25"));
         assert!(expanded.contains("result-1"));
         assert_eq!(expanded.matches("click to collapse").count(), 1);
@@ -1151,8 +1169,8 @@ mod tests {
             .take_while(|line| !line.trim().is_empty())
             .collect::<Vec<_>>();
         assert_eq!(compact_call, expanded_call);
-        assert!(!compact.contains("line 1 "));
-        assert!(expanded.contains("line 1 "));
+        assert!(!compact.contains("line 20"));
+        assert!(expanded.contains("line 20"));
     }
 
     #[test]

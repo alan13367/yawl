@@ -345,7 +345,7 @@ mod tests {
             "orchestration schemas should stay compact; got {orchestration_chars} bytes"
         );
         let spawn = specs
-            .into_iter()
+            .iter()
             .find(|spec| spec.name == "subagent_spawn")
             .expect("spawn tool present");
         assert!(
@@ -356,6 +356,25 @@ mod tests {
             spawn.description
         );
         assert!(spawn.description.contains("# Target"));
+        assert!(
+            spawn
+                .description
+                .contains("Set model only when the user explicitly requests a listed model")
+        );
+        let wait = specs
+            .iter()
+            .find(|spec| spec.name == "subagent_wait")
+            .expect("wait tool present");
+        assert!(wait.description.contains("Omit timeout_secs to block"));
+        let cancel = specs
+            .iter()
+            .find(|spec| spec.name == "subagent_cancel")
+            .expect("cancel tool present");
+        assert!(
+            cancel
+                .description
+                .contains("Use only when the work is no longer needed")
+        );
         let required = spawn.input_schema.get("required").expect("required list");
         assert_eq!(
             required,

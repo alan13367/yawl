@@ -1837,7 +1837,7 @@ fn fresh_tool_output_triggers_compaction_even_when_reported_usage_was_low() {
         .context_windows
         .insert("test".into(), 20_000);
     let path = test.root.join("large.txt");
-    std::fs::write(&path, "x".repeat(60_000)).unwrap();
+    std::fs::write(&path, "x".repeat(56_000)).unwrap();
     for _ in 0..12 {
         test.agent
             .append_input_message(Message::user("old history"))

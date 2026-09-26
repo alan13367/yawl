@@ -15,7 +15,7 @@ const FOLLOW_UP_GRACE: Duration = Duration::from_secs(30);
 pub(super) fn entry(broker: QuestionBroker) -> ToolEntry {
     ToolEntry::new(ToolSpec {
             name: TOOL_NAME.into(),
-            description: "Ask the user one to three multiple-choice questions. Each question needs 2 or 3 options and one recommended option. Yawl adds an open-answer choice automatically; custom replies have a null option_index and their text in answer. Set the recommendation with the recommended index; do not add '(Recommended)' to an option label. This must be the only tool call in its step. If the result says timed_out, do not ask again in this turn.".into(),
+            description: "Ask the user one to three multiple-choice questions. Each question needs 2 or 3 options and one recommended option. Yawl adds an open-answer choice automatically; custom replies have a null option_index and their text in answer. Set the recommendation with the recommended index; do not add '(Recommended)' to an option label. This must be the only tool call in its step. If the result says timed_out, the user is away: proceed with the returned defaults and do not ask again in this turn.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -519,6 +519,13 @@ mod tests {
                 recommended: 1,
             })
             .collect()
+    }
+
+    #[test]
+    fn description_carries_the_single_call_and_timeout_rules() {
+        let description = entry(QuestionBroker::default()).spec.description.clone();
+        assert!(description.contains("only tool call in its step"));
+        assert!(description.contains("proceed with the returned defaults and do not ask again"));
     }
 
     #[test]

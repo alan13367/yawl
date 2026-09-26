@@ -475,7 +475,7 @@ impl Conversation {
             let system = match &self.kind {
                 ConversationKind::Persistent(state) => crate::prompt::build_system_prompt(
                     &self.config.home_dir,
-                    self.config.subagents,
+                    registry.has_subagent_tools(),
                     self.print_mode,
                     registry.has_web_tools(),
                     registry.skills(),
@@ -484,7 +484,6 @@ impl Conversation {
                             .then_some(state.session.active_goal())
                             .flatten(),
                         plan: plan_prompt(state.session.active_plan(), plan_path.as_deref(), mode),
-                        interactive_questions: self.questions.is_enabled(),
                         init: mode == TurnMode::Init,
                     },
                 ),
@@ -1146,14 +1145,13 @@ impl Conversation {
         let system = match &self.kind {
             ConversationKind::Persistent(state) => crate::prompt::build_system_prompt(
                 &self.config.home_dir,
-                self.config.subagents,
+                registry.has_subagent_tools(),
                 self.print_mode,
                 registry.has_web_tools(),
                 registry.skills(),
                 crate::prompt::MainPromptState {
                     goal: state.session.active_goal(),
                     plan: plan_path.as_deref().map(crate::prompt::PlanPrompt::Active),
-                    interactive_questions: self.questions.is_enabled(),
                     init: false,
                 },
             ),

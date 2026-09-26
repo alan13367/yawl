@@ -436,6 +436,24 @@ fn reasoning_collapses_to_a_single_tinted_tag_by_default() {
 }
 
 #[test]
+fn notices_raised_while_reasoning_streams_are_visible_immediately() {
+    let mut state = empty_session_state();
+    let editor = Editor::default();
+    state.apply(Update::Transcript(TranscriptEvent::ReasoningDelta {
+        kind: ReasoningKind::Summary,
+        text: "**Inspecting the request**".into(),
+    }));
+    let _ = build_frame(&mut state, &editor, 80, 20);
+
+    state.notice("Could not paste image: the selected model does not accept image input.");
+    let (frame, _) = build_frame(&mut state, &editor, 80, 20);
+
+    let plain = markdown::strip_ansi(&frame.join("\n"));
+    assert!(plain.contains("Thinking"), "{plain}");
+    assert!(plain.contains("Could not paste image"), "{plain}");
+}
+
+#[test]
 fn clicked_codex_reasoning_streams_the_paragraph_after_its_headline() {
     let mut state = empty_session_state();
     let editor = Editor::default();

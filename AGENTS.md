@@ -45,13 +45,15 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tools/catalog.rs`: per-scan caches for builtin entries, skills, and subagent presets
 - `src/tools/output.rs`: bounded excerpts and saved artifacts for verbose command and web output
 - `src/tools/shell.rs`: foreground/background shell schemas and execution
-- `src/tools/files.rs`: bounded file reads/writes/edits plus native listing, literal text search, and paged UTF-8 reads
+- `src/tools/files.rs`: native file-tool facade with shared argument, cancellation, and no-follow open helpers
+- `src/tools/files/read.rs`, `files/write.rs`, `files/discovery.rs`: `read_file` whole, line-page, byte-page, and image reads; `write_file` and `edit_file`; restricted-child `list_files` and `search_files`. `files/test_support.rs` holds shared test fixtures
 - `src/tools/git.rs`: fixed read-only Git inspection for restricted children
 - `src/tools/mode.rs`: goal and plan single-call mode entries
 - `src/tools/orchestration.rs`: subagent spawn/send/wait/cancel/list entries and dispatch
 - `src/tools/skills.rs`: `read_skill` entry and execution
-- `src/tools/exec.rs`, `src/tools/planning_shell.rs`, `src/tools/user_input.rs`, `src/tools/web.rs`: exec-tool contract, gated planning inspection, interactive question broker, plus web search/fetch request execution and provider parsing
-- `src/tools/web/html.rs`: HTML-to-Markdown extraction with bounded concurrency
+- `src/tools/exec.rs`, `src/tools/planning_shell.rs`, `src/tools/user_input.rs`: exec-tool contract, gated planning inspection, and interactive question broker
+- `src/tools/web.rs`: web tool facade with the shared HTTP agent, bounded body reads, cancellation, and untrusted-content delimiters
+- `src/tools/web/search.rs`, `web/fetch.rs`, `web/html.rs`: DuckDuckGo, Brave, and Firecrawl search backends; page fetch with inline limits and saved full pages; HTML-to-Markdown extraction with bounded concurrency. `web/test_support.rs` holds local HTTP test fixtures
 - `src/subagent/manager.rs`: subagent capacity, execution, waiting, and delivery facade
 - `src/subagent/manager/capacity.rs`, `manager/execution.rs`, `manager/waiting.rs`, `manager/delivery.rs`, `manager/validation.rs`: admission and queueing, worker threads, blocking observers, deferred results, and input validation
 - `src/subagent/manager/format.rs`: snapshot and deferred-result presentation
@@ -79,7 +81,7 @@ Run `cargo fmt --all` after editing Rust. After making code changes, run `cargo 
 ## Code rules
 
 - Follow existing module boundaries and Rust naming conventions. Organize by responsibility, not by file size alone.
-- Keep `main.rs`, `agent.rs`, `provider/mod.rs`, `config.rs`, `tui/mod.rs`, `tui/git.rs`, `tui/picker.rs`, `tui/commands.rs`, `tui/render.rs`, `tui/tool_view.rs`, `tools/mod.rs`, `tools/web.rs`, `subagent/manager.rs`, `onboarding.rs`, and `doctor.rs` as facades. Put implementation in their private child modules.
+- Keep `main.rs`, `agent.rs`, `provider/mod.rs`, `config.rs`, `tui/mod.rs`, `tui/git.rs`, `tui/picker.rs`, `tui/commands.rs`, `tui/render.rs`, `tui/tool_view.rs`, `tools/mod.rs`, `tools/files.rs`, `tools/web.rs`, `subagent/manager.rs`, `onboarding.rs`, and `doctor.rs` as facades. Put implementation in their private child modules.
 - Preserve established public paths when moving code. Re-export from the facade instead of forcing callers to follow the internal layout.
 - Prefer sibling visibility through `pub(super)` over widening internal APIs to `pub(crate)` or `pub`.
 - Prefer the standard library over a new dependency. Commit `Cargo.lock` when dependencies change.
