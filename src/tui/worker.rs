@@ -17,9 +17,10 @@ use super::events::{Event, EventReader, Key, MouseEvent, MouseKind};
 use super::input::{EditAction, Editor, Submission};
 use super::picker::{
     ActivePickers, PickerAction, SettingsCategory, SettingsItem, SettingsLocation,
-    open_model_picker_from_config, picker_is_editing, poll_model_picker,
-    reasoning_picker_from_config, select_picker_item, settings_item_index,
-    status_bar_editor_picker, sync_color_preview, take_picker_action, web_search_provider_picker,
+    open_model_picker_from_config, open_subagent_model_picker, picker_is_editing,
+    poll_model_picker, reasoning_picker_from_config, remove_model_confirm, select_picker_item,
+    settings_item_index, status_bar_editor_picker, sync_color_preview, take_picker_action,
+    web_search_provider_picker,
 };
 use super::state::{
     COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, handle_tool_click,
@@ -438,9 +439,8 @@ pub(super) fn pump_events<R: Read, T>(
                                         editor.restore_submission(input);
                                         continue;
                                     }
-                                    let displayed = super::displayed_submission(editor, &input);
                                     let mut input = input;
-                                    input.set_text(displayed);
+                                    editor.expand_pastes_in_submission(&mut input);
                                     handle_submission_while_busy(
                                         input,
                                         state,
@@ -631,14 +631,12 @@ fn handle_steering_while_busy(
         state.notice(
             "Commands cannot be sent as steering. They stay queued or run as usual with Enter.",
         );
-        let displayed = super::displayed_submission(editor, &input);
         let mut input = input;
-        input.set_text(displayed);
+        editor.expand_pastes_in_submission(&mut input);
         state.queued_inputs.push_back(input);
         state.scroll_offset = 0;
         return Ok(());
     }
-    let displayed = super::displayed_submission(editor, &input);
     let agent_text = editor.expand_submission(&input.text);
     let agent_input = match input.turn_input(agent_text) {
         Ok(input) => input,
@@ -657,7 +655,7 @@ fn handle_steering_while_busy(
     }
     steers.push(agent_input);
     let mut pending = input;
-    pending.set_text(displayed);
+    editor.expand_pastes_in_submission(&mut pending);
     state.pending_steers.push_back(pending);
     state.scroll_offset = 0;
     Ok(())
@@ -809,6 +807,7 @@ pub(super) fn activate_picker_action_while_busy(
         Ok(None) => {}
     }
     match action {
+        PickerAction::OpenSubagentModels => open_subagent_model_picker(active_config, state),
         PickerAction::OpenModels { save: true } => {
             let selected_model = active_config
                 .model
@@ -821,6 +820,20 @@ pub(super) fn activate_picker_action_while_busy(
             let selected_model = state.model.clone();
             open_model_picker_from_config(active_config, &selected_model, state, false);
         }
+        PickerAction::ReturnToModels { save, selected } => {
+            open_busy_model_picker(active_config, state, save, selected);
+        }
+        PickerAction::ConfirmRemoveModel {
+            model,
+            save,
+            selected,
+        } => match remove_model_confirm(active_config, &model, save, selected) {
+            Ok(picker) => state.picker = Some(picker),
+            Err(message) => {
+                state.notice(message);
+                open_busy_model_picker(active_config, state, save, selected);
+            }
+        },
         PickerAction::OpenReasoning { save: true } => {
             state.picker = Some(active_pickers.default_reasoning.clone());
         }
@@ -879,6 +892,16 @@ pub(super) fn activate_picker_action_while_busy(
             state.activity = "change queued until the active response finishes".into();
         }
     }
+}
+
+fn open_busy_model_picker(config: &Config, state: &mut ViewState, save: bool, selected: usize) {
+    let selected_model = if save {
+        config.model.as_deref().unwrap_or(&state.model).to_string()
+    } else {
+        state.model.clone()
+    };
+    open_model_picker_from_config(config, &selected_model, state, save);
+    select_picker_item(state, selected);
 }
 
 fn handle_status_bar_action_while_busy(

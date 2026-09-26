@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::config::UiColor;
 
+use super::super::tool_view::SubagentLabel;
 use super::ImageSupport;
 use super::entries::{RenderedEntry, entry_default_expanded, render_entry};
 
@@ -67,7 +68,7 @@ impl CacheSlot {
         transcript: &super::super::transcript::Transcript,
         tools_expanded: bool,
         hide_reasoning: bool,
-        labels: &[(&str, &str)],
+        labels: &[SubagentLabel],
         spinner_tick: usize,
     ) {
         let entries = transcript.entries();
@@ -242,7 +243,7 @@ impl RenderCache {
         &'a mut self,
         transcript: &super::super::transcript::Transcript,
         settings: RenderSettings,
-        labels: &[(&str, &str)],
+        labels: &[SubagentLabel],
         spinner_tick: usize,
     ) -> &'a CacheSlot {
         let slot_idx = self

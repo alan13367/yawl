@@ -359,6 +359,76 @@ fn display_settings_apply_during_an_active_turn() {
     );
     assert!(!config.providers.contains_key("new-provider"));
 
+    state.pending_actions.clear();
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::OpenSubagentModels,
+        &mut active_pickers,
+        &mut config,
+    );
+    assert_eq!(
+        state.picker.as_ref().expect("subagent model picker").title,
+        "Default subagent model"
+    );
+    let save = PickerAction::ApplySetting {
+        argument: "subagent_model local:queued".into(),
+        location: Some(super::picker::SettingsLocation {
+            category: SettingsCategory::Subagents,
+            item: SettingsItem::SubagentModel,
+        }),
+    };
+    activate_picker_action_while_busy(&mut state, save, &mut active_pickers, &mut config);
+    assert_eq!(
+        config.subagent_model, "inherit",
+        "busy turn must keep its model"
+    );
+    assert!(
+        matches!(state.pending_actions.front(), Some(PickerAction::ApplySetting { argument, .. }) if argument == "subagent_model local:queued")
+    );
+
+    state.pending_actions.clear();
+    config.providers.insert(
+        "local".into(),
+        crate::config::ProviderConfig {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            api: "openai-completions".into(),
+            api_key: None,
+            auth_header: None,
+            headers: Default::default(),
+            models: vec![crate::config::ModelConfig {
+                id: "busy".into(),
+                name: None,
+                context_window: None,
+                max_tokens: None,
+                input: Vec::new(),
+                reasoning_efforts: Vec::new(),
+                compat: Default::default(),
+            }],
+            compat: Default::default(),
+        },
+    );
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::ConfirmRemoveModel {
+            model: "local:busy".into(),
+            save: false,
+            selected: 0,
+        },
+        &mut active_pickers,
+        &mut config,
+    );
+    assert_eq!(
+        state.picker.as_ref().expect("removal confirmation").title,
+        "Remove model?"
+    );
+    let remove = state.picker.as_ref().unwrap().items[1].action.clone();
+    activate_picker_action_while_busy(&mut state, remove, &mut active_pickers, &mut config);
+    assert_eq!(config.providers["local"].models.len(), 1);
+    assert!(matches!(
+        state.pending_actions.front(),
+        Some(PickerAction::RemoveModel { model, .. }) if model == "local:busy"
+    ));
+
     let _ = std::fs::remove_dir_all(root);
 }
 

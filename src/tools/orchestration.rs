@@ -74,8 +74,9 @@ pub(super) fn entries(presets: &[AgentPreset]) -> Vec<ToolEntry> {
     let spawn_description = format!(
         "Start a background subagent and return its ID. Prompt contract: # Target (paths, \
          ownership, non-goals), # Change, # Acceptance. Declare all required tools; omit agent for \
-         writes, commands, or unsupported tools. scout is read-only. Never set a model. Agents: \
-         {available_agents}."
+         writes, commands, or unsupported tools. scout is read-only. Set model only when the \
+         user explicitly requests a listed model; it overrides preset and default models. \
+         Agents: {available_agents}."
     );
     vec![
         tool(
@@ -92,6 +93,10 @@ pub(super) fn entries(presets: &[AgentPreset]) -> Vec<ToolEntry> {
                         "description": "All tools the child needs; [] only for a tool-free answer."
                     },
                     "name": {"type": "string"},
+                    "model": {
+                        "type": "string",
+                        "description": "Optional provider:model ID the user explicitly requested."
+                    },
                     "agent": {
                         "type": "string",
                         "enum": agent_names,
@@ -104,12 +109,13 @@ pub(super) fn entries(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         ),
         tool(
             "subagent_send",
-            "Send another turn to a subagent; restart it if settled.",
+            "Steer child; queue=true adds a turn; restart if settled.",
             json!({
                 "type": "object",
                 "properties": {
                     "id": {"type": "string"},
-                    "message": {"type": "string"}
+                    "message": {"type": "string"},
+                    "queue": {"type": "boolean"}
                 },
                 "required": ["id", "message"]
             }),
@@ -203,11 +209,13 @@ pub(super) fn execute(
     };
     let result = match tool {
         SubagentTool::Spawn => {
-            if args.get("model").is_some() {
-                return ToolOutcome::error(
-                    "'model' is not accepted; subagents use the configured model or inherit the active parent model",
-                );
-            }
+            let model = match args.get("model") {
+                Some(value) => value
+                    .as_str()
+                    .map(Some)
+                    .ok_or_else(|| "'model' must be a string when provided".to_string()),
+                None => Ok(None),
+            };
             let prompt = str_arg(args, "prompt").map_err(|error| error.content);
             let required_tools = string_array(args, "required_tools");
             let name = match args.get("name") {
@@ -220,6 +228,7 @@ pub(super) fn execute(
             prompt.and_then(|prompt| {
                 required_tools.and_then(|required_tools| {
                     name.and_then(|name| {
+                        let model = model?;
                         let preset: Option<&AgentPreset> = match args.get("agent") {
                             Some(value) => {
                                 let agent = value.as_str().ok_or_else(|| {
@@ -251,12 +260,13 @@ pub(super) fn execute(
                         let supplied_name = (!name.trim().is_empty()).then_some(name.as_str());
                         context
                             .manager
-                            .spawn(
+                            .spawn_with_model(
                                 context.config.clone(),
                                 &context.parent_model,
                                 supplied_name,
                                 prompt,
                                 preset,
+                                model,
                             )
                             .map(|id| format!("started {id}"))
                     })
@@ -266,8 +276,24 @@ pub(super) fn execute(
         SubagentTool::Send => {
             let id = str_arg(args, "id").map_err(|error| error.content);
             let message = str_arg(args, "message").map_err(|error| error.content);
+            let queue = match args.get("queue") {
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| "'queue' must be a boolean".to_string()),
+                None => Ok(false),
+            };
             id.and_then(|id| {
-                message.and_then(|message| context.manager.send(id, message, RunOrigin::Model))
+                message.and_then(|message| {
+                    queue.and_then(|queue| {
+                        if queue {
+                            context.manager.send(id, message, RunOrigin::Model)
+                        } else {
+                            context
+                                .manager
+                                .steer_with_origin(id, message, RunOrigin::Model)
+                        }
+                    })
+                })
             })
         }
         SubagentTool::Wait => string_array(args, "ids").and_then(|ids| {
@@ -348,8 +374,8 @@ mod tests {
         assert!(properties.get("agent").is_some());
         assert!(properties.get("required_tools").is_some());
         assert!(
-            properties.get("model").is_none(),
-            "the orchestrator must not override the configured child model"
+            properties["model"].get("enum").is_none(),
+            "the model catalog must not churn the tool schema"
         );
         assert!(
             properties["agent"]["description"]
@@ -359,7 +385,189 @@ mod tests {
     }
 
     #[test]
-    fn spawn_rejects_model_overrides_from_the_orchestrator() {
+    fn send_tool_advertises_optional_queue_mode() {
+        let send = entries(&[])
+            .into_iter()
+            .find(|entry| entry.spec.name == "subagent_send")
+            .expect("send tool");
+        assert!(send.spec.description.contains("Steer child"));
+        assert_eq!(
+            send.spec.input_schema["properties"]["queue"]["type"],
+            "boolean"
+        );
+        assert_eq!(send.spec.input_schema["required"], json!(["id", "message"]));
+    }
+
+    #[test]
+    fn send_steers_a_running_child_unless_queue_is_requested() {
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let mut config = crate::config::Config::test_default();
+        config.providers.insert(
+            "local".into(),
+            crate::config::ProviderConfig {
+                base_url: format!("http://{}/v1", listener.local_addr().expect("address")),
+                api: "openai-completions".into(),
+                api_key: None,
+                auth_header: Some(false),
+                headers: Default::default(),
+                models: Vec::new(),
+                compat: Default::default(),
+            },
+        );
+        let manager = SubagentManager::new("session".into(), 1);
+        let id = manager
+            .spawn(config.clone(), "local:model", None, "initial task", None)
+            .expect("spawn");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let connection = loop {
+            match listener.accept() {
+                Ok((connection, _)) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "child did not connect");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("provider connection: {error}"),
+            }
+        };
+        let context = SubagentContext {
+            manager: manager.clone(),
+            config,
+            parent_model: "local:model".into(),
+            presets: Vec::new(),
+        };
+        let default = execute(
+            Some(&context),
+            SubagentTool::Send,
+            &json!({"id": id.as_str(), "message": "finish with a summary"}),
+        );
+        let queued = execute(
+            Some(&context),
+            SubagentTool::Send,
+            &json!({"id": id.as_str(), "message": "another turn", "queue": true}),
+        );
+        let snapshot = manager.snapshots().pop().expect("child snapshot");
+        assert!(!default.is_error, "{}", default.content);
+        assert_eq!(default.content, format!("steering {id}"));
+        assert!(!queued.is_error, "{}", queued.content);
+        assert_eq!(queued.content, format!("queued message for {id}"));
+        assert_eq!(snapshot.pending_steers, ["finish with a summary"]);
+        assert_eq!(snapshot.queued_messages.len(), 1);
+        assert_eq!(snapshot.queued_messages[0].text, "another turn");
+        let invalid = execute(
+            Some(&context),
+            SubagentTool::Send,
+            &json!({"id": id.as_str(), "message": "ignored", "queue": "yes"}),
+        );
+        assert!(invalid.is_error);
+        assert!(invalid.content.contains("'queue' must be a boolean"));
+        drop(connection);
+        drop(listener);
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn sending_to_a_settled_child_restarts_a_model_originated_run() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let mut config = crate::config::Config::test_default();
+        config.providers.insert(
+            "local".into(),
+            crate::config::ProviderConfig {
+                base_url: format!("http://{}/v1", listener.local_addr().expect("address")),
+                api: "openai-completions".into(),
+                api_key: None,
+                auth_header: Some(false),
+                headers: Default::default(),
+                models: Vec::new(),
+                compat: Default::default(),
+            },
+        );
+        let server = std::thread::spawn(move || {
+            for answer in ["first", "follow-up"] {
+                let (mut stream, _) = listener.accept().expect("provider connection");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).expect("provider request");
+                    assert!(read > 0, "request closed before body");
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(header_end) =
+                        request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= header_end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let body = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{answer}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("provider response");
+                stream.flush().expect("flush provider response");
+            }
+        });
+        let manager = SubagentManager::new("session".into(), 1);
+        let id = manager
+            .spawn(config.clone(), "local:model", None, "initial task", None)
+            .expect("spawn");
+        assert!(manager.wait_all(5), "initial run should settle");
+        manager.drain_deferred();
+        let context = SubagentContext {
+            manager: manager.clone(),
+            config,
+            parent_model: "local:model".into(),
+            presets: Vec::new(),
+        };
+        let sent = execute(
+            Some(&context),
+            SubagentTool::Send,
+            &json!({"id": id.as_str(), "message": "finish the follow-up"}),
+        );
+        assert!(!sent.is_error, "{}", sent.content);
+        assert_eq!(sent.content, format!("restarted {id}"));
+        assert!(manager.wait_all(5), "follow-up should settle");
+        let deliveries = manager.drain_deferred();
+        assert_eq!(deliveries.len(), 1, "model follow-up must be delivered");
+        assert!(
+            deliveries[0].result.contains("follow-up"),
+            "unexpected model follow-up delivery: {:?}; error: {:?}; snapshots: {:?}",
+            deliveries[0].result,
+            deliveries[0].error,
+            manager.snapshots()
+        );
+        server.join().expect("server");
+        manager.shutdown_and_discard();
+    }
+
+    #[test]
+    fn spawn_rejects_unlisted_model_overrides() {
         let presets = bundled();
         let context = SubagentContext {
             manager: crate::subagent::SubagentManager::new("session".into(), 1),
@@ -375,10 +583,21 @@ mod tests {
         let outcome = execute(Some(&context), SubagentTool::Spawn, &args);
         assert!(outcome.is_error, "unexpected outcome: {}", outcome.content);
         assert!(
-            outcome.content.contains("not accepted"),
+            outcome.content.contains("not in the available model list")
+                && outcome.content.contains("available: none"),
             "{}",
             outcome.content
         );
+        let non_string = execute(
+            Some(&context),
+            SubagentTool::Spawn,
+            &serde_json::json!({
+                "prompt": "Inspect the requested file.",
+                "required_tools": ["read_file"],
+                "model": 7
+            }),
+        );
+        assert!(non_string.content.contains("'model' must be a string"));
         context.manager.shutdown_and_discard();
     }
 }

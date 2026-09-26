@@ -20,6 +20,7 @@ impl SubagentManager {
         self.lock().limit = limit.clamp(1, 16);
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn(
         &self,
         config: Config,
@@ -27,6 +28,18 @@ impl SubagentManager {
         name: Option<&str>,
         prompt: &str,
         preset: Option<&AgentPreset>,
+    ) -> Result<SubagentId, String> {
+        self.spawn_with_model(config, parent_model, name, prompt, preset, None)
+    }
+
+    pub(crate) fn spawn_with_model(
+        &self,
+        config: Config,
+        parent_model: &str,
+        name: Option<&str>,
+        prompt: &str,
+        preset: Option<&AgentPreset>,
+        explicit_model: Option<&str>,
     ) -> Result<SubagentId, String> {
         let supplied_name = match name.map(str::trim) {
             Some(name) if !name.is_empty() => Some(validate_name(name)?),
@@ -37,7 +50,7 @@ impl SubagentManager {
             .and_then(|preset| preset.model.as_deref())
             .map(str::trim)
             .filter(|model| !model.is_empty() && *model != "inherit");
-        let model = resolve_model(&config, parent_model, preset_model)?;
+        let model = resolve_model(&config, parent_model, preset_model, explicit_model)?;
 
         let (id, conversation, work) = {
             let mut state = self.lock();
@@ -118,6 +131,8 @@ impl SubagentManager {
                 pending_delivery: Vec::new(),
                 suppress_delivery: false,
                 steers,
+                steer_origins: VecDeque::new(),
+                model_steer_accepted: false,
             });
             (id, conversation, work)
         };
@@ -126,6 +141,15 @@ impl SubagentManager {
     }
 
     pub(crate) fn steer(&self, id: &str, message: &str) -> Result<String, String> {
+        self.steer_with_origin(id, message, RunOrigin::PrivateUser)
+    }
+
+    pub(crate) fn steer_with_origin(
+        &self,
+        id: &str,
+        message: &str,
+        origin: RunOrigin,
+    ) -> Result<String, String> {
         let message = validate_message(message, "message")?;
         let (enqueue, send_instead) = {
             let mut state = self.lock();
@@ -146,6 +170,7 @@ impl SubagentManager {
                     images: Vec::new(),
                 });
                 entry.snapshot.pending_steers.push(message.clone());
+                entry.steer_origins.push_back(origin);
                 self.shared.changed.notify_all();
                 (true, false)
             } else {
@@ -153,7 +178,7 @@ impl SubagentManager {
             }
         };
         if send_instead {
-            return self.send(id, &message, RunOrigin::PrivateUser);
+            return self.send(id, &message, origin);
         }
         let _ = enqueue;
         Ok(format!("steering {id}"))

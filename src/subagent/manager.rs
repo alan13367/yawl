@@ -60,6 +60,9 @@ struct Entry {
     pending_delivery: Vec<PendingDelivery>,
     suppress_delivery: bool,
     steers: crate::agent::SteerInbox,
+    steer_origins: VecDeque<RunOrigin>,
+    /// An accepted orchestrator steer makes this turn eligible for delivery.
+    model_steer_accepted: bool,
 }
 
 #[derive(Clone)]

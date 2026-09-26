@@ -256,7 +256,7 @@ fn render_item(state: &ViewState, item: &StatusBarItemConfig) -> Option<String> 
             "settings pending",
             LabelPosition::After,
         ),
-        StatusBarKind::ActiveSubagents => render_active_subagents(state, item),
+        StatusBarKind::ActiveSubagents => None,
         StatusBarKind::FailedSubagents => render_count(
             item,
             failed_subagent_count(state),
@@ -411,32 +411,6 @@ fn render_goal(state: &ViewState, item: &StatusBarItemConfig) -> Option<String> 
     } else {
         format!("{label}: {preview}")
     })
-}
-
-fn render_active_subagents(state: &ViewState, item: &StatusBarItemConfig) -> Option<String> {
-    let running = state
-        .subagent_snapshots
-        .iter()
-        .filter(|snapshot| snapshot.status.is_active())
-        .collect::<Vec<_>>();
-    if running.is_empty() && item.visibility == StatusBarVisibility::Auto {
-        return None;
-    }
-    let core = match (item.format, running.as_slice()) {
-        (_, []) => "0".into(),
-        (StatusBarFormat::Compact | StatusBarFormat::Current, [snapshot]) => snapshot.name.clone(),
-        (StatusBarFormat::Compact | StatusBarFormat::Current, many) => many.len().to_string(),
-        (StatusBarFormat::Detailed, [snapshot]) => format!("{} running", snapshot.name),
-        (StatusBarFormat::Detailed, many) => format!("{} running", many.len()),
-    };
-    let (builtin, position) = match item.format {
-        StatusBarFormat::Compact => (None, LabelPosition::After),
-        StatusBarFormat::Current if running.len() == 1 => (None, LabelPosition::After),
-        StatusBarFormat::Current => (Some("agents"), LabelPosition::After),
-        StatusBarFormat::Detailed if running.len() == 1 => (Some("agent"), LabelPosition::Before),
-        StatusBarFormat::Detailed => (Some("agents"), LabelPosition::After),
-    };
-    Some(labeled(item, builtin, position, &core))
 }
 
 fn failed_subagent_count(state: &ViewState) -> usize {

@@ -12,7 +12,7 @@ use crate::subagent::types::{
 };
 
 use super::capacity::prune_settled;
-use super::execution::apply_turn_event;
+use super::execution::{apply_turn_event, requeue_unaccepted_steers};
 use super::format::salvage_result;
 use super::validation::{resolve_model, validate_id_list, wait_timeout};
 use super::*;
@@ -67,6 +67,8 @@ fn test_entry(status: SubagentStatus) -> Entry {
         pending_delivery: Vec::new(),
         suppress_delivery: false,
         steers: crate::agent::SteerInbox::default(),
+        steer_origins: VecDeque::new(),
+        model_steer_accepted: false,
     }
 }
 
@@ -372,12 +374,12 @@ fn model_precedence_prefers_config_then_parent() {
     let mut config = provider_config("http://127.0.0.1:9/v1".into());
     config.subagent_model = "local:configured".into();
     assert_eq!(
-        resolve_model(&config, "local:parent", None).expect("configured model"),
+        resolve_model(&config, "local:parent", None, None).expect("configured model"),
         "local:configured"
     );
     config.subagent_model = "inherit".into();
     assert_eq!(
-        resolve_model(&config, "local:parent", None).expect("inherited model"),
+        resolve_model(&config, "local:parent", None, None).expect("inherited model"),
         "local:parent"
     );
 }
@@ -398,7 +400,7 @@ fn unresolvable_configured_models_are_rejected_at_spawn_time() {
         },
     );
     config.subagent_model = "broken:model".into();
-    let error = resolve_model(&config, "local:parent", None)
+    let error = resolve_model(&config, "local:parent", None, None)
         .expect_err("unusable provider models must fail fast");
     assert!(
         error.contains("'broken:model' is not usable"),
@@ -984,6 +986,8 @@ fn pruning_keeps_active_waited_and_undelivered_entries() {
             pending_delivery: Vec::new(),
             suppress_delivery: false,
             steers: crate::agent::SteerInbox::default(),
+            steer_origins: VecDeque::new(),
+            model_steer_accepted: false,
         });
     }
     state.deferred.push_back(DeferredResult {
@@ -1072,6 +1076,108 @@ fn late_wait_consumes_deferred_results_and_private_runs_stay_private() {
     assert!(!manager.has_deferred());
     server.join().expect("provider server should exit");
     manager.shutdown_and_discard();
+}
+
+#[test]
+fn accepted_model_steers_deliver_a_private_turn_once_without_queueing() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let config = provider_config(format!("http://{}/v1", listener.local_addr().unwrap()));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        for (index, response) in [
+            "initial",
+            "private partial",
+            "steered result",
+            "private again",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "provider request timed out");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = read_request(&mut stream).expect("request");
+            if index == 1 {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            if index == 2 {
+                assert!(request.contains("first model steer"));
+                assert!(request.contains("second model steer"));
+            }
+            write_response(&mut stream, response).expect("response");
+        }
+    });
+    let manager = SubagentManager::new("session".into(), 1);
+    let id = manager
+        .spawn(config, "local:model", None, "initial task", None)
+        .unwrap();
+    assert!(manager.wait_all(5));
+    manager.drain_deferred();
+    manager
+        .send(id.as_str(), "private task", RunOrigin::PrivateUser)
+        .unwrap();
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    for message in ["first model steer", "second model steer"] {
+        assert_eq!(
+            manager
+                .steer_with_origin(id.as_str(), message, RunOrigin::Model)
+                .unwrap(),
+            format!("steering {id}")
+        );
+    }
+    manager
+        .steer(id.as_str(), "private steer after model steers")
+        .unwrap();
+    assert!(manager.snapshots()[0].queued_messages.is_empty());
+    release_tx.send(()).unwrap();
+    assert!(manager.wait_all(5));
+    let snapshot = manager.snapshots().remove(0);
+    assert_eq!(
+        snapshot.completed_turns, 2,
+        "steers must not start another turn"
+    );
+    assert_eq!(
+        snapshot.origin,
+        RunOrigin::PrivateUser,
+        "keep the initiating origin"
+    );
+    assert!(snapshot.transcript.iter().any(|item| matches!(
+        item.as_ref(), SubagentTranscriptItem::Steer(text) if text == "first model steer"
+    )));
+    let deliveries = manager.drain_deferred();
+    // A later private turn must not inherit the model steer's delivery obligation.
+    manager
+        .send(id.as_str(), "another private task", RunOrigin::PrivateUser)
+        .unwrap();
+    assert!(manager.wait_all(5));
+    let private_deliveries = manager.drain_deferred();
+    server.join().expect("server");
+    manager.shutdown_and_discard();
+    assert_eq!(
+        deliveries.len(),
+        1,
+        "accepted model steers need one automatic result"
+    );
+    assert_eq!(deliveries[0].run_number, 2);
+    assert!(deliveries[0].result.contains("steered result"));
+    assert!(private_deliveries.is_empty());
 }
 
 #[test]
@@ -1181,13 +1287,13 @@ fn preset_model_overrides_config() {
     let mut preset = super::super::presets::bundled().remove(0);
     preset.model = Some("local:fast".into());
 
-    let via_preset = resolve_model(&config, "local:parent", preset.model.as_deref())
+    let via_preset = resolve_model(&config, "local:parent", preset.model.as_deref(), None)
         .expect("preset model applies");
     assert_eq!(via_preset, "local:fast");
 
     preset.model = None;
-    let via_config =
-        resolve_model(&config, "local:parent", preset.model.as_deref()).expect("config applies");
+    let via_config = resolve_model(&config, "local:parent", preset.model.as_deref(), None)
+        .expect("config applies");
     assert_eq!(via_config, "local:configured");
 }
 
@@ -1316,6 +1422,41 @@ fn run_timeout_interrupts_an_in_flight_subagent_request() {
 }
 
 #[test]
+fn unaccepted_model_steers_keep_their_origin_when_requeued() {
+    let manager = SubagentManager::new("session".into(), 1);
+    manager
+        .lock()
+        .entries
+        .push(test_entry(SubagentStatus::Running));
+    manager
+        .steer(SubagentId::new(1).as_str(), "accepted private steer")
+        .expect("private steer");
+    manager
+        .steer_with_origin("sa-1", "late model steer", RunOrigin::Model)
+        .expect("model steer");
+    let mut state = manager.lock();
+    apply_turn_event(
+        &mut state,
+        &SubagentId::new(1),
+        crate::agent::TurnEvent::SteerAccepted {
+            text: "accepted private steer",
+        },
+    );
+    let entry = &mut state.entries[0];
+    requeue_unaccepted_steers(
+        entry,
+        vec![crate::provider::TurnInput {
+            text: "late model steer".into(),
+            images: Vec::new(),
+        }],
+    );
+    assert_eq!(entry.work.len(), 1);
+    assert_eq!(entry.work[0].origin, RunOrigin::Model);
+    assert_eq!(entry.snapshot.queued_messages[0].origin, RunOrigin::Model);
+    assert!(entry.steer_origins.is_empty());
+}
+
+#[test]
 fn canceled_steers_do_not_restart_work_or_consume_capacity() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let config = provider_config(format!(
@@ -1413,4 +1554,88 @@ fn interrupted_follow_up_does_not_salvage_a_previous_answer() {
     let salvage = salvage_result(&snapshot, "");
     assert!(salvage.contains("current partial"));
     assert!(!salvage.contains("previous answer"));
+}
+
+#[test]
+fn explicit_listed_model_overrides_preset_and_config_without_removing_preset_limits() {
+    let mut config = provider_config("http://127.0.0.1:9/v1".into());
+    config.subagent_model = "local:configured".into();
+    config
+        .providers
+        .get_mut("local")
+        .expect("provider")
+        .models
+        .push(crate::config::ModelConfig {
+            id: "requested".into(),
+            name: None,
+            context_window: None,
+            max_tokens: None,
+            input: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            compat: Default::default(),
+        });
+    let mut preset = super::super::presets::bundled().remove(0);
+    preset.model = Some("local:pinned".into());
+    let model = resolve_model(
+        &config,
+        "local:parent",
+        preset.model.as_deref(),
+        Some("local:requested"),
+    )
+    .expect("explicit model wins");
+    assert_eq!(model, "local:requested");
+    assert!(preset.tools.as_ref().is_some_and(
+        |tools| tools.contains(&"read_file".into()) && !tools.contains(&"shell".into())
+    ));
+    assert_eq!(
+        resolve_model(&config, "local:parent", None, Some("local:requested"))
+            .expect("override config"),
+        "local:requested"
+    );
+    let manager = SubagentManager::new("session".into(), 1);
+    let id = manager
+        .spawn_with_model(
+            config.clone(),
+            "local:parent",
+            None,
+            "read the file",
+            Some(&preset),
+            Some("local:requested"),
+        )
+        .expect("explicit model spawn");
+    let snapshot = manager
+        .snapshots()
+        .into_iter()
+        .find(|snapshot| snapshot.id == id)
+        .expect("child snapshot");
+    assert_eq!(snapshot.model, "local:requested");
+    assert_eq!(snapshot.agent, preset.name);
+    manager
+        .wait(&[id.to_string()], Some(10))
+        .expect("child settles");
+    manager.shutdown_and_discard();
+
+    for invalid in ["local:missing", "not-a-model", ""] {
+        assert!(
+            resolve_model(
+                &config,
+                "local:parent",
+                preset.model.as_deref(),
+                Some(invalid)
+            )
+            .unwrap_err()
+            .contains("not in the available model list")
+        );
+    }
+    config
+        .providers
+        .get_mut("local")
+        .expect("provider")
+        .base_url
+        .clear();
+    assert!(
+        resolve_model(&config, "local:parent", None, Some("local:requested"))
+            .unwrap_err()
+            .contains("not usable")
+    );
 }

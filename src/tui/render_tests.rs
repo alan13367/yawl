@@ -158,6 +158,34 @@ fn frame_keeps_input_and_status_pinned() {
 }
 
 #[test]
+fn pasted_image_tag_uses_a_distinct_composer_color() {
+    let mut state = empty_session_state();
+    state.accent_color = UiColor::parse("blue").expect("blue accent");
+    let mut editor = Editor::default();
+    editor.paste("See ");
+    editor.insert_image(super::clipboard::StagedImage {
+        id: 1,
+        path: std::path::PathBuf::from("/unused/image.png"),
+        media_type: "image/png".into(),
+    });
+    editor.paste(" now");
+
+    let (frame, _) = build_frame(&mut state, &editor, 40, 12);
+    let line = frame
+        .iter()
+        .find(|line| line.contains("[Image #1]"))
+        .expect("image token in composer");
+    let (_, after) = line.split_once("[Image #1]").expect("image token");
+    assert!(after.starts_with("\x1b[0m now"), "{line:?}");
+    assert!(
+        line.split("[Image #1]")
+            .next()
+            .is_some_and(|before| before.matches("\x1b[38;2;").count() >= 2),
+        "the image must have its own color, not only the composer border: {line:?}"
+    );
+}
+
+#[test]
 fn input_box_moves_complete_words_to_the_next_row() {
     let mut state = empty_session_state();
     let mut editor = Editor::default();
@@ -210,7 +238,7 @@ fn wide_input_glyphs_are_not_clipped_at_the_text_box_edge() {
 }
 
 #[test]
-fn active_background_terminal_gets_its_own_row_above_status() {
+fn active_background_terminal_sits_above_composer_without_moving_cursor() {
     let mut state = empty_session_state();
     state.transcript = Transcript::from_messages(&[crate::provider::Message::assistant(
         "server setup complete".into(),
@@ -227,25 +255,61 @@ fn active_background_terminal_gets_its_own_row_above_status() {
         .expect("start background terminal");
 
     let (frame, cursor) = build_frame(&mut state, &Editor::default(), 54, 12);
-    let notice = markdown::strip_ansi(&frame[frame.len() - 2]);
-    let styled_notice = &frame[frame.len() - 2];
+    let notice = markdown::strip_ansi(&frame[frame.len() - 5]);
+    let styled_notice = &frame[frame.len() - 5];
     let status = markdown::strip_ansi(frame.last().expect("status row"));
 
     assert_eq!(frame.len(), 12);
-    assert!(notice.contains("1 background terminal running  ·  /ps to view"));
+    assert!(notice.contains("● 1 terminal"));
+    assert!(notice.ends_with(" /ps  view "));
+    assert!(!styled_notice.contains("\x1b[48;"));
+    let top_border = markdown::strip_ansi(&frame[frame.len() - 4]);
+    assert_eq!(top_border, format!("┌{}┐", "─".repeat(52)));
+    assert_eq!(
+        cursor.0 - 2,
+        frame.len() - 4,
+        "the status sits directly above the full input border"
+    );
     assert!(
         styled_notice.contains("38;2;116;199;213"),
         "the default notice uses cyan instead of the white accent"
     );
     assert!(status.contains("test"));
     assert!(!status.contains("background terminal"));
-    assert_eq!(cursor.0, 9, "the notice row must be reserved in the layout");
-    let narrow = markdown::strip_ansi(&render::render_background_process_notice(
-        8,
-        20,
-        UiColor::WHITE,
-    ));
-    assert!(narrow.contains("8 bg running · /ps"));
+    assert_eq!(
+        cursor.0, 10,
+        "activity belongs above the composer, not below it"
+    );
+    assert!(frame.iter().all(|line| markdown::visible_width(line) == 54));
+    for (width, height) in [(20, 8), (40, 12), (100, 24)] {
+        let mut editor = Editor::default();
+        editor.paste("first line\nsecond line");
+        let (frame, cursor) = build_frame(&mut state, &editor, width, height);
+        assert_eq!(frame.len(), height);
+        assert!(
+            frame
+                .iter()
+                .all(|line| markdown::visible_width(line) == width)
+        );
+        assert!(markdown::strip_ansi(&frame[cursor.0 - 1]).contains("second line"));
+        let border_row = frame
+            .iter()
+            .position(|line| markdown::strip_ansi(line).starts_with('┌'))
+            .expect("complete input top border");
+        assert_eq!(
+            markdown::strip_ansi(&frame[border_row]),
+            format!("┌{}┐", "─".repeat(width - 2))
+        );
+        assert!(markdown::strip_ansi(&frame[border_row - 1]).contains("/ps"));
+        assert!(!frame[border_row - 1].contains("\x1b[48;"));
+        assert_eq!(state.transcript_row_entries.len(), height - 6);
+    }
+
+    state.transcript.open_search();
+    state.transcript.search_push('s');
+    let (frame, cursor) = build_frame(&mut state, &Editor::default(), 54, 12);
+    assert!(markdown::strip_ansi(&frame[cursor.0 - 1]).contains("Find"));
+    state.transcript.close_search();
 
     state.background_processes.shutdown_and_discard();
     assert!(
@@ -253,24 +317,8 @@ fn active_background_terminal_gets_its_own_row_above_status() {
         "settlement must schedule a redraw"
     );
     let (frame, cursor) = build_frame(&mut state, &Editor::default(), 54, 12);
-    assert!(!markdown::strip_ansi(&frame.join("\n")).contains("background terminal running"));
+    assert!(!markdown::strip_ansi(&frame.join("\n")).contains("/ps  view"));
     assert_eq!(cursor.0, 10, "the transcript reclaims the notice row");
-}
-
-#[test]
-fn background_terminal_color_stays_distinct_from_the_accent() {
-    let cyan = UiColor::parse("cyan").expect("cyan palette color");
-    let amber = UiColor::parse("yellow").expect("yellow palette color");
-
-    let with_cyan_accent = render::render_background_process_notice(1, 60, cyan);
-    let with_amber_accent = render::render_background_process_notice(1, 60, amber);
-    let with_custom_cyan =
-        render::render_background_process_notice(1, 60, UiColor::new(110, 195, 210));
-
-    assert!(with_cyan_accent.contains("38;2;232;202;118"));
-    assert!(!with_cyan_accent.contains("38;2;116;199;213"));
-    assert!(with_amber_accent.contains("38;2;116;199;213"));
-    assert!(with_custom_cyan.contains("38;2;232;202;118"));
 }
 
 #[test]
@@ -1739,7 +1787,7 @@ fn status_bar_previews_running_and_paused_goals() {
 }
 
 #[test]
-fn status_bar_names_a_running_subagent_instead_of_zero_counts() {
+fn running_subagents_move_from_the_status_bar_to_the_activity_strip() {
     let mut state = empty_session_state();
     state.reasoning_effort = Some("medium".into());
     state.context_tokens = 42_679;
@@ -1756,15 +1804,40 @@ fn status_bar_names_a_running_subagent_instead_of_zero_counts() {
     state.subagent_snapshots = vec![snapshot];
     state.subagent_tokens = 182_600;
     let editor = Editor::default();
-    let (frame, _) = build_frame(&mut state, &editor, 120, 24);
+    let (frame, cursor) = build_frame(&mut state, &editor, 120, 24);
     let status = markdown::strip_ansi(frame.last().expect("status bar"));
     assert!(
-        status.contains("medium  ·  15% / 272k  ·  LucidOtter  ·  182.6k child"),
-        "the status bar should stay compact and name the running agent; got:\n{status}"
+        status.contains("medium  ·  15% / 272k  ·  182.6k child"),
+        "the status bar should stay compact; got:\n{status}"
     );
-    assert!(!status.contains("running"));
+    assert!(!status.contains("LucidOtter"));
     assert!(!status.contains("failed"));
-    assert!(!status.contains("tokens"));
+    let border_row = frame
+        .iter()
+        .position(|line| markdown::strip_ansi(line).starts_with('┌'))
+        .expect("input border");
+    let strip = markdown::strip_ansi(&frame[border_row - 1]);
+    assert!(strip.contains("● 1 subagent  │  LucidOtter"), "{strip}");
+    assert!(strip.ends_with(" /subagents  view "), "{strip}");
+    assert_eq!(
+        cursor.0 - 2,
+        border_row,
+        "the strip sits above the input box"
+    );
+
+    let saved = crate::config::StatusBarConfig {
+        items: vec![crate::config::StatusBarItemConfig::new(
+            crate::config::StatusBarKind::ActiveSubagents,
+        )],
+        ..Default::default()
+    };
+    assert!(saved.without_retired().items.is_empty());
+    assert!(
+        crate::config::StatusBarConfig::default()
+            .items
+            .iter()
+            .all(|item| item.kind != crate::config::StatusBarKind::ActiveSubagents)
+    );
 }
 
 #[test]
@@ -1842,7 +1915,6 @@ fn status_bar_formats_context_and_uses_always_fallbacks() {
         crate::config::StatusBarKind::Steering,
         crate::config::StatusBarKind::Goal,
         crate::config::StatusBarKind::Pending,
-        crate::config::StatusBarKind::ActiveSubagents,
         crate::config::StatusBarKind::FailedSubagents,
         crate::config::StatusBarKind::ChildTokens,
     ]
@@ -1863,7 +1935,6 @@ fn status_bar_formats_context_and_uses_always_fallbacks() {
         "0 steering",
         "no goal",
         "0 pending",
-        "0 agents",
         "0 failed",
         "0 child",
     ] {

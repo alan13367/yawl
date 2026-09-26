@@ -15,6 +15,7 @@ use super::markdown;
 
 const OUTPUT_PREVIEW_LINES: usize = 10;
 const CALL_PREVIEW_LINES: usize = 6;
+const SHELL_COMMAND_PREVIEW_ROWS: usize = 12;
 const DIFF_PREVIEW_LINES: usize = 12;
 const SUCCESS_BACKGROUND: &str = "\x1b[48;2;42;50;41m";
 const ERROR_BACKGROUND: &str = "\x1b[48;2;50;42;42m";
@@ -35,6 +36,14 @@ pub(super) struct ToolLine {
     pub(super) text: String,
     pub(super) tone: Tone,
     pub(super) wrap: bool,
+}
+
+/// Display name and liveness for a subagent ID referenced by a tool card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SubagentLabel {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) active: bool,
 }
 
 struct BackgroundStartDetails {
@@ -96,7 +105,7 @@ pub(super) fn render_labeled(
     is_error: bool,
     running: bool,
     elapsed: Option<Duration>,
-    labels: &[(&str, &str)],
+    labels: &[SubagentLabel],
     width: usize,
     expanded: bool,
 ) -> Vec<String> {
@@ -136,6 +145,7 @@ pub(super) fn render_labeled(
             elapsed,
             is_error,
             labels,
+            content_width,
             expanded,
         )
     };
@@ -193,6 +203,27 @@ pub(super) fn render_labeled(
         ));
     }
 
+    if name == "shell" {
+        // Command and output previews share one hint at the bottom of the card.
+        let mut hints = Vec::new();
+        lines.retain(|line| {
+            if line.tone == Tone::Muted && line.text.contains("Ctrl+O or click to ") {
+                hints.push(line.text.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(hint) = hints.pop() {
+            let hint = if expanded || (hints.is_empty() && hint.contains("earlier lines")) {
+                hint
+            } else {
+                "... Ctrl+O or click to expand".to_string()
+            };
+            lines.push(ToolLine::new(hint, Tone::Muted));
+        }
+    }
+
     let background = if is_error {
         ERROR_BACKGROUND
     } else if name == "read_skill" {
@@ -232,7 +263,8 @@ fn render_call(
     running: bool,
     elapsed: Option<Duration>,
     is_error: bool,
-    labels: &[(&str, &str)],
+    labels: &[SubagentLabel],
+    content_width: usize,
     expanded: bool,
 ) -> Vec<ToolLine> {
     let status = if background_start && running {
@@ -259,14 +291,39 @@ fn render_call(
     match name {
         "shell" => {
             let command = string_arg(args, "command").unwrap_or(raw_args);
-            let mut call = prefixed_lines(command, "$ ", "  ", Tone::Header)
-                .into_iter()
-                .map(ToolLine::wrapping)
-                .collect::<Vec<_>>();
-            if let Some(last) = call.last_mut() {
+            let mut call = prefixed_lines(command, "$ ", "  ", Tone::Header);
+            if !background_start && let Some(last) = call.last_mut() {
                 last.text.push_str(status);
             }
-            call
+            // Preview rendered rows, not source lines: a single long script line
+            // must not take over the transcript before it is expanded.
+            let rows = call
+                .into_iter()
+                .flat_map(|line| {
+                    wrap_chars(&sanitize_line(&line.text), content_width)
+                        .into_iter()
+                        .map(|text| ToolLine::new(text, Tone::Header))
+                })
+                .collect::<Vec<_>>();
+            let truncated = rows.len() > SHELL_COMMAND_PREVIEW_ROWS;
+            let mut call = preview_lines(rows, SHELL_COMMAND_PREVIEW_ROWS, expanded, false);
+            if background_start {
+                let title = background_details.map_or_else(
+                    || format!("Background terminal{status}"),
+                    |details| format!("Background terminal  ·  {}", details.id),
+                );
+                let mut titled = vec![
+                    ToolLine::new(title, Tone::Header),
+                    ToolLine::new("", Tone::Output),
+                ];
+                titled.extend(call);
+                titled
+            } else {
+                if truncated && !expanded && !status.is_empty() {
+                    call.push(ToolLine::new(status.trim(), Tone::Muted));
+                }
+                call
+            }
         }
         "shell_output" => vec![ToolLine::new(
             format!(
@@ -372,16 +429,10 @@ fn render_call(
             }
             call
         }
+        "subagent_wait" if running => running_wait_lines(args, labels, elapsed),
         "subagent_wait" => {
             let targets = labeled_ids(args, labels);
-            let title = if running {
-                match elapsed {
-                    Some(elapsed) => {
-                        format!("Waiting for {targets} · {}", format_elapsed(elapsed))
-                    }
-                    None => format!("Waiting for {targets}"),
-                }
-            } else if is_error {
+            let title = if is_error {
                 format!("Waiting for {targets}  [error]")
             } else {
                 format!("Waiting for {targets}")
@@ -620,29 +671,72 @@ fn parse_background_stop(output: &str) -> Option<String> {
         .map(|(_, status)| capitalize_label(status))
 }
 
-fn labeled_id(id: &str, labels: &[(&str, &str)]) -> String {
+fn labeled_id(id: &str, labels: &[SubagentLabel]) -> String {
     labels
         .iter()
-        .find(|(key, _)| *key == id)
-        .map(|(_, name)| *name)
+        .find(|label| label.id == id)
+        .map(|label| label.name.as_str())
         .filter(|name| !name.is_empty())
         .unwrap_or(id)
         .to_string()
 }
 
-fn labeled_ids(args: Option<&Value>, labels: &[(&str, &str)]) -> String {
+fn arg_ids(args: Option<&Value>) -> Vec<&str> {
     args.and_then(|args| args.get("ids"))
         .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|id| labeled_id(id, labels))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .filter(|joined| !joined.is_empty())
-        .unwrap_or_else(|| "?".to_string())
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+fn join_labels(ids: &[&str], labels: &[SubagentLabel]) -> String {
+    ids.iter()
+        .map(|id| labeled_id(id, labels))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn labeled_ids(args: Option<&Value>, labels: &[SubagentLabel]) -> String {
+    let ids = arg_ids(args);
+    if ids.is_empty() {
+        "?".to_string()
+    } else {
+        join_labels(&ids, labels)
+    }
+}
+
+/// A waited ID counts as finished only when a known child has settled;
+/// unknown IDs stay listed so the card never hides work it cannot see.
+fn running_wait_lines(
+    args: Option<&Value>,
+    labels: &[SubagentLabel],
+    elapsed: Option<Duration>,
+) -> Vec<ToolLine> {
+    let ids = arg_ids(args);
+    if ids.is_empty() {
+        return vec![ToolLine::new("Waiting for ?", Tone::Header)];
+    }
+    let (done, pending): (Vec<&str>, Vec<&str>) = ids
+        .iter()
+        .partition(|id| labels.iter().any(|label| label.id == **id && !label.active));
+    let mut title = if pending.is_empty() {
+        "Collecting results".to_string()
+    } else {
+        format!("Waiting for {}", join_labels(&pending, labels))
+    };
+    if !done.is_empty() {
+        title.push_str(&format!(" · {} of {} done", done.len(), ids.len()));
+    }
+    if let Some(elapsed) = elapsed {
+        title.push_str(&format!(" · {}", format_elapsed(elapsed)));
+    }
+    let mut lines = vec![ToolLine::new(title, Tone::Header)];
+    if !done.is_empty() {
+        lines.push(ToolLine::new(
+            format!("Finished: {}", join_labels(&done, labels)),
+            Tone::Muted,
+        ));
+    }
+    lines
 }
 
 /// Compact human elapsed time: `42s`, `3m 07s`, `1h 04m`.
@@ -760,8 +854,8 @@ fn preview_lines(
     };
     if keep_tail {
         let mut preview = Vec::with_capacity(limit + 1);
-        preview.push(ToolLine::new(marker, Tone::Muted));
         preview.extend(lines.drain(omitted..));
+        preview.push(ToolLine::new(marker, Tone::Muted));
         preview
     } else {
         lines.truncate(limit);
@@ -938,6 +1032,74 @@ mod tests {
         assert!(plain.contains("10 earlier lines"));
         assert!(!plain.contains("line 1 "));
         assert!(plain.contains("line 20"));
+    }
+
+    #[test]
+    fn shell_output_preview_places_expand_hint_after_the_tail() {
+        let output = (1..=20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rendered = render(
+            "shell",
+            r#"{"command":"cargo test"}"#,
+            &output,
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&rendered.join("\n"));
+        assert!(plain.find("line 20").unwrap() < plain.find("click to expand").unwrap());
+    }
+
+    #[test]
+    fn long_shell_command_is_bounded_by_visible_rows_and_expands_fully() {
+        let command = format!("python -c '{}'", "x".repeat(1200));
+        let args = serde_json::json!({"command": command}).to_string();
+        let compact = render("shell", &args, "done", false, false, None, 40, false);
+        let expanded = render("shell", &args, "done", false, false, None, 40, true);
+        let compact_plain = markdown::strip_ansi(&compact.join("\n"));
+        let expanded_plain = markdown::strip_ansi(&expanded.join("\n"));
+
+        assert!(
+            compact.len() <= 18,
+            "shell card used {} rows",
+            compact.len()
+        );
+        assert!(compact_plain.contains("$ python -c"));
+        assert!(compact_plain.contains("done"));
+        assert!(compact_plain.contains("click to expand"));
+        assert!(expanded_plain.contains("click to collapse"));
+        assert!(expanded_plain.matches('x').count() >= 1200);
+    }
+
+    #[test]
+    fn shell_command_and_output_share_a_bottom_hint() {
+        let command = (1..=25)
+            .map(|line| format!("echo command-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let args = serde_json::json!({"command": command}).to_string();
+        let output = (1..=20)
+            .map(|line| format!("result-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact = render("shell", &args, &output, false, false, None, 80, false);
+        let expanded = render("shell", &args, &output, false, false, None, 80, true);
+        let compact = markdown::strip_ansi(&compact.join("\n"));
+        let expanded = markdown::strip_ansi(&expanded.join("\n"));
+
+        assert!(compact.contains("command-12"));
+        assert!(!compact.contains("command-25"));
+        assert!(compact.contains("result-20"));
+        assert!(!compact.contains("result-1 "));
+        assert_eq!(compact.matches("click to expand").count(), 1);
+        assert!(compact.find("result-20").unwrap() < compact.find("click to expand").unwrap());
+        assert!(expanded.contains("command-25"));
+        assert!(expanded.contains("result-1"));
+        assert_eq!(expanded.matches("click to collapse").count(), 1);
     }
 
     #[test]
@@ -1129,6 +1291,61 @@ mod tests {
         assert!(saved_file_output("list_files", None, "{broken JSON").is_none());
     }
 
+    fn label(id: &str, name: &str, active: bool) -> SubagentLabel {
+        SubagentLabel {
+            id: id.into(),
+            name: name.into(),
+            active,
+        }
+    }
+
+    #[test]
+    fn running_wait_drops_finished_children_from_the_waiting_list() {
+        let args = r#"{"ids":["sa-1","sa-2","sa-3"]}"#;
+        let wait = |labels: &[SubagentLabel], running: bool| {
+            markdown::strip_ansi(
+                &render_labeled(
+                    "subagent_wait",
+                    args,
+                    "",
+                    false,
+                    running,
+                    Some(Duration::from_secs(42)),
+                    labels,
+                    80,
+                    false,
+                )
+                .join("\n"),
+            )
+        };
+
+        let partial = wait(
+            &[label("sa-1", "Otter", false), label("sa-2", "Falcon", true)],
+            true,
+        );
+        assert!(
+            partial.contains("Waiting for Falcon, sa-3 · 1 of 3 done · 42s"),
+            "{partial}"
+        );
+        assert!(partial.contains("Finished: Otter"));
+
+        let settled = [
+            label("sa-1", "Otter", false),
+            label("sa-2", "Falcon", false),
+            label("sa-3", "Heron", false),
+        ];
+        let all = wait(&settled, true);
+        assert!(
+            all.contains("Collecting results · 3 of 3 done · 42s"),
+            "{all}"
+        );
+        assert!(all.contains("Finished: Otter, Falcon, Heron"));
+
+        let finished = wait(&settled, false);
+        assert!(finished.contains("Waiting for Otter, Falcon, Heron"));
+        assert!(!finished.contains("done"));
+    }
+
     #[test]
     fn subagent_calls_render_readable_summaries_instead_of_json() {
         let wait = render(
@@ -1153,7 +1370,10 @@ mod tests {
             false,
             true,
             Some(Duration::from_secs(27)),
-            &[("sa-1", "LucidOtter"), ("sa-2", "SwiftFalcon")],
+            &[
+                label("sa-1", "LucidOtter", true),
+                label("sa-2", "SwiftFalcon", true),
+            ],
             80,
             false,
         );
@@ -1287,10 +1507,35 @@ mod tests {
         );
         let plain = markdown::strip_ansi(&rendered.join("\n"));
 
-        assert!(plain.contains("$ npm run dev  [started in background · bg-1]"));
+        assert!(plain.contains("Background terminal  ·  bg-1"));
+        assert!(plain.contains("$ npm run dev"));
+        assert!(!plain.contains("$ npm run dev  [started"));
         assert!(plain.contains("● Started in background  ·  pid 4242  ·  web  ·  /ps to view"));
         assert!(!plain.contains("next_cursor"));
         assert!(!plain.contains("started bg-1 (pid"));
+    }
+
+    #[test]
+    fn background_shell_card_titles_the_terminal_before_its_command() {
+        let rendered = render(
+            "shell",
+            r#"{"command":"cargo test --quiet","background":true,"name":"tests"}"#,
+            "started bg-3 (pid 4242) as tests in the background\nnext_cursor: 0",
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        let rows = rendered
+            .iter()
+            .map(|line| markdown::strip_ansi(line).trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(rows[0], "Background terminal  ·  bg-3");
+        assert_eq!(rows[1], "$ cargo test --quiet");
+        assert!(rows[2].starts_with("● Started in background"));
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]
@@ -1307,7 +1552,8 @@ mod tests {
         );
         let plain = markdown::strip_ansi(&rendered.join("\n"));
 
-        assert!(plain.contains("$ npm run dev  [starting in background 2s]"));
+        assert!(plain.contains("Background terminal  [starting in background 2s]"));
+        assert!(plain.contains("$ npm run dev"));
     }
 
     #[test]
@@ -1334,6 +1580,32 @@ mod tests {
         assert!(!plain.contains("[stdout]"));
         assert!(!plain.contains("[stderr]"));
         assert!(!plain.contains("bg-1: running"));
+    }
+
+    #[test]
+    fn background_output_preview_places_expand_hint_after_the_tail() {
+        let output = (1..=20)
+            .map(|line| format!("test case-{line} ... ok"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = format!("bg-1: running (pid 4242)\n[stdout]\n{output}\nnext_cursor: 97");
+        let rendered = render(
+            "shell_output",
+            r#"{"id":"bg-1","cursor":0}"#,
+            &output,
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        let plain = markdown::strip_ansi(&rendered.join("\n"));
+
+        assert!(plain.contains("● Running  ·  pid 4242"));
+        assert!(!plain.contains("case-1 "));
+        assert!(plain.contains("case-20"));
+        assert_eq!(plain.matches("click to expand").count(), 1);
+        assert!(plain.find("case-20").unwrap() < plain.find("click to expand").unwrap());
     }
 
     #[test]

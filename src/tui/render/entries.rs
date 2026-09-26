@@ -45,7 +45,7 @@ pub(super) fn render_entry(
     hide_reasoning: bool,
     image_support: ImageSupport,
     accent_color: UiColor,
-    labels: &[(&str, &str)],
+    labels: &[tool_view::SubagentLabel],
     spinner_tick: usize,
 ) -> Option<RenderedEntry> {
     let lines = match entry {

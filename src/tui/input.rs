@@ -11,15 +11,28 @@ use super::events::Key;
 const LONG_PASTE_CHARS: usize = 400;
 const LONG_PASTE_LINES: usize = 8;
 
+/// An image's location in editor characters, not an occurrence of its label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachedImage {
+    start: usize,
+    image: StagedImage,
+}
+
+impl AttachedImage {
+    fn end(&self) -> usize {
+        self.start + self.image.marker().chars().count()
+    }
+}
+
 /// One editor submission with any staged clipboard images.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Submission {
     pub(super) text: String,
-    images: Vec<StagedImage>,
+    images: Vec<AttachedImage>,
 }
 
 impl Submission {
-    pub(super) fn new(text: String, images: Vec<StagedImage>) -> Self {
+    fn new(text: String, images: Vec<AttachedImage>) -> Self {
         Self { text, images }
     }
 
@@ -27,8 +40,12 @@ impl Submission {
         !self.referenced_images().is_empty()
     }
 
-    pub(super) fn set_text(&mut self, text: String) {
-        self.text = text;
+    pub(super) fn max_image_id(&self) -> usize {
+        self.referenced_images()
+            .iter()
+            .map(|image| image.id)
+            .max()
+            .unwrap_or(0)
     }
 
     pub(super) fn turn_input(&self, text: String) -> Result<crate::provider::TurnInput, String> {
@@ -61,14 +78,16 @@ impl Submission {
         let mut images = self
             .images
             .iter()
-            .filter_map(|image| {
+            .filter(|attached| {
                 self.text
-                    .find(&image.marker())
-                    .map(|offset| (offset, image))
+                    .chars()
+                    .skip(attached.start)
+                    .take(attached.end() - attached.start)
+                    .eq(attached.image.marker().chars())
             })
             .collect::<Vec<_>>();
-        images.sort_by_key(|(offset, _)| *offset);
-        images.into_iter().map(|(_, image)| image).collect()
+        images.sort_by_key(|attached| attached.start);
+        images.into_iter().map(|attached| &attached.image).collect()
     }
 }
 
@@ -123,8 +142,10 @@ pub struct Editor {
     /// `@` mention tags inserted by completion: `(display, relative path)`.
     /// The short display stays visible; the path is substituted on submit.
     mentions: Vec<(String, String)>,
-    images: Vec<StagedImage>,
-    next_image_id: usize,
+    images: Vec<AttachedImage>,
+    /// Highest image number submitted through this editor. Keep it across
+    /// session switches so `/new` followed by `/resume` cannot reuse a label.
+    submitted_image_id: usize,
     clipboard: ClipboardStore,
 }
 
@@ -147,22 +168,23 @@ impl Editor {
     }
 
     pub(super) fn next_image_id(&self) -> usize {
-        self.next_image_id.saturating_add(1)
+        self.images
+            .iter()
+            .map(|attached| attached.image.id)
+            .fold(self.submitted_image_id, usize::max)
+            .saturating_add(1)
     }
 
     pub(super) fn can_add_image(&self) -> bool {
-        Submission::new(self.text(), self.images.clone())
-            .referenced_images()
-            .len()
-            < 5
+        self.images.len() < 5
     }
 
     pub(super) fn insert_image(&mut self, image: StagedImage) {
         self.leave_history();
-        self.next_image_id = self.next_image_id.max(image.id);
+        let start = self.cursor;
         let marker = image.marker();
-        self.images.push(image);
         self.insert_chars(marker.chars());
+        self.images.push(AttachedImage { start, image });
     }
 
     pub(super) fn paste_clipboard_image(&mut self, supports_images: bool) -> Result<(), String> {
@@ -189,6 +211,19 @@ impl Editor {
     /// Replaces long-paste placeholders with the original pasted text.
     pub fn expand_pastes(&self, text: &str) -> String {
         expand_paste_placeholders(text, &self.pastes)
+    }
+
+    /// Expands display placeholders without losing the position of an image
+    /// that follows one. Used for messages queued while a turn is running.
+    pub(super) fn expand_pastes_in_submission(&self, input: &mut Submission) {
+        if self.pastes.is_empty() {
+            return;
+        }
+        for attached in &mut input.images {
+            let prefix: String = input.text.chars().take(attached.start).collect();
+            attached.start = self.expand_pastes(&prefix).chars().count();
+        }
+        input.text = self.expand_pastes(&input.text);
     }
 
     /// Prepares submitted text for the agent: `@` mention tags become
@@ -243,14 +278,14 @@ impl Editor {
         let display = self.unique_mention_display(path);
         let replacement: Vec<char> = format!("@{display}").chars().collect();
         let length = replacement.len();
-        self.buffer.splice(start..end, replacement);
+        self.replace_range(start, end, replacement);
         self.cursor = start + length;
         if !self
             .buffer
             .get(self.cursor)
             .is_some_and(|character| character.is_whitespace())
         {
-            self.buffer.insert(self.cursor, ' ');
+            self.replace_range(self.cursor, self.cursor, [' ']);
         }
         self.cursor += 1;
         if !self
@@ -327,10 +362,10 @@ impl Editor {
             .iter()
             .position(|character| character.is_whitespace())
             .unwrap_or(self.buffer.len());
-        self.buffer.splice(0..end, command.chars());
+        self.replace_range(0, end, command.chars());
         self.cursor = command.chars().count();
         if self.buffer.get(self.cursor).is_none() {
-            self.buffer.push(' ');
+            self.replace_range(self.cursor, self.cursor, [' ']);
         }
         self.cursor += 1;
         self.leave_history();
@@ -368,8 +403,26 @@ impl Editor {
             Key::Steer | Key::Ctrl('g') => return self.steer(),
             Key::Backspace => self.backspace(),
             Key::Delete => self.delete(),
-            Key::Left => self.cursor = self.cursor.saturating_sub(1),
-            Key::Right => self.cursor = (self.cursor + 1).min(self.buffer.len()),
+            Key::Left => {
+                self.cursor = self.cursor.saturating_sub(1);
+                if let Some((start, _)) = self
+                    .image_spans()
+                    .into_iter()
+                    .find(|(start, end)| *start < self.cursor && self.cursor < *end)
+                {
+                    self.cursor = start;
+                }
+            }
+            Key::Right => {
+                self.cursor = (self.cursor + 1).min(self.buffer.len());
+                if let Some((_, end)) = self
+                    .image_spans()
+                    .into_iter()
+                    .find(|(start, end)| *start < self.cursor && self.cursor < *end)
+                {
+                    self.cursor = end;
+                }
+            }
             Key::Home | Key::Ctrl('a') => self.cursor = self.line_start(),
             Key::End | Key::Ctrl('e') => self.cursor = self.line_end(),
             Key::Up => {
@@ -394,7 +447,11 @@ impl Editor {
     }
 
     pub fn layout(&self, width: usize) -> InputLayout {
-        self.layout_with_buffer(width, &self.buffer)
+        self.layout_with_buffer(width, &self.buffer, &self.image_spans(), None)
+    }
+
+    pub(super) fn styled_layout(&self, width: usize, image_style: &str) -> InputLayout {
+        self.layout_with_buffer(width, &self.buffer, &self.image_spans(), Some(image_style))
     }
 
     pub fn masked_layout(&self, width: usize) -> InputLayout {
@@ -403,13 +460,19 @@ impl Editor {
             .iter()
             .map(|character| if *character == '\n' { '\n' } else { '•' })
             .collect::<Vec<_>>();
-        self.layout_with_buffer(width, &masked)
+        self.layout_with_buffer(width, &masked, &[], None)
     }
 
-    fn layout_with_buffer(&self, width: usize, buffer: &[char]) -> InputLayout {
+    fn layout_with_buffer(
+        &self,
+        width: usize,
+        buffer: &[char],
+        image_spans: &[(usize, usize)],
+        image_style: Option<&str>,
+    ) -> InputLayout {
         let width = width.max(3);
         self.layout_width.set(width);
-        let layout = buffer_layout(buffer, width);
+        let layout = buffer_layout(buffer, width, image_spans, image_style);
         let cursor = layout.positions[self.cursor];
         InputLayout {
             lines: layout.lines,
@@ -418,12 +481,24 @@ impl Editor {
         }
     }
 
+    /// Only spans inserted as images are editor tokens. Matching text is plain text.
+    fn image_spans(&self) -> Vec<(usize, usize)> {
+        let mut spans = self
+            .images
+            .iter()
+            .map(|attached| (attached.start, attached.end()))
+            .collect::<Vec<_>>();
+        spans.sort_unstable();
+        spans
+    }
+
     fn move_vertical(&mut self, upward: bool) -> bool {
         let width = self.layout_width.get();
         if width < 3 {
             return false;
         }
-        let positions = buffer_layout(&self.buffer, width).positions;
+        let image_spans = self.image_spans();
+        let positions = buffer_layout(&self.buffer, width, &image_spans, None).positions;
         let current = positions[self.cursor];
         let target_row = if upward {
             current.row.checked_sub(1)
@@ -441,7 +516,12 @@ impl Editor {
         let Some((target, _)) = positions
             .iter()
             .enumerate()
-            .filter(|(_, position)| position.row == target_row)
+            .filter(|(index, position)| {
+                position.row == target_row
+                    && !image_spans
+                        .iter()
+                        .any(|(start, end)| *start < *index && *index < *end)
+            })
             .min_by_key(|(_, position)| position.column.abs_diff(preferred_column))
         else {
             return false;
@@ -452,29 +532,67 @@ impl Editor {
 
     fn insert(&mut self, character: char) {
         self.leave_history();
-        self.buffer.insert(self.cursor, character);
-        self.cursor += 1;
+        self.insert_chars([character]);
     }
 
     fn insert_chars(&mut self, chars: impl IntoIterator<Item = char>) {
-        let chars: Vec<char> = chars.into_iter().collect();
-        let count = chars.len();
-        self.buffer.splice(self.cursor..self.cursor, chars);
+        let count = self.replace_range(self.cursor, self.cursor, chars);
         self.cursor += count;
+    }
+
+    /// Keep inserted image positions in sync with edits to the character buffer.
+    fn replace_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        chars: impl IntoIterator<Item = char>,
+    ) -> usize {
+        let chars = chars.into_iter().collect::<Vec<_>>();
+        let count = chars.len();
+        self.images.retain_mut(|attached| {
+            if attached.end() <= start {
+                true
+            } else if attached.start >= end {
+                attached.start = attached.start - (end - start) + count;
+                true
+            } else {
+                false
+            }
+        });
+        self.buffer.splice(start..end, chars);
+        count
     }
 
     fn backspace(&mut self) {
         self.leave_history();
         if self.cursor > 0 {
-            self.cursor -= 1;
-            self.buffer.remove(self.cursor);
+            if let Some((start, end)) = self
+                .image_spans()
+                .into_iter()
+                .find(|(start, end)| *start < self.cursor && self.cursor <= *end)
+            {
+                self.replace_range(start, end, []);
+                self.cursor = start;
+            } else {
+                self.cursor -= 1;
+                self.replace_range(self.cursor, self.cursor + 1, []);
+            }
         }
     }
 
     fn delete(&mut self) {
         self.leave_history();
         if self.cursor < self.buffer.len() {
-            self.buffer.remove(self.cursor);
+            if let Some((start, end)) = self
+                .image_spans()
+                .into_iter()
+                .find(|(start, end)| *start <= self.cursor && self.cursor < *end)
+            {
+                self.replace_range(start, end, []);
+                self.cursor = start;
+            } else {
+                self.replace_range(self.cursor, self.cursor + 1, []);
+            }
         }
     }
 
@@ -495,26 +613,44 @@ impl Editor {
     fn kill_to_line_start(&mut self) {
         self.leave_history();
         let start = self.line_start();
-        self.buffer.drain(start..self.cursor);
+        self.replace_range(start, self.cursor, []);
         self.cursor = start;
     }
 
     fn kill_to_line_end(&mut self) {
         self.leave_history();
         let end = self.line_end();
-        self.buffer.drain(self.cursor..end);
+        self.replace_range(self.cursor, end, []);
     }
 
     fn kill_previous_word(&mut self) {
         self.leave_history();
+        let image_spans = self.image_spans();
         let mut start = self.cursor;
         while start > 0 && self.buffer[start - 1].is_whitespace() {
             start -= 1;
         }
+        if let Some((marker_start, _)) = image_spans
+            .iter()
+            .copied()
+            .find(|(marker_start, marker_end)| *marker_start < start && start <= *marker_end)
+        {
+            self.replace_range(marker_start, self.cursor, []);
+            self.cursor = marker_start;
+            return;
+        }
         while start > 0 && !self.buffer[start - 1].is_whitespace() {
+            if let Some((marker_start, _)) = image_spans
+                .iter()
+                .copied()
+                .find(|(marker_start, marker_end)| *marker_start < start && start <= *marker_end)
+            {
+                start = marker_start;
+                break;
+            }
             start -= 1;
         }
-        self.buffer.drain(start..self.cursor);
+        self.replace_range(start, self.cursor, []);
         self.cursor = start;
     }
 
@@ -539,10 +675,24 @@ impl Editor {
             return None;
         }
         let submission = Submission::new(text, self.images.clone());
+        self.submitted_image_id = self.submitted_image_id.max(submission.max_image_id());
         if self.history.last() != Some(&submission) {
             self.history.push(submission.clone());
         }
         self.clear();
+        Some(submission)
+    }
+
+    /// Takes an edited queued message without recording it as a new prompt.
+    pub(super) fn take_queued_edit(&mut self) -> Option<Submission> {
+        let text: String = self.buffer.iter().collect();
+        if text.trim().is_empty() {
+            return None;
+        }
+        let mut submission = Submission::new(text, std::mem::take(&mut self.images));
+        self.submitted_image_id = self.submitted_image_id.max(submission.max_image_id());
+        self.clear();
+        self.expand_pastes_in_submission(&mut submission);
         Some(submission)
     }
 
@@ -627,11 +777,25 @@ fn should_wrap_word(buffer: &[char], index: usize, column: usize, width: usize) 
     column > 2 && word_width <= width.saturating_sub(2) && column.saturating_add(word_width) > width
 }
 
-fn buffer_layout(buffer: &[char], width: usize) -> BufferLayout {
+fn next_buffer_line(lines: &mut Vec<String>, line: &mut String, styled: &mut bool) {
+    if *styled {
+        line.push_str("\x1b[0m");
+        *styled = false;
+    }
+    lines.push(std::mem::replace(line, String::from("  ")));
+}
+
+fn buffer_layout(
+    buffer: &[char],
+    width: usize,
+    image_spans: &[(usize, usize)],
+    image_style: Option<&str>,
+) -> BufferLayout {
     let mut lines = Vec::new();
     let mut positions = Vec::with_capacity(buffer.len().saturating_add(1));
     let mut line = String::from("> ");
     let mut column = 2usize;
+    let mut styled = false;
 
     for (index, character) in buffer.iter().copied().enumerate() {
         if character == '\n' {
@@ -639,16 +803,20 @@ fn buffer_layout(buffer: &[char], width: usize) -> BufferLayout {
                 row: lines.len(),
                 column,
             });
-            lines.push(line);
-            line = String::from("  ");
+            next_buffer_line(&mut lines, &mut line, &mut styled);
             column = 2;
             continue;
         }
+        let marker = image_spans
+            .iter()
+            .find(|(start, end)| *start <= index && index < *end);
         let displayed = displayed_character(character);
         let character_width = UnicodeWidthChar::width(displayed).unwrap_or(0);
-        if character.is_whitespace() && wraps_before(column, character_width, width) {
-            lines.push(line);
-            line = String::from("  ");
+        if marker.is_none()
+            && character.is_whitespace()
+            && wraps_before(column, character_width, width)
+        {
+            next_buffer_line(&mut lines, &mut line, &mut styled);
             column = 2;
             positions.push(CursorPosition {
                 row: lines.len(),
@@ -656,17 +824,34 @@ fn buffer_layout(buffer: &[char], width: usize) -> BufferLayout {
             });
             continue;
         }
-        if should_wrap_word(buffer, index, column, width)
+        let fits_as_token =
+            marker.is_some_and(|(start, end)| end - start <= width.saturating_sub(2));
+        let wrap_token = marker.is_some_and(|(start, end)| {
+            index == *start
+                && fits_as_token
+                && column > 2
+                && column.saturating_add(end - start) > width
+        });
+        if wrap_token
+            || (!fits_as_token && should_wrap_word(buffer, index, column, width))
             || wraps_before(column, character_width, width)
         {
-            lines.push(line);
-            line = String::from("  ");
+            next_buffer_line(&mut lines, &mut line, &mut styled);
             column = 2;
         }
         positions.push(CursorPosition {
             row: lines.len(),
             column,
         });
+        let should_style = marker.is_some() && image_style.is_some();
+        if should_style != styled {
+            if let Some(style) = image_style.filter(|_| should_style) {
+                line.push_str(style);
+            } else {
+                line.push_str("\x1b[0m");
+            }
+            styled = should_style;
+        }
         line.push(displayed);
         column = column.saturating_add(character_width);
     }
@@ -674,6 +859,9 @@ fn buffer_layout(buffer: &[char], width: usize) -> BufferLayout {
         row: lines.len(),
         column,
     });
+    if styled {
+        line.push_str("\x1b[0m");
+    }
     lines.push(line);
     BufferLayout { lines, positions }
 }
@@ -813,10 +1001,14 @@ mod tests {
     fn image_markers_control_order_and_deduplicate_payloads() {
         let (first, first_path) = staged_image(1, "first");
         let (second, second_path) = staged_image(2, "second");
-        let submission = Submission::new(
-            "[Image #2] compare [Image #1] with [Image #2]".into(),
-            vec![first, second],
-        );
+        let mut editor = Editor::default();
+        editor.insert_image(second);
+        editor.paste(" compare ");
+        editor.insert_image(first);
+        editor.paste(" with [Image #2]");
+        let EditAction::Submit(submission) = editor.handle_key(Key::Enter) else {
+            panic!("expected submission");
+        };
 
         let input = submission
             .turn_input(submission.text.clone())
@@ -830,10 +1022,15 @@ mod tests {
     #[test]
     fn deleting_marker_detaches_image_and_history_restores_it() {
         let (image, path) = staged_image(1, "history");
-        let detached = Submission::new("marker removed".into(), vec![image.clone()]);
+        let mut editor = Editor::default();
+        editor.insert_image(image.clone());
+        editor.handle_key(Key::Backspace);
+        editor.paste("marker removed");
+        let EditAction::Submit(detached) = editor.handle_key(Key::Enter) else {
+            panic!("expected detached submission");
+        };
         assert!(!detached.has_images());
 
-        let mut editor = Editor::default();
         editor.insert_image(image);
         assert!(matches!(
             editor.handle_key(Key::Enter),
@@ -844,6 +1041,239 @@ mod tests {
             panic!("expected recalled submission");
         };
         assert!(recalled.has_images());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn image_numbering_continues_across_submitted_and_queued_prompts() {
+        let mut editor = Editor::default();
+        let (first, first_path) = staged_image(editor.next_image_id(), "before-new");
+        editor.insert_image(first);
+        assert!(matches!(
+            editor.handle_key(Key::Enter),
+            EditAction::Submit(_)
+        ));
+
+        let (second, second_path) = staged_image(editor.next_image_id(), "second-prompt");
+        editor.insert_image(second);
+        assert_eq!(editor.text(), "[Image #2]");
+        let EditAction::Queue(queued) = editor.queue() else {
+            panic!("expected queued image");
+        };
+
+        assert_eq!(queued.max_image_id(), 2);
+        let (third, third_path) = staged_image(editor.next_image_id(), "after-new");
+        editor.insert_image(third);
+        assert_eq!(editor.text(), "[Image #3]");
+        editor.clear();
+        assert_eq!(editor.next_image_id(), 3);
+        for path in [first_path, second_path, third_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn repasting_after_deleting_image_reuses_number_and_new_payload() {
+        let mut editor = Editor::default();
+        let (first, first_path) = staged_image(editor.next_image_id(), "deleted");
+        editor.insert_image(first);
+        editor.handle_key(Key::Backspace);
+        assert!(editor.is_empty());
+
+        let (second, second_path) = staged_image(editor.next_image_id(), "repasted");
+        editor.insert_image(second.clone());
+        assert_eq!(editor.text(), "[Image #1]");
+        let EditAction::Submit(submission) = editor.handle_key(Key::Enter) else {
+            panic!("expected submission");
+        };
+        assert_eq!(submission.referenced_images(), vec![&second]);
+        let _ = std::fs::remove_file(first_path);
+        let _ = std::fs::remove_file(second_path);
+    }
+
+    #[test]
+    fn image_markers_move_and_delete_as_whole_tokens() {
+        let (image, path) = staged_image(1, "atomic");
+        let mut editor = Editor::default();
+        editor.insert_image(image);
+        editor.handle_key(Key::Left);
+        editor.handle_key(Key::Char('a'));
+        assert_eq!(editor.text(), "a[Image #1]");
+        editor.handle_key(Key::Right);
+        editor.handle_key(Key::Backspace);
+        assert_eq!(editor.text(), "a");
+        let (second, second_path) = staged_image(2, "atomic-delete");
+        editor.insert_image(second);
+        editor.handle_key(Key::Left);
+        editor.handle_key(Key::Delete);
+        assert_eq!(editor.text(), "a");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(second_path);
+    }
+
+    #[test]
+    fn staged_image_marker_wraps_as_one_colored_token() {
+        let (image, path) = staged_image(1, "layout");
+        let mut editor = Editor::default();
+        editor.paste("hello ");
+        editor.insert_image(image);
+        editor.paste(" x");
+        let style = "\x1b[38;2;180;200;220m";
+        let layout = editor.styled_layout(16, style);
+        assert_eq!(layout.lines[0], "> hello ");
+        assert_eq!(layout.lines[1], format!("  {style}[Image #1]\x1b[0m x"));
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 14));
+        assert_eq!(editor.text(), "hello [Image #1] x");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn image_marker_stays_atomic_across_word_and_vertical_editing() {
+        let (image, path) = staged_image(1, "navigation");
+        let mut editor = Editor::default();
+        editor.paste("long text\n");
+        editor.insert_image(image);
+        editor.paste(" tail");
+        editor.layout(25);
+        editor.handle_key(Key::Up);
+        editor.handle_key(Key::Down);
+        editor.handle_key(Key::Ctrl('w'));
+        assert_eq!(editor.text(), "long text\n[Image #1] ");
+        editor.handle_key(Key::Ctrl('w'));
+        assert_eq!(editor.text(), "long text\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn narrow_image_marker_keeps_all_characters_and_color() {
+        let (image, path) = staged_image(1, "narrow");
+        let mut editor = Editor::default();
+        editor.insert_image(image);
+        let style = "\x1b[38;2;180;200;220m";
+        let layout = editor.styled_layout(5, style);
+        assert!(layout.lines.len() > 1);
+        let text = layout
+            .lines
+            .iter()
+            .map(|line| {
+                super::super::markdown::strip_ansi(line)
+                    .chars()
+                    .skip(2)
+                    .collect::<String>()
+            })
+            .collect::<String>();
+        assert_eq!(text, "[Image #1]");
+        assert!(layout.lines.iter().all(|line| line.contains(style)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn image_lookalike_without_staged_file_stays_plain_text() {
+        let mut editor = Editor::default();
+        editor.paste("[Image #1]");
+        assert_eq!(
+            editor.styled_layout(40, "\x1b[38;2;180;200;220m").lines,
+            ["> [Image #1]"]
+        );
+        editor.handle_key(Key::Left);
+        editor.handle_key(Key::Backspace);
+        assert_eq!(editor.text(), "[Image #]");
+    }
+
+    #[test]
+    fn deleting_attached_tag_does_not_send_image_from_literal_lookalike() {
+        let (image, path) = staged_image(1, "literal-lookalike");
+        let mut editor = Editor::default();
+        editor.paste("[Image #1]");
+        editor.insert_image(image);
+        editor.handle_key(Key::Backspace);
+        assert_eq!(editor.text(), "[Image #1]");
+        assert_eq!(editor.image_spans(), Vec::<(usize, usize)>::new());
+        let EditAction::Submit(submission) = editor.handle_key(Key::Enter) else {
+            panic!("expected submission");
+        };
+        assert!(!submission.has_images());
+        assert!(
+            submission
+                .turn_input(submission.text.clone())
+                .unwrap()
+                .images
+                .is_empty()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn literal_lookalike_stays_plain_when_an_image_is_attached() {
+        let (image, path) = staged_image(1, "literal-before-token");
+        let mut editor = Editor::default();
+        editor.paste("[Image #1]");
+        editor.insert_image(image);
+        assert_eq!(editor.image_spans(), [(10, 20)]);
+        editor.handle_key(Key::Left);
+        editor.handle_key(Key::Backspace);
+        assert_eq!(editor.text(), "[Image #1[Image #1]");
+        assert_eq!(editor.image_spans(), [(9, 19)]);
+        let EditAction::Submit(submission) = editor.handle_key(Key::Enter) else {
+            panic!("expected submission");
+        };
+        assert_eq!(submission.referenced_images().len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn image_position_survives_editing_and_history_recall() {
+        let (image, path) = staged_image(1, "position");
+        let mut editor = Editor::default();
+        editor.paste("界 ");
+        editor.insert_image(image);
+        editor.handle_key(Key::Home);
+        editor.paste("prefix ");
+        assert_eq!(editor.image_spans(), [(9, 19)]);
+        let EditAction::Submit(submission) = editor.handle_key(Key::Enter) else {
+            panic!("expected submission");
+        };
+        assert!(submission.has_images());
+        editor.handle_key(Key::Up);
+        assert_eq!(editor.image_spans(), [(9, 19)]);
+        editor.handle_key(Key::End);
+        editor.handle_key(Key::Backspace);
+        let EditAction::Submit(without_image) = editor.handle_key(Key::Enter) else {
+            panic!("expected submission");
+        };
+        assert!(!without_image.has_images());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn expanding_pastes_before_and_after_an_image_keeps_its_position() {
+        let (image, path) = staged_image(1, "pastes");
+        let mut editor = Editor::default();
+        let long = "paste text ".repeat(40);
+        editor.paste(&long);
+        editor.insert_image(image);
+        editor.paste(&long);
+        let EditAction::Queue(mut input) = editor.queue() else {
+            panic!("expected queued submission");
+        };
+        editor.expand_pastes_in_submission(&mut input);
+        let expected_start = long.chars().count();
+        assert_eq!(input.images[0].start, expected_start);
+        assert_eq!(input.text, format!("{long}[Image #1]{long}"));
+        assert!(input.has_images());
+        editor.restore_submission(input);
+        assert_eq!(
+            editor.image_spans(),
+            [(expected_start, expected_start + 10)]
+        );
+        editor.handle_key(Key::End);
+        for _ in 0..long.chars().count() {
+            editor.handle_key(Key::Backspace);
+        }
+        assert_eq!(
+            editor.image_spans(),
+            [(expected_start, expected_start + 10)]
+        );
         let _ = std::fs::remove_file(path);
     }
 

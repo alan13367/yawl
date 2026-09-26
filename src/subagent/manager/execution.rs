@@ -12,7 +12,7 @@ use crate::subagent::types::{
 
 use super::delivery::flush_pending_deliveries;
 use super::format::salvage_result;
-use super::{PendingDelivery, Shared, State, SubagentManager, WorkItem};
+use super::{Entry, PendingDelivery, Shared, State, SubagentManager, WorkItem};
 
 impl SubagentManager {
     pub(super) fn start_worker(
@@ -145,7 +145,9 @@ impl SubagentManager {
                 }
                 _ => bounded(&final_result, MAX_FINAL_RESULT_BYTES),
             };
-            if work.origin == RunOrigin::Model && !entry.suppress_delivery {
+            if (work.origin == RunOrigin::Model || entry.model_steer_accepted)
+                && !entry.suppress_delivery
+            {
                 entry.pending_delivery.push(PendingDelivery {
                     run_number: work.run_number,
                     outcome,
@@ -162,22 +164,7 @@ impl SubagentManager {
                 entry.work.clear();
                 entry.snapshot.queued_messages.clear();
             }
-            for leftover in leftovers {
-                if entry.work.len() >= MAX_QUEUE_MESSAGES {
-                    break;
-                }
-                let run_number = entry.next_run_number;
-                entry.next_run_number = entry.next_run_number.saturating_add(1);
-                entry.work.push_back(WorkItem {
-                    message: leftover.text.clone(),
-                    origin: RunOrigin::PrivateUser,
-                    run_number,
-                });
-                entry.snapshot.queued_messages.push(QueuedSubagentMessage {
-                    text: leftover.text,
-                    origin: RunOrigin::PrivateUser,
-                });
-            }
+            requeue_unaccepted_steers(entry, leftovers);
             let next = entry.work.pop_front();
             if !entry.snapshot.queued_messages.is_empty() {
                 entry.snapshot.queued_messages.remove(0);
@@ -245,6 +232,7 @@ impl SubagentManager {
             );
             return false;
         }
+        state.entries[index].model_steer_accepted = false;
         state.entries[index]
             .snapshot
             .begin_turn(&work.message, work.origin, work.run_number);
@@ -280,7 +268,7 @@ impl SubagentManager {
         entry.snapshot.latest_outcome = Some(RunOutcome::Failed);
         entry.snapshot.settled_at = Some(Instant::now());
         if was_active
-            && entry.snapshot.origin == RunOrigin::Model
+            && (entry.snapshot.origin == RunOrigin::Model || entry.model_steer_accepted)
             && !entry.suppress_delivery
             && !entry
                 .pending_delivery
@@ -302,6 +290,33 @@ impl SubagentManager {
     }
 }
 
+pub(super) fn requeue_unaccepted_steers(
+    entry: &mut Entry,
+    leftovers: Vec<crate::provider::TurnInput>,
+) {
+    for leftover in leftovers {
+        if entry.work.len() >= MAX_QUEUE_MESSAGES {
+            break;
+        }
+        let origin = entry
+            .steer_origins
+            .pop_front()
+            .unwrap_or(RunOrigin::PrivateUser);
+        let run_number = entry.next_run_number;
+        entry.next_run_number = entry.next_run_number.saturating_add(1);
+        entry.work.push_back(WorkItem {
+            message: leftover.text.clone(),
+            origin,
+            run_number,
+        });
+        entry.snapshot.queued_messages.push(QueuedSubagentMessage {
+            text: leftover.text,
+            origin,
+        });
+    }
+    entry.steer_origins.clear();
+}
+
 pub(super) fn apply_turn_event(
     state: &mut State,
     id: &SubagentId,
@@ -320,6 +335,12 @@ pub(super) fn apply_turn_event(
         }
         crate::agent::TurnEvent::Compacted { .. } => {
             state.total_child_usage.record_cache_reset();
+        }
+        crate::agent::TurnEvent::SteerAccepted { .. } => {
+            let entry = &mut state.entries[index];
+            if entry.steer_origins.pop_front() == Some(RunOrigin::Model) {
+                entry.model_steer_accepted = true;
+            }
         }
         _ => {}
     }
@@ -341,6 +362,7 @@ fn settle_entry(state: &mut State, index: usize, outcome: RunOutcome, shared: &S
     entry.snapshot.live_reasoning.clear();
     entry.snapshot.current_activity.clear();
     entry.snapshot.pending_steers.clear();
+    entry.steer_origins.clear();
     if shutting_down {
         entry.pending_delivery.clear();
     }

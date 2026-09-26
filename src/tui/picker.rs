@@ -27,7 +27,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use super::ViewState;
 use super::connection::{ConnectEditField, ConnectStep};
 use super::events::Key;
-use super::input::Editor;
+use super::input::{Editor, Submission};
 use super::markdown;
 use crate::onboarding::provider::{
     ConnectionActivation, ConnectionPlan, CredentialChoice, ProviderId,
@@ -132,8 +132,24 @@ pub(super) struct SettingsLocation {
 pub(super) enum PickerAction {
     SwitchModel(String),
     SaveModel(String),
+    OpenSubagentModels,
     OpenModels {
         save: bool,
+    },
+    /// Reopen the model picker, restoring `selected` after a canceled removal.
+    ReturnToModels {
+        save: bool,
+        selected: usize,
+    },
+    ConfirmRemoveModel {
+        model: String,
+        save: bool,
+        selected: usize,
+    },
+    RemoveModel {
+        model: String,
+        save: bool,
+        selected: usize,
     },
     OpenReasoning {
         save: bool,
@@ -253,7 +269,7 @@ pub(super) enum PickerAction {
     SendQueued(usize),
     ApplyQueued {
         index: usize,
-        value: String,
+        input: Submission,
     },
     MoveQueued {
         index: usize,
@@ -314,6 +330,7 @@ pub(super) struct ModelRefreshJob {
     config: Config,
     selected_model: String,
     save: bool,
+    subagent: bool,
 }
 
 impl ActivePickers {
@@ -365,6 +382,21 @@ pub(super) fn open_model_picker_from_config(
     save: bool,
 ) {
     state.picker = Some(model_picker(config, selected_model, save));
+    start_model_refresh(config, selected_model, state, save, false);
+}
+
+pub(super) fn open_subagent_model_picker(config: &Config, state: &mut ViewState) {
+    state.picker = Some(subagent_model_picker(config, &config.subagent_model));
+    start_model_refresh(config, &config.subagent_model, state, true, true);
+}
+
+fn start_model_refresh(
+    config: &Config,
+    selected_model: &str,
+    state: &mut ViewState,
+    save: bool,
+    subagent: bool,
+) {
     state.model_refresh = None;
     if crate::provider::codex::credential_status(config)
         != crate::provider::codex::CodexLoginStatus::LoggedIn
@@ -372,7 +404,7 @@ pub(super) fn open_model_picker_from_config(
         return;
     }
     if let Some(picker) = state.picker.as_mut() {
-        picker.hint = "Refreshing Codex models…  ↑/↓ move  Enter select  Esc cancel".into();
+        picker.hint.insert_str(0, REFRESHING_HINT);
     }
     let config_for_worker = config.clone();
     let (sender, receiver) = mpsc::channel();
@@ -385,6 +417,7 @@ pub(super) fn open_model_picker_from_config(
         config: config.clone(),
         selected_model: selected_model.to_string(),
         save,
+        subagent,
     });
 }
 
@@ -392,7 +425,9 @@ pub(super) fn poll_model_picker(state: &mut ViewState) -> bool {
     let Some(job) = state.model_refresh.take() else {
         return false;
     };
-    let expected_title = if job.save {
+    let expected_title = if job.subagent {
+        "Default subagent model"
+    } else if job.save {
         "Default model"
     } else {
         "Choose model"
@@ -411,27 +446,32 @@ pub(super) fn poll_model_picker(state: &mut ViewState) -> bool {
         }
         Ok(Ok(())) => {
             if picker.editing.is_none() {
-                state.picker = Some(refreshed_model_picker(
-                    &job.config,
-                    &job.selected_model,
-                    job.save,
-                    picker,
-                ));
+                state.picker = Some(if job.subagent {
+                    refreshed_subagent_model_picker(&job.config, &job.selected_model, picker)
+                } else {
+                    refreshed_model_picker(&job.config, &job.selected_model, job.save, picker)
+                });
                 true
             } else {
-                if let Some(picker) = state.picker.as_mut() {
-                    picker.hint = "↑/↓ move  Enter select  Esc cancel".into();
-                }
+                clear_refreshing_hint(state);
                 true
             }
         }
         Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
             state.notice("Could not refresh Codex models. Showing the saved catalog.");
-            if let Some(picker) = state.picker.as_mut() {
-                picker.hint = "↑/↓ move  Enter select  Esc cancel".into();
-            }
+            clear_refreshing_hint(state);
             true
         }
+    }
+}
+
+const REFRESHING_HINT: &str = "Refreshing Codex models…  ";
+
+fn clear_refreshing_hint(state: &mut ViewState) {
+    if let Some(picker) = state.picker.as_mut()
+        && let Some(hint) = picker.hint.strip_prefix(REFRESHING_HINT)
+    {
+        picker.hint = hint.to_string();
     }
 }
 
@@ -441,11 +481,22 @@ pub(super) fn refreshed_model_picker(
     save: bool,
     previous: &Picker,
 ) -> Picker {
+    refresh_model_selection(previous, model_picker(config, selected_model, save))
+}
+
+pub(super) fn refreshed_subagent_model_picker(
+    config: &Config,
+    selected_model: &str,
+    previous: &Picker,
+) -> Picker {
+    refresh_model_selection(previous, subagent_model_picker(config, selected_model))
+}
+
+fn refresh_model_selection(previous: &Picker, mut updated: Picker) -> Picker {
     let selected = previous
         .items
         .get(previous.selected)
         .map(|item| &item.action);
-    let mut updated = model_picker(config, selected_model, save);
     if let Some(index) = updated
         .items
         .iter()
@@ -456,12 +507,78 @@ pub(super) fn refreshed_model_picker(
                 Some(PickerAction::EditModel { save: old, .. }),
                 PickerAction::EditModel { save: new, .. },
             ) => old == new,
+            (
+                Some(PickerAction::ApplySetting { argument: old, .. }),
+                PickerAction::ApplySetting { argument: new, .. },
+            ) => old == new,
+            (
+                Some(PickerAction::EditSetting { key: old, .. }),
+                PickerAction::EditSetting { key: new, .. },
+            ) => old == new,
             _ => false,
         })
     {
         updated.selected = index;
     }
     updated
+}
+
+pub(super) fn subagent_model_picker(config: &Config, selected_model: &str) -> Picker {
+    let location = Some(SettingsLocation {
+        category: SettingsCategory::Subagents,
+        item: SettingsItem::SubagentModel,
+    });
+    let mut models = crate::model::available_models(config);
+    if selected_model != "inherit" && !models.iter().any(|(id, _)| id == selected_model) {
+        models.push((selected_model.to_string(), "Current default".into()));
+    }
+    let mut items = vec![PickerItem {
+        label: "Inherit".into(),
+        description: "Use the active parent model".into(),
+        action: PickerAction::ApplySetting {
+            argument: "subagent_model inherit".into(),
+            location,
+        },
+    }];
+    items.extend(models.into_iter().map(|(id, label)| PickerItem {
+        label,
+        description: id.clone(),
+        action: PickerAction::ApplySetting {
+            argument: format!("subagent_model {id}"),
+            location,
+        },
+    }));
+    items.push(PickerItem {
+        label: "Use another model ID…".into(),
+        description: "Enter a model not listed above".into(),
+        action: PickerAction::EditSetting {
+            key: "subagent_model".into(),
+            initial: if selected_model == "inherit" {
+                String::new()
+            } else {
+                selected_model.to_string()
+            },
+            location,
+        },
+    });
+    let argument = format!("subagent_model {selected_model}");
+    let selected = items
+        .iter()
+        .position(|item| {
+            matches!(&item.action, PickerAction::ApplySetting { argument: value, .. } if value == &argument)
+        })
+        .unwrap_or(0);
+    Picker {
+        title: "Default subagent model".into(),
+        hint: "↑/↓ move  Enter select  Esc cancel".into(),
+        items,
+        selected,
+        editing: None,
+        parent: Some(PickerAction::OpenSettingsCategory {
+            category: SettingsCategory::Subagents,
+            selected: settings_item_index(SettingsCategory::Subagents, SettingsItem::SubagentModel),
+        }),
+    }
 }
 
 pub(super) fn model_picker(config: &Config, selected_model: &str, save: bool) -> Picker {
@@ -507,7 +624,7 @@ pub(super) fn model_picker(config: &Config, selected_model: &str, save: bool) ->
         } else {
             "Choose model".into()
         },
-        hint: "↑/↓ move  Enter select  Esc cancel".into(),
+        hint: "↑/↓ move  Enter select  d remove  Esc cancel".into(),
         items,
         selected,
         editing: None,
@@ -689,6 +806,11 @@ pub(super) fn take_picker_action(
                         state.picker = None;
                         return Some(PickerAction::ApplyStatusBarSeparator(value));
                     }
+                    PickerEdit::Queued(index) => {
+                        let input = editor.take_queued_edit()?;
+                        state.picker = None;
+                        return Some(PickerAction::ApplyQueued { index, input });
+                    }
                     _ => {}
                 }
                 if let Some(value) = editor.take_text() {
@@ -718,9 +840,10 @@ pub(super) fn take_picker_action(
                                 PickerAction::SwitchModel(value.trim().to_string())
                             }
                         }
-                        PickerEdit::Queued(index) => PickerAction::ApplyQueued { index, value },
-                        PickerEdit::StatusBarLabel(_) | PickerEdit::StatusBarSeparator => {
-                            unreachable!("status-bar edits return before non-empty edit handling")
+                        PickerEdit::Queued(_)
+                        | PickerEdit::StatusBarLabel(_)
+                        | PickerEdit::StatusBarSeparator => {
+                            unreachable!("queued and status-bar edits return before text handling")
                         }
                         PickerEdit::Connect { field, .. } => PickerAction::ApplyConnect {
                             field,
@@ -866,6 +989,15 @@ pub(super) fn take_picker_action(
                     let description = picker.items[selected].description.clone();
                     *picker = delete_session_confirm(id, label, description, selected);
                 }
+                Some(PickerAction::SwitchModel(model) | PickerAction::SaveModel(model)) => {
+                    let save = matches!(picker.items[selected].action, PickerAction::SaveModel(_));
+                    state.picker = None;
+                    return Some(PickerAction::ConfirmRemoveModel {
+                        model,
+                        save,
+                        selected,
+                    });
+                }
                 Some(PickerAction::SendQueued(index)) => {
                     return Some(PickerAction::RemoveQueued(index));
                 }
@@ -909,6 +1041,52 @@ fn delete_session_confirm(
             selected: resume_selected,
         }),
     }
+}
+
+/// Configured provider models can be removed; Codex catalog entries cannot.
+pub(super) fn remove_model_confirm(
+    config: &Config,
+    model: &str,
+    save: bool,
+    selected: usize,
+) -> Result<Picker, String> {
+    let configured = model.split_once(':').filter(|(provider, id)| {
+        config
+            .providers
+            .get(*provider)
+            .is_some_and(|provider| provider.models.iter().any(|entry| entry.id == *id))
+    });
+    let Some((provider, _)) = configured else {
+        return Err(if crate::model::is_codex(config, model) {
+            format!("`{model}` comes from the Codex account catalog and cannot be removed.")
+        } else {
+            format!("`{model}` is not a configured provider model.")
+        });
+    };
+    let back = PickerAction::ReturnToModels { save, selected };
+    Ok(Picker {
+        title: "Remove model?".into(),
+        hint: "Enter confirm  Esc back".into(),
+        selected: 0,
+        items: vec![
+            PickerItem {
+                label: "Cancel".into(),
+                description: "Keep this model".into(),
+                action: back.clone(),
+            },
+            PickerItem {
+                label: "Remove".into(),
+                description: format!("{model} · from providers.{provider}.models"),
+                action: PickerAction::RemoveModel {
+                    model: model.to_string(),
+                    save,
+                    selected,
+                },
+            },
+        ],
+        editing: None,
+        parent: Some(back),
+    })
 }
 
 fn picker_cancel_action(picker: &Picker) -> Option<PickerAction> {

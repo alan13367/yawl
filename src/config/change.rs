@@ -54,6 +54,10 @@ pub(crate) enum ConfigChange {
         model: String,
         reasoning_efforts: Vec<String>,
     },
+    RemoveProviderModel {
+        name: String,
+        model: String,
+    },
     AnthropicBaseUrl(String),
     OpenAiBaseUrl(String),
     AnthropicApiKey(Option<String>),
@@ -195,6 +199,14 @@ impl ConfigChange {
                 {
                     return Err(Error::Config("unsupported reasoning effort".into()));
                 }
+                if model.trim().is_empty() {
+                    Err(Error::Config("provider model must not be empty".into()))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::RemoveProviderModel { name, model } => {
+                validate_provider_name(name)?;
                 if model.trim().is_empty() {
                     Err(Error::Config("provider model must not be empty".into()))
                 } else {
@@ -377,6 +389,24 @@ impl ConfigChange {
                 }
                 Ok(())
             }
+            Self::RemoveProviderModel { name, model } => {
+                let Some(Value::Object(provider)) = root
+                    .get_mut("providers")
+                    .and_then(|providers| providers.get_mut(name))
+                else {
+                    return Ok(());
+                };
+                if let Some(Value::Array(models)) = provider.get_mut("models") {
+                    models.retain(|entry| {
+                        entry
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .or_else(|| entry.as_str())
+                            != Some(model)
+                    });
+                }
+                Ok(())
+            }
             Self::AnthropicBaseUrl(url) => insert_root(root, "anthropic_base_url", json!(url)),
             Self::OpenAiBaseUrl(url) => insert_root(root, "openai_base_url", json!(url)),
             Self::AnthropicApiKey(key) => match key {
@@ -443,6 +473,10 @@ impl ConfigChange {
                     entry.id == *model && entry.reasoning_efforts == *reasoning_efforts
                 })
             }),
+            Self::RemoveProviderModel { name, model } => !config
+                .providers
+                .get(name)
+                .is_some_and(|provider| provider.models.iter().any(|entry| entry.id == *model)),
             Self::AnthropicBaseUrl(url) => config.anthropic_base_url == *url,
             Self::OpenAiBaseUrl(url) => config.openai_base_url == *url,
             Self::AnthropicApiKey(key) => config.anthropic_api_key == *key,
@@ -683,6 +717,60 @@ mod tests {
                     reasoning_efforts: vec!["typo".into()]
                 })
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn removing_a_provider_model_keeps_the_provider_and_other_models() {
+        let dirs = TestDirs::new("remove-model");
+        fs::create_dir_all(&dirs.home).unwrap();
+        fs::write(
+            dirs.home.join("config.json"),
+            json!({
+                "model": "local:gone",
+                "providers": {"local": {"base_url": "http://localhost/v1", "custom": 1, "models": [
+                    {"id": "gone", "name": "Gone"},
+                    {"id": "kept:free", "reasoning_efforts": ["low"]}
+                ]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let config = dirs.config();
+        let change = ConfigChange::RemoveProviderModel {
+            name: "local".into(),
+            model: "gone".into(),
+        };
+        let outcome = config.change_global(change.clone()).unwrap();
+        assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
+        let ids = outcome.config.providers["local"]
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["kept:free"]);
+        let saved: Value =
+            serde_json::from_str(&fs::read_to_string(dirs.home.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["providers"]["local"]["custom"], 1);
+        assert_eq!(
+            saved["model"], "local:gone",
+            "the active model is untouched"
+        );
+        assert_eq!(
+            saved["providers"]["local"]["models"],
+            json!([{"id": "kept:free", "reasoning_efforts": ["low"]}])
+        );
+
+        let again = outcome.config.change_global(change).unwrap();
+        assert_eq!(again.effect, ConfigChangeEffect::Applied);
+        assert!(
+            config
+                .change_global(ConfigChange::RemoveProviderModel {
+                    name: "missing".into(),
+                    model: "gone".into(),
+                })
+                .is_ok_and(|outcome| outcome.effect == ConfigChangeEffect::Applied)
         );
     }
 

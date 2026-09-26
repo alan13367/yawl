@@ -31,6 +31,12 @@ impl Default for StatusBarConfig {
 }
 
 impl StatusBarConfig {
+    pub(crate) fn without_retired(mut self) -> Self {
+        self.items
+            .retain(|item| item.kind != StatusBarKind::ActiveSubagents);
+        self
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         validate_status_text(&self.separator, 8, "status_bar.separator")?;
         let mut seen = std::collections::HashSet::new();
@@ -125,13 +131,15 @@ pub(crate) enum StatusBarKind {
     Steering,
     Goal,
     Pending,
+    /// Retired: active subagents have their own strip above the composer.
+    /// Still parsed so saved layouts load, then dropped by `without_retired`.
     ActiveSubagents,
     FailedSubagents,
     ChildTokens,
 }
 
 impl StatusBarKind {
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::Model,
         Self::Reasoning,
         Self::Context,
@@ -141,7 +149,6 @@ impl StatusBarKind {
         Self::Steering,
         Self::Goal,
         Self::Pending,
-        Self::ActiveSubagents,
         Self::FailedSubagents,
         Self::ChildTokens,
     ];

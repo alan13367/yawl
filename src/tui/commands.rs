@@ -22,9 +22,9 @@ use crate::provider::TurnInput;
 
 use super::picker::{
     Picker, PickerAction, PickerItem, SettingsCategory, SettingsItem, SettingsLocation,
-    color_picker, open_model_picker, open_reasoning_picker, select_picker_item,
-    selection_color_picker, settings_category_picker, settings_picker, status_bar_editor_picker,
-    web_search_provider_picker,
+    color_picker, open_model_picker, open_reasoning_picker, open_subagent_model_picker,
+    remove_model_confirm, select_picker_item, selection_color_picker, settings_category_picker,
+    settings_picker, status_bar_editor_picker, web_search_provider_picker,
 };
 use super::state::ViewState;
 
@@ -490,9 +490,9 @@ pub(super) fn handle_queue_picker_action(
     action: PickerAction,
 ) -> Option<PickerAction> {
     match action {
-        PickerAction::ApplyQueued { index, value } => {
-            if let Some(input) = state.queued_inputs.get_mut(index) {
-                input.set_text(value);
+        PickerAction::ApplyQueued { index, input } => {
+            if let Some(queued) = state.queued_inputs.get_mut(index) {
+                *queued = input;
                 state.activity = format!("updated queued message {}", index + 1);
             }
             state.picker = queue_picker(state, index);
@@ -571,6 +571,32 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::OpenModels { save } => open_model_picker(agent, state, save),
+        PickerAction::ReturnToModels { save, selected } => {
+            open_model_picker(agent, state, save);
+            select_picker_item(state, selected);
+        }
+        PickerAction::ConfirmRemoveModel {
+            model,
+            save,
+            selected,
+        } => match remove_model_confirm(agent.config(), &model, save, selected) {
+            Ok(picker) => state.picker = Some(picker),
+            Err(message) => {
+                state.notice(message);
+                open_model_picker(agent, state, save);
+                select_picker_item(state, selected);
+            }
+        },
+        PickerAction::RemoveModel {
+            model,
+            save,
+            selected,
+        } => {
+            remove_model(agent, &model, state);
+            open_model_picker(agent, state, save);
+            select_picker_item(state, selected);
+        }
+        PickerAction::OpenSubagentModels => open_subagent_model_picker(agent.config(), state),
         PickerAction::OpenReasoning { save } => open_reasoning_picker(agent, state, save),
         PickerAction::SetReasoning { effort, save } => {
             if save {
@@ -999,6 +1025,21 @@ pub(super) fn resume(agent: &mut Agent, selector: &str, state: &mut ViewState) {
     load_session(agent, id, state);
 }
 
+pub(super) fn new_session(agent: &mut Agent, state: &mut ViewState) {
+    match agent.reset() {
+        Ok(()) => {
+            let queued_inputs = std::mem::take(&mut state.queued_inputs);
+            let pending_steers = std::mem::take(&mut state.pending_steers);
+            let pending_actions = std::mem::take(&mut state.pending_actions);
+            *state = ViewState::from_agent(agent);
+            state.queued_inputs = queued_inputs;
+            state.pending_steers = pending_steers;
+            state.pending_actions = pending_actions;
+        }
+        Err(error) => state.notice(format!("Could not start a session: {error}")),
+    }
+}
+
 pub(super) fn load_session(agent: &mut Agent, id: &str, state: &mut ViewState) {
     let previous_model = agent.model().to_string();
     match agent.load_session(id) {
@@ -1016,6 +1057,26 @@ pub(super) fn load_session(agent: &mut Agent, id: &str, state: &mut ViewState) {
             });
         }
         Err(error) => state.notice(format!("Could not resume '{id}': {error}")),
+    }
+}
+
+fn remove_model(agent: &mut Agent, model: &str, state: &mut ViewState) {
+    let Some((provider, id)) = model.split_once(':') else {
+        state.notice(format!("`{model}` is not a configured provider model."));
+        return;
+    };
+    let change = ConfigChange::RemoveProviderModel {
+        name: provider.to_string(),
+        model: id.to_string(),
+    };
+    if apply_config_change(agent, change, state)
+        && agent
+            .config()
+            .providers
+            .get(provider)
+            .is_none_or(|provider| provider.models.iter().all(|entry| entry.id != id))
+    {
+        state.notice(format!("Removed `{model}` from the model list."));
     }
 }
 

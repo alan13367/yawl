@@ -240,11 +240,11 @@ Tools:
         prompt.push_str(r#"
 <subagent_guidance>
 - Delegate directly when the task has enough scope; inspect only to resolve missing scope. Use scout for scoped code discovery.
-- Delegate only useful, self-contained work. Prompts need # Target (paths, ownership, non-goals), # Change, and # Acceptance. Give parallel agents disjoint scopes, define interfaces first, and keep working.
-- Declare every required tool; use [] only for tool-free answers. Omit agent for shell commands, file changes, or missing preset capabilities. File changes require write_file or edit_file. scout can discover/read files and inspect Git changes. Never set a model.
-- Children lack this conversation and cannot delegate. Use subagent_send to queue follow-ups. They skip project-wide formatting, linting, builds, and tests; validate once after all finish. Long reports are saved; use paged read_file.
+- Delegate only useful, self-contained work. Prompts need # Target (paths, ownership, non-goals), # Change, and # Acceptance. Give parallel agents disjoint scopes and keep working.
+- Declare every required tool; use [] only for tool-free answers. Omit agent for shell commands, file changes, or missing preset capabilities. File changes require write_file or edit_file. scout can discover/read files and inspect Git changes. Set model only for an explicit user request for a listed model.
+- Children lack this conversation and cannot delegate. subagent_send steers; queue=true adds a turn. They skip project-wide formatting, linting, builds, and tests; validate once after all finish. Use paged read_file for long reports.
 - Settled does not mean completed. Resolve missing capabilities or finish the work yourself; do not just relay suggested commands.
-- Before your final response, wait for every spawned subagent and consider each result. subagent_wait without a timeout blocks until every ID settles. Set timeout_secs only for a bounded status check. Cancel only unwanted work.
+- Before your final response, wait for every spawned subagent and consider each result. subagent_wait without a timeout blocks until every ID settles. Set timeout_secs for bounded checks. Cancel only unwanted work.
 "#);
         prompt.push_str(delivery);
         prompt.push_str("</subagent_guidance>\n");
@@ -596,7 +596,7 @@ mod tests {
         );
         assert!(
             main.contains("Declare every required tool")
-                && main.contains("Never set a model")
+                && main.contains("Set model only for an explicit user request for a listed model")
                 && main.contains("scout can discover/read files and inspect Git changes")
                 && main.contains("Omit agent for shell commands, file changes"),
             "the parent must route write tasks away from read-only presets"

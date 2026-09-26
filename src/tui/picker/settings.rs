@@ -275,11 +275,11 @@ pub(in crate::tui) fn settings_category_picker_from(
                 "Maximum active subagents",
                 config.max_subagents.to_string(),
             ),
-            edit(
-                SettingsItem::SubagentModel,
-                "Default subagent model",
-                config.subagent_model.clone(),
-            ),
+            PickerItem {
+                label: "Default subagent model".into(),
+                description: config.subagent_model.clone(),
+                action: PickerAction::OpenSubagentModels,
+            },
             edit(
                 SettingsItem::SubagentRequestBudget,
                 "Subagent request budget",

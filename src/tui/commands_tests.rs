@@ -278,6 +278,55 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
     assert!(super::commands::promote_queued(&mut state, index));
     assert!(!state.queue_paused);
     assert_eq!(state.queued_inputs[0].text, "edited second");
+
+    state.queued_inputs.clear();
+    editor.insert_image(super::clipboard::StagedImage {
+        id: 1,
+        path: "/unused/image.png".into(),
+        media_type: "image/png".into(),
+    });
+    let EditAction::Queue(input) = editor.queue() else {
+        panic!("expected queued image");
+    };
+    state.queued_inputs.push_back(input);
+    open_queue_picker(&mut state);
+    assert!(take_picker_action(&mut state, &mut editor, Key::Char('e')).is_none());
+    editor.handle_key(Key::Home);
+    editor.paste("caption ");
+    let action = take_picker_action(&mut state, &mut editor, Key::Enter)
+        .expect("saving a queue edit returns an action");
+    assert!(handle_queue_picker_action(&mut state, action).is_none());
+    assert_eq!(state.queued_inputs[0].text, "caption [Image #1]");
+    assert!(state.queued_inputs[0].has_images());
+
+    assert!(take_picker_action(&mut state, &mut editor, Key::Char('e')).is_none());
+    editor.handle_key(Key::End);
+    editor.handle_key(Key::Backspace);
+    editor.paste("[Image #1]");
+    let action = take_picker_action(&mut state, &mut editor, Key::Enter)
+        .expect("saving a queue edit returns an action");
+    assert!(handle_queue_picker_action(&mut state, action).is_none());
+    assert_eq!(state.queued_inputs[0].text, "caption [Image #1]");
+    assert!(!state.queued_inputs[0].has_images());
+
+    let long = "queued paste ".repeat(40);
+    assert!(take_picker_action(&mut state, &mut editor, Key::Char('e')).is_none());
+    editor.paste(&long);
+    let action = take_picker_action(&mut state, &mut editor, Key::Enter)
+        .expect("saving a queue edit returns an action");
+    assert!(handle_queue_picker_action(&mut state, action).is_none());
+    assert_eq!(
+        state.queued_inputs[0].text,
+        format!("caption [Image #1]{long}"),
+        "queue edits expand long pastes like other queued messages"
+    );
+    state.picker = None;
+    editor.handle_key(Key::Up);
+    assert_eq!(
+        editor.text(),
+        "[Image #1]",
+        "queue edits must not become new prompt history"
+    );
 }
 
 #[test]
@@ -902,4 +951,48 @@ fn format_copy_all_drops_a_user_turn_with_only_an_empty_assistant() {
     assert!(text.contains("Assistant:\nanswer"));
     assert!(!text.contains("failed turn"));
     assert!(text.contains("User:\n[conversation summary]"));
+}
+
+#[test]
+fn new_then_resume_does_not_reuse_submitted_image_numbers() {
+    let root = std::env::temp_dir().join(format!(
+        "yawl-image-numbering-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config = Config {
+        model: Some("claude".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
+    };
+    let cwd = crate::config::working_dir();
+    let dirs = config.session_dirs(&cwd);
+    let mut session = crate::session::Session::create(&dirs.project, &cwd, "claude").unwrap();
+    let session_id = session.id.clone();
+    let mut editor = Editor::default();
+    editor.insert_image(super::clipboard::StagedImage {
+        id: editor.next_image_id(),
+        path: root.join("first.png"),
+        media_type: "image/png".into(),
+    });
+    let EditAction::Submit(input) = editor.handle_key(Key::Enter) else {
+        panic!("expected image submission");
+    };
+    session
+        .append_message(&crate::provider::Message::user(&input.text))
+        .unwrap();
+    let mut agent = Agent::new(config, "claude".into(), session, Vec::new());
+    let mut state = ViewState::from_agent(&agent);
+
+    super::commands::new_session(&mut agent, &mut state);
+    assert_ne!(agent.session_id(), session_id);
+    resume(&mut agent, &session_id, &mut state);
+    assert_eq!(agent.session_id(), session_id);
+    assert_eq!(editor.next_image_id(), 2);
+
+    let _ = std::fs::remove_dir_all(root);
 }

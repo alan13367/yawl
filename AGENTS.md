@@ -30,6 +30,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tui/render/reasoning.rs`: thinking tags, accent-derived thinking colors, duration labels, and reasoning trace formatting
 - `src/tui/render/transcript.rs`: visible transcript windows, scrolling and selection reveal, pending inputs, and loading indicators
 - `src/tui/render/welcome.rs`, `render/questions.rs`: welcome animation and question composer
+- `src/tui/render/activity.rs`: compact background-terminal and subagent activity strips above the composer
 - `src/tui/terminal.rs`, `events.rs`, `input.rs`, `transcript.rs`: terminal lifecycle, input decoding/editing, and transcript reduction
 - `src/tui/markdown.rs`, `highlight.rs`, `status_bar.rs`: sanitized Markdown, syntax highlighting, and configurable status rendering
 - `src/tui/tool_view.rs`: generic tool-card rendering facade

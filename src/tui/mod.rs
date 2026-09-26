@@ -455,18 +455,7 @@ fn handle_submission<R: Read>(
             }
             "connect" if argument.is_empty() => connection::open(state, agent.config(), false),
             "connect" => state.notice("Usage: /connect"),
-            name if is_new_session_command(name) => match agent.reset() {
-                Ok(()) => {
-                    let queued_inputs = std::mem::take(&mut state.queued_inputs);
-                    let pending_steers = std::mem::take(&mut state.pending_steers);
-                    let pending_actions = std::mem::take(&mut state.pending_actions);
-                    *state = ViewState::from_agent(agent);
-                    state.queued_inputs = queued_inputs;
-                    state.pending_steers = pending_steers;
-                    state.pending_actions = pending_actions;
-                }
-                Err(error) => state.notice(format!("Could not start a session: {error}")),
-            },
+            name if is_new_session_command(name) => commands::new_session(agent, state),
             "compact" => {
                 state.apply(Update::Compacting);
                 terminal.draw(state, editor)?;

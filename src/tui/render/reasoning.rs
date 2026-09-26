@@ -35,7 +35,7 @@ pub(super) fn render_thinking_tag(
 
 /// Shift the accent hue by 45 degrees and bound saturation and brightness.
 /// Neutral accents get a blue-gray tint rather than resembling reply text.
-fn thinking_color(accent: UiColor) -> UiColor {
+pub(super) fn thinking_color(accent: UiColor) -> UiColor {
     let [red, green, blue] = [accent.red, accent.green, accent.blue].map(f64::from);
     let max = red.max(green).max(blue);
     let min = red.min(green).min(blue);

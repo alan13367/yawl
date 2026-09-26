@@ -1,8 +1,9 @@
 //! Focused tests for the corresponding TUI responsibility.
 
 use super::picker::{
-    SettingsCategory, SettingsItem, model_picker, refreshed_model_picker, settings_category_picker,
-    settings_picker, status_bar_add_picker, status_bar_editor_picker, web_search_provider_picker,
+    SettingsCategory, SettingsItem, SettingsLocation, model_picker, refreshed_model_picker,
+    settings_category_picker, settings_picker, status_bar_add_picker, status_bar_editor_picker,
+    web_search_provider_picker,
 };
 use super::*;
 
@@ -845,4 +846,195 @@ fn web_search_provider_picker_lists_supported_providers_and_selects_current() {
             selected: 1,
         })
     ));
+}
+
+#[test]
+fn subagent_model_picker_inherits_and_keeps_custom_and_manual_selection_on_refresh() {
+    use super::picker::{PickerAction, subagent_model_picker};
+    let mut config = test_agent().config().clone();
+    let inherited = subagent_model_picker(&config, "inherit");
+    assert_eq!(inherited.selected, 0);
+    assert!(
+        matches!(&inherited.items[0].action, PickerAction::ApplySetting { argument, .. } if argument == "subagent_model inherit")
+    );
+    assert!(matches!(
+        inherited.parent,
+        Some(PickerAction::OpenSettingsCategory {
+            category: SettingsCategory::Subagents,
+            ..
+        })
+    ));
+
+    config.providers.insert(
+        "local".into(),
+        crate::config::ProviderConfig {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            api: "openai-completions".into(),
+            api_key: None,
+            auth_header: None,
+            headers: Default::default(),
+            models: vec![crate::config::ModelConfig {
+                id: "listed".into(),
+                name: Some("Listed".into()),
+                context_window: None,
+                max_tokens: None,
+                input: Vec::new(),
+                reasoning_efforts: Vec::new(),
+                compat: Default::default(),
+            }],
+            compat: Default::default(),
+        },
+    );
+    let listed = subagent_model_picker(&config, "local:listed");
+    assert_eq!(listed.items[listed.selected].label, "Listed");
+    let custom = subagent_model_picker(&config, "local:custom");
+    assert_eq!(custom.items[custom.selected].description, "local:custom");
+    let refreshed =
+        super::picker::refreshed_subagent_model_picker(&config, "local:custom", &custom);
+    assert_eq!(
+        refreshed.items[refreshed.selected].description,
+        "local:custom"
+    );
+    let mut manual = listed;
+    manual.selected = manual.items.len() - 1;
+    let refreshed =
+        super::picker::refreshed_subagent_model_picker(&config, "local:listed", &manual);
+    assert_eq!(refreshed.selected, refreshed.items.len() - 1);
+    assert!(matches!(
+        refreshed.items[refreshed.selected].action,
+        PickerAction::EditSetting { .. }
+    ));
+}
+
+#[test]
+fn subagent_model_manual_entry_and_escape_return_to_setting() {
+    use super::picker::{subagent_model_picker, take_picker_action};
+    let config = test_agent().config().clone();
+    let mut picker = subagent_model_picker(&config, "inherit");
+    picker.selected = picker.items.len() - 1;
+    let mut state = test_picker_state(picker);
+    let mut editor = Editor::default();
+    assert!(take_picker_action(&mut state, &mut editor, Key::Enter).is_none());
+    editor.paste("local:manual");
+    assert!(
+        matches!(take_picker_action(&mut state, &mut editor, Key::Enter), Some(PickerAction::ApplySetting { argument, location: Some(SettingsLocation { category: SettingsCategory::Subagents, item: SettingsItem::SubagentModel }) }) if argument == "subagent_model local:manual")
+    );
+    state.picker = Some(subagent_model_picker(&config, "inherit"));
+    assert!(
+        matches!(take_picker_action(&mut state, &mut editor, Key::Escape), Some(PickerAction::OpenSettingsCategory { category: SettingsCategory::Subagents, selected }) if selected == super::picker::settings_item_index(SettingsCategory::Subagents, SettingsItem::SubagentModel))
+    );
+}
+
+#[test]
+fn subagent_model_idle_save_reopens_the_highlighted_setting() {
+    let mut agent = test_agent();
+    let mut state = ViewState::from_agent(&agent);
+    super::commands::activate_picker_action(
+        &mut agent,
+        &mut state,
+        PickerAction::ApplySetting {
+            argument: "subagent_model local:manual".into(),
+            location: Some(SettingsLocation {
+                category: SettingsCategory::Subagents,
+                item: SettingsItem::SubagentModel,
+            }),
+        },
+    );
+    assert_eq!(agent.config().subagent_model, "local:manual");
+    let picker = state.picker.as_ref().expect("settings reopen");
+    assert_eq!(
+        picker.selected,
+        super::picker::settings_item_index(
+            SettingsCategory::Subagents,
+            SettingsItem::SubagentModel
+        )
+    );
+    assert_eq!(picker.items[picker.selected].description, "local:manual");
+}
+
+#[test]
+fn model_picker_removes_configured_models_only_after_confirmation() {
+    use super::commands::activate_picker_action;
+    use super::picker::{open_model_picker, remove_model_confirm, take_picker_action};
+
+    let mut agent = test_agent();
+    let home = agent.config().home_dir.clone();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.json"),
+        serde_json::json!({
+            "model": "test",
+            "providers": {"local": {"base_url": "http://127.0.0.1:9/v1", "models": [
+                {"id": "first"}, {"id": "second"}
+            ]}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut state = ViewState::from_agent(&agent);
+    activate_picker_action(&mut agent, &mut state, PickerAction::Reload);
+    let mut editor = Editor::default();
+    open_model_picker(&agent, &mut state, false);
+    let picker = state.picker.as_mut().expect("model picker");
+    assert!(picker.hint.contains("d remove"));
+    let first = picker
+        .items
+        .iter()
+        .position(|item| item.description == "local:first")
+        .expect("configured model is listed");
+    picker.selected = first;
+
+    let confirm = take_picker_action(&mut state, &mut editor, Key::Char('d'))
+        .expect("d asks for confirmation");
+    activate_picker_action(&mut agent, &mut state, confirm);
+    let picker = state.picker.as_ref().expect("confirmation picker");
+    assert_eq!(picker.title, "Remove model?");
+    assert_eq!(picker.selected, 0, "Cancel is the default");
+
+    let back = take_picker_action(&mut state, &mut editor, Key::Escape).expect("escape goes back");
+    activate_picker_action(&mut agent, &mut state, back);
+    let picker = state.picker.as_ref().expect("model picker again");
+    assert_eq!(picker.items[picker.selected].description, "local:first");
+    assert_eq!(agent.config().providers["local"].models.len(), 2);
+
+    let confirm = take_picker_action(&mut state, &mut editor, Key::Delete).unwrap();
+    activate_picker_action(&mut agent, &mut state, confirm);
+    assert!(take_picker_action(&mut state, &mut editor, Key::Down).is_none());
+    let remove = take_picker_action(&mut state, &mut editor, Key::Enter).expect("confirm");
+    activate_picker_action(&mut agent, &mut state, remove);
+
+    let ids = agent.config().providers["local"]
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["second"]);
+    let picker = state.picker.as_ref().expect("model picker reopens");
+    assert_eq!(picker.title, "Choose model");
+    assert!(
+        picker
+            .items
+            .iter()
+            .all(|item| item.description != "local:first")
+    );
+    assert!(state.transcript.entries().iter().any(
+        |entry| matches!(entry, Entry::Notice(text) if text.contains("Removed `local:first`"))
+    ));
+
+    let current = picker
+        .items
+        .iter()
+        .position(|item| item.description == "test")
+        .expect("current model entry");
+    state.picker.as_mut().unwrap().selected = current;
+    let confirm = take_picker_action(&mut state, &mut editor, Key::Char('d')).unwrap();
+    activate_picker_action(&mut agent, &mut state, confirm);
+    assert_eq!(state.picker.as_ref().unwrap().title, "Choose model");
+    assert!(state.transcript.entries().iter().any(
+        |entry| matches!(entry, Entry::Notice(text) if text.contains("not a configured provider model"))
+    ));
+    assert!(
+        remove_model_confirm(agent.config(), "openai-codex:gpt-test", false, 0)
+            .is_err_and(|message| message.contains("Codex account catalog"))
+    );
 }

@@ -160,7 +160,7 @@ impl Config {
         }
         if let Some(value) = file.status_bar {
             value.validate().map_err(Error::Config)?;
-            self.status_bar = value;
+            self.status_bar = value.without_retired();
         }
         if let Some(value) = file.scroll_bar {
             self.scroll_bar = value;
@@ -537,6 +537,23 @@ mod tests {
             json!({"status_bar_color": "green"}),
         )?)?;
         assert_eq!(cfg.accent_color.config_value(), "green");
+        Ok(())
+    }
+
+    #[test]
+    fn saved_layouts_drop_the_retired_active_subagents_item()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut cfg = test_config();
+        cfg.apply(serde_json::from_value(json!({
+            "status_bar": {"items": [{"kind": "active_subagents"}, {"kind": "model"}]}
+        }))?)?;
+        let kinds = cfg
+            .status_bar
+            .items
+            .iter()
+            .map(|item| item.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, [crate::config::StatusBarKind::Model]);
         Ok(())
     }
 

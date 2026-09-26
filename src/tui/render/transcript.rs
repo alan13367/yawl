@@ -2,6 +2,7 @@
 //!
 //! Owns scroll bounds, selection reveal, loading indicators, and screen placement.
 
+use super::super::tool_view::SubagentLabel;
 use super::super::transcript::Entry;
 use super::super::{ViewState, markdown};
 use super::cache::{LineOwner, RenderSettings};
@@ -15,18 +16,15 @@ pub(in crate::tui) struct TranscriptWindow {
     pub(in crate::tui) max_scroll: usize,
 }
 
-pub(super) fn subagent_labels(state: &ViewState) -> Vec<(String, String)> {
+pub(super) fn subagent_labels(state: &ViewState) -> Vec<SubagentLabel> {
     state
         .subagent_snapshots
         .iter()
-        .map(|snapshot| (snapshot.id.to_string(), snapshot.name.clone()))
-        .collect()
-}
-
-pub(super) fn label_refs(labels: &[(String, String)]) -> Vec<(&str, &str)> {
-    labels
-        .iter()
-        .map(|(id, name)| (id.as_str(), name.as_str()))
+        .map(|snapshot| SubagentLabel {
+            id: snapshot.id.to_string(),
+            name: snapshot.name.clone(),
+            active: snapshot.status.is_active(),
+        })
         .collect()
 }
 
@@ -51,7 +49,6 @@ pub(in crate::tui) fn render_transcript_window(
     let selected = state.transcript.selected_index();
     let reveal = state.transcript.take_reveal_selected();
     let labels = subagent_labels(state);
-    let label_refs = label_refs(&labels);
     let settings = RenderSettings {
         width,
         tools_expanded: state.tools_expanded,
@@ -63,7 +60,7 @@ pub(in crate::tui) fn render_transcript_window(
         let slot = state.render_cache.get_or_render_slot(
             &state.transcript,
             settings,
-            &label_refs,
+            &labels,
             state.spinner_tick,
         );
         (
@@ -84,7 +81,7 @@ pub(in crate::tui) fn render_transcript_window(
     let slot = state.render_cache.get_or_render_slot(
         &state.transcript,
         settings,
-        &label_refs,
+        &labels,
         state.spinner_tick,
     );
     let mut lines = Vec::with_capacity(end - start);

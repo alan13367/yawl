@@ -9,6 +9,7 @@ use crate::subagent::types::{MAX_PROMPT_CHARS, MAX_TRACKED_SUBAGENTS};
 use super::State;
 
 const MAX_WAIT_SECS: u64 = 300;
+const MAX_LISTED_MODELS: usize = 24;
 
 pub(super) fn validate_name(name: &str) -> Result<String, String> {
     let name = name.trim();
@@ -40,7 +41,29 @@ pub(super) fn resolve_model(
     config: &Config,
     parent_model: &str,
     preset_model: Option<&str>,
+    explicit_model: Option<&str>,
 ) -> Result<String, String> {
+    if let Some(model) = explicit_model {
+        let available = crate::model::available_models(config);
+        if !available.iter().any(|(id, _)| id == model) {
+            let mut listed = available
+                .iter()
+                .take(MAX_LISTED_MODELS)
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if available.len() > MAX_LISTED_MODELS {
+                listed.push_str(", …");
+            }
+            if listed.is_empty() {
+                listed.push_str("none");
+            }
+            return Err(format!(
+                "model '{model}' is not in the available model list; available: {listed}"
+            ));
+        }
+        return validate_resolved_model(config, model.to_string());
+    }
     if let Some(model) = preset_model.map(str::trim) {
         if model.is_empty() {
             return Err("model must not be empty".into());

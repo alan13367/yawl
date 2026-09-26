@@ -4,6 +4,7 @@
 //! entry presentation, reasoning blocks, transcript windows, and overlays.
 //! TUI callers keep the entry points here.
 
+mod activity;
 mod cache;
 mod entries;
 mod questions;
@@ -11,6 +12,7 @@ mod reasoning;
 mod transcript;
 mod welcome;
 
+use activity::render_activity_rows;
 pub(super) use cache::{LineOwner, RenderCache};
 use entries::render_entry;
 pub(super) use entries::{entry_default_expanded, render_user_panel};
@@ -19,7 +21,7 @@ pub(super) use entries::{render_entries, render_expanded, render_queued_panel};
 pub(super) use reasoning::render_reasoning;
 #[cfg(test)]
 pub(super) use transcript::render_loading_state;
-use transcript::{label_refs, subagent_labels};
+use transcript::subagent_labels;
 pub(super) use transcript::{loading_label, render_transcript_window};
 pub(super) use welcome::WELCOME_ANIMATION_TICKS;
 use welcome::render_welcome;
@@ -38,9 +40,6 @@ use super::state::{ScrollGeometry, scroll_bar_position, scroll_bar_span};
 use super::{ViewState, markdown};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-const BACKGROUND_NOTICE_CYAN: UiColor = UiColor::new(116, 199, 213);
-const BACKGROUND_NOTICE_AMBER: UiColor = UiColor::new(232, 202, 118);
 
 /// Invalid one-based terminal coordinates signal views that have no editor
 /// and must leave the hardware cursor hidden.
@@ -256,17 +255,31 @@ pub(super) fn build_frame_with_images(
     let layout = if super::picker::picker_is_secret(state) {
         editor.masked_layout(inner_width)
     } else {
-        editor.layout(inner_width)
+        editor.styled_layout(
+            inner_width,
+            &foreground_color(reasoning::thinking_color(state.accent_color)),
+        )
     };
     let background_count = state.background_processes.active_count();
     state.background_active_count = background_count;
-    let background_notice_height = usize::from(background_count > 0);
+    let background_snapshots = if background_count > 0 {
+        state.background_processes.snapshots()
+    } else {
+        Vec::new()
+    };
+    let activity_rows = render_activity_rows(
+        &state.subagent_snapshots,
+        &background_snapshots,
+        columns,
+        state.accent_color,
+    );
+    let activity_height = activity_rows.len();
     let status_line = super::status_bar::render(state, columns);
     let status_height = usize::from(status_line.is_some());
     let search_height = usize::from(state.transcript.search_active());
     let max_input_lines = (rows / 3).max(1);
     let max_question_lines = rows
-        .saturating_sub(2 + background_notice_height + status_height + search_height)
+        .saturating_sub(2 + activity_height + status_height + search_height)
         .max(1);
     let (input_lines, cursor_input_row, cursor_input_col, hide_input_cursor) =
         if let Some(question) = &state.question {
@@ -300,7 +313,7 @@ pub(super) fn build_frame_with_images(
         };
     let input_height = input_lines.len() + 2;
     let menu_capacity = COMPLETION_MENU_ROWS
-        .min(rows.saturating_sub(input_height + background_notice_height + status_height));
+        .min(rows.saturating_sub(input_height + activity_height + status_height));
     let menu_entries = if state.picker.is_none() && state.question.is_none() {
         sync_completion_filter(state, editor);
         menu_rows(state, editor)
@@ -359,7 +372,7 @@ pub(super) fn build_frame_with_images(
     }
     let menu_height = menu.len();
     let transcript_height = rows.saturating_sub(
-        input_height + menu_height + search_height + background_notice_height + status_height,
+        input_height + menu_height + search_height + activity_height + status_height,
     );
     let transcript = render_transcript_window(state, columns, transcript_height, image_support);
     let transcript_width = columns;
@@ -440,6 +453,7 @@ pub(super) fn build_frame_with_images(
             columns,
         ));
     }
+    frame.extend(activity_rows);
     let text_box_color = foreground_color(state.accent_color);
     let composer_label = if state.question.is_some() {
         Some("Your input")
@@ -477,14 +491,6 @@ pub(super) fn build_frame_with_images(
     frame.push(format!("{text_box_color}└{bottom_border}┘\x1b[0m"));
     frame.extend(menu);
 
-    if background_count > 0 {
-        frame.push(render_background_process_notice(
-            background_count,
-            columns,
-            state.accent_color,
-        ));
-    }
-
     if let Some(status_line) = status_line {
         frame.push(status_line);
     }
@@ -502,7 +508,7 @@ pub(super) fn build_frame_with_images(
         )
     } else {
         (
-            transcript_height + search_height + 2 + cursor_input_row,
+            transcript_height + search_height + activity_height + 2 + cursor_input_row,
             (2 + cursor_input_col).min(columns.saturating_sub(1)),
         )
     };
@@ -623,49 +629,7 @@ fn render_choice_lines(
         .collect()
 }
 
-pub(super) fn render_background_process_notice(
-    count: usize,
-    width: usize,
-    accent: UiColor,
-) -> String {
-    let color = background_notice_color(accent);
-    if width < 48 {
-        return markdown::fit_width(
-            &format!(
-                " {}\x1b[1m{count} bg\x1b[22m {}running \u{b7} /ps\x1b[0m",
-                foreground_color(color),
-                status_style(color),
-            ),
-            width,
-        );
-    }
-    let noun = if count == 1 {
-        "background terminal"
-    } else {
-        "background terminals"
-    };
-    markdown::fit_width(
-        &format!(
-            " {}\u{25cf}  \x1b[1m{count} {noun}\x1b[22m {}running  \u{b7}  /ps to view\x1b[0m",
-            foreground_color(color),
-            status_style(color),
-        ),
-        width,
-    )
-}
-
-fn background_notice_color(accent: UiColor) -> UiColor {
-    if perceptual_color_distance(accent, BACKGROUND_NOTICE_CYAN)
-        >= perceptual_color_distance(accent, BACKGROUND_NOTICE_AMBER)
-    {
-        BACKGROUND_NOTICE_CYAN
-    } else {
-        BACKGROUND_NOTICE_AMBER
-    }
-}
-
-/// Weighted RGB distance keeps the notice visually separate from both named
-/// and custom accent colors without adding another configurable setting.
+/// Weighted RGB distance keeps activity separate from the composer accent.
 fn perceptual_color_distance(left: UiColor, right: UiColor) -> u32 {
     let red_mean = (u32::from(left.red) + u32::from(right.red)) / 2;
     let squared_delta =
@@ -686,7 +650,6 @@ fn render_block_viewer(
         return build_frame(state, &Editor::default(), columns, rows);
     };
     let labels = subagent_labels(state);
-    let label_refs = label_refs(&labels);
     let Some(entry) = state.transcript.entry(index) else {
         state.transcript.close_viewer();
         return build_frame(state, &Editor::default(), columns, rows);
@@ -705,7 +668,7 @@ fn render_block_viewer(
         state.hide_reasoning,
         ImageSupport::None,
         state.accent_color,
-        &label_refs,
+        &labels,
         state.spinner_tick,
     )
     .unwrap_or_default();
