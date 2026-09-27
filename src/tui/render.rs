@@ -19,9 +19,9 @@ pub(super) use entries::{entry_default_expanded, render_user_panel};
 #[cfg(test)]
 pub(super) use entries::{render_entries, render_expanded, render_queued_panel};
 pub(super) use reasoning::render_reasoning;
-#[cfg(test)]
-pub(super) use transcript::render_loading_state;
 use transcript::subagent_labels;
+#[cfg(test)]
+pub(super) use transcript::{MODEL_STREAM_STALL, render_loading_state};
 pub(super) use transcript::{loading_label, render_transcript_window};
 pub(super) use welcome::WELCOME_ANIMATION_TICKS;
 use welcome::render_welcome;
@@ -471,7 +471,7 @@ pub(super) fn build_frame_with_images(
     for line in &input_lines {
         frame.push(format!(
             "{text_box_color}│\x1b[0m{}{text_box_color}│\x1b[0m",
-            markdown::fit_width(line, inner_width)
+            markdown::fit_composer_width(line, inner_width)
         ));
     }
     let show_queue_hint = state.question.is_none()

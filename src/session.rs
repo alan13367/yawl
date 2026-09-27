@@ -58,6 +58,10 @@ impl PlanState {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SessionEvent {
@@ -77,6 +81,15 @@ enum SessionEvent {
     /// recent switch so resuming continues with the last used model.
     ModelSwitch {
         model: String,
+    },
+    /// The user chose a reasoning effort for this session. `effort: null` is
+    /// an explicit provider default. `inherit` drops the choice so later
+    /// resumes follow the saved config default again. Replays keep the latest
+    /// event.
+    ReasoningEffort {
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        inherit: bool,
     },
     /// `replaced` messages beginning at `start` (at that point in replay)
     /// were folded into `summary`. Older logs omit `start` and default to the
@@ -167,6 +180,10 @@ pub struct Session {
     /// Last model used in this log: the header model unless a later switch
     /// event exists.
     model: String,
+    /// `None` when the session has no reasoning choice of its own.
+    /// `Some(None)` is an explicit provider default. `Some(Some(level))` is
+    /// an explicit effort.
+    reasoning_effort: Option<Option<String>>,
     active_goal: Option<String>,
     active_plan: Option<PlanState>,
     plan_before_turn: Option<PlanState>,
@@ -180,6 +197,7 @@ struct ReplayedSession {
     plan_handoffs: std::collections::HashSet<usize>,
     messages: Vec<Message>,
     model: String,
+    reasoning_effort: Option<Option<String>>,
     active_goal: Option<String>,
     active_plan: Option<PlanState>,
     plan_before_turn: Option<PlanState>,
@@ -227,6 +245,7 @@ impl Session {
             #[cfg(test)]
             fail_after_appends: None,
             model: model.to_string(),
+            reasoning_effort: None,
             active_goal: None,
             active_plan: None,
             plan_before_turn: None,
@@ -268,6 +287,7 @@ impl Session {
             #[cfg(test)]
             fail_after_appends: None,
             model: replayed.model,
+            reasoning_effort: replayed.reasoning_effort,
             active_goal: replayed.active_goal,
             active_plan: replayed.active_plan,
             plan_before_turn: replayed.plan_before_turn,
@@ -340,6 +360,43 @@ impl Session {
             model: model.to_string(),
         })?;
         self.model = model.to_string();
+        Ok(())
+    }
+
+    /// The session's own reasoning choice, if it has one.
+    ///
+    /// `None` means resume should use the saved config default. `Some(None)`
+    /// is an explicit provider default. `Some(Some(level))` is an explicit
+    /// effort.
+    pub fn recorded_reasoning(&self) -> Option<Option<String>> {
+        self.reasoning_effort.clone()
+    }
+
+    /// Records a reasoning choice so a later resume keeps it instead of the
+    /// saved config default. Repeating the current choice writes nothing.
+    pub fn append_reasoning_effort(&mut self, effort: Option<String>) -> Result<(), Error> {
+        if self.reasoning_effort.as_ref() == Some(&effort) {
+            return Ok(());
+        }
+        self.append(&SessionEvent::ReasoningEffort {
+            effort: effort.clone(),
+            inherit: false,
+        })?;
+        self.reasoning_effort = Some(effort);
+        Ok(())
+    }
+
+    /// Drops a session reasoning choice so later resumes follow the saved
+    /// config default. A session that already inherits writes nothing.
+    pub fn clear_reasoning_effort(&mut self) -> Result<(), Error> {
+        if self.reasoning_effort.is_none() {
+            return Ok(());
+        }
+        self.append(&SessionEvent::ReasoningEffort {
+            effort: None,
+            inherit: true,
+        })?;
+        self.reasoning_effort = None;
         Ok(())
     }
 
@@ -605,6 +662,7 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
     let file = File::open(path)?;
     let mut messages: Vec<Message> = Vec::new();
     let mut model = String::new();
+    let mut reasoning_effort = None;
     let mut active_goal = None;
     let mut active_plan = None;
     let mut plan_before_turn = None;
@@ -644,6 +702,9 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
         match event {
             SessionEvent::Meta { .. } => {}
             SessionEvent::ModelSwitch { model: switched } => model = switched,
+            SessionEvent::ReasoningEffort { effort, inherit } => {
+                reasoning_effort = if inherit { None } else { Some(effort) };
+            }
             SessionEvent::UndoStarted { mut undo } => {
                 undo.plan_state = plans::restore_revision(undo.plan_state, &plan_revisions);
                 pending_undo = Some(Box::new(undo));
@@ -765,6 +826,7 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
         plan_handoffs,
         messages,
         model,
+        reasoning_effort,
         active_goal,
         active_plan,
         plan_before_turn,
@@ -1357,6 +1419,34 @@ mod tests {
         let (reopened, _) = Session::open(&dir, &session.id)?;
         assert_eq!(reopened.model(), "removed-provider:some-model");
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn reasoning_choice_survives_replay_and_explicit_default_is_distinct() -> Result<(), Error> {
+        let root = temp_root("reasoning");
+        let dir = root.join("sessions");
+        let mut session = Session::create(&dir, Path::new("/projects/yawl"), "model")?;
+        let id = session.id.clone();
+        assert_eq!(session.recorded_reasoning(), None);
+        session.append_reasoning_effort(Some("medium".into()))?;
+        session.append_reasoning_effort(Some("medium".into()))?;
+        session.append_message(&Message::user("hello"))?;
+        drop(session);
+
+        let (mut session, _) = Session::open(&dir, &id)?;
+        assert_eq!(session.recorded_reasoning(), Some(Some("medium".into())));
+        session.append_reasoning_effort(None)?;
+        drop(session);
+
+        let (mut session, _) = Session::open(&dir, &id)?;
+        assert_eq!(session.recorded_reasoning(), Some(None));
+        session.clear_reasoning_effort()?;
+        drop(session);
+
+        let (session, _) = Session::open(&dir, &id)?;
+        assert_eq!(session.recorded_reasoning(), None);
+        let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 

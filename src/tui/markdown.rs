@@ -3,7 +3,8 @@
 //! highlighted lines so terminal drag-select copies clean commands).
 
 use super::highlight;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const RESET: &str = "\x1b[0m";
 const INLINE_CODE: &str = "\x1b[38;2;155;188;198m";
@@ -434,6 +435,50 @@ pub(crate) fn fit_width(text: &str, width: usize) -> String {
     if visible < width {
         line.push_str(&" ".repeat(width - visible));
     }
+    line
+}
+
+/// Fits a composer row using the same grapheme widths as the input editor.
+/// Segment the unstyled text so ANSI sequences cannot split a cluster.
+/// Transcript fitting retains its existing per-character width convention.
+pub(super) fn fit_composer_width(text: &str, width: usize) -> String {
+    let plain = strip_ansi(text);
+    let mut visible = 0usize;
+    let mut remaining_chars = 0usize;
+    for grapheme in plain.graphemes(true) {
+        let cluster_width = grapheme.width();
+        if grapheme.contains('\n') || visible.saturating_add(cluster_width) > width {
+            break;
+        }
+        visible += cluster_width;
+        remaining_chars += grapheme.chars().count();
+    }
+
+    let bytes = text.as_bytes();
+    let mut line = String::new();
+    let mut index = 0usize;
+    let mut styled = false;
+    while index < bytes.len() {
+        if let Some(end) = ansi_sequence_end(bytes, index) {
+            let sequence = &text[index..end];
+            line.push_str(sequence);
+            styled |= sequence.ends_with('m');
+            index = end;
+        } else if remaining_chars > 0 {
+            let Some(character) = text[index..].chars().next() else {
+                break;
+            };
+            line.push(character);
+            index += character.len_utf8();
+            remaining_chars -= 1;
+        } else {
+            break;
+        }
+    }
+    if styled && !line.ends_with(RESET) {
+        line.push_str(RESET);
+    }
+    line.push_str(&" ".repeat(width - visible));
     line
 }
 
@@ -938,6 +983,24 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(strip_ansi(&lines.join("")), "abcdefg✅hi");
+    }
+
+    #[test]
+    fn composer_fitting_preserves_clusters_and_ansi_styles() {
+        let family = "👨\u{200d}👩\u{200d}👧";
+        for text in [
+            format!("\x1b[31m{family}abc\x1b[0m"),
+            "👨\u{200d}\x1b[31m👩\u{200d}👧abc\x1b[0m".into(),
+        ] {
+            let fitted = fit_composer_width(&text, 4);
+            assert_eq!(strip_ansi(&fitted), format!("{family}ab"));
+            assert!(fitted.contains("\x1b[31m"));
+            assert!(fitted.ends_with(RESET));
+            assert_eq!(strip_ansi(&fit_composer_width(&text, 1)), " ");
+        }
+        assert_eq!(fit_composer_width("e\u{301}", 3), "e\u{301}  ");
+        assert_eq!(strip_ansi(&fit_composer_width("abc", 0)), "");
+        assert_eq!(fit_composer_width("a\nb", 3), "a  ");
     }
 
     #[test]

@@ -2,12 +2,19 @@
 //!
 //! Owns scroll bounds, selection reveal, loading indicators, and screen placement.
 
+use std::time::Duration;
+
 use super::super::tool_view::SubagentLabel;
 use super::super::transcript::Entry;
 use super::super::{ViewState, markdown};
 use super::cache::{LineOwner, RenderSettings};
 use super::entries::{render_queued_panel, render_steer_panel};
 use super::{ImageSupport, SPINNER_FRAMES, foreground_color};
+
+/// How long a live response may sit without a model delta before `Waiting…`
+/// returns. A server can buffer an entire tool call and emit nothing until
+/// it is parsed; the preamble already on screen would otherwise freeze.
+pub(in crate::tui) const MODEL_STREAM_STALL: Duration = Duration::from_millis(500);
 
 pub(in crate::tui) struct TranscriptWindow {
     pub(in crate::tui) lines: Vec<(String, Option<LineOwner>)>,
@@ -142,7 +149,12 @@ pub(in crate::tui) fn loading_label(activity: &str) -> Option<&str> {
 
 pub(in crate::tui) fn render_loading_state(state: &ViewState, width: usize) -> Option<String> {
     let label = loading_label(&state.activity)?;
+    let stream_quiet = state
+        .transcript
+        .last_model_activity()
+        .is_some_and(|at| at.elapsed() >= MODEL_STREAM_STALL);
     if has_visible_in_flight_content(state)
+        && !stream_quiet
         && !state.activity.starts_with("preparing ")
         && state.activity != "loading skill"
         && state.activity != "compacting conversation"

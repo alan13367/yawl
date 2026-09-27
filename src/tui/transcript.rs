@@ -80,6 +80,10 @@ pub(super) struct Transcript {
     viewer_open: bool,
     search: Option<TranscriptSearch>,
     reveal_selected: bool,
+    /// When the current response last received a text or reasoning delta.
+    /// A quiet gap after that is what brings the waiting spinner back while
+    /// a server buffers a tool call.
+    last_model_activity: Option<Instant>,
 }
 
 impl Transcript {
@@ -200,7 +204,17 @@ impl Transcript {
             viewer_open: false,
             search: None,
             reveal_selected: false,
+            last_model_activity: None,
         }
+    }
+
+    pub(super) fn last_model_activity(&self) -> Option<Instant> {
+        self.last_model_activity
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_last_model_activity(&mut self, at: Instant) {
+        self.last_model_activity = Some(at);
     }
 
     pub(super) fn entries(&self) -> &[Entry] {
@@ -422,10 +436,12 @@ impl Transcript {
     pub(super) fn finish_streaming_response(&mut self) {
         self.streaming_entries_start = None;
         self.streaming_assistant = None;
+        self.last_model_activity = None;
         self.close_streaming_reasoning();
     }
 
     pub(super) fn push_user(&mut self, content: String) {
+        self.last_model_activity = None;
         self.entries.push(Entry::User(content));
         if self.focused {
             self.selected = Some(self.entries.len() - 1);
@@ -433,6 +449,7 @@ impl Transcript {
     }
 
     pub(super) fn push_steer(&mut self, content: String) {
+        self.last_model_activity = None;
         self.entries.push(Entry::Steer(content));
         if self.focused {
             self.selected = Some(self.entries.len() - 1);
@@ -453,6 +470,7 @@ impl Transcript {
     pub(super) fn apply(&mut self, event: TranscriptEvent) {
         match event {
             TranscriptEvent::TextDelta(text) => {
+                self.last_model_activity = Some(Instant::now());
                 self.streaming_entries_start
                     .get_or_insert(self.entries.len());
                 self.close_streaming_reasoning();
@@ -470,6 +488,7 @@ impl Transcript {
                 }
             }
             TranscriptEvent::ReasoningDelta { kind, text } => {
+                self.last_model_activity = Some(Instant::now());
                 self.streaming_entries_start
                     .get_or_insert(self.entries.len());
                 self.streaming_assistant = None;
@@ -498,6 +517,7 @@ impl Transcript {
                 }
                 self.streaming_assistant = None;
                 self.streaming_reasoning = None;
+                self.last_model_activity = None;
                 self.selected = self.selected.filter(|index| *index < self.entries.len());
                 self.expansion_overrides
                     .retain(|index, _| *index < self.entries.len());

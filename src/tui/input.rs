@@ -3,7 +3,8 @@
 
 use std::cell::Cell;
 
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::clipboard::{ClipboardStore, StagedImage};
 use super::events::Key;
@@ -403,26 +404,8 @@ impl Editor {
             Key::Steer | Key::Ctrl('g') => return self.steer(),
             Key::Backspace => self.backspace(),
             Key::Delete => self.delete(),
-            Key::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
-                if let Some((start, _)) = self
-                    .image_spans()
-                    .into_iter()
-                    .find(|(start, end)| *start < self.cursor && self.cursor < *end)
-                {
-                    self.cursor = start;
-                }
-            }
-            Key::Right => {
-                self.cursor = (self.cursor + 1).min(self.buffer.len());
-                if let Some((_, end)) = self
-                    .image_spans()
-                    .into_iter()
-                    .find(|(start, end)| *start < self.cursor && self.cursor < *end)
-                {
-                    self.cursor = end;
-                }
-            }
+            Key::Left => self.cursor = self.previous_stop(),
+            Key::Right => self.cursor = self.next_stop(),
             Key::Home | Key::Ctrl('a') => self.cursor = self.line_start(),
             Key::End | Key::Ctrl('e') => self.cursor = self.line_end(),
             Key::Up => {
@@ -492,12 +475,38 @@ impl Editor {
         spans
     }
 
+    /// Nearest grapheme boundary before the cursor, outside image markers.
+    fn previous_stop(&self) -> usize {
+        let boundary = grapheme_boundaries(&self.buffer)
+            .into_iter()
+            .rev()
+            .find(|boundary| *boundary < self.cursor)
+            .unwrap_or(0);
+        self.image_spans()
+            .into_iter()
+            .find(|(start, end)| *start < boundary && boundary < *end)
+            .map_or(boundary, |(start, _)| start)
+    }
+
+    /// Nearest grapheme boundary after the cursor, outside image markers.
+    fn next_stop(&self) -> usize {
+        let boundary = grapheme_boundaries(&self.buffer)
+            .into_iter()
+            .find(|boundary| *boundary > self.cursor)
+            .unwrap_or(self.buffer.len());
+        self.image_spans()
+            .into_iter()
+            .find(|(start, end)| *start < boundary && boundary < *end)
+            .map_or(boundary, |(_, end)| end)
+    }
+
     fn move_vertical(&mut self, upward: bool) -> bool {
         let width = self.layout_width.get();
         if width < 3 {
             return false;
         }
         let image_spans = self.image_spans();
+        let boundaries = grapheme_boundaries(&self.buffer);
         let positions = buffer_layout(&self.buffer, width, &image_spans, None).positions;
         let current = positions[self.cursor];
         let target_row = if upward {
@@ -518,6 +527,7 @@ impl Editor {
             .enumerate()
             .filter(|(index, position)| {
                 position.row == target_row
+                    && boundaries.binary_search(index).is_ok()
                     && !image_spans
                         .iter()
                         .any(|(start, end)| *start < *index && *index < *end)
@@ -574,8 +584,9 @@ impl Editor {
                 self.replace_range(start, end, []);
                 self.cursor = start;
             } else {
-                self.cursor -= 1;
-                self.replace_range(self.cursor, self.cursor + 1, []);
+                let start = self.previous_stop();
+                self.replace_range(start, self.cursor, []);
+                self.cursor = start;
             }
         }
     }
@@ -591,7 +602,8 @@ impl Editor {
                 self.replace_range(start, end, []);
                 self.cursor = start;
             } else {
-                self.replace_range(self.cursor, self.cursor + 1, []);
+                let end = self.next_stop();
+                self.replace_range(self.cursor, end, []);
             }
         }
     }
@@ -754,17 +766,50 @@ fn wraps_before(column: usize, character_width: usize, width: usize) -> bool {
     column > 2 && column.saturating_add(character_width) > width
 }
 
-fn word_width(buffer: &[char], start: usize) -> usize {
+/// Character indices where grapheme clusters start, followed by the buffer length.
+fn grapheme_boundaries(buffer: &[char]) -> Vec<usize> {
+    let text: String = buffer.iter().collect();
+    let mut boundaries = Vec::with_capacity(buffer.len() + 1);
+    let mut index = 0;
+    for grapheme in text.graphemes(true) {
+        boundaries.push(index);
+        index += grapheme.chars().count();
+    }
+    boundaries.push(index);
+    boundaries
+}
+
+/// Terminal width per character. A cluster's whole width sits on its first
+/// character and the rest are zero, so a cluster never splits across lines.
+fn display_widths(buffer: &[char]) -> Vec<usize> {
+    let mut widths = vec![0; buffer.len()];
+    for cluster in grapheme_boundaries(buffer).windows(2) {
+        let displayed: String = buffer[cluster[0]..cluster[1]]
+            .iter()
+            .copied()
+            .map(displayed_character)
+            .collect();
+        widths[cluster[0]] = displayed.width();
+    }
+    widths
+}
+
+fn word_width(buffer: &[char], widths: &[usize], start: usize) -> usize {
     buffer[start..]
         .iter()
-        .copied()
-        .take_while(|character| !character.is_whitespace())
-        .map(displayed_character)
-        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .zip(&widths[start..])
+        .take_while(|(character, _)| !character.is_whitespace())
+        .map(|(_, width)| width)
         .sum()
 }
 
-fn should_wrap_word(buffer: &[char], index: usize, column: usize, width: usize) -> bool {
+fn should_wrap_word(
+    buffer: &[char],
+    widths: &[usize],
+    index: usize,
+    column: usize,
+    width: usize,
+) -> bool {
     let character = buffer[index];
     if character.is_whitespace()
         || index
@@ -773,7 +818,7 @@ fn should_wrap_word(buffer: &[char], index: usize, column: usize, width: usize) 
     {
         return false;
     }
-    let word_width = word_width(buffer, index);
+    let word_width = word_width(buffer, widths, index);
     column > 2 && word_width <= width.saturating_sub(2) && column.saturating_add(word_width) > width
 }
 
@@ -796,6 +841,7 @@ fn buffer_layout(
     let mut line = String::from("> ");
     let mut column = 2usize;
     let mut styled = false;
+    let widths = display_widths(buffer);
 
     for (index, character) in buffer.iter().copied().enumerate() {
         if character == '\n' {
@@ -811,7 +857,7 @@ fn buffer_layout(
             .iter()
             .find(|(start, end)| *start <= index && index < *end);
         let displayed = displayed_character(character);
-        let character_width = UnicodeWidthChar::width(displayed).unwrap_or(0);
+        let character_width = widths[index];
         if marker.is_none()
             && character.is_whitespace()
             && wraps_before(column, character_width, width)
@@ -833,7 +879,7 @@ fn buffer_layout(
                 && column.saturating_add(end - start) > width
         });
         if wrap_token
-            || (!fits_as_token && should_wrap_word(buffer, index, column, width))
+            || (!fits_as_token && should_wrap_word(buffer, &widths, index, column, width))
             || wraps_before(column, character_width, width)
         {
             next_buffer_line(&mut lines, &mut line, &mut styled);
@@ -1342,6 +1388,60 @@ mod tests {
 
         assert_eq!(layout.lines, ["> abc", "  界de", "  f"]);
         assert_eq!((layout.cursor_row, layout.cursor_col), (2, 3));
+    }
+
+    #[test]
+    fn editing_keys_treat_grapheme_clusters_as_one_character() {
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let flag = "🇪🇸";
+        let accented = "e\u{301}";
+        let mut editor = Editor::default();
+        editor.paste(&format!("a{family}{flag}{accented}b"));
+
+        editor.handle_key(Key::Left);
+        editor.handle_key(Key::Backspace);
+        assert_eq!(editor.text(), format!("a{family}{flag}b"));
+        editor.handle_key(Key::Left);
+        assert_eq!(editor.text(), format!("a{family}{flag}b"));
+        editor.handle_key(Key::Delete);
+        assert_eq!(editor.text(), format!("a{family}b"));
+        editor.handle_key(Key::Backspace);
+        assert_eq!(editor.text(), "ab");
+        editor.handle_key(Key::Char('x'));
+        assert_eq!(editor.text(), "axb");
+
+        editor.clear();
+        editor.paste(flag);
+        editor.handle_key(Key::Home);
+        editor.handle_key(Key::Right);
+        editor.handle_key(Key::Char('!'));
+        assert_eq!(editor.text(), format!("{flag}!"));
+    }
+
+    #[test]
+    fn layout_measures_grapheme_clusters_as_single_cells() {
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let mut editor = Editor::default();
+        editor.paste(&format!("{family}e\u{301}"));
+
+        let layout = editor.layout(20);
+
+        assert_eq!((layout.cursor_row, layout.cursor_col), (0, 5));
+        let layout = editor.layout(4);
+        assert_eq!(layout.lines, [format!("> {family}"), "  e\u{301}".into()]);
+    }
+
+    #[test]
+    fn vertical_movement_does_not_land_inside_a_cluster() {
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let mut editor = Editor::default();
+        editor.paste(&format!("{family}{family}\nabcdef"));
+        editor.layout(20);
+
+        editor.handle_key(Key::Up);
+        editor.handle_key(Key::Backspace);
+
+        assert_eq!(editor.text(), format!("{family}\nabcdef"));
     }
 
     #[test]

@@ -186,6 +186,32 @@ fn pasted_image_tag_uses_a_distinct_composer_color() {
 }
 
 #[test]
+fn composer_preserves_graphemes_and_trailing_text_in_the_final_frame() {
+    use unicode_width::UnicodeWidthStr;
+
+    for text in [
+        "👨\u{200d}👩\u{200d}👧abcdefghijklm",
+        "🇪🇸abcdefghijklm",
+        "⚠️abcdefghijklm",
+        "e\u{301}abcdefghijklm",
+    ] {
+        let mut state = empty_session_state();
+        let mut editor = Editor::default();
+        editor.paste(text);
+
+        let (frame, _) = build_frame(&mut state, &editor, 20, 12);
+        let input = frame
+            .iter()
+            .map(|line| markdown::strip_ansi(line))
+            .find(|line| line.starts_with("│> "))
+            .expect("composer row");
+
+        assert!(input.contains(text), "{input:?}");
+        assert_eq!(input.width(), 20, "{input:?}");
+    }
+}
+
+#[test]
 fn input_box_moves_complete_words_to_the_next_row() {
     let mut state = empty_session_state();
     let mut editor = Editor::default();
@@ -744,6 +770,33 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         "Hello!".into(),
     )));
     assert!(render_loading_state(&state, 80).is_none());
+}
+
+#[test]
+fn waiting_returns_when_a_visible_response_goes_quiet() {
+    let mut state = overflow_state();
+    state.activity = "responding".into();
+    state.apply(Update::Transcript(TranscriptEvent::TextDelta(
+        "I'll check that.".into(),
+    )));
+    assert!(
+        render_loading_state(&state, 80).is_none(),
+        "fresh text is the feedback"
+    );
+
+    state
+        .transcript
+        .set_last_model_activity(std::time::Instant::now() - super::render::MODEL_STREAM_STALL);
+    let loading = render_loading_state(&state, 80).expect("a quiet stream should show waiting");
+    assert!(markdown::strip_ansi(&loading).contains("Waiting…"));
+
+    state.apply(Update::Transcript(TranscriptEvent::TextDelta(
+        " Still here.".into(),
+    )));
+    assert!(
+        render_loading_state(&state, 80).is_none(),
+        "a new delta hides the spinner again"
+    );
 }
 
 #[test]

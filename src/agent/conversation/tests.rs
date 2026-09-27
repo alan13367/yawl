@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::{Conversation, is_undoable_user_prompt, last_undoable_user_index};
 use crate::agent::TurnEvent;
 use crate::compaction;
-use crate::config::Config;
+use crate::config::{Config, ConfigChange};
 use crate::error::Error;
 use crate::provider::{
     CompactionOutput, Event as ProviderEvent, Message, Provider, Request, Role, TokenUsage,
@@ -1740,6 +1740,100 @@ fn switched_models_are_recorded_and_adopted_on_resume() {
     resumed.load_session(&id).unwrap();
     assert_eq!(resumed.model(), "other-model");
     assert_eq!(resumed.messages().len(), 1);
+}
+
+fn resume_with_reasoning(test: &TestAgent, id: &str, saved_default: Option<&str>) -> Conversation {
+    let (session, messages) = Session::open(&test.sessions_dir, id).unwrap();
+    let mut config = test.agent.config().clone();
+    config.reasoning_effort = saved_default.map(str::to_string);
+    Conversation::persistent(
+        config,
+        test.agent.model().to_string(),
+        session,
+        messages,
+        test.root.join("cwd"),
+    )
+}
+
+#[test]
+fn resumed_session_keeps_a_reasoning_choice_over_the_saved_default() {
+    let mut test = TestAgent::new("reasoning-resume");
+    test.agent.config.reasoning_effort = Some("xhigh".into());
+    test.agent.configured_reasoning_effort = Some("xhigh".into());
+    test.agent
+        .append_input_message(Message::user("start"))
+        .unwrap();
+    let id = test.agent.session_id().to_string();
+
+    let resumed = resume_with_reasoning(&test, &id, Some("low"));
+    assert_eq!(
+        resumed.config().reasoning_effort.as_deref(),
+        Some("low"),
+        "a session with no reasoning choice uses the saved default"
+    );
+    drop(resumed);
+
+    test.agent
+        .set_reasoning_effort(Some("medium".into()))
+        .unwrap();
+    let resumed = resume_with_reasoning(&test, &id, Some("xhigh"));
+    assert_eq!(
+        resumed.config().reasoning_effort.as_deref(),
+        Some("medium"),
+        "resume keeps the effort chosen for the session"
+    );
+    drop(resumed);
+
+    test.agent.set_reasoning_effort(None).unwrap();
+    let resumed = resume_with_reasoning(&test, &id, Some("xhigh"));
+    assert_eq!(
+        resumed.config().reasoning_effort.as_deref(),
+        None,
+        "an explicit provider default stays cleared on resume"
+    );
+}
+
+#[test]
+fn config_reload_keeps_a_session_reasoning_choice_until_the_default_is_saved() {
+    let mut test = TestAgent::new("reasoning-reload");
+    test.agent.config.reasoning_effort = Some("xhigh".into());
+    test.agent.configured_reasoning_effort = Some("xhigh".into());
+    test.agent
+        .append_input_message(Message::user("start"))
+        .unwrap();
+    test.agent
+        .set_reasoning_effort(Some("medium".into()))
+        .unwrap();
+
+    test.agent
+        .change_global_config(ConfigChange::Bell(false))
+        .unwrap();
+    assert_eq!(
+        test.agent.config().reasoning_effort.as_deref(),
+        Some("medium"),
+        "reloading an unrelated setting keeps the session effort"
+    );
+
+    test.agent
+        .change_global_config(ConfigChange::ReasoningEffort {
+            stored: "high".into(),
+            effective: Some("high".into()),
+        })
+        .unwrap();
+    assert_eq!(
+        test.agent.config().reasoning_effort.as_deref(),
+        Some("high")
+    );
+
+    let id = test.agent.session_id().to_string();
+    let (session, _) = Session::open(&test.sessions_dir, &id).unwrap();
+    assert_eq!(session.recorded_reasoning(), None);
+    let resumed = resume_with_reasoning(&test, &id, Some("xhigh"));
+    assert_eq!(
+        resumed.config().reasoning_effort.as_deref(),
+        Some("xhigh"),
+        "a cleared session choice uses the config opened with the session"
+    );
 }
 
 fn text_step(text: &'static str) -> ProviderStep {

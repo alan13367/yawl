@@ -95,6 +95,9 @@ enum ConversationKind {
 /// memory-only-child capabilities.
 pub(crate) struct Conversation {
     config: Config,
+    /// Reasoning effort from the saved config, independent of a session choice.
+    /// Reloading settings updates this. `/reasoning` does not.
+    configured_reasoning_effort: Option<String>,
     /// Current model spec (may carry an `anthropic:`/`openai:` prefix);
     /// switchable mid-session via `/model`.
     model: String,
@@ -130,8 +133,14 @@ impl Conversation {
             .context()
             .filter(|usage| usage.model == model && usage.messages <= messages.len())
             .cloned();
+        let configured_reasoning_effort = config.reasoning_effort.clone();
+        let mut config = config;
+        if let Some(effort) = session.recorded_reasoning() {
+            config.reasoning_effort = effort;
+        }
         Self {
             config,
+            configured_reasoning_effort,
             model,
             messages,
             kind: ConversationKind::Persistent(PersistentState {
@@ -154,8 +163,10 @@ impl Conversation {
     }
 
     pub(crate) fn memory(config: Config, model: String, session_id: String) -> Self {
+        let configured_reasoning_effort = config.reasoning_effort.clone();
         Self {
             config,
+            configured_reasoning_effort,
             model,
             messages: Vec::new(),
             kind: ConversationKind::Child(ChildState {
@@ -380,8 +391,15 @@ impl Conversation {
         Ok(())
     }
 
-    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
+    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) -> Result<(), Error> {
+        if self.config.reasoning_effort == effort {
+            return Ok(());
+        }
+        if let ConversationKind::Persistent(state) = &mut self.kind {
+            state.session.append_reasoning_effort(effort.clone())?;
+        }
         self.config.reasoning_effort = effort;
+        Ok(())
     }
 
     pub(crate) fn sync_display_config(&mut self, config: &Config) {
@@ -400,7 +418,10 @@ impl Conversation {
         let dirs = self.config.session_dirs(&cwd);
         let old_id = self.session_id().to_string();
         let abandon_empty = !crate::session::has_message(&dirs.project, &old_id);
-        let session = Session::create(&dirs.project, &cwd, &self.model)?;
+        let mut session = Session::create(&dirs.project, &cwd, &self.model)?;
+        if self.config.reasoning_effort != self.configured_reasoning_effort {
+            session.append_reasoning_effort(self.config.reasoning_effort.clone())?;
+        }
         self.persistent_state().subagents.shutdown_and_discard();
         self.persistent_state().background.shutdown_and_discard();
         let session_id = session.id.clone();
@@ -472,6 +493,10 @@ impl Conversation {
         });
         self.messages = messages;
         self.model = model;
+        self.config.reasoning_effort = match self.persistent_state().session.recorded_reasoning() {
+            Some(effort) => effort,
+            None => self.configured_reasoning_effort.clone(),
+        };
         self.context_usage = self
             .persistent_state()
             .session
@@ -513,16 +538,37 @@ impl Conversation {
         registry
     }
 
+    /// After a config reload, keep a session reasoning choice in effect.
+    /// Saving a new default clears that choice so the session follows it.
+    fn restore_session_reasoning(&mut self, reasoning_changed: bool) -> Result<(), Error> {
+        self.configured_reasoning_effort
+            .clone_from(&self.config.reasoning_effort);
+        let recorded = match &mut self.kind {
+            ConversationKind::Persistent(state) if reasoning_changed => {
+                state.session.clear_reasoning_effort()?;
+                None
+            }
+            ConversationKind::Persistent(state) => state.session.recorded_reasoning(),
+            ConversationKind::Child(_) => None,
+        };
+        if let Some(effort) = recorded {
+            self.config.reasoning_effort = effort;
+        }
+        Ok(())
+    }
+
     pub(crate) fn change_global_config(
         &mut self,
         change: ConfigChange,
     ) -> Result<ConfigChangeEffect, Error> {
         let changes_model = matches!(&change, ConfigChange::Model(_));
+        let changes_reasoning = matches!(&change, ConfigChange::ReasoningEffort { .. });
         let outcome = self.config.change_global(change)?;
         self.config = outcome.config;
         if let ConversationKind::Persistent(state) = &self.kind {
             state.subagents.set_limit(self.config.max_subagents);
         }
+        self.restore_session_reasoning(changes_reasoning)?;
         if changes_model {
             let model = self
                 .config
@@ -541,11 +587,15 @@ impl Conversation {
         let changes_model = changes
             .iter()
             .any(|change| matches!(change, ConfigChange::Model(_)));
+        let changes_reasoning = changes
+            .iter()
+            .any(|change| matches!(change, ConfigChange::ReasoningEffort { .. }));
         let outcome = self.config.change_global_batch(changes)?;
         self.config = outcome.config;
         if let ConversationKind::Persistent(state) = &self.kind {
             state.subagents.set_limit(self.config.max_subagents);
         }
+        self.restore_session_reasoning(changes_reasoning)?;
         if changes_model {
             let model = self
                 .config

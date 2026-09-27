@@ -282,11 +282,7 @@ impl Terminal {
             }
             self.stdout.write_all(b"\x1b[2J")?;
         }
-        for (index, line) in frame.iter().enumerate() {
-            if force || self.last_frame.get(index) != Some(line) {
-                write!(self.stdout, "\x1b[{};1H\x1b[2K{line}", index + 1)?;
-            }
-        }
+        write_frame_rows(&mut self.stdout, &frame, &self.last_frame, force)?;
         if force {
             write_inline_images(&mut self.stdout, self.image_protocol, &images)?;
         }
@@ -392,6 +388,27 @@ fn write_kitty_image(
         output.write_all(b"\x1b\\")?;
     }
     Ok(())
+}
+
+pub(super) fn write_frame_rows(
+    output: &mut impl Write,
+    frame: &[String],
+    previous: &[String],
+    force: bool,
+) -> io::Result<()> {
+    // Every row is explicitly positioned. A terminal may measure Unicode
+    // differently from us; never let an overlong row wrap into an unchanged
+    // row below it, where incremental drawing would leave the damage behind.
+    output.write_all(b"\x1b[?7l")?;
+    let result = frame.iter().enumerate().try_for_each(|(index, line)| {
+        if force || previous.get(index) != Some(line) {
+            write!(output, "\x1b[{};1H\x1b[2K{line}", index + 1)?;
+        }
+        Ok(())
+    });
+    // Attempt restoration even if a row write failed.
+    let restore = output.write_all(b"\x1b[?7h");
+    result.and(restore)
 }
 
 pub(super) fn cursor_control(cursor: (usize, usize), selecting: bool) -> String {

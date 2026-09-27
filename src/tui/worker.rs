@@ -156,9 +156,23 @@ where
             &mut active_config,
         )
     });
+    finish_agent_job(agent, state, active_config, result)
+}
+
+fn finish_agent_job<T>(
+    agent: &mut Agent,
+    state: &mut ViewState,
+    active_config: Config,
+    result: Result<T, Error>,
+) -> Result<T, Error> {
     recover_unaccepted_steers(agent, state);
     agent.sync_display_config(&active_config);
-    agent.set_reasoning_effort(active_config.reasoning_effort);
+    if let Err(error) = agent.set_reasoning_effort(active_config.reasoning_effort) {
+        state.reasoning_effort =
+            crate::model::effective_reasoning_effort(agent.config(), agent.model())
+                .map(str::to_string);
+        state.notice(format!("Could not save reasoning effort: {error}"));
+    }
     result
 }
 
@@ -1130,5 +1144,66 @@ mod question_tests {
 
         broker.cancel_pending();
         assert!(handle.join().expect("asker thread").is_err());
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_save_failure_preserves_job_outcome() {
+        for successful in [true, false] {
+            let root = std::env::temp_dir().join(format!(
+                "yawl-worker-save-{}-{}-{successful}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            ));
+            let config = Config {
+                home_dir: root.join("home"),
+                project_dir: root.join("project/.yawl"),
+                reasoning_effort: Some("low".into()),
+                ..Config::test_default()
+            };
+            let cwd = root.join("project");
+            let mut session = crate::session::Session::create(
+                &config.session_dirs(&cwd).project,
+                &cwd,
+                "openai-codex:gpt-5.4",
+            )
+            .unwrap();
+            session.fail_append_after(0);
+            let mut agent = Agent::new(config, "openai-codex:gpt-5.4".into(), session, Vec::new());
+            let mut state = ViewState::from_agent(&agent);
+            state.reasoning_effort = Some("high".into());
+            let mut active_config = agent.config().clone();
+            active_config.reasoning_effort = Some("high".into());
+            let outcome = if successful {
+                Ok(true)
+            } else {
+                Err(Error::Protocol("original failure".into()))
+            };
+            let result = finish_agent_job(&mut agent, &mut state, active_config, outcome);
+            if successful {
+                assert!(
+                    matches!(result, Ok(true)),
+                    "completed job must remain successful: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(Error::Protocol(ref message)) if message == "original failure")
+                );
+            }
+            assert_eq!(agent.config().reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(state.reasoning_effort.as_deref(), Some("low"));
+            assert!(state.transcript.entries().iter().any(|entry| matches!(
+                entry, super::super::transcript::Entry::Notice(message)
+                    if message.contains("Could not save reasoning effort")
+            )));
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }

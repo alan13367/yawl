@@ -518,13 +518,13 @@ pub(super) fn handle_queue_picker_action(
 }
 
 /// Switches the session model and follows up with the reasoning picker for
-/// Codex models. The switch is recorded in the session log so a later resume
-/// keeps using it.
+/// models with supported levels. The session log records the switch so a
+/// later resume keeps using it.
 pub(super) fn switch_model(agent: &mut Agent, model: String, state: &mut ViewState) {
     match agent.switch_model(model) {
         Ok(()) => {
             refresh_model_selection(agent, state);
-            if crate::model::is_codex(agent.config(), agent.model()) {
+            if !crate::model::reasoning_efforts(agent.config(), agent.model()).is_empty() {
                 open_reasoning_picker(agent, state, false);
             } else {
                 state.notice(format!("Switched to {}.", agent.model()));
@@ -556,7 +556,7 @@ pub(super) fn activate_picker_action(
         PickerAction::SwitchModel(model) => switch_model(agent, model, state),
         PickerAction::SaveModel(model) => {
             if settings(agent, &format!("model {model}"), state) {
-                if crate::model::is_codex(agent.config(), agent.model()) {
+                if !crate::model::reasoning_efforts(agent.config(), agent.model()).is_empty() {
                     open_reasoning_picker(agent, state, true);
                 } else {
                     open_settings_location(
@@ -702,6 +702,7 @@ pub(super) fn activate_picker_action(
         }
         PickerAction::ApplyConnectionPlan(plan) => {
             let session_model = plan.session_model().map(str::to_string);
+            let use_this_session = session_model.is_some();
             match agent.change_global_config_batch(plan.changes_for_save()) {
                 Ok(effects) => {
                     for effect in effects {
@@ -719,6 +720,12 @@ pub(super) fn activate_picker_action(
                         ));
                     } else {
                         state.notice(format!("{} connection saved.", plan.provider_label));
+                        if use_this_session
+                            && !crate::model::reasoning_efforts(agent.config(), agent.model())
+                                .is_empty()
+                        {
+                            open_reasoning_picker(agent, state, false);
+                        }
                     }
                 }
                 Err(error) => state.notice(format!("Could not save connection: {error}")),

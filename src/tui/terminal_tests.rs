@@ -21,6 +21,123 @@ fn screen_selection_extracts_styled_text_in_either_direction() {
     assert!(highlighted[0].contains("\x1b[7m"));
 }
 
+/// Models the row-addressing and autowrap commands emitted by write_frame_rows.
+/// Widths deliberately follow graphemes, as terminals can disagree with the
+/// transcript renderer's character-based measurement.
+struct RowScreen {
+    cells: Vec<Vec<char>>,
+    row: usize,
+    column: usize,
+    autowrap: bool,
+}
+
+impl RowScreen {
+    fn apply(&mut self, output: &[u8]) {
+        use unicode_segmentation::UnicodeSegmentation;
+        use unicode_width::UnicodeWidthStr;
+
+        let text = std::str::from_utf8(output).expect("UTF-8 terminal output");
+        let mut rest = text;
+        while !rest.is_empty() {
+            if let Some(command) = rest.strip_prefix("\x1b[") {
+                let end = command
+                    .find(|c: char| ('@'..='~').contains(&c))
+                    .expect("complete CSI");
+                let sequence = &command[..=end];
+                match sequence {
+                    "?7l" => self.autowrap = false,
+                    "?7h" => self.autowrap = true,
+                    "2K" => self.cells[self.row].fill(' '),
+                    _ if sequence.ends_with('H') => {
+                        let (row, column) = sequence[..end].split_once(';').expect("CUP");
+                        self.row = row.parse::<usize>().unwrap() - 1;
+                        self.column = column.parse::<usize>().unwrap() - 1;
+                    }
+                    _ => assert!(sequence.ends_with('m'), "unexpected CSI: {sequence}"),
+                }
+                rest = &command[end + 1..];
+                continue;
+            }
+            let end = rest.find('\x1b').unwrap_or(rest.len());
+            for cluster in rest[..end].graphemes(true) {
+                let width = cluster.width();
+                if width == 0 {
+                    continue;
+                }
+                let columns = self.cells[0].len();
+                if self.column + width > columns {
+                    if self.autowrap {
+                        self.row += 1;
+                        self.column = 0;
+                    } else {
+                        self.column = columns.saturating_sub(width);
+                    }
+                }
+                self.cells[self.row][self.column] = cluster.chars().next().unwrap();
+                self.column += width;
+            }
+            rest = &rest[end..];
+        }
+    }
+}
+
+#[test]
+fn scrolling_rows_cannot_overwrite_an_unchanged_composer_corner() {
+    use super::terminal::write_frame_rows;
+
+    let mut screen = RowScreen {
+        cells: vec![vec![' '; 20]; 3],
+        row: 0,
+        column: 0,
+        autowrap: true,
+    };
+    let border = format!("┌{}┐", "─".repeat(18));
+    let mut frame = vec![" ".repeat(20), border, "│>".into()];
+    let mut output = Vec::new();
+    write_frame_rows(&mut output, &frame, &[], true).unwrap();
+    screen.apply(&output);
+    assert_eq!(screen.cells[1][0], '┌');
+
+    // Scrolling changes only the transcript. An emoji presentation sequence
+    // occupies one more terminal cell than the transcript fitter accounts for.
+    for text in ["⚠️ warning", "ordinary text", "⚠️ warning"] {
+        let previous = frame.clone();
+        frame[0] = markdown::fit_width(text, 20);
+        output.clear();
+        write_frame_rows(&mut output, &frame, &previous, false).unwrap();
+        screen.apply(&output);
+        assert_eq!(
+            screen.cells[1][0], '┌',
+            "scrolling {text:?} erased the corner"
+        );
+        assert!(screen.autowrap, "restore autowrap after row output");
+    }
+}
+
+#[test]
+fn row_output_restores_autowrap_after_a_write_error() {
+    struct FailRowWrite(Vec<u8>);
+
+    impl std::io::Write for FailRowWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes != b"\x1b[?7l" && bytes != b"\x1b[?7h" {
+                return Err(std::io::Error::other("row write failed"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut output = FailRowWrite(Vec::new());
+    let result = super::terminal::write_frame_rows(&mut output, &["row".into()], &[], true);
+    assert!(result.is_err());
+    assert_eq!(output.0, b"\x1b[?7l\x1b[?7h");
+}
+
 #[test]
 fn views_without_an_editor_keep_the_terminal_cursor_hidden() {
     assert_eq!(cursor_control(HIDDEN_CURSOR, false), "\x1b[?25l");

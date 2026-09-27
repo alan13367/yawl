@@ -55,7 +55,10 @@ pub(super) fn apply_reasoning_effort(
     effort: Option<String>,
     state: &mut ViewState,
 ) {
-    agent.set_reasoning_effort(effort.clone());
+    if let Err(error) = agent.set_reasoning_effort(effort.clone()) {
+        state.notice(format!("Could not save reasoning effort: {error}"));
+        return;
+    }
     state.reasoning_effort = effort;
     let label = state
         .reasoning_effort

@@ -138,8 +138,8 @@ impl Agent {
         self.conversation.switch_model(model)
     }
 
-    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) {
-        self.conversation.set_reasoning_effort(effort);
+    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<String>) -> Result<(), Error> {
+        self.conversation.set_reasoning_effort(effort)
     }
 
     pub(crate) fn sync_display_config(&mut self, config: &Config) {

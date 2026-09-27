@@ -996,3 +996,196 @@ fn new_then_resume_does_not_reuse_submitted_image_numbers() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn model_selection_follows_up_with_only_the_models_supported_reasoning_levels() {
+    for save in [false, true] {
+        for levels in [vec!["low", "ultra"], vec![]] {
+            let root = std::env::temp_dir().join(format!(
+                "yawl-model-reasoning-{}-{}-{save}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                levels.len(),
+            ));
+            let mut config = Config {
+                model: Some("test".into()),
+                reasoning_effort: Some("high".into()),
+                home_dir: root.join("home/.yawl"),
+                project_dir: root.join("project/.yawl"),
+                ..Config::test_default()
+            };
+            config.providers.insert(
+                "local".into(),
+                crate::config::ProviderConfig {
+                    base_url: "http://127.0.0.1:9/v1".into(),
+                    api: "openai-completions".into(),
+                    api_key: None,
+                    auth_header: None,
+                    headers: Default::default(),
+                    models: vec![crate::config::ModelConfig {
+                        id: "listed".into(),
+                        name: None,
+                        context_window: None,
+                        max_tokens: None,
+                        input: Vec::new(),
+                        reasoning_efforts: levels.iter().map(|level| (*level).into()).collect(),
+                        compat: Default::default(),
+                    }],
+                    compat: Default::default(),
+                },
+            );
+            // Saved model changes reload the provider metadata from disk.
+            std::fs::create_dir_all(&config.home_dir).unwrap();
+            std::fs::write(
+                config.home_dir.join("config.json"),
+                serde_json::to_vec(&serde_json::json!({"providers": {"local": {"baseUrl": "http://127.0.0.1:9/v1", "api": "openai-completions", "models": [{"id": "listed", "reasoning_efforts": levels}]}}})).unwrap(),
+            )
+            .unwrap();
+            let cwd = root.join("project");
+            let session =
+                crate::session::Session::create(&config.session_dirs(&cwd).project, &cwd, "test")
+                    .unwrap();
+            let mut agent = Agent::new(config, "test".into(), session, Vec::new());
+            let mut state = ViewState::from_agent(&agent);
+            let action = if save {
+                PickerAction::SaveModel("local:listed".into())
+            } else {
+                PickerAction::SwitchModel("local:listed".into())
+            };
+            activate_picker_action(&mut agent, &mut state, action);
+            assert_eq!(agent.model(), "local:listed");
+            if levels.is_empty() {
+                assert!(
+                    !state
+                        .picker
+                        .as_ref()
+                        .is_some_and(|picker| picker.title.starts_with("Reasoning"))
+                );
+            } else {
+                let picker = state.picker.as_ref().expect("reasoning picker should open");
+                assert_eq!(picker.title, "Reasoning · listed");
+                assert_eq!(
+                    picker.selected, 0,
+                    "unsupported prior effort uses provider default"
+                );
+                let choices = picker
+                    .items
+                    .iter()
+                    .map(|item| {
+                        let PickerAction::SetReasoning {
+                            effort,
+                            save: choice_save,
+                        } = &item.action
+                        else {
+                            panic!("expected reasoning choice");
+                        };
+                        assert_eq!(*choice_save, save);
+                        effort.as_deref()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(choices, [None, Some("low"), Some("ultra")]);
+                let action = picker.items[2].action.clone();
+                state.picker = None;
+                activate_picker_action(&mut agent, &mut state, action);
+                assert_eq!(agent.config().reasoning_effort.as_deref(), Some("ultra"));
+                assert_eq!(state.reasoning_effort.as_deref(), Some("ultra"));
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[test]
+fn new_connection_session_activation_prompts_for_just_saved_reasoning_levels() {
+    use crate::config::ConfigChange;
+    use crate::onboarding::provider::{ConnectionActivation, ConnectionPlan};
+
+    for activation in [
+        ConnectionActivation::Session,
+        ConnectionActivation::ConnectionOnly,
+    ] {
+        for levels in [vec!["low".to_string(), "ultra".to_string()], vec![]] {
+            let root = std::env::temp_dir().join(format!(
+                "yawl-connect-reasoning-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            ));
+            let config = Config {
+                model: Some("test".into()),
+                home_dir: root.join("home/.yawl"),
+                project_dir: root.join("project/.yawl"),
+                ..Config::test_default()
+            };
+            let cwd = root.join("project");
+            let session =
+                crate::session::Session::create(&config.session_dirs(&cwd).project, &cwd, "test")
+                    .unwrap();
+            let mut agent = Agent::new(config, "test".into(), session, Vec::new());
+            let mut state = ViewState::from_agent(&agent);
+            let plan = ConnectionPlan {
+                changes: vec![
+                    ConfigChange::Provider {
+                        name: "local".into(),
+                        base_url: "http://127.0.0.1:9/v1".into(),
+                        api_key: None,
+                    },
+                    ConfigChange::ProviderModel {
+                        name: "local".into(),
+                        model: "new-model".into(),
+                        reasoning_efforts: levels.clone(),
+                    },
+                ],
+                model: "local:new-model".into(),
+                activation,
+                provider_label: "Local".into(),
+            };
+            activate_picker_action(
+                &mut agent,
+                &mut state,
+                PickerAction::ApplyConnectionPlan(plan),
+            );
+            if activation == ConnectionActivation::Session {
+                assert_eq!(agent.model(), "local:new-model");
+                if !levels.is_empty() {
+                    let picker = state.picker.as_ref().expect("reasoning picker should open");
+                    assert_eq!(picker.title, "Reasoning · new-model");
+                    let efforts = picker
+                        .items
+                        .iter()
+                        .map(|item| {
+                            let PickerAction::SetReasoning {
+                                effort,
+                                save: false,
+                            } = &item.action
+                            else {
+                                panic!("expected a session reasoning choice");
+                            };
+                            effort.as_deref()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(efforts, [None, Some("low"), Some("ultra")]);
+                    let action = picker.items[2].action.clone();
+                    state.picker = None;
+                    activate_picker_action(&mut agent, &mut state, action);
+                    assert_eq!(agent.config().reasoning_effort.as_deref(), Some("ultra"));
+                } else {
+                    assert!(state.picker.is_none());
+                }
+            } else {
+                assert_eq!(agent.model(), "test");
+                assert!(state.picker.is_none());
+            }
+            assert_eq!(
+                agent.config().providers["local"].models[0].reasoning_efforts,
+                levels
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}

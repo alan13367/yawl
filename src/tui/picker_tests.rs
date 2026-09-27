@@ -442,12 +442,17 @@ fn test_picker_state(picker: Picker) -> ViewState {
 }
 
 fn test_agent() -> Agent {
+    // Parallel tests can read the same clock value on coarse clocks.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let root =
-        std::env::temp_dir().join(format!("yawl-picker-agent-{}-{nonce}", std::process::id()));
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "yawl-picker-agent-{}-{nonce}-{sequence}",
+        std::process::id()
+    ));
     let config = Config {
         model: Some("test".into()),
         home_dir: root.join("home/.yawl"),
