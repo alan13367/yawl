@@ -33,6 +33,7 @@ fn plan_prompt<'a>(
         (TurnMode::Plan, Some(PlanState::Draft { objective, .. })) => {
             Some(PlanPrompt::Draft(objective))
         }
+        (_, Some(PlanState::Draft { objective, .. })) => Some(PlanPrompt::Paused(objective)),
         (TurnMode::PlanRevise, Some(PlanState::Ready { .. })) => path.map(PlanPrompt::Revise),
         (TurnMode::PlanFollowUp, Some(PlanState::Ready { .. })) => path.map(PlanPrompt::FollowUp),
         (TurnMode::PlanImplement, Some(PlanState::Ready { .. })) => path.map(PlanPrompt::Implement),
@@ -451,25 +452,21 @@ impl Conversation {
                 }
             }
             if mode == TurnMode::PlanImplement {
-                self.prepare_plan_handoff(sink, resolve_provider)?;
+                self.prepare_plan_handoff(sink)?;
             }
             let plan_path = self.plan_file_reference()?;
 
             // Rescan every iteration so a tool the model just wrote is
-            // available on its very next step.
+            // available on its very next step. Plan phases share one tool
+            // list and system prompt so local servers keep their prompt
+            // cache; phases differ only in execution gates and a hidden note.
             let mut registry = self.scan_tools();
             match mode {
                 TurnMode::Goal => registry.advertise_goal_complete(),
-                TurnMode::Plan | TurnMode::PlanRevise => {
-                    registry.retain_for_planning();
-                    registry.advertise_plan_complete();
+                TurnMode::Plan | TurnMode::PlanRevise | TurnMode::PlanFollowUp => {
+                    registry.restrict_to_planning();
                 }
-                TurnMode::PlanFollowUp => {
-                    registry.retain_for_planning();
-                    registry.advertise_plan_action();
-                }
-                TurnMode::PlanImplement => registry.advertise_plan_implemented(),
-                TurnMode::Normal | TurnMode::Init => {}
+                TurnMode::PlanImplement | TurnMode::Normal | TurnMode::Init => {}
             }
             let specs = registry.specs();
             let system = match &self.kind {
@@ -483,7 +480,6 @@ impl Conversation {
                         goal: (mode == TurnMode::Goal)
                             .then_some(state.session.active_goal())
                             .flatten(),
-                        plan: plan_prompt(state.session.active_plan(), plan_path.as_deref(), mode),
                         init: mode == TurnMode::Init,
                     },
                 ),
@@ -497,6 +493,11 @@ impl Conversation {
 
             let overhead = context::prompt_tokens(&system, registry.tool_tokens());
             self.maybe_compact(overhead, sink, resolve_provider)?;
+            if let ConversationKind::Persistent(state) = &self.kind {
+                let note = plan_prompt(state.session.active_plan(), plan_path.as_deref(), mode)
+                    .map(crate::prompt::plan_phase_note);
+                self.sync_plan_phase_note(note)?;
+            }
 
             if let Some(effort) = self.steers.take_reasoning_effort() {
                 self.set_reasoning_effort(effort)?;
@@ -1139,7 +1140,6 @@ impl Conversation {
     {
         self.recover_history()?;
         sink(TurnEvent::Compacting);
-        let plan_path = self.plan_file_reference()?;
         let registry = self.scan_tools();
         let specs = registry.specs();
         let system = match &self.kind {
@@ -1151,7 +1151,6 @@ impl Conversation {
                 registry.skills(),
                 crate::prompt::MainPromptState {
                     goal: state.session.active_goal(),
-                    plan: plan_path.as_deref().map(crate::prompt::PlanPrompt::Active),
                     init: false,
                 },
             ),

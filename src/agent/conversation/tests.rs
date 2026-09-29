@@ -10,8 +10,8 @@ use crate::compaction;
 use crate::config::{Config, ConfigChange};
 use crate::error::Error;
 use crate::provider::{
-    CompactionOutput, Event as ProviderEvent, Message, Provider, Request, Role, TokenUsage,
-    ToolCall,
+    CompactionOutput, Event as ProviderEvent, Message, MessageControl, Provider, Request, Role,
+    TokenUsage, ToolCall,
 };
 use crate::session::Session;
 
@@ -2013,11 +2013,20 @@ fn deferred_delivery_is_restored_after_a_partial_append_failure() {
     assert_eq!(test.agent.messages[0].subagent_results.len(), 1);
 }
 
-type HandoffRequests = Rc<RefCell<Vec<(String, Vec<Message>)>>>;
+/// System prompt, advertised tool names, and messages of each request.
+type HandoffRequests = Rc<RefCell<Vec<(String, Vec<String>, Vec<Message>)>>>;
 
 struct HandoffProvider {
     requests: HandoffRequests,
     classify: bool,
+}
+
+fn latest_plan_phase(messages: &[Message]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.control == Some(MessageControl::PlanPhase))
+        .map(|message| message.content.as_str())
 }
 
 impl Provider for HandoffProvider {
@@ -2026,14 +2035,14 @@ impl Provider for HandoffProvider {
         request: &Request<'_>,
         sink: &mut dyn FnMut(ProviderEvent),
     ) -> Result<(), Error> {
-        self.requests
-            .borrow_mut()
-            .push((request.system.into(), request.messages.to_vec()));
-        if request.tools.is_empty() {
-            sink(ProviderEvent::TextDelta(
-                "Keep the public API stable. Earlier checks passed.".into(),
-            ));
-        } else if self.classify && request.system.contains("phase=\"follow_up\"") {
+        self.requests.borrow_mut().push((
+            request.system.into(),
+            request.tools.iter().map(|tool| tool.name.clone()).collect(),
+            request.messages.to_vec(),
+        ));
+        let follow_up = latest_plan_phase(request.messages)
+            .is_some_and(|note| note.contains("phase=\"follow_up\""));
+        if self.classify && follow_up {
             sink(ProviderEvent::ToolCall(ToolCall {
                 id: "classify".into(),
                 name: crate::tools::PLAN_ACTION_TOOL_NAME.into(),
@@ -2106,17 +2115,28 @@ fn plan_handoff_reduces_requests_for_picker_and_classified_follow_up() -> Result
                 .run_plan_implementation_with(None, &mut |_| {}, &mut resolve)?;
         }
         let requests = captures.borrow();
-        assert_eq!(requests.len(), if classify { 3 } else { 2 });
-        let (system, messages) = requests.last().unwrap();
+        // No summarizer request: acceptance goes straight to implementation.
+        assert_eq!(requests.len(), if classify { 2 } else { 1 });
+        let (system, tools, messages) = requests.last().unwrap();
+        for (other_system, other_tools, _) in requests.iter() {
+            assert_eq!(
+                other_system, system,
+                "plan phases must share the system prompt"
+            );
+            assert_eq!(other_tools, tools, "plan phases must share the tool list");
+        }
+        assert!(!system.contains("<active_plan"));
         assert!(!system.contains("# Unique implementation plan"));
-        assert!(system.contains("read the saved plan file"));
+        let phase = latest_plan_phase(messages).expect("implementation phase note");
+        assert!(phase.contains("phase=\"implementation\""));
+        assert!(phase.contains("read the saved plan file"));
         let text = messages
             .iter()
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(text.matches("# Unique implementation plan").count(), 1);
-        assert!(text.contains("Keep the public API stable"));
+        assert!(text.contains("replaced by its completed plan"));
         assert!(!text.contains("large investigation output"));
         assert!(text.contains(if classify {
             "Implement, preserving compatibility"
@@ -2137,6 +2157,15 @@ fn plan_handoff_reduces_requests_for_picker_and_classified_follow_up() -> Result
                     .iter()
                     .any(|message| message.tool_call_id.as_deref() == Some("classify"))
             );
+            // The follow-up request extends the planning history, so a
+            // server's cached prefix of that history stays reusable.
+            let (_, _, first) = &requests[0];
+            assert!(first.len() > 3);
+            assert!(
+                first
+                    .iter()
+                    .any(|m| m.content.contains("large investigation output"))
+            );
         }
         drop(requests);
         // Undo implementation retains the compact handoff and its ready plan.
@@ -2150,11 +2179,16 @@ fn plan_handoff_reduces_requests_for_picker_and_classified_follow_up() -> Result
         captures.borrow_mut().clear();
         test.agent
             .run_plan_implementation_with(None, &mut |_| {}, &mut resolve)?;
-        assert_eq!(
-            captures.borrow().len(),
-            1,
-            "resume after undo must not summarize again"
+        assert_eq!(captures.borrow().len(), 1);
+        let requests = captures.borrow();
+        let (_, _, resumed) = requests.last().unwrap();
+        assert!(
+            !resumed
+                .iter()
+                .any(|m| m.content.contains("large investigation output")),
+            "resume after undo must keep the handoff"
         );
+        drop(requests);
         let log = std::fs::read_to_string(test.sessions_dir.join(format!("{id}.jsonl")))?;
         assert!(
             log.contains("large investigation output"),
@@ -2166,45 +2200,18 @@ fn plan_handoff_reduces_requests_for_picker_and_classified_follow_up() -> Result
 
 #[test]
 fn failed_plan_handoff_preserves_history_and_retries() -> Result<(), Error> {
-    for fail_storage in [false, true] {
-        let mut test = ready_handoff_fixture("handoff-failure");
-        test.agent
-            .append_input_message(Message::user("Implement with care"))?;
-        let before = serde_json::to_value(&test.agent.messages)?;
-        let captures = Rc::new(RefCell::new(Vec::new()));
-        let mut resolve = |_: &str, _: &Config| -> Result<(Box<dyn Provider>, String), Error> {
-            Ok((
-                Box::new(HandoffProvider {
-                    requests: captures.clone(),
-                    classify: false,
-                }),
-                "test".into(),
-            ))
-        };
-        if fail_storage {
-            // Usage is saved first; then the compaction append fails.
-            test.agent.persistent_mut().session.fail_append_after(1);
-            assert!(
-                test.agent
-                    .prepare_plan_handoff(&mut |_| {}, &mut resolve)
-                    .is_err()
-            );
-        } else {
-            let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Fail])));
-            let mut failed = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
-            assert!(
-                test.agent
-                    .prepare_plan_handoff(&mut |_| {}, &mut failed)
-                    .is_err()
-            );
-        }
-        assert_eq!(serde_json::to_value(&test.agent.messages)?, before);
-        assert!(!test.agent.persistent_state().session.plan_has_handoff(1));
-        assert!(test.agent.active_plan().is_some());
-        test.agent.prepare_plan_handoff(&mut |_| {}, &mut resolve)?;
-        assert_eq!(test.agent.messages.len(), 2);
-        assert!(test.agent.persistent_state().session.plan_has_handoff(1));
-    }
+    let mut test = ready_handoff_fixture("handoff-failure");
+    test.agent
+        .append_input_message(Message::user("Implement with care"))?;
+    let before = serde_json::to_value(&test.agent.messages)?;
+    test.agent.persistent_mut().session.fail_append_after(0);
+    assert!(test.agent.prepare_plan_handoff(&mut |_| {}).is_err());
+    assert_eq!(serde_json::to_value(&test.agent.messages)?, before);
+    assert!(!test.agent.persistent_state().session.plan_has_handoff(1));
+    assert!(test.agent.active_plan().is_some());
+    test.agent.prepare_plan_handoff(&mut |_| {})?;
+    assert_eq!(test.agent.messages.len(), 2);
+    assert!(test.agent.persistent_state().session.plan_has_handoff(1));
     Ok(())
 }
 
@@ -2213,17 +2220,7 @@ fn plan_handoff_survives_compaction_and_new_revision_gets_a_new_handoff() -> Res
     let mut test = ready_handoff_fixture("handoff-revision");
     test.agent
         .append_input_message(Message::user("Implement"))?;
-    let captures = Rc::new(RefCell::new(Vec::new()));
-    let mut resolve = |_: &str, _: &Config| -> Result<(Box<dyn Provider>, String), Error> {
-        Ok((
-            Box::new(HandoffProvider {
-                requests: captures.clone(),
-                classify: false,
-            }),
-            "test".into(),
-        ))
-    };
-    test.agent.prepare_plan_handoff(&mut |_| {}, &mut resolve)?;
+    test.agent.prepare_plan_handoff(&mut |_| {})?;
     test.agent.persist_compaction(
         "Implementation progress; consult saved plan.",
         0,
@@ -2238,8 +2235,13 @@ fn plan_handoff_survives_compaction_and_new_revision_gets_a_new_handoff() -> Res
     );
     let path = test.agent.plan_file_reference()?.unwrap();
     std::fs::remove_file(&path)?;
-    test.agent.prepare_plan_handoff(&mut |_| {}, &mut resolve)?;
-    assert_eq!(captures.borrow().len(), 1);
+    let compacted = serde_json::to_value(&test.agent.messages)?;
+    test.agent.prepare_plan_handoff(&mut |_| {})?;
+    assert_eq!(
+        serde_json::to_value(&test.agent.messages)?,
+        compacted,
+        "an existing handoff must not replace later history"
+    );
     assert_eq!(
         test.agent.plan_file_reference()?.as_deref(),
         Some(path.as_str())
@@ -2255,8 +2257,7 @@ fn plan_handoff_survives_compaction_and_new_revision_gets_a_new_handoff() -> Res
     test.agent.messages.push(ready);
     test.agent
         .append_input_message(Message::user("Implement the revised plan"))?;
-    test.agent.prepare_plan_handoff(&mut |_| {}, &mut resolve)?;
-    assert_eq!(captures.borrow().len(), 2);
+    test.agent.prepare_plan_handoff(&mut |_| {})?;
     assert!(test.agent.messages[0].content.contains(plan));
     assert!(
         !test.agent.messages[0]
@@ -2268,35 +2269,131 @@ fn plan_handoff_survives_compaction_and_new_revision_gets_a_new_handoff() -> Res
     Ok(())
 }
 
-#[test]
-fn canceled_handoff_keeps_the_original_context() -> Result<(), Error> {
-    struct CancelSummary(crate::cancellation::CancellationToken);
-    impl Provider for CancelSummary {
-        fn stream_once(
-            &self,
-            _: &Request<'_>,
-            sink: &mut dyn FnMut(ProviderEvent),
-        ) -> Result<(), Error> {
-            sink(ProviderEvent::TextDelta("partial summary".into()));
-            self.0.cancel();
-            sink(ProviderEvent::Done);
-            Ok(())
+/// Replays scripted tool calls (or a text reply for `None`) while recording
+/// each request's system prompt, tools, and messages.
+struct PhaseProvider {
+    requests: HandoffRequests,
+    steps: Rc<RefCell<VecDeque<Option<ToolCall>>>>,
+}
+
+impl Provider for PhaseProvider {
+    fn stream_once(
+        &self,
+        request: &Request<'_>,
+        sink: &mut dyn FnMut(ProviderEvent),
+    ) -> Result<(), Error> {
+        self.requests.borrow_mut().push((
+            request.system.into(),
+            request.tools.iter().map(|tool| tool.name.clone()).collect(),
+            request.messages.to_vec(),
+        ));
+        match self.steps.borrow_mut().pop_front().flatten() {
+            Some(call) => sink(ProviderEvent::ToolCall(call)),
+            None => sink(ProviderEvent::TextDelta("ok".into())),
         }
+        sink(ProviderEvent::Done);
+        Ok(())
     }
-    let mut test = ready_handoff_fixture("handoff-cancel");
+}
+
+#[test]
+fn plan_phases_keep_the_prompt_prefix_and_gate_tools_in_history_notes() -> Result<(), Error> {
+    let mut test = TestAgent::new("plan-phase-prefix");
+    test.agent.start_plan("Add a parser".to_string().into())?;
     test.agent
-        .append_input_message(Message::user("Implement"))?;
-    let before = serde_json::to_value(&test.agent.messages)?;
-    let token = test.agent.cancellation.clone();
-    let mut resolve = |_: &str, _: &Config| -> Result<(Box<dyn Provider>, String), Error> {
-        Ok((Box::new(CancelSummary(token.clone())), "test".into()))
+        .persistent_mut()
+        .session
+        .append_plan_questions_asked()?;
+    let blocked = test.root.join("blocked.txt");
+    let call = |id: &str, name: &str, arguments: String| {
+        Some(ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+        })
     };
-    let result = crate::cancellation::scope(&token, || {
-        test.agent.prepare_plan_handoff(&mut |_| {}, &mut resolve)
-    });
-    assert!(matches!(result, Err(Error::Interrupted)));
-    assert_eq!(serde_json::to_value(&test.agent.messages)?, before);
-    assert!(!test.agent.persistent_state().session.plan_has_handoff(1));
-    token.clear();
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        call(
+            "write",
+            "write_file",
+            serde_json::json!({"path": blocked, "content": "no"}).to_string(),
+        ),
+        call(
+            "complete",
+            crate::tools::PLAN_COMPLETE_TOOL_NAME,
+            r##"{"plan":"# Parser plan"}"##.into(),
+        ),
+        call(
+            "done",
+            crate::tools::PLAN_IMPLEMENTED_TOOL_NAME,
+            r#"{"result":"Parser added."}"#.into(),
+        ),
+        None,
+    ])));
+    let captures: HandoffRequests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = |_: &str, _: &Config| -> Result<(Box<dyn Provider>, String), Error> {
+        Ok((
+            Box::new(PhaseProvider {
+                requests: captures.clone(),
+                steps: steps.clone(),
+            }),
+            "test".into(),
+        ))
+    };
+
+    assert!(test.agent.run_plan_with(&mut |_| {}, &mut resolve)?);
+    assert!(!blocked.exists(), "planning must not run write_file");
+    let rejected = test
+        .agent
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("write"))
+        .expect("write result");
+    assert!(rejected.is_error);
+    assert!(rejected.content.contains("unavailable while planning"));
+
+    assert!(
+        test.agent
+            .run_plan_implementation_with(None, &mut |_| {}, &mut resolve)?
+    );
+    assert_eq!(test.agent.active_plan(), None);
+    assert!(
+        test.agent
+            .run_turn_with(Some("thanks".into()), &mut |_| {}, &mut resolve)?
+    );
+
+    let requests = captures.borrow();
+    assert_eq!(requests.len(), 4);
+    // Draft planning and implementation send the same prefix; only the
+    // hidden phase notes in history differ.
+    for (system, tools, _) in &requests[1..3] {
+        assert_eq!(system, &requests[0].0);
+        assert_eq!(tools, &requests[0].1);
+    }
+    assert!(requests[0].1.iter().any(|name| name == "write_file"));
+    assert!(!requests[0].0.contains("<active_plan"));
+    let phases = requests
+        .iter()
+        .map(|(_, _, messages)| latest_plan_phase(messages).unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(phases[0].contains("phase=\"planning\""));
+    assert!(phases[0].contains("Add a parser"));
+    assert!(phases[2].contains("phase=\"implementation\""));
+    assert_eq!(phases[3], super::plan::PLAN_MODE_ENDED);
+    // After completion the plan tools leave the list again.
+    assert!(
+        !requests[3]
+            .1
+            .iter()
+            .any(|name| name == crate::tools::PLAN_COMPLETE_TOOL_NAME)
+    );
+    // Phase notes are hidden and never become undo points.
+    assert!(
+        test.agent
+            .messages
+            .iter()
+            .filter(|m| m.control == Some(MessageControl::PlanPhase))
+            .all(|m| m.is_hidden_control() && !is_undoable_user_prompt(m))
+    );
     Ok(())
 }

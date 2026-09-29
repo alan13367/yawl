@@ -2,10 +2,8 @@
 
 use super::{Conversation, ConversationKind, last_undoable_user_index};
 use crate::agent::events::TurnEvent;
-use crate::config::Config;
 use crate::error::Error;
-use crate::provider::ToolCall;
-use crate::provider::{self, Message, Request, stream_turn};
+use crate::provider::{Message, MessageControl, TokenUsage, ToolCall};
 use crate::session::PlanState;
 use crate::tools::{
     PLAN_ACTION_TOOL_NAME, PLAN_COMPLETE_TOOL_NAME, PLAN_IMPLEMENTED_TOOL_NAME,
@@ -16,7 +14,8 @@ pub(super) const PLAN_CONTINUATION: &str = "Continue planning. Ask another batch
 pub(super) const PLAN_QUESTION_REQUIRED: &str = "Before finishing the plan, call request_user_input with exactly three meaningful multiple-choice questions. Each question needs one recommended option.";
 pub(super) const PLAN_IMPLEMENT_CONTINUATION: &str = "Continue implementing the active plan. When it is fully complete, call plan_implemented with the final user-facing result as the only tool call in that step.";
 
-const HANDOFF_SYSTEM: &str = "Summarize the earlier conversation for implementation of its completed plan. Preserve user constraints, decisions and reasons, relevant code locations and investigation findings, unresolved issues, and work already performed. The full active plan will be supplied separately: do not repeat it. Target roughly 1,000 tokens of dense factual text. Preserve essential details rather than truncating them. Return only the summary, without tool calls.";
+pub(super) const PLAN_MODE_ENDED: &str =
+    "Plan mode ended; ignore earlier plan mode updates and follow the conversation normally.";
 
 impl Conversation {
     pub(super) fn plan_file_reference(&self) -> Result<Option<String>, Error> {
@@ -29,14 +28,14 @@ impl Conversation {
         }
     }
 
-    pub(super) fn prepare_plan_handoff<F>(
+    /// Replaces the planning history with the completed plan. The plan is
+    /// required to be self-contained, so no summarizer request runs: servers
+    /// without a prompt cache would otherwise re-read the whole planning
+    /// conversation before implementation starts.
+    pub(super) fn prepare_plan_handoff(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent<'_>),
-        resolve_provider: &mut F,
-    ) -> Result<(), Error>
-    where
-        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
-    {
+    ) -> Result<(), Error> {
         let Some(PlanState::Ready { plan, revision }) = self.plan_state() else {
             return Err(Error::Config("no completed plan is active".into()));
         };
@@ -50,35 +49,8 @@ impl Conversation {
             .ok_or_else(|| Error::Config("no saved plan file".into()))?;
         let replaced = last_undoable_user_index(&self.messages)
             .ok_or_else(|| Error::Protocol("plan implementation has no user prompt".into()))?;
-        sink(TurnEvent::Compacting);
-        let ask = Message::user(format!(
-            "Summarize this conversation. The active plan is included in its history and will also be supplied to the implementer separately.\n\n{}",
-            crate::compaction::transcript(&self.messages[..replaced])
-        ));
-        let (provider, model) = resolve_provider(&self.model, &self.config)?;
-        let request = Request {
-            model: &model,
-            system: HANDOFF_SYSTEM,
-            messages: std::slice::from_ref(&ask),
-            tools: &[],
-            max_tokens: crate::model::max_tokens(&self.config, &self.model),
-            supports_images: false,
-            prompt_cache_control: false,
-            prompt_cache_key: None,
-        };
-        let out = stream_turn(provider.as_ref(), &request, &mut |_| {})?;
-        self.record_usage(out.usage)?;
-        if crate::cancellation::interrupted() {
-            return Err(Error::Interrupted);
-        }
-        if out.text.trim().is_empty() || !out.tool_calls.is_empty() {
-            return Err(Error::Protocol(
-                "plan handoff summarizer must return non-empty text without tool calls".into(),
-            ));
-        }
         let handoff = format!(
-            "Implementation handoff\n\n{}\n\nSaved plan file: {path}\n\n{plan}",
-            out.text.trim()
+            "Implementation handoff\n\nThe planning conversation was replaced by its completed plan.\n\nSaved plan file: {path}\n\n{plan}"
         );
         self.persistent_mut()
             .session
@@ -89,11 +61,29 @@ impl Conversation {
         sink(TurnEvent::Usage {
             context_tokens: 0,
             context_window: self.context_window(),
-            request_usage: out.usage,
+            request_usage: TokenUsage::default(),
             session_usage: self.usage(),
         });
         sink(TurnEvent::Compacted { replaced });
         Ok(())
+    }
+
+    /// Appends a hidden phase note when the plan phase differs from the
+    /// latest note in history. Notes only ever append, so the prompt prefix
+    /// already cached by the server stays valid.
+    pub(super) fn sync_plan_phase_note(&mut self, note: Option<String>) -> Result<(), Error> {
+        let latest = self
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.control == Some(MessageControl::PlanPhase))
+            .map(|message| message.content.as_str());
+        let note = match (note, latest) {
+            (Some(note), latest) if latest != Some(note.as_str()) => note,
+            (None, Some(latest)) if latest != PLAN_MODE_ENDED => PLAN_MODE_ENDED.to_string(),
+            _ => return Ok(()),
+        };
+        self.append_input_message(Message::user(note).with_control(MessageControl::PlanPhase))
     }
 }
 

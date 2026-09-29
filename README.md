@@ -101,7 +101,7 @@ The Git dashboard supports keyboard and mouse navigation. Click a file or commit
 
 ### Goals and plans
 
-`/goal TEXT` keeps the agent working until it marks the goal complete. `/plan TEXT` starts a read-only workflow that asks questions and saves a Markdown plan. You can revise the plan or choose Implement. Implementation starts with a summary and the plan as model context; the original conversation stays in the session log.
+`/goal TEXT` keeps the agent working until it marks the goal complete. `/plan TEXT` starts a read-only workflow that asks questions and saves a Markdown plan. You can revise the plan or choose Implement. Implementation starts from the saved plan alone, without an extra summarization request; the original conversation stays in the session log. Plan phases keep the same system prompt and tool list and add their instructions as hidden messages, so local servers can reuse their prompt cache; planning still rejects any tool that is not read-only.
 
 ## Models and configuration
 

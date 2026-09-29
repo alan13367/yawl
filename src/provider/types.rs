@@ -59,6 +59,9 @@ pub enum MessageControl {
     GoalContinuation,
     PlanContinuation,
     PlanImplementationStart,
+    /// Plan phase instructions, kept in history instead of the system
+    /// prompt so phase changes preserve the cached prompt prefix.
+    PlanPhase,
     Steering,
     ToolSkipped,
 }
@@ -299,6 +302,7 @@ impl Message {
                 MessageControl::GoalContinuation
                     | MessageControl::PlanContinuation
                     | MessageControl::PlanImplementationStart
+                    | MessageControl::PlanPhase
             )
         )
     }

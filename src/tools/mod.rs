@@ -51,13 +51,32 @@ enum ToolImpl {
     WebSearch,
     WebFetch,
     GoalComplete,
-    PlanningShell,
     UserInput(QuestionBroker),
     PlanComplete,
     PlanAction,
     PlanImplemented,
     Exec(exec::ExecTool),
     Subagent(orchestration::SubagentTool),
+}
+
+impl ToolImpl {
+    fn runs_during_planning(&self) -> bool {
+        matches!(
+            self,
+            ToolImpl::Shell
+                | ToolImpl::ReadFile
+                | ToolImpl::ListFiles
+                | ToolImpl::SearchFiles
+                | ToolImpl::GitInspect
+                | ToolImpl::ReadSkill
+                | ToolImpl::WebSearch
+                | ToolImpl::WebFetch
+                | ToolImpl::UserInput(_)
+                | ToolImpl::PlanComplete
+                | ToolImpl::PlanAction
+                | ToolImpl::PlanImplemented
+        )
+    }
 }
 
 struct ToolEntry {
@@ -134,6 +153,7 @@ pub struct Registry {
     subagents: Option<orchestration::SubagentContext>,
     background: Option<BackgroundProcessManager>,
     web: Option<web::WebTools>,
+    planning_only: bool,
 }
 
 impl Registry {
@@ -191,6 +211,7 @@ impl Registry {
             subagents: None,
             background,
             web: config.web_browsing.then(|| web::WebTools::new(config)),
+            planning_only: false,
         };
         let (skills, warnings) = cache.skills(config);
         registry.warnings.extend(warnings);
@@ -303,25 +324,20 @@ impl Registry {
         self.insert(mode::plan_implemented_entry());
     }
 
-    /// Keeps only read tools and replaces the unrestricted shell with its
-    /// planning-only inspection gate.
-    pub(crate) fn retain_for_planning(&mut self) {
-        self.entries.retain(|entry| {
-            matches!(
-                &entry.imp,
-                ToolImpl::Shell
-                    | ToolImpl::ReadFile
-                    | ToolImpl::ListFiles
-                    | ToolImpl::SearchFiles
-                    | ToolImpl::GitInspect
-                    | ToolImpl::ReadSkill
-                    | ToolImpl::WebSearch
-                    | ToolImpl::WebFetch
-                    | ToolImpl::UserInput(_)
-                    | ToolImpl::PlanComplete
-            )
-        });
-        self.insert(planning_shell::entry());
+    /// Advertises every plan-mode tool at once. Keeping one tool list for
+    /// the whole plan lifecycle lets servers reuse the cached prompt prefix
+    /// across phases; the turn loop rejects tools the current phase forbids.
+    pub(crate) fn advertise_plan_tools(&mut self) {
+        self.advertise_plan_complete();
+        self.advertise_plan_action();
+        self.advertise_plan_implemented();
+    }
+
+    /// Gates execution to read-only inspection without changing the
+    /// advertised tools: `shell` runs through the planning command gate and
+    /// every tool outside the planning set is rejected.
+    pub(crate) fn restrict_to_planning(&mut self) {
+        self.planning_only = true;
     }
 
     pub(crate) fn skills(&self) -> &[Skill] {
@@ -386,11 +402,24 @@ impl Registry {
                     .join(", ")
             ));
         };
+        if self.planning_only && !entry.imp.runs_during_planning() {
+            return ToolOutcome::error(format!(
+                "tool '{name}' is unavailable while planning; inspect with read_file, read-only shell commands, web tools, or request_user_input"
+            ));
+        }
         let args: Value = match serde_json::from_str(args_json) {
             Ok(v) => v,
             Err(e) => return ToolOutcome::error(format!("invalid tool arguments json: {e}")),
         };
         let mut outcome = match &entry.imp {
+            ToolImpl::Shell if self.planning_only => match planning_shell::prepare(&args) {
+                Ok(args) => shell::execute_with_path(
+                    &args,
+                    None,
+                    planning_shell::inspection_path().as_deref(),
+                ),
+                Err(error) => ToolOutcome::error(error),
+            },
             ToolImpl::Shell => shell::execute(&args, self.background.as_ref()),
             ToolImpl::ShellList => shell::list(self.background.as_ref()),
             ToolImpl::ShellOutput => shell::output(self.background.as_ref(), &args),
@@ -405,14 +434,6 @@ impl Registry {
             ToolImpl::WebSearch => web::execute(self.web.as_ref(), &args, true),
             ToolImpl::WebFetch => web::execute(self.web.as_ref(), &args, false),
             ToolImpl::GoalComplete => mode::non_empty_arg(&args, "result", GOAL_COMPLETE_TOOL_NAME),
-            ToolImpl::PlanningShell => match planning_shell::prepare(&args) {
-                Ok(args) => shell::execute_with_path(
-                    &args,
-                    None,
-                    planning_shell::inspection_path().as_deref(),
-                ),
-                Err(error) => ToolOutcome::error(error),
-            },
             ToolImpl::UserInput(broker) => match user_input::parse_questions(&args)
                 .and_then(|questions| broker.ask(questions))
             {
@@ -438,7 +459,7 @@ impl Registry {
         };
         // `web_fetch` returns up to its configured limit inline and saves
         // longer pages itself.
-        let save_output = matches!(entry.imp, ToolImpl::Exec(_) | ToolImpl::PlanningShell)
+        let save_output = matches!(entry.imp, ToolImpl::Exec(_))
             || (matches!(entry.imp, ToolImpl::Shell)
                 && args.get("background").and_then(Value::as_bool) != Some(true));
         if save_output {
@@ -484,6 +505,12 @@ pub(crate) const USER_INPUT_TOOL_NAME: &str = user_input::TOOL_NAME;
 pub(crate) const PLAN_COMPLETE_TOOL_NAME: &str = "plan_complete";
 pub(crate) const PLAN_ACTION_TOOL_NAME: &str = "plan_action";
 pub(crate) const PLAN_IMPLEMENTED_TOOL_NAME: &str = "plan_implemented";
+
+/// Tells the model which calls run while planning, since the advertised
+/// tool list stays unrestricted.
+pub(crate) fn planning_restriction_note() -> String {
+    planning_shell::restriction_note()
+}
 
 pub(crate) fn validate_user_input(arguments: &str) -> Result<usize, String> {
     let value: Value = serde_json::from_str(arguments)
@@ -1012,41 +1039,58 @@ fi
         let broker = QuestionBroker::default();
         broker.enable();
         registry.advertise_user_input(broker);
-        assert!(registry.has_subagent_tools());
+        registry.advertise_plan_tools();
+        let unrestricted = registry
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name.clone())
+            .collect::<Vec<_>>();
 
-        registry.retain_for_planning();
-        registry.advertise_plan_complete();
-        assert!(!registry.has_subagent_tools());
-
+        registry.restrict_to_planning();
         let names = registry
             .specs()
             .into_iter()
             .map(|spec| spec.name.clone())
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names, unrestricted,
+            "planning must not change the tool list"
+        );
         for required in [
             "shell",
-            "read_file",
-            "web_search",
-            "web_fetch",
+            "write_file",
+            "subagent_spawn",
             USER_INPUT_TOOL_NAME,
             PLAN_COMPLETE_TOOL_NAME,
-        ] {
-            assert!(names.contains(required), "missing planning tool {required}");
-        }
-        for forbidden in [
-            "write_file",
-            "edit_file",
-            "shell_list",
-            "shell_output",
-            "shell_stop",
-            "subagent_spawn",
-            "subagent_wait",
+            PLAN_ACTION_TOOL_NAME,
+            PLAN_IMPLEMENTED_TOOL_NAME,
         ] {
             assert!(
-                !names.contains(forbidden),
-                "planning exposed forbidden tool {forbidden}"
+                names.iter().any(|name| name == required),
+                "missing {required}"
             );
         }
+        for forbidden in [
+            r#"{"path":"changed.txt","content":"nope"}"#,
+            r#"{"path":"changed.txt","old":"a","new":"b"}"#,
+        ]
+        .into_iter()
+        .zip(["write_file", "edit_file"])
+        .map(|(args, name)| registry.execute(name, args, "session"))
+        .chain([
+            registry.execute("shell_list", "{}", "session"),
+            registry.execute("subagent_list", "{}", "session"),
+        ]) {
+            assert!(forbidden.is_error);
+            assert!(
+                forbidden.content.contains("unavailable while planning"),
+                "{}",
+                forbidden.content
+            );
+        }
+        let background =
+            registry.execute("shell", r#"{"command":"ls","background":true}"#, "session");
+        assert!(background.is_error);
         let inspection = registry.execute(
             "shell",
             r#"{"command":"rg --files | head -n 1"}"#,

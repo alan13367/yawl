@@ -535,6 +535,11 @@ impl Conversation {
         if matches!(&self.kind, ConversationKind::Persistent(_)) && self.questions.is_enabled() {
             registry.advertise_user_input(self.questions.clone());
         }
+        if let ConversationKind::Persistent(state) = &self.kind
+            && state.session.active_plan().is_some()
+        {
+            registry.advertise_plan_tools();
+        }
         registry
     }
 
