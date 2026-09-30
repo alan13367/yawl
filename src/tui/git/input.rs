@@ -270,6 +270,9 @@ pub(in crate::tui) fn handle_event(state: &mut ViewState, _editor: &mut Editor, 
             });
             let history_wheel =
                 over_history || (view.mouse_position.is_none() && view.focus == GitFocus::History);
+            // A narrow dashboard hides the log or diff behind the panel; the
+            // wheel then scrolls what is on screen.
+            let left_visible = view.layout.divider > 0 || view.layout.right_width == 0;
             if history_wheel {
                 if amount > 0 {
                     view.history_scroll = view.history_scroll.saturating_sub(amount as usize);
@@ -285,7 +288,7 @@ pub(in crate::tui) fn handle_event(state: &mut ViewState, _editor: &mut Editor, 
                         .history_selected
                         .clamp(view.history_scroll, view.history_scroll + visible - 1);
                 }
-            } else if view.show_log {
+            } else if view.show_log && left_visible {
                 if amount > 0 {
                     view.log_scroll = view.log_scroll.saturating_sub(amount as usize);
                 } else {
@@ -293,7 +296,7 @@ pub(in crate::tui) fn handle_event(state: &mut ViewState, _editor: &mut Editor, 
                         .log_scroll
                         .saturating_add(amount.unsigned_abs() as usize);
                 }
-            } else if view.focus == GitFocus::Diff || view.diff.is_some() {
+            } else if view.diff.is_some() && left_visible {
                 if let Some(diff) = view.diff.as_mut() {
                     resolve_diff_scroll(diff);
                     if amount > 0 {

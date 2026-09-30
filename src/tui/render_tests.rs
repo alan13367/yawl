@@ -66,6 +66,7 @@ fn frame_keeps_input_and_status_pinned() {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,
@@ -716,6 +717,7 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,
@@ -818,6 +820,7 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,
@@ -950,6 +953,7 @@ fn loading_state_ignores_status_activity() {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,
@@ -1030,6 +1034,7 @@ fn overflow_state() -> ViewState {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,
@@ -1352,6 +1357,7 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,
@@ -1577,6 +1583,7 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,
@@ -1744,6 +1751,7 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,
@@ -2337,6 +2345,7 @@ fn empty_session_state() -> ViewState {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,
@@ -2695,4 +2704,132 @@ fn clicking_the_thinking_tag_toggles_but_the_traces_stay_inert() {
         "clicking the tag again collapses it"
     );
     assert!(!state.transcript.entry_expanded(0, false));
+}
+
+fn transcript_rows(frame: &[String], rows: usize) -> Vec<String> {
+    frame[..rows]
+        .iter()
+        .map(|line| markdown::strip_ansi(line))
+        .collect()
+}
+
+#[test]
+fn scrolled_up_view_stays_put_while_output_streams() {
+    let mut state = overflow_state();
+    let editor = Editor::default();
+    state.scroll_offset = 6;
+    let (before, _) = build_frame(&mut state, &editor, 40, 16);
+    for index in 0..8 {
+        state.apply(Update::Transcript(TranscriptEvent::TextDelta(format!(
+            "streamed {index}\n\n"
+        ))));
+        let (after, _) = build_frame(&mut state, &editor, 40, 16);
+        // The rows above the jump button are unchanged.
+        assert_eq!(transcript_rows(&before, 8), transcript_rows(&after, 8));
+    }
+    assert!(state.scroll_offset > 6);
+}
+
+#[test]
+fn view_at_the_bottom_keeps_following_output() {
+    let mut state = overflow_state();
+    let editor = Editor::default();
+    build_frame(&mut state, &editor, 40, 16);
+    state.apply(Update::Transcript(TranscriptEvent::TextDelta(
+        "newest streamed text".into(),
+    )));
+    let (frame, _) = build_frame(&mut state, &editor, 40, 16);
+    assert_eq!(state.scroll_offset, 0);
+    assert!(
+        frame
+            .iter()
+            .any(|line| line.contains("newest streamed text"))
+    );
+    assert!(!frame.iter().any(|line| line.contains("Scroll to bottom")));
+}
+
+#[test]
+fn jump_button_appears_when_scrolled_up_and_returns_to_the_bottom() {
+    let mut state = overflow_state();
+    let editor = Editor::default();
+    state.scroll_offset = 4;
+    let (frame, _) = build_frame(&mut state, &editor, 40, 16);
+    assert!(frame.iter().all(|line| markdown::visible_width(line) == 40));
+    let button = state.follow.button.expect("jump button");
+    let label_row = markdown::strip_ansi(&frame[button.top]);
+    assert!(label_row.contains("↓ Scroll to bottom"));
+    // One borderless row, centered.
+    assert_eq!(button.bottom, button.top + 1);
+    assert!(
+        frame[..=button.top]
+            .iter()
+            .all(|line| !markdown::strip_ansi(line).contains(['┌', '└']))
+    );
+    let centered = (40 - (button.right - button.left)) / 2;
+    assert_eq!(button.left, centered);
+
+    let press = |kind| crate::tui::events::MouseEvent {
+        kind,
+        row: button.top,
+        column: button.left + 2,
+    };
+    assert!(super::state::handle_jump_button_mouse(
+        &mut state,
+        press(crate::tui::events::MouseKind::Press)
+    ));
+    assert_eq!(state.scroll_offset, 0);
+    // The release that ends the press belongs to the button too.
+    assert!(super::state::handle_jump_button_mouse(
+        &mut state,
+        press(crate::tui::events::MouseKind::Release)
+    ));
+    let (frame, _) = build_frame(&mut state, &editor, 40, 16);
+    assert!(state.follow.button.is_none());
+    assert!(!frame.iter().any(|line| line.contains("Scroll to bottom")));
+
+    // A selection drag that ends over the button still reaches selection.
+    state.scroll_offset = 4;
+    build_frame(&mut state, &editor, 40, 16);
+    assert!(state.follow.button.is_some());
+    assert!(!super::state::handle_jump_button_mouse(
+        &mut state,
+        press(crate::tui::events::MouseKind::Release)
+    ));
+
+    // Views without the transcript drop the hit area.
+    state.transcript.focus();
+    state.transcript.open_viewer();
+    build_frame(&mut state, &editor, 40, 16);
+    assert!(state.follow.button.is_none());
+}
+
+#[test]
+fn background_warnings_do_not_yank_a_scrolled_up_view() {
+    let mut state = overflow_state();
+    let editor = Editor::default();
+    state.scroll_offset = 5;
+    build_frame(&mut state, &editor, 40, 16);
+    state.apply(Update::Warning("provider warning".into()));
+    build_frame(&mut state, &editor, 40, 16);
+    assert!(state.scroll_offset > 5);
+}
+
+#[test]
+fn hidden_notices_render_nothing() {
+    let rendered = render_entries(
+        &[
+            Entry::Notice(String::new()),
+            Entry::Assistant("visible".into()),
+        ],
+        24,
+        false,
+        false,
+    );
+    let text = rendered
+        .iter()
+        .map(|line| markdown::strip_ansi(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!text.contains("Yawl"));
+    assert!(text.contains("visible"));
 }

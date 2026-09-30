@@ -74,6 +74,7 @@ fn test_state() -> ViewState {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,
@@ -1498,4 +1499,86 @@ fn history_and_log_reverse_at_bottom() {
         handle_event(&mut state, &mut editor, Event::MouseScroll(1));
         assert_ne!(render(&mut state, &editor, 120, 30).0, bottom);
     }
+}
+
+#[test]
+fn narrow_dashboard_shows_one_pane_at_a_time() {
+    let Some(repo) = Repo::new("narrow-panes") else {
+        return;
+    };
+    std::fs::write(repo.0.join("phone.rs"), "changed\n").unwrap();
+    let (status, _) = load_status(&repo.0).unwrap();
+    let mut state = state();
+    state.git_view = Some(GitView::new(repo.0.clone(), status));
+    let editor = Editor::default();
+
+    let (panel, _) = render(&mut state, &editor, 44, 30);
+    assert!(panel.iter().all(|line| markdown::visible_width(line) <= 44));
+    assert_eq!(state.git_view.as_ref().unwrap().layout.divider, 0);
+    let row = state.git_view.as_ref().unwrap().layout.file_rows[0].0;
+    assert!(markdown::strip_ansi(&panel[row]).contains("phone.rs"));
+
+    open_selected_diff(&mut state);
+    let (diff, _) = render(&mut state, &editor, 44, 30);
+    assert!(diff.iter().all(|line| markdown::visible_width(line) <= 44));
+    let text = diff
+        .iter()
+        .map(|line| markdown::strip_ansi(line))
+        .collect::<String>();
+    assert!(text.contains("changed"));
+    assert!(!text.contains("HISTORY"));
+    assert_eq!(
+        state.git_view.as_ref().unwrap().layout.close_button,
+        Some((0, 0))
+    );
+
+    // Tab moves focus back to the panel while the diff stays open; the
+    // panel, with its commit box, must be the visible pane.
+    let mut editor = Editor::default();
+    handle_event(&mut state, &mut editor, Event::Key(Key::Tab));
+    assert!(state.git_view.as_ref().unwrap().diff.is_some());
+    let (panel, _) = render(&mut state, &editor, 44, 30);
+    let text = panel
+        .iter()
+        .map(|line| markdown::strip_ansi(line))
+        .collect::<String>();
+    assert!(text.contains("Message"));
+    assert!(text.contains("HISTORY"));
+    let layout = &state.git_view.as_ref().unwrap().layout;
+    assert_eq!(layout.divider, 0);
+    // The diff's close hotspot must not sit over the visible panel.
+    assert_eq!(layout.close_button, None);
+    // The wheel must not scroll the hidden diff.
+    let diff_scroll = |state: &ViewState| {
+        state
+            .git_view
+            .as_ref()
+            .unwrap()
+            .diff
+            .as_ref()
+            .unwrap()
+            .scroll
+    };
+    let before = diff_scroll(&state);
+    handle_event(&mut state, &mut editor, Event::MouseScroll(-3));
+    assert_eq!(diff_scroll(&state), before);
+
+    let view = state.git_view.as_mut().unwrap();
+    view.diff = None;
+    view.show_log = true;
+    view.focus = GitFocus::Files;
+    let (log, _) = render(&mut state, &editor, 44, 30);
+    assert!(log.iter().all(|line| markdown::visible_width(line) <= 44));
+    assert_eq!(state.git_view.as_ref().unwrap().layout.right_width, 0);
+
+    // Focusing the message box shows the panel even with the log open, so
+    // typing never edits a hidden commit message.
+    state.git_view.as_mut().unwrap().focus = GitFocus::Commit;
+    let (panel, _) = render(&mut state, &editor, 44, 30);
+    assert_eq!(state.git_view.as_ref().unwrap().layout.divider, 0);
+    let text = panel
+        .iter()
+        .map(|line| markdown::strip_ansi(line))
+        .collect::<String>();
+    assert!(text.contains("Message"));
 }

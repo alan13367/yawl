@@ -58,6 +58,7 @@ Commands
 | `/subagents` | Open the subagent dashboard |
 | `/git` | Open the git dashboard (offers repo setup outside a repo) |
 | `/ps` | Open the background process dashboard |
+| `/remote [off]` | Control this session from a device in your tailnet |
 | --- | --- |
 | `/hotkeys` | Show keyboard shortcuts grid |
 | `/help` | Show this command reference |

@@ -22,6 +22,7 @@ mod picker;
 #[cfg(test)]
 mod picker_tests;
 mod processes;
+mod remote;
 mod render;
 #[cfg(test)]
 mod render_tests;
@@ -40,7 +41,7 @@ mod worker;
 #[cfg(test)]
 mod worker_tests;
 
-use std::io::{self, Read};
+use std::io::Read;
 
 use crate::agent::Agent;
 use crate::error::Error;
@@ -110,8 +111,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
     crate::install_interrupt_handler()?;
     agent.enable_interactive_questions();
     let mut terminal = Terminal::enter()?;
-    let stdin = io::stdin();
-    let mut events = EventReader::new(stdin.lock());
+    let mut events = EventReader::new(terminal.remote().terminal_input(remote::FdInput::stdin()));
     let mut editor = Editor::default();
     let mut state = ViewState::from_agent(agent);
     terminal.draw(&mut state, &editor)?;
@@ -200,6 +200,9 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                 _ => {}
             }
             needs_draw |= !matches!(&event, Event::Tick | Event::FocusGained | Event::FocusLost);
+            if matches!(&event, Event::Tick) {
+                needs_draw |= terminal.remote().poll(&mut state);
+            }
             if matches!(&event, Event::Tick) && crate::interrupted() {
                 crate::set_interrupted(false);
                 if !git::handle_interrupt(&mut state) && !processes::handle_interrupt(&mut state) {
@@ -489,6 +492,7 @@ fn handle_submission<R: Read>(
             "ps" => state.notice("Usage: /ps"),
             "git" if argument.is_empty() => git::open_dashboard(state),
             "git" => state.notice("Usage: /git"),
+            "remote" => remote::command(terminal, state, argument),
             "resume" if argument.is_empty() => open_resume_picker(agent, state),
             "resume" => resume(agent, argument, state),
             "unqueue" => unqueue(argument, state),

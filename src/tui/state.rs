@@ -46,6 +46,33 @@ pub(super) const COPY_TOAST_TICKS: u8 = 15;
 /// engages (~2s at the terminal's 100 ms raw-mode read timeout).
 pub(super) const SCROLL_BAR_AUTO_HIDE_TICKS: u32 = 20;
 
+/// Output-following state: where the viewport is pinned while scrolled up,
+/// and the "Scroll to bottom" button drawn in that case.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FollowState {
+    /// Width and total transcript rows of the last rendered window.
+    pub(super) anchor: Option<(usize, usize)>,
+    /// Screen rows and columns (end-exclusive) of the jump button.
+    pub(super) button: Option<JumpButton>,
+    /// The last press landed on the jump button, so its release belongs to
+    /// it too.
+    pub(super) pressed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct JumpButton {
+    pub(super) top: usize,
+    pub(super) bottom: usize,
+    pub(super) left: usize,
+    pub(super) right: usize,
+}
+
+impl JumpButton {
+    pub(super) fn contains(&self, row: usize, column: usize) -> bool {
+        (self.top..self.bottom).contains(&row) && (self.left..self.right).contains(&column)
+    }
+}
+
 /// Layout facts the scroll bar needs to render and hit-test. Captured each
 /// frame while the bar is drawn.
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +121,8 @@ pub(super) struct ViewState {
     pub(super) bell: bool,
     pub(super) scroll_bar_idle_ticks: u32,
     pub(super) scroll_geometry: Option<ScrollGeometry>,
+    /// Keeps a scrolled-up viewport still while output streams in below it.
+    pub(super) follow: FollowState,
     pub(super) scroll_bar_drag: Option<usize>,
     /// Maps each transcript screen row (0..transcript height) to its owning
     /// transcript entry, captured each frame for click-to-expand hit-testing.
@@ -173,6 +202,7 @@ impl ViewState {
             show_scroll_bar: agent.config().scroll_bar,
             scroll_bar_idle_ticks: 0,
             scroll_geometry: None,
+            follow: Default::default(),
             scroll_bar_drag: None,
             transcript_row_entries: Vec::new(),
             tool_click_press: None,
@@ -365,11 +395,12 @@ impl ViewState {
             Update::Compacting => self.activity = "compacting conversation".into(),
             Update::Compacted { replaced } => {
                 self.activity.clear();
-                self.notice(format!("Compacted {replaced} older messages."));
+                self.transcript
+                    .notice(format!("Compacted {replaced} older messages."));
             }
             Update::Warning(text) => {
                 self.activity.clear();
-                self.notice(text);
+                self.transcript.notice(text);
             }
             Update::Usage {
                 context_tokens,
@@ -558,6 +589,28 @@ pub(super) fn scroll_bar_span(height: usize, total_lines: usize) -> (usize, usiz
 pub(super) fn scroll_bar_position(travel: usize, max_scroll: usize, scroll_offset: usize) -> usize {
     let viewport_top = max_scroll.saturating_sub(scroll_offset);
     (viewport_top * travel / max_scroll).min(travel)
+}
+
+/// Handles a press on the "Scroll to bottom" button. Returns true when the
+/// event belongs to it: a press on the button, or the release that ends that
+/// press. Any other release reaches text selection.
+pub(super) fn handle_jump_button_mouse(state: &mut ViewState, event: MouseEvent) -> bool {
+    match event.kind {
+        MouseKind::Press => {
+            let hit = state
+                .follow
+                .button
+                .is_some_and(|button| button.contains(event.row, event.column));
+            if hit {
+                state.scroll_offset = 0;
+                state.follow.button = None;
+            }
+            state.follow.pressed = hit;
+            hit
+        }
+        MouseKind::Release => std::mem::take(&mut state.follow.pressed),
+        MouseKind::Drag | MouseKind::Move => false,
+    }
 }
 
 /// Handles presses and drags on the transcript scroll bar. Returns true when

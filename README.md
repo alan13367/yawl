@@ -60,8 +60,10 @@ Yawl has no approval prompt or permission layer. Tools run with your account's a
 | `/`, `@` | Find a command or skill; tag a project file |
 | `Ctrl+F` | Search the transcript |
 | `Ctrl+O` | Expand or collapse all tool output |
-| `PageUp`, `PageDown`, mouse wheel | Scroll |
+| `PageUp`, `PageDown`, mouse wheel | Scroll; `Ctrl`+wheel moves one row |
 | Drag | Select and copy text |
+
+Scrolling up while a response streams keeps the view where it is, and new output collects below it. A **↓ Scroll to bottom** button appears whenever the view is not at the bottom. Click it, or scroll back down, to follow the output again.
 
 With the transcript focused, arrows select blocks, `h`/`l` fold or unfold, `Enter` opens a viewer, and `y` copies. Click tool cards or thinking tags to expand them. Reasoning is collapsed by default; `hide_reasoning` removes it entirely.
 
@@ -89,6 +91,7 @@ Canceling a response pauses queued messages and pending steering. Use `/unqueue`
 | `/subagents` | Open the subagent dashboard and takeover view |
 | `/git` | Stage, discard, commit, push, and browse history and diffs |
 | `/ps` | Open the background-process dashboard |
+| `/remote [off]` | Control this session from a phone or browser in your Tailscale network |
 | `/resume [ID\|NUMBER]` | Open the session picker or resume directly; `d` deletes a session |
 | `/unqueue [NUMBER\|all]` | Edit, remove, or clear queued messages |
 | `/goal [TEXT]` | Start, resume, cancel, or show a persistent goal |
@@ -102,6 +105,28 @@ The Git dashboard supports keyboard and mouse navigation. Click a file or commit
 ### Goals and plans
 
 `/goal TEXT` keeps the agent working until it marks the goal complete. `/plan TEXT` starts a read-only workflow that asks questions and saves a Markdown plan. You can revise the plan or choose Implement. Implementation starts from the saved plan alone, without an extra summarization request; the original conversation stays in the session log. Plan phases keep the same system prompt and tool list and add their instructions as hidden messages, so local servers can reuse their prompt cache; planning still rejects any tool that is not read-only.
+
+### Remote control
+
+`/remote` lets another device in your [Tailscale](https://tailscale.com) network control the current session from a browser. Yawl listens only on this machine's Tailscale address, port 7474 by default. It looks for the address on Tailscale's tunnel interface (`utun*` on macOS, `tailscale*` on Linux), not just any address in the shared 100.64.0.0/10 range. It shows the address, a six-digit pairing code, and a QR code, and copies the link to the clipboard. This notice is removed once a device connects or remote control stops.
+- **Scan the QR code:** the phone opens the page and pairs automatically. The link carries the code in its `#fragment`, which browsers never send to the server.
+- **Use the clipboard:** with Universal Clipboard, paste the link on an iPhone.
+- **Type it:** open the address on the other device and enter the code.
+
+After five wrong codes, remote control stops.
+
+The page mirrors the full-screen interface at the device's size, so every command, picker, and dashboard works. On phones and tablets:
+- Tap Yawl's composer, or `⌨`, to type with the phone keyboard. Keystrokes stream live, so completion menus, `@` mentions, and autocorrect all work.
+- `✎` opens a sheet for pasting or writing longer text.
+- A key bar provides `Esc`, `Enter`, `Backspace`, arrows, `Tab`, `Ctrl+C`, `Ctrl+O`, and paging.
+- Swipe to scroll and tap to click.
+- `/copy` opens a sheet on the device.
+
+On a computer, detected by a mouse or trackpad, the page behaves like a terminal. The touch controls are hidden, and the keyboard, mouse, and paste go straight to Yawl. `Shift+Enter` inserts a newline and `Ctrl+Enter` steers. Dragging to select or running `/copy` shows a Copy button, because plain HTTP pages cannot write the clipboard unprompted. `Option`-drag makes a normal browser selection for `⌘C`.
+
+Only the device currently in control can type. When another device connects, the previous one is locked out even though it stays paired. A device that reconnects on its own, such as a phone waking up, never takes control back from another connected device. It offers a **Take control** button instead. The page loads xterm.js from `cdn.jsdelivr.net`, so the device needs internet access.
+
+While a device has control, the host terminal shows a lock screen and ignores input. Press `Ctrl+C` there to end remote control and take back the terminal. While remote control runs, the host's `Ctrl+C` never raises an interrupt signal, so it cannot cancel work the device started. `/remote off` from either side stops it, even during a turn, and a new `/remote` requires pairing again. Traffic stays inside your tailnet, encrypted by WireGuard, but anyone with the code can run tools as you.
 
 ## Models and configuration
 

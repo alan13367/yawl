@@ -304,6 +304,11 @@ fn key_from_encoded(code: u32, modifier: u8) -> Option<Key> {
     if code == 10 {
         return Some(Key::Newline);
     }
+    // Kitty-protocol terminals, and the remote page, send Esc as `CSI 27u`
+    // so it never merges with a following key.
+    if code == 27 {
+        return Some(Key::Escape);
+    }
     if ctrl
         && let Some(character) = char::from_u32(code)
         && character.is_ascii_alphabetic()
@@ -327,6 +332,9 @@ fn parse_mouse(body: &str, final_byte: u8) -> Option<Event> {
     if fields.next().is_some() {
         return None;
     }
+    // Ctrl+wheel scrolls one row instead of three; the remote page uses it
+    // to track touch gestures closely.
+    let rows = if button & 0b1_0000 != 0 { 1 } else { 3 };
     // Ignore Shift/Alt/Ctrl modifier bits while preserving the wheel code.
     let button = button & !0b1_1100;
     match button {
@@ -335,8 +343,8 @@ fn parse_mouse(body: &str, final_byte: u8) -> Option<Event> {
             column,
             row,
         })),
-        64 => Some(Event::MouseScroll(3)),
-        65 => Some(Event::MouseScroll(-3)),
+        64 => Some(Event::MouseScroll(rows)),
+        65 => Some(Event::MouseScroll(-rows)),
         0 | 32 => Some(Event::Mouse(MouseEvent {
             kind: if final_byte == b'm' {
                 MouseKind::Release
@@ -376,6 +384,14 @@ mod tests {
     fn decodes_kitty_ctrl_enter_as_steer() -> std::io::Result<()> {
         let mut reader = EventReader::new(Cursor::new(b"\x1b[13;5u"));
         assert_eq!(reader.read_event()?, Event::Key(Key::Steer));
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_kitty_escape_without_merging_the_next_key() -> std::io::Result<()> {
+        let mut reader = EventReader::new(&b"\x1b[27u\x1b[A"[..]);
+        assert_eq!(reader.read_event()?, Event::Key(Key::Escape));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Up));
         Ok(())
     }
 
@@ -421,6 +437,14 @@ mod tests {
         let input = b"\x1b[200~one\r\ntwo\x1b[201~";
         let mut reader = EventReader::new(Cursor::new(input));
         assert_eq!(reader.read_event()?, Event::Paste("one\ntwo".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn ctrl_wheel_scrolls_a_single_row() -> std::io::Result<()> {
+        let mut reader = EventReader::new(Cursor::new(b"\x1b[<80;10;4M\x1b[<81;10;4M"));
+        assert_eq!(reader.read_event()?, Event::MouseScroll(1));
+        assert_eq!(reader.read_event()?, Event::MouseScroll(-1));
         Ok(())
     }
 

@@ -36,7 +36,7 @@ use super::completion::{
 };
 use super::input::Editor;
 use super::picker::{Picker, PickerAction, picker_is_plan_handoff, render_picker};
-use super::state::{ScrollGeometry, scroll_bar_position, scroll_bar_span};
+use super::state::{JumpButton, ScrollGeometry, scroll_bar_position, scroll_bar_span};
 use super::{ViewState, markdown};
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -134,6 +134,40 @@ pub(super) fn render_copy_toast(frame: &mut [String], columns: usize, accent: Ui
     }
 }
 
+const JUMP_LABEL: &str = " ↓ Scroll to bottom ";
+
+/// Draws a "Scroll to bottom" pill centered on the last transcript row while
+/// the view is scrolled up, and records its hit area.
+pub(super) fn render_jump_button(region: &mut [String], state: &mut ViewState, columns: usize) {
+    let width = markdown::visible_width(JUMP_LABEL);
+    let Some(row) = region.len().checked_sub(1) else {
+        return;
+    };
+    if columns < width + 2 {
+        return;
+    }
+    let accent = state.accent_color;
+    let luminance =
+        u32::from(accent.red) * 299 + u32::from(accent.green) * 587 + u32::from(accent.blue) * 114;
+    let text = if luminance > 140_000 {
+        "\x1b[38;2;18;18;22m"
+    } else {
+        "\x1b[38;2;245;245;245m"
+    };
+    let pill = format!(
+        "\x1b[48;2;{};{};{}m{text}\x1b[1m{JUMP_LABEL}\x1b[0m",
+        accent.red, accent.green, accent.blue
+    );
+    let left = (columns - width) / 2;
+    region[row] = markdown::overlay_at(&region[row], left, &pill);
+    state.follow.button = Some(JumpButton {
+        top: row,
+        bottom: row + 1,
+        left,
+        right: left + width,
+    });
+}
+
 /// Thumb shading as a fraction of the accent color.
 const SCROLL_THUMB_INTENSITY: f32 = 0.65;
 
@@ -203,6 +237,9 @@ pub(super) fn build_frame_with_images(
     rows: usize,
     image_support: ImageSupport,
 ) -> RenderedFrame {
+    // Only the transcript view draws the jump button; every other view must
+    // not leave a stale hit area behind.
+    state.follow.button = None;
     if state.git_init.is_some() {
         let (lines, cursor) = super::git::render_init(state, editor, columns, rows);
         state.transcript_row_entries.clear();
@@ -383,6 +420,7 @@ pub(super) fn build_frame_with_images(
     // map to `None`, transcript rows map to their owning entry, and picker or
     // welcome screens clear the map because no tool card is visible.
     let mut click_map = Vec::with_capacity(transcript_height);
+    let mut showing_transcript = false;
     if let Some(picker) = state
         .picker
         .as_ref()
@@ -407,6 +445,7 @@ pub(super) fn build_frame_with_images(
         ));
         state.transcript_row_entries.clear();
     } else {
+        showing_transcript = true;
         click_map.extend(std::iter::repeat_n(
             None,
             transcript_height.saturating_sub(visible.len()),
@@ -431,6 +470,9 @@ pub(super) fn build_frame_with_images(
                 line
             }
         }));
+    }
+    if showing_transcript && state.scroll_offset > 0 {
+        render_jump_button(&mut region, state, columns);
     }
     apply_scroll_bar(
         &mut region,
@@ -654,6 +696,8 @@ fn render_block_viewer(
         state.transcript.close_viewer();
         return build_frame(state, &Editor::default(), columns, rows);
     };
+    // The viewer reuses `scroll_offset` for its own content.
+    state.follow.anchor = None;
     let label = crate::subagent::sanitize_preview(entry.label(), 128);
     let title = format!(
         " {}{} {} · Esc close · y copy\x1b[0m",

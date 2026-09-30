@@ -682,6 +682,7 @@ mod tests {
             bell: false,
             scroll_bar_idle_ticks: 0,
             scroll_geometry: None,
+            follow: Default::default(),
             scroll_bar_drag: None,
             transcript_row_entries: Vec::new(),
             tool_click_press: None,

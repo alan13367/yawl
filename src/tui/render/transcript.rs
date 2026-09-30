@@ -77,6 +77,21 @@ pub(in crate::tui) fn render_transcript_window(
     };
     let total_lines = cached_lines + tail.len();
     let max_scroll = total_lines.saturating_sub(height);
+    // While scrolled up, keep the same rows on screen as output grows or
+    // shrinks below them; at the bottom (offset zero) the view follows.
+    if state.scroll_offset > 0
+        && let Some((anchor_width, anchor_total)) = state.follow.anchor
+        && anchor_width == width
+    {
+        state.scroll_offset = if total_lines >= anchor_total {
+            state.scroll_offset + (total_lines - anchor_total)
+        } else {
+            state
+                .scroll_offset
+                .saturating_sub(anchor_total - total_lines)
+        };
+    }
+    state.follow.anchor = Some((width, total_lines));
     if reveal && let Some(range) = selected_range {
         state.scroll_offset = max_scroll.saturating_sub(range.start);
     } else {

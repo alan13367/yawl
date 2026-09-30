@@ -154,12 +154,36 @@ fn hovered_row(line: &str, color: UiColor) -> String {
     selected_row(line, &selection_style(tint))
 }
 
-fn panel_width(columns: usize) -> usize {
-    if columns < 60 {
-        30.min(columns.saturating_sub(12)).max(20)
-    } else {
-        ((columns * 35) / 100).clamp(30, 44)
+/// Below this width, such as on a phone, the dashboard shows one pane at a
+/// time: the panel, or the diff, log, or branch list while one is open.
+const SINGLE_PANE_COLUMNS: usize = 60;
+
+/// Whether a single-pane layout should show the left pane. The branch list
+/// owns the keyboard while open; the log shows unless the message box or
+/// history has focus, and a diff shows only while it has focus. Commit
+/// editing, the commit menu, and confirmations live in the panel.
+fn prefers_left_pane(view: &GitView) -> bool {
+    if view.confirm.is_some() || view.commit_menu.is_some() {
+        return false;
     }
+    let panel_focused = matches!(view.focus, GitFocus::Commit | GitFocus::History);
+    view.show_branches
+        || (view.show_log && !panel_focused)
+        || (view.diff.is_some() && view.focus == GitFocus::Diff)
+}
+
+/// Returns `(left, right)` pane widths; one divider column separates them.
+fn pane_widths(columns: usize, left_open: bool) -> (usize, usize) {
+    if columns < SINGLE_PANE_COLUMNS {
+        let width = columns.saturating_sub(1);
+        return if left_open { (width, 0) } else { (0, width) };
+    }
+    let right_width = panel_width(columns).min(columns - 21);
+    (columns - right_width - 1, right_width)
+}
+
+fn panel_width(columns: usize) -> usize {
+    ((columns * 35) / 100).clamp(30, 44)
 }
 
 const COMMIT_MENU_LABEL: &str = "│ ∨ (v)";
@@ -176,9 +200,11 @@ pub(in crate::tui) fn render(
 ) -> (Vec<String>, (usize, usize)) {
     let columns = columns.max(40);
     let rows = rows.max(10);
-    let right_width = panel_width(columns).min(columns - 21);
-    let divider = columns - right_width - 1;
-    let left_width = divider;
+    let (left_width, right_width) = pane_widths(
+        columns,
+        state.git_view.as_ref().is_some_and(prefers_left_pane),
+    );
+    let divider = left_width;
     let content_height = rows - 1;
 
     // Files stay on top; history anchors to the bottom and takes the
@@ -305,21 +331,31 @@ pub(in crate::tui) fn render(
             layout.history_rows.push((row, offset));
             row += 1;
         }
-        if view.diff.is_some() || view.show_log || view.show_branches {
+        if left_width > 0 && (view.diff.is_some() || view.show_log || view.show_branches) {
             layout.close_button = Some((0, 0));
         }
         view.layout = layout;
     }
 
-    let right_lines = render_right(
-        state,
-        right_width,
-        content_height,
-        file_capacity,
-        history_capacity,
-        pad_between,
-    );
-    let left_lines = render_left(state, editor, left_width, content_height);
+    // A single-pane layout hides one side at width zero; rendering it anyway
+    // would wrap the transcript or diff at one column and disturb its caches.
+    let right_lines = if right_width > 0 {
+        render_right(
+            state,
+            right_width,
+            content_height,
+            file_capacity,
+            history_capacity,
+            pad_between,
+        )
+    } else {
+        Vec::new()
+    };
+    let left_lines = if left_width > 0 {
+        render_left(state, editor, left_width, content_height)
+    } else {
+        Vec::new()
+    };
 
     let mut frame = Vec::with_capacity(rows);
     for index in 0..content_height {
@@ -1126,8 +1162,36 @@ mod tests {
     }
 
     #[test]
-    fn panel_width_stays_usable_on_small_terminals() {
-        assert!(panel_width(40) >= 20);
+    fn narrow_layout_keeps_panel_controls_visible_over_a_focused_diff() {
+        let mut view = GitView::new(PathBuf::from("/unused"), GitStatus::default());
+        view.show_log = true;
+        assert!(prefers_left_pane(&view));
+        view.show_log = false;
+        view.focus = GitFocus::Diff;
+        assert!(!prefers_left_pane(&view), "no diff is open");
+        view.commit_menu = Some(super::super::CommitMenuState { selected: 0 });
+        view.show_branches = true;
+        assert!(
+            !prefers_left_pane(&view),
+            "the commit menu lives in the panel"
+        );
+        view.commit_menu = None;
+        view.confirm = Some(super::super::Confirm::DiscardFile {
+            path: "a".into(),
+            renamed_from: None,
+            untracked: false,
+            staged: false,
+        });
+        assert!(!prefers_left_pane(&view), "confirmations live in the panel");
+    }
+
+    #[test]
+    fn panes_split_on_wide_terminals_and_alternate_on_narrow_ones() {
+        assert_eq!(pane_widths(44, false), (0, 43));
+        assert_eq!(pane_widths(44, true), (43, 0));
+        let (left, right) = pane_widths(120, false);
+        assert_eq!(left + right + 1, 120);
+        assert!((30..=44).contains(&right));
         assert!(panel_width(200) <= 44);
     }
 

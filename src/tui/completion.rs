@@ -25,6 +25,7 @@ pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
         ("/subagents", "Open the subagent dashboard"),
         ("/git", "Open the git dashboard"),
         ("/ps", "Open the background process dashboard"),
+        ("/remote", "Control this session from another device"),
         ("/new", "Start a session without changing directories"),
         ("/clear", "Alias for /new"),
         ("/compact", "Summarize older messages"),

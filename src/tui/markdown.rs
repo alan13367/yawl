@@ -501,6 +501,53 @@ pub(crate) fn strip_ansi(text: &str) -> String {
     output
 }
 
+/// Draws `overlay` over the cells of `text` starting at `column`. Text on
+/// both sides keeps its styling; a wide character cut by either edge becomes
+/// spaces.
+pub(crate) fn overlay_at(text: &str, column: usize, overlay: &str) -> String {
+    let end = column + visible_width(overlay);
+    let bytes = text.as_bytes();
+    let (mut before, mut after, mut replay) = (String::new(), String::new(), String::new());
+    let mut cell = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if let Some(sequence_end) = ansi_sequence_end(bytes, index) {
+            let sequence = &text[index..sequence_end];
+            if cell < column {
+                before.push_str(sequence);
+            }
+            // Styling that starts under the overlay must still apply after it.
+            if cell < end {
+                replay.push_str(sequence);
+            } else {
+                after.push_str(sequence);
+            }
+            index = sequence_end;
+            continue;
+        }
+        let character = text[index..]
+            .chars()
+            .next()
+            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        let width = terminal_character_width(character);
+        if cell + width <= column {
+            before.push(character);
+        } else if cell < column {
+            before.push_str(&" ".repeat(column - cell));
+        } else if cell >= end {
+            after.push(character);
+        } else if cell + width > end {
+            after.push_str(&" ".repeat(cell + width - end));
+        }
+        cell += width;
+        index += character.len_utf8();
+    }
+    if cell < column {
+        before.push_str(&" ".repeat(column - cell));
+    }
+    format!("{before}\x1b[0m{overlay}\x1b[0m{replay}{after}")
+}
+
 /// Applies a background color to the final visible character without
 /// replacing it or changing the line's terminal width.
 pub(crate) fn overlay_last_cell_background(text: &str, background: &str) -> String {
@@ -861,6 +908,20 @@ pub(crate) fn wrapped_plain_prefixed_lines(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overlay_keeps_styling_on_both_sides() {
+        let line = "\x1b[31mred text\x1b[0m and \x1b[32mgreen tail\x1b[0m";
+        let overlaid = overlay_at(line, 4, "[XX]");
+        assert_eq!(strip_ansi(&overlaid), "red [XX] and green tail");
+        assert_eq!(visible_width(&overlaid), visible_width(line));
+        // The red run under the overlay continues after it.
+        let after = overlaid.split("[XX]").nth(1).expect("after overlay");
+        assert!(after.starts_with("\x1b[0m\x1b[31m"));
+        // A wide character cut by the edge becomes padding.
+        assert_eq!(strip_ansi(&overlay_at("ab界cd", 3, "X")), "ab Xcd");
+        assert_eq!(strip_ansi(&overlay_at("ab", 4, "X")), "ab  X");
+    }
+
     use super::*;
 
     #[test]

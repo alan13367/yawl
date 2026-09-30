@@ -26,6 +26,10 @@ fn settings_and_model_pickers_are_recognized_during_an_active_turn() {
         busy_command("/unqueue 2"),
         Some(BusyCommand::Unqueue("2".into()))
     );
+    assert_eq!(
+        busy_command("/remote off"),
+        Some(BusyCommand::Remote("off".into()))
+    );
     assert_eq!(busy_command("/settings max_tokens 1"), None);
     assert_eq!(busy_command("hello"), None);
 }
@@ -75,6 +79,7 @@ fn display_settings_apply_during_an_active_turn() {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,

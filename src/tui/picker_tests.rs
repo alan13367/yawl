@@ -67,6 +67,46 @@ fn picker_is_bounded_and_highlights_selection() {
 }
 
 #[test]
+fn narrow_picker_lists_labels_and_wraps_the_selected_description() {
+    let item = |label: &str, description: &str| PickerItem {
+        label: label.into(),
+        description: description.into(),
+        action: PickerAction::SwitchModel(label.into()),
+    };
+    let picker = Picker {
+        title: "Settings".into(),
+        hint: "Enter open".into(),
+        selected: 1,
+        items: vec![
+            item("Model", "hidden-first-description"),
+            item(
+                "Interface",
+                "Colors, reasoning display, status bar, bell, and scroll bar",
+            ),
+        ],
+        editing: None,
+        parent: None,
+    };
+    let rendered = render_picker(&picker, &Editor::default(), "\x1b[7m", "", 40, 14);
+    assert!(
+        rendered
+            .iter()
+            .all(|line| markdown::visible_width(line) == 40)
+    );
+    let text = rendered
+        .iter()
+        .map(|line| markdown::strip_ansi(line))
+        .collect::<Vec<_>>();
+    assert!(text.iter().any(|line| line.starts_with("┌")));
+    assert!(!text.join("\n").contains("hidden-first-description"));
+    let detail = text
+        .iter()
+        .position(|line| line.contains("Colors, reasoning"))
+        .expect("selected description is shown");
+    assert!(text[detail + 1].contains("scroll bar"));
+}
+
+#[test]
 fn picker_uses_available_width_and_accent_colored_outline() {
     let model = "omlx:mtplx-qwen38-27b-optimized-speed-with-a-long-model-name";
     let picker = Picker {
@@ -577,6 +617,7 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,
@@ -671,6 +712,7 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,

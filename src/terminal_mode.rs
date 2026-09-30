@@ -34,6 +34,30 @@ impl RawMode {
         }
         Ok(Self { original })
     }
+
+    /// Toggles whether Ctrl+C raises SIGINT. With signals off, Ctrl+C arrives
+    /// as a 0x03 input byte instead.
+    pub(crate) fn set_signals(&self, enabled: bool) -> Result<(), Error> {
+        // SAFETY: The zeroed value is initialized by `tcgetattr` before any
+        // field is read.
+        let mut current: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: stdin is a valid process descriptor and `current` points
+        // to writable termios storage.
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut current) } != 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+        if enabled {
+            current.c_lflag |= libc::ISIG;
+        } else {
+            current.c_lflag &= !libc::ISIG;
+        }
+        // SAFETY: stdin is valid and `current` points to initialized terminal
+        // settings.
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &current) } != 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for RawMode {

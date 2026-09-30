@@ -243,14 +243,24 @@ impl Transcript {
     }
 
     pub(super) fn focus(&mut self) {
-        if self.entries.is_empty() {
+        let Some(last) = self.visible_indices().last() else {
             return;
-        }
+        };
         self.focused = true;
-        if self.selected_index().is_none() {
-            self.selected = Some(self.entries.len() - 1);
+        if self.selected_entry().is_none_or(|entry| entry.is_hidden()) {
+            self.selected = Some(last);
         }
         self.reveal_selected = true;
+    }
+
+    /// Indices of entries that render, in order; hidden notices are skipped
+    /// by navigation.
+    fn visible_indices(&self) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !entry.is_hidden())
+            .map(|(index, _)| index)
     }
 
     pub(super) fn blur(&mut self) {
@@ -258,18 +268,22 @@ impl Transcript {
     }
 
     pub(super) fn move_selection(&mut self, amount: isize) {
-        if self.entries.is_empty() {
+        let visible = self.visible_indices().collect::<Vec<_>>();
+        let Some(&last) = visible.last() else {
             self.selected = None;
             return;
-        }
-        let current = self.selected_index().unwrap_or(self.entries.len() - 1);
-        self.selected = Some(if amount < 0 {
-            current.saturating_sub(amount.unsigned_abs())
+        };
+        let current = self.selected_index().unwrap_or(last);
+        // The first visible entry at or after the current one.
+        let position = visible.partition_point(|index| *index < current);
+        let position = if amount < 0 {
+            position.saturating_sub(amount.unsigned_abs())
         } else {
-            current
+            position
                 .saturating_add(amount as usize)
-                .min(self.entries.len() - 1)
-        });
+                .min(visible.len() - 1)
+        };
+        self.selected = Some(visible[position]);
         self.reveal_selected = true;
     }
 
@@ -317,7 +331,10 @@ impl Transcript {
     }
 
     pub(super) fn open_viewer(&mut self) {
-        if self.selected_entry().is_some() {
+        if self
+            .selected_entry()
+            .is_some_and(|entry| !entry.is_hidden())
+        {
             self.viewer_open = true;
         }
     }
@@ -460,6 +477,27 @@ impl Transcript {
         self.entries.push(Entry::Notice(text));
     }
 
+    /// Hides the notice at `index` if it still reads `text`, which guards
+    /// against a transcript rebuilt since it was shown. The entry stays in
+    /// place, empty, so indices held elsewhere remain valid; hidden entries
+    /// render nothing and navigation skips them.
+    pub(super) fn hide_notice(&mut self, index: usize, text: &str) -> bool {
+        let Some(Entry::Notice(content)) = self.entries.get_mut(index) else {
+            return false;
+        };
+        if content != text {
+            return false;
+        }
+        content.clear();
+        if self.selected == Some(index) {
+            let before = self.visible_indices().rfind(|visible| *visible < index);
+            let fallback = before.or_else(|| self.visible_indices().next());
+            self.selected = fallback;
+            self.viewer_open &= fallback.is_some();
+        }
+        true
+    }
+
     pub(super) fn push_diff(&mut self, path: String, lines: Vec<super::tool_view::ToolLine>) {
         self.entries.push(Entry::Diff { path, lines });
         if self.focused {
@@ -573,6 +611,11 @@ impl Transcript {
 }
 
 impl Entry {
+    /// A notice emptied by [`Transcript::hide_notice`].
+    pub(super) fn is_hidden(&self) -> bool {
+        matches!(self, Self::Notice(text) if text.is_empty())
+    }
+
     pub(super) fn searchable_text(&self) -> String {
         match self {
             Self::User(text)
@@ -639,6 +682,45 @@ impl Entry {
 mod tests {
     use super::*;
     use crate::provider::{Reasoning, SubagentResult, ToolCall};
+
+    #[test]
+    fn hiding_a_notice_empties_it_in_place() {
+        let mut transcript = Transcript::from_messages(&[]);
+        transcript.notice("pairing".into());
+        transcript.notice("other".into());
+        assert!(!transcript.hide_notice(1, "pairing"));
+        assert!(!transcript.hide_notice(5, "pairing"));
+        assert!(transcript.hide_notice(0, "pairing"));
+        assert!(transcript.entries()[0].is_hidden());
+        assert!(matches!(&transcript.entries()[1], Entry::Notice(text) if text == "other"));
+    }
+
+    #[test]
+    fn navigation_skips_hidden_notices() {
+        let mut transcript = Transcript::from_messages(&[]);
+        transcript.notice("first".into());
+        transcript.notice("pairing".into());
+        transcript.notice("last".into());
+        transcript.focus();
+        transcript.move_selection(-1);
+        assert_eq!(transcript.selected_index(), Some(1));
+        // Hiding the selected notice moves the selection off it.
+        assert!(transcript.hide_notice(1, "pairing"));
+        assert_eq!(transcript.selected_index(), Some(0));
+        transcript.move_selection(1);
+        assert_eq!(transcript.selected_index(), Some(2));
+        transcript.move_selection(-1);
+        assert_eq!(transcript.selected_index(), Some(0));
+        transcript.select_entry(1);
+        transcript.open_viewer();
+        assert!(!transcript.viewer_open());
+
+        let mut only_hidden = Transcript::from_messages(&[]);
+        only_hidden.notice("pairing".into());
+        assert!(only_hidden.hide_notice(0, "pairing"));
+        only_hidden.focus();
+        assert!(!only_hidden.is_focused());
+    }
 
     /// Strips live timing fields so live and replayed entries compare equal:
     /// the live freeze and the persisted duration differ by channel latency.

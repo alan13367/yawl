@@ -9,11 +9,12 @@ use crate::terminal_mode::RawMode;
 
 use super::events::{MouseEvent, MouseKind};
 use super::input::Editor;
+use super::remote::{self, Remote, Snapshot};
 use super::render::{FrameImage, HIDDEN_CURSOR, ImageSupport, build_frame_with_images};
 use super::{ViewState, markdown};
 
 pub(super) struct Terminal {
-    _raw_mode: RawMode,
+    raw_mode: RawMode,
     stdout: io::Stdout,
     active: bool,
     focused: bool,
@@ -24,6 +25,15 @@ pub(super) struct Terminal {
     selection: Option<TextSelection>,
     image_protocol: ImageProtocol,
     mouse_mode: MouseMode,
+    remote: Remote,
+    /// Remote state as of the last draw.
+    remote_controlled: bool,
+    remote_revision: u64,
+    /// Whether host Ctrl+C raises SIGINT; off while a remote session runs.
+    host_signals: bool,
+    /// Host lock screen as of the last draw while a device has control.
+    lock_frame: Vec<String>,
+    lock_size: (u16, u16),
 }
 
 /// All-motion reports are needed only while the Git dashboard is visible.
@@ -171,7 +181,7 @@ impl Terminal {
         let raw_mode = RawMode::enter()?;
 
         let mut terminal = Self {
-            _raw_mode: raw_mode,
+            raw_mode,
             stdout: io::stdout(),
             active: true,
             focused: true,
@@ -186,6 +196,12 @@ impl Terminal {
                 std::env::var("TERM").ok().as_deref(),
                 std::env::var_os("KITTY_WINDOW_ID").is_some(),
             )),
+            remote: Remote::new(),
+            remote_controlled: false,
+            remote_revision: 0,
+            host_signals: true,
+            lock_frame: Vec::new(),
+            lock_size: (0, 0),
         };
         terminal.stdout.write_all(
             b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[>1u\x1b[=1;1u\x1b[>4;1m",
@@ -200,8 +216,82 @@ impl Terminal {
         self.last_size = (0, 0);
     }
 
+    /// Reports whether the next draw would differ because of size or remote
+    /// session changes, even without new UI state.
     pub(super) fn size_changed(&self) -> bool {
-        terminal_size() != self.last_size
+        let remote = self.remote.snapshot();
+        if remote.controlled != self.remote_controlled || remote.revision != self.remote_revision {
+            return true;
+        }
+        if remote.controlled {
+            terminal_size() != self.lock_size
+        } else {
+            terminal_size() != self.last_size
+        }
+    }
+
+    pub(super) fn remote(&self) -> &Remote {
+        &self.remote
+    }
+
+    /// Host Ctrl+C must reach the input filter as a byte instead of raising
+    /// SIGINT and interrupting whatever the remote device started. Signals
+    /// stay off for the whole session, from before any device can attach;
+    /// the UI reads Ctrl+C as a key meanwhile, as on kitty-protocol
+    /// terminals.
+    pub(super) fn sync_host_signals(&mut self, session_running: bool) -> Result<(), Error> {
+        let enabled = !session_running;
+        if enabled != self.host_signals {
+            self.raw_mode.set_signals(enabled)?;
+            self.host_signals = enabled;
+        }
+        Ok(())
+    }
+
+    /// Applies remote-session transitions before a draw. Returns the frame
+    /// size and whether the frame goes to the remote device.
+    fn sync_remote(&mut self, remote: &Snapshot) -> Result<((u16, u16), bool), Error> {
+        // Restoring signals after a session is best effort: until it
+        // succeeds, Ctrl+C still arrives as a key.
+        let _ = self.sync_host_signals(remote.address.is_some());
+        if remote.controlled != self.remote_controlled {
+            self.remote_controlled = remote.controlled;
+            self.selection = None;
+            self.lock_frame.clear();
+            self.lock_size = (0, 0);
+            if remote.controlled {
+                self.mouse_mode.update(&mut self.stdout, false, false)?;
+            }
+            self.invalidate();
+        }
+        if remote.revision != self.remote_revision {
+            self.remote_revision = remote.revision;
+            // A newly attached device has no previous frame to diff against.
+            self.invalidate();
+        }
+        Ok(if remote.controlled {
+            (remote.size.unwrap_or(remote::DEFAULT_SIZE), true)
+        } else {
+            (terminal_size(), false)
+        })
+    }
+
+    fn draw_lock_screen(&mut self, remote: &Snapshot) -> Result<(), Error> {
+        let (columns, rows) = terminal_size();
+        let screen = remote::lock_screen(remote, columns, rows);
+        if (columns, rows) == self.lock_size && screen == self.lock_frame {
+            return Ok(());
+        }
+        self.stdout.write_all(b"\x1b[?25l")?;
+        if self.image_protocol == ImageProtocol::Kitty {
+            self.stdout.write_all(b"\x1b_Ga=d,d=A,q=2;\x1b\\")?;
+        }
+        self.stdout.write_all(b"\x1b[2J")?;
+        write_frame_rows(&mut self.stdout, &screen, &[], true)?;
+        self.stdout.flush()?;
+        self.lock_frame = screen;
+        self.lock_size = (columns, rows);
+        Ok(())
     }
 
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Result<bool, Error> {
@@ -245,16 +335,24 @@ impl Terminal {
     }
 
     pub(super) fn draw(&mut self, state: &mut ViewState, editor: &Editor) -> Result<(), Error> {
-        let (columns, rows) = terminal_size();
+        let remote = self.remote.snapshot();
+        let ((columns, rows), to_remote) = self.sync_remote(&remote)?;
         if self.last_size != (columns, rows) {
             super::git::clear_hover(state);
         }
+        // Browsers get no inline images; only the host terminal protocol is
+        // known.
+        let image_protocol = if to_remote {
+            ImageProtocol::None
+        } else {
+            self.image_protocol
+        };
         let rendered = build_frame_with_images(
             state,
             editor,
             usize::from(columns),
             usize::from(rows),
-            self.image_protocol.support(),
+            image_protocol.support(),
         );
         let base_frame = rendered.lines;
         let cursor = rendered.cursor;
@@ -275,27 +373,35 @@ impl Terminal {
             || self.last_frame.len() != frame.len()
             || images_changed
             || image_rows_changed;
-        self.stdout.write_all(b"\x1b[?25l")?;
+        let mut output = Vec::new();
+        output.extend_from_slice(b"\x1b[?25l");
         if force {
-            if self.image_protocol == ImageProtocol::Kitty && !self.last_images.is_empty() {
-                self.stdout.write_all(b"\x1b_Ga=d,d=A,q=2;\x1b\\")?;
+            if image_protocol == ImageProtocol::Kitty && !self.last_images.is_empty() {
+                output.extend_from_slice(b"\x1b_Ga=d,d=A,q=2;\x1b\\");
             }
-            self.stdout.write_all(b"\x1b[2J")?;
+            output.extend_from_slice(b"\x1b[2J");
         }
-        write_frame_rows(&mut self.stdout, &frame, &self.last_frame, force)?;
+        write_frame_rows(&mut output, &frame, &self.last_frame, force)?;
         if force {
-            write_inline_images(&mut self.stdout, self.image_protocol, &images)?;
+            write_inline_images(&mut output, image_protocol, &images)?;
         }
-        self.stdout
-            .write_all(cursor_control(cursor, self.selection.is_some()).as_bytes())?;
-        let git_visible =
-            state.git_view.is_some() && state.git_init.is_none() && state.process_view.is_none();
-        self.mouse_mode.update(
-            &mut self.stdout,
-            git_visible,
-            self.focused && super::git::pointer_over_control(state),
-        )?;
-        self.stdout.flush()?;
+        output.extend_from_slice(cursor_control(cursor, self.selection.is_some()).as_bytes());
+        if to_remote {
+            self.remote
+                .send_frame(String::from_utf8_lossy(&output).into_owned());
+            self.draw_lock_screen(&remote)?;
+        } else {
+            self.stdout.write_all(&output)?;
+            let git_visible = state.git_view.is_some()
+                && state.git_init.is_none()
+                && state.process_view.is_none();
+            self.mouse_mode.update(
+                &mut self.stdout,
+                git_visible,
+                self.focused && super::git::pointer_over_control(state),
+            )?;
+            self.stdout.flush()?;
+        }
         self.last_frame = frame;
         self.last_images = displayed_images;
         self.last_size = (columns, rows);
@@ -303,6 +409,7 @@ impl Terminal {
     }
 
     /// Copies `text` via a platform clipboard command, falling back to OSC 52.
+    /// While a remote device has control, the text goes to that device.
     ///
     /// # Errors
     ///
@@ -310,6 +417,9 @@ impl Terminal {
     pub(super) fn copy_text(&mut self, text: &str) -> Result<bool, Error> {
         if text.is_empty() {
             return Ok(false);
+        }
+        if self.remote_controlled {
+            return Ok(self.remote.send_clipboard(text));
         }
         if !copy_with_platform_command(text) {
             let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
@@ -328,6 +438,10 @@ impl Terminal {
     /// turn or a pending question. Best effort: failures never interrupt the
     /// event loop.
     pub(super) fn ring_bell(&mut self) {
+        if self.remote_controlled {
+            self.remote.send_bell();
+            return;
+        }
         Self::ring_bell_to(&mut self.stdout, self.focused);
     }
 

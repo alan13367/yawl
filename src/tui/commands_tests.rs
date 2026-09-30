@@ -195,6 +195,7 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         bell: false,
         scroll_bar_idle_ticks: 0,
         scroll_geometry: None,
+        follow: Default::default(),
         scroll_bar_drag: None,
         transcript_row_entries: Vec::new(),
         tool_click_press: None,

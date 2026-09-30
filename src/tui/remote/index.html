@@ -1,0 +1,1080 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#131419">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="yawl">
+<title>yawl remote</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23131419'/%3E%3Cpath d='M8 11l6 5-6 5M16 22h8' stroke='%23c9ccd6' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" integrity="sha384-8Xk9wy/gzEDUKrXtrmCFa2bBuK3BpjpDuL/p0SeKQX19Khl/M+lHOgD/CyYf7efP" crossorigin="anonymous">
+<style>
+:root {
+  --bg: #131419;
+  --panel: #1c1d24;
+  --key: #272933;
+  --key-active: #3a3d4a;
+  --text: #d6d8e0;
+  --muted: #8b8fa0;
+  --accent: #8ab4ff;
+  --danger: #ff8a8a;
+  --app-height: 100dvh;
+  --app-top: 0px;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+button { font: inherit; color: inherit; border: 0; cursor: pointer; }
+[hidden] { display: none !important; }
+
+#app {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: var(--app-top);
+  height: var(--app-height);
+  display: flex;
+  flex-direction: column;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+}
+#term {
+  flex: 1;
+  min-height: 0;
+  padding: 4px 4px 0;
+  touch-action: none;
+  overflow: hidden;
+}
+#term .xterm-viewport { overflow: hidden !important; }
+
+#keys {
+  display: flex;
+  gap: 6px;
+  padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+  overflow-x: auto;
+  touch-action: pan-x;
+  scrollbar-width: none;
+  background: var(--panel);
+  border-top: 1px solid #2a2c36;
+  flex-shrink: 0;
+}
+#keys::-webkit-scrollbar { display: none; }
+#keys button {
+  flex: 0 0 auto;
+  min-width: 40px;
+  height: 36px;
+  padding: 0 8px;
+  border-radius: 8px;
+  background: var(--key);
+  font: 600 14px/36px ui-monospace, SFMono-Regular, Menlo, monospace;
+  user-select: none;
+  -webkit-user-select: none;
+}
+#keys button.pressed { background: var(--key-active); }
+
+#keys button.active { background: var(--accent); color: #0d1320; }
+.desktop #keys, .desktop #kbd, .desktop #compose { display: none !important; }
+
+/* Receives the phone keyboard. Yawl's own composer in the terminal shows
+   what is typed, so this field stays invisible. The 16px font stops iOS
+   from zooming on focus. */
+#kbd {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+  height: 32px;
+  opacity: 0;
+  pointer-events: none;
+  resize: none;
+  border: 0;
+  font-size: 16px;
+  caret-color: transparent;
+}
+
+.screen {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 24px;
+  text-align: center;
+  background: var(--bg);
+}
+.screen h1 { margin: 0; font-size: 22px; font-weight: 650; }
+.screen p { margin: 0; color: var(--muted); max-width: 32ch; }
+#code {
+  width: 100%;
+  max-width: 240px;
+  padding: 12px;
+  border: 1px solid #333642;
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--text);
+  font: 600 28px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.3em;
+  text-align: center;
+  outline: none;
+}
+#code:focus { border-color: var(--accent); }
+.primary {
+  min-width: 160px;
+  height: 44px;
+  padding: 0 20px;
+  border-radius: 12px;
+  background: var(--accent);
+  color: #0d1320;
+  font-weight: 650;
+}
+.secondary {
+  height: 44px;
+  padding: 0 20px;
+  border-radius: 12px;
+  background: var(--key);
+}
+#pair-error { color: var(--danger); min-height: 1.4em; }
+
+#status {
+  position: fixed;
+  left: 50%;
+  top: calc(var(--app-top) + env(safe-area-inset-top) + 12px);
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100% - 32px);
+  padding: 8px 8px 8px 14px;
+  border-radius: 12px;
+  background: #2a2c36;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  font-size: 14px;
+}
+#status button {
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #0d1320;
+  font-weight: 650;
+}
+#status:not(:has(button:not([hidden]))) { padding-right: 14px; }
+
+.sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: calc(100% - var(--app-top) - var(--app-height));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 70%;
+  padding: 16px 16px calc(16px + env(safe-area-inset-bottom));
+  border-radius: 16px 16px 0 0;
+  background: var(--panel);
+  box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.5);
+}
+.sheet strong { font-size: 16px; }
+.sheet textarea {
+  flex: 1;
+  min-height: 120px;
+  padding: 10px;
+  border: 1px solid #333642;
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  resize: none;
+  outline: none;
+}
+#compose-text { font: 16px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.sheet textarea:focus { border-color: var(--accent); }
+.sheet div { display: flex; gap: 10px; justify-content: flex-end; }
+</style>
+</head>
+<body>
+<section id="pair" class="screen" hidden>
+  <h1>yawl remote</h1>
+  <p>Enter the pairing code shown in the terminal after running <code>/remote</code>.</p>
+  <form id="pair-form">
+    <input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*" maxlength="6" placeholder="000000" aria-label="Pairing code">
+  </form>
+  <button id="pair-submit" class="primary" type="button">Connect</button>
+  <p id="pair-error" role="alert"></p>
+</section>
+
+<section id="ended" class="screen" hidden>
+  <h1 id="ended-title">Remote control ended</h1>
+  <p id="ended-text">Run <code>/remote</code> on the host to start again.</p>
+  <button id="ended-action" class="primary" type="button">Reconnect</button>
+</section>
+
+<main id="app" hidden>
+  <div id="term"></div>
+  <div id="keys" role="toolbar" aria-label="Terminal keys"></div>
+  <textarea id="kbd" rows="1" enterkeyhint="send" autocapitalize="sentences" aria-label="Type into yawl" tabindex="-1"></textarea>
+</main>
+
+<section id="compose" class="sheet" hidden>
+  <strong>Paste or write a longer message</strong>
+  <textarea id="compose-text" autocapitalize="sentences" placeholder="Message yawl"></textarea>
+  <div>
+    <button id="compose-close" class="secondary" type="button">Cancel</button>
+    <button id="compose-insert" class="secondary" type="button">Insert</button>
+    <button id="compose-send" class="primary" type="button">Send</button>
+  </div>
+</section>
+
+<div id="status" hidden><span id="status-text"></span><button id="status-action" type="button" hidden></button></div>
+
+<section id="clip" class="sheet" hidden>
+  <strong>Copied from yawl</strong>
+  <textarea id="clip-text" readonly></textarea>
+  <div>
+    <button id="clip-close" class="secondary" type="button">Close</button>
+    <button id="clip-copy" class="primary" type="button">Copy</button>
+  </div>
+</section>
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js" integrity="sha384-M169f14mRZOXm3hD/v2Ti0ThIT/RnAQagXA9nlE15yHAtrW19gdePJh/HaTzUOe/" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js" integrity="sha384-iF+jqbuti4XlB64clWgFWYEscb+UnSRv3VgVikGYZu+otNFnSHr7y7NcKfBnGizn" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.18.0/lib/addon-webgl.js" integrity="sha384-AkzdQDeATxpW8V7I2EPcwg17qAoLQMjEFHb//1QaAAIyIlbDAHGKno5+huH7RKxq" crossorigin="anonymous"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const ESC = "\x1b";
+// A mouse or trackpad with hover means a computer: the terminal takes the
+// keyboard and mouse directly and the touch controls are hidden.
+const DESKTOP = window.matchMedia("(hover: hover) and (pointer: fine)").matches;
+document.documentElement.classList.toggle("desktop", DESKTOP);
+// Mouse reporting (press, release, drag; SGR encoding), bracketed paste, and
+// focus events: the modes Yawl enables in a real terminal.
+const DESKTOP_MODES = ESC + "[?1002h" + ESC + "[?1006h" + ESC + "[?2004h" + ESC + "[?1004h";
+// `bytes` go straight to yawl; `tap` runs on release so it may focus fields.
+const KEYS = [
+  { label: "⌨", tap: toggleKeyboard, id: "key-keyboard" },
+  { label: "esc", bytes: ESC },
+  { label: "⏎", bytes: "\r" },
+  { label: "⌫", bytes: "\x7f", repeat: true },
+  { label: "↑", bytes: ESC + "[A", repeat: true },
+  { label: "↓", bytes: ESC + "[B", repeat: true },
+  { label: "tab", bytes: "\t" },
+  { label: "^C", bytes: "\x03" },
+  { label: "←", bytes: ESC + "[D", repeat: true },
+  { label: "→", bytes: ESC + "[C", repeat: true },
+  { label: "^O", bytes: "\x0f" },
+  { label: "PgUp", bytes: ESC + "[5~", repeat: true },
+  { label: "PgDn", bytes: ESC + "[6~", repeat: true },
+  { label: "✎", tap: openCompose },
+  { label: "A−", tap: () => zoom(-1) },
+  { label: "A+", tap: () => zoom(1) },
+];
+const FORWARDED = {
+  ArrowUp: ESC + "[A",
+  ArrowDown: ESC + "[B",
+  ArrowLeft: ESC + "[D",
+  ArrowRight: ESC + "[C",
+  Escape: ESC,
+  Tab: "\t",
+  PageUp: ESC + "[5~",
+  PageDown: ESC + "[6~",
+  Home: ESC + "[H",
+  End: ESC + "[F",
+  Delete: ESC + "[3~",
+};
+
+let term = null;
+let fit = null;
+let events = null;
+let ended = false;
+// Another device has control. Only an explicit "Take control" reconnects
+// with `take`; other reconnects resume this device's own stream and are
+// refused while another device is connected.
+let replaced = false;
+// Yawl's dashboards need at least this many columns and rows.
+const MIN_COLS = 40;
+const MIN_ROWS = 10;
+let size = "";
+// Token from the current event stream's `hello`; the server accepts input and
+// resizes only from the connection that holds control.
+let client = "";
+let fontSize = 13;
+try { fontSize = Number(localStorage.getItem("yawl-font-size")) || 13; } catch {}
+
+// ---- Input ---------------------------------------------------------------
+
+let pending = "";
+let flushing = false;
+
+function send(bytes) {
+  if (!bytes || ended) return;
+  // Keys are batched while a request is in flight, so a lone Esc would merge
+  // with the next key into one escape sequence. The kitty encoding keeps it
+  // unambiguous.
+  if (bytes === ESC) bytes = ESC + "[27u";
+  pending += bytes;
+  if (!flushing) flush();
+}
+
+async function flush() {
+  flushing = true;
+  let failures = 0;
+  while (pending && !ended) {
+    const chunk = pending;
+    pending = "";
+    try {
+      const response = await post("/input", chunk);
+      failures = 0;
+      if (response.status === 401) { pending = ""; showPairing(); }
+      if (connectionNotice) status("");
+    } catch {
+      // A reused connection the server already closed fails once; retry
+      // right away, then back off. Keys are kept in order either way.
+      pending = chunk + pending;
+      failures += 1;
+      if (failures > 1) {
+        status("Connection lost. Retrying…", null, null, true);
+        await new Promise((resolve) => setTimeout(resolve, Math.min(failures * 500, 3000)));
+      }
+    }
+  }
+  flushing = false;
+}
+
+function post(path, body) {
+  return fetch(path, {
+    method: "POST",
+    body,
+    credentials: "same-origin",
+    headers: { "Content-Type": "text/plain;charset=utf-8", "X-Yawl-Client": client },
+  });
+}
+
+function paste(text) {
+  send(ESC + "[200~" + text.replace(/\r\n?/g, "\n") + ESC + "[201~");
+}
+
+// ---- Keyboard ------------------------------------------------------------
+//
+// The phone keyboard types into the invisible #kbd field, and yawl's own
+// composer shows the result. The field is only a short buffer: each change is
+// sent as the backspaces and characters that turn the old buffer into the new
+// one, so autocorrect and dictation work. Whenever yawl's cursor may have
+// moved on its own (Enter, arrows, key-bar presses, taps), the buffer is
+// cleared so later edits still land at yawl's cursor.
+
+const segmenter = typeof Intl !== "undefined" && Intl.Segmenter
+  ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+  : null;
+const graphemes = (text) => segmenter
+  ? Array.from(segmenter.segment(text), (part) => part.segment)
+  : Array.from(text);
+
+let typed = "";
+let composing = false;
+
+function syncTyped() {
+  const next = $("kbd").value;
+  if (next === typed) return;
+  const before = graphemes(typed);
+  const after = graphemes(next);
+  let common = 0;
+  while (common < before.length && common < after.length && before[common] === after[common]) {
+    common += 1;
+  }
+  const inserted = after.slice(common).join("");
+  typed = next;
+  send("\x7f".repeat(before.length - common));
+  if (inserted.includes("\n") || inserted.length > 200) {
+    paste(inserted);
+  } else {
+    send(inserted.replace(/\t/g, " "));
+  }
+}
+
+function resetTyped() {
+  $("kbd").value = "";
+  typed = "";
+}
+
+// Sends keys that act on yawl's cursor directly, after flushing typed text.
+function sendKey(bytes) {
+  if (!composing) syncTyped();
+  send(bytes);
+  resetTyped();
+}
+
+function toggleKeyboard() {
+  const box = $("kbd");
+  if (document.activeElement === box) box.blur();
+  else focusKeyboard();
+}
+
+function focusKeyboard() {
+  resetTyped();
+  $("kbd").focus({ preventScroll: true });
+}
+
+function bindKeyboard() {
+  const box = $("kbd");
+  box.addEventListener("compositionstart", () => { composing = true; });
+  box.addEventListener("compositionend", () => { composing = false; syncTyped(); });
+  box.addEventListener("input", () => { if (!composing) syncTyped(); });
+  box.addEventListener("paste", (event) => {
+    const text = event.clipboardData && event.clipboardData.getData("text");
+    if (!text) return;
+    event.preventDefault();
+    syncTyped();
+    paste(text);
+    resetTyped();
+  });
+  box.addEventListener("keydown", (event) => {
+    if (event.isComposing || composing) return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      sendKey(event.shiftKey ? "\n" : "\r");
+    } else if (event.key === "Backspace" && !box.value) {
+      event.preventDefault();
+      sendKey("\x7f");
+    } else if (event.ctrlKey && event.key.length === 1 && /[a-z]/i.test(event.key)) {
+      event.preventDefault();
+      sendKey(String.fromCharCode(event.key.toLowerCase().charCodeAt(0) - 96));
+    } else if (FORWARDED[event.key] && !event.shiftKey) {
+      event.preventDefault();
+      sendKey(FORWARDED[event.key]);
+    }
+  });
+  const indicator = () => {
+    const button = $("key-keyboard");
+    if (button) button.classList.toggle("active", document.activeElement === box);
+  };
+  box.addEventListener("focus", indicator);
+  box.addEventListener("blur", () => {
+    syncTyped();
+    resetTyped();
+    indicator();
+  });
+}
+
+// ---- Compose sheet -------------------------------------------------------
+
+function openCompose() {
+  $("kbd").blur();
+  $("compose").hidden = false;
+  $("compose-text").focus();
+}
+
+function closeCompose() {
+  $("compose").hidden = true;
+  $("compose-text").value = "";
+}
+
+function submitCompose(submit) {
+  const text = $("compose-text").value;
+  closeCompose();
+  if (text) paste(text);
+  if (submit) send("\r");
+  resetTyped();
+}
+
+function buildKeys() {
+  const bar = $("keys");
+  for (const key of KEYS) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = key.label;
+    if (key.id) button.id = key.id;
+    const press = () => { if (key.bytes) sendKey(key.bytes); };
+    // Keys fire on release, and only for a touch that did not move, so the
+    // bar can be swiped sideways without sending the key under the finger.
+    // Holding a repeating key fires it continuously instead.
+    let start = null;
+    let delay = null;
+    let interval = null;
+    const release = () => {
+      clearTimeout(delay);
+      clearInterval(interval);
+      button.classList.remove("pressed");
+    };
+    button.addEventListener("touchstart", (event) => {
+      const point = event.touches[0];
+      start = { x: point.clientX, y: point.clientY, repeated: false };
+      button.classList.add("pressed");
+      if (key.repeat) {
+        delay = setTimeout(() => {
+          start.repeated = true;
+          press();
+          interval = setInterval(press, 70);
+        }, 380);
+      }
+    }, { passive: true });
+    button.addEventListener("touchmove", (event) => {
+      const point = event.touches[0];
+      if (start && Math.hypot(point.clientX - start.x, point.clientY - start.y) > 8) {
+        start = null;
+        release();
+      }
+    }, { passive: true });
+    // Cancelling touchend also keeps focus, and the keyboard, in #kbd.
+    button.addEventListener("touchend", (event) => {
+      event.preventDefault();
+      const tapped = start;
+      start = null;
+      release();
+      if (!tapped || tapped.repeated) return;
+      if (navigator.vibrate) navigator.vibrate(8);
+      if (key.tap) key.tap();
+      else press();
+    }, { passive: false });
+    button.addEventListener("touchcancel", () => { start = null; release(); });
+    button.addEventListener("mousedown", (event) => event.preventDefault());
+    button.addEventListener("click", () => (key.tap ? key.tap() : press()));
+    bar.append(button);
+  }
+}
+
+// ---- Pointer and touch ---------------------------------------------------
+
+function cellAt(x, y) {
+  const screen = document.querySelector("#term .xterm-screen");
+  if (!screen || !term) return null;
+  const rect = screen.getBoundingClientRect();
+  const column = Math.floor(((x - rect.left) / rect.width) * term.cols) + 1;
+  const row = Math.floor(((y - rect.top) / rect.height) * term.rows) + 1;
+  return {
+    column: Math.min(Math.max(column, 1), term.cols),
+    row: Math.min(Math.max(row, 1), term.rows),
+  };
+}
+
+function cellHeight() {
+  const screen = document.querySelector("#term .xterm-screen");
+  return screen && term ? screen.getBoundingClientRect().height / term.rows : 16;
+}
+
+function click(x, y) {
+  const cell = cellAt(x, y);
+  if (!cell) return;
+  send(`${ESC}[<0;${cell.column};${cell.row}M${ESC}[<0;${cell.column};${cell.row}m`);
+}
+
+// Rows (1-based, inclusive) of yawl's composer box: the last box drawn near
+// the bottom of the screen, above the status bar.
+function composerRows() {
+  const buffer = term.buffer.active;
+  let bottom = 0;
+  for (let row = term.rows; row >= Math.max(1, term.rows - 16); row -= 1) {
+    const line = buffer.getLine(buffer.viewportY + row - 1);
+    const text = line ? line.translateToString(true) : "";
+    if (!bottom && text.startsWith("└")) bottom = row;
+    else if (bottom && text.startsWith("┌")) return [row, bottom];
+  }
+  return null;
+}
+
+// Tapping yawl's composer opens the keyboard; any other tap is a click.
+function tap(x, y) {
+  const cell = cellAt(x, y);
+  const rows = term && cell ? composerRows() : null;
+  if (rows && cell.row >= rows[0] && cell.row <= rows[1]) {
+    focusKeyboard();
+    return;
+  }
+  if (document.activeElement === $("kbd")) $("kbd").blur();
+  click(x, y);
+}
+
+// Positive rows scroll toward older content. Yawl reads Ctrl+wheel reports
+// (button 64|16) as one row each, so scrolling follows the finger closely.
+function wheel(rows, x, y) {
+  const cell = cellAt(x, y) || { column: 1, row: 1 };
+  const button = rows > 0 ? 80 : 81;
+  send(`${ESC}[<${button};${cell.column};${cell.row}M`.repeat(Math.abs(rows)));
+}
+
+// Turns pixel movement into whole-row scroll reports, carrying the rest.
+function scroller() {
+  let carry = 0;
+  return (pixels, x, y) => {
+    carry += pixels;
+    const height = cellHeight();
+    const rows = Math.trunc(carry / height);
+    if (rows) {
+      carry -= rows * height;
+      wheel(rows, x, y);
+    }
+  };
+}
+
+// Momentum decays like native scrolling: velocity (px/ms) falls off with a
+// ~325 ms time constant.
+const FLING_TIME_CONSTANT = 325;
+const FLING_MIN_VELOCITY = 0.3;
+const FLING_MAX_VELOCITY = 6;
+
+function bindPointer() {
+  const element = $("term");
+  // Trackpads send many small wheel events; accumulate pixels so scrolling
+  // tracks the gesture row by row.
+  const wheelScroll = scroller();
+  element.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const pixels = event.deltaMode === 1 ? event.deltaY * cellHeight() : event.deltaY;
+    wheelScroll(-pixels, event.clientX, event.clientY);
+  }, { passive: false, capture: true });
+  // On computers xterm.js reports clicks and drags itself.
+  if (DESKTOP) return;
+  let touch = null;
+  let momentum = 0;
+  element.addEventListener("touchstart", (event) => {
+    cancelAnimationFrame(momentum);
+    const point = event.touches[0];
+    touch = {
+      x: point.clientX,
+      y: point.clientY,
+      lastY: point.clientY,
+      time: performance.now(),
+      moved: false,
+      scroll: scroller(),
+      // Recent positions, for the release velocity.
+      samples: [[performance.now(), point.clientY]],
+    };
+  }, { passive: true, capture: true });
+  element.addEventListener("touchmove", (event) => {
+    if (!touch) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const point = event.touches[0];
+    const now = performance.now();
+    if (Math.abs(point.clientY - touch.y) > 8 || Math.abs(point.clientX - touch.x) > 8) {
+      touch.moved = true;
+    }
+    touch.scroll(point.clientY - touch.lastY, point.clientX, point.clientY);
+    touch.lastY = point.clientY;
+    touch.samples.push([now, point.clientY]);
+    while (touch.samples.length > 2 && now - touch.samples[0][0] > 100) touch.samples.shift();
+  }, { passive: false, capture: true });
+  element.addEventListener("touchend", (event) => {
+    if (!touch) return;
+    event.stopPropagation();
+    const { x, y, moved, time, samples, scroll } = touch;
+    touch = null;
+    const now = performance.now();
+    if (!moved && now - time < 600) {
+      event.preventDefault();
+      tap(x, y);
+      return;
+    }
+    // Release velocity over the last ~100 ms; a finger that stopped before
+    // lifting does not fling.
+    const [firstTime, firstY] = samples[0];
+    const [lastTime, lastY] = samples[samples.length - 1];
+    let velocity = now - lastTime < 60 && lastTime > firstTime
+      ? (lastY - firstY) / (lastTime - firstTime)
+      : 0;
+    velocity = Math.max(-FLING_MAX_VELOCITY, Math.min(FLING_MAX_VELOCITY, velocity));
+    if (Math.abs(velocity) < FLING_MIN_VELOCITY) return;
+    let last = now;
+    const glide = (frame) => {
+      const elapsed = Math.max(frame - last, 0);
+      last = frame;
+      velocity *= Math.exp(-elapsed / FLING_TIME_CONSTANT);
+      if (Math.abs(velocity) < 0.02) return;
+      scroll(velocity * elapsed, x, y);
+      momentum = requestAnimationFrame(glide);
+    };
+    momentum = requestAnimationFrame(glide);
+  }, { passive: false, capture: true });
+
+  element.addEventListener("mousedown", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  }, { capture: true });
+  element.addEventListener("mouseup", (event) => {
+    event.stopPropagation();
+    if (event.button === 0) tap(event.clientX, event.clientY);
+  }, { capture: true });
+}
+
+// ---- Layout ----------------------------------------------------------------
+
+function layout() {
+  const viewport = window.visualViewport;
+  const root = document.documentElement.style;
+  if (viewport) {
+    root.setProperty("--app-height", viewport.height + "px");
+    root.setProperty("--app-top", viewport.offsetTop + "px");
+  }
+  if (!term || !fit) return;
+  // Start from the preferred font and shrink it until the minimum fits.
+  if (term.options.fontSize !== fontSize) term.options.fontSize = fontSize;
+  let dimensions = fit.proposeDimensions();
+  while (dimensions && (dimensions.cols < MIN_COLS || dimensions.rows < MIN_ROWS)
+      && term.options.fontSize > 6) {
+    term.options.fontSize -= 1;
+    dimensions = fit.proposeDimensions();
+  }
+  if (!dimensions || !dimensions.cols || !dimensions.rows) return;
+  // A viewport too small even at the smallest font still gets the size Yawl
+  // renders, so rows and clicks line up; the overflow is clipped.
+  const columns = Math.max(dimensions.cols, MIN_COLS);
+  const rows = Math.max(dimensions.rows, MIN_ROWS);
+  const next = `${columns} ${rows}`;
+  if (next === size) return;
+  size = next;
+  term.resize(columns, rows);
+  if (client) post("/resize", next).catch(() => {});
+}
+
+let layoutTimer = 0;
+function scheduleLayout() {
+  clearTimeout(layoutTimer);
+  layoutTimer = setTimeout(layout, 60);
+}
+
+function zoom(direction) {
+  fontSize = Math.min(Math.max(fontSize + direction, 9), 20);
+  try { localStorage.setItem("yawl-font-size", String(fontSize)); } catch {}
+  if (term) term.options.fontSize = fontSize;
+  layout();
+}
+
+// ---- Session -------------------------------------------------------------
+
+let connectionNotice = false;
+
+// `connection` notices (connecting, reconnecting) clear when frames arrive.
+function status(text, action, onAction, connection = false) {
+  connectionNotice = connection && Boolean(text);
+  $("status").hidden = !text;
+  $("status-text").textContent = text || "";
+  const button = $("status-action");
+  button.hidden = !action;
+  button.textContent = action || "";
+  button.onclick = onAction || null;
+}
+
+function showScreen(id) {
+  for (const screen of ["pair", "ended", "app"]) $(screen).hidden = screen !== id;
+  if (id !== "app") status("");
+}
+
+function showPairing(message) {
+  if (events) { events.close(); events = null; }
+  showScreen("pair");
+  $("pair-error").textContent = message || "";
+  $("code").value = "";
+  setTimeout(() => $("code").focus(), 50);
+}
+
+function showEnded(title, text, action, onAction) {
+  ended = true;
+  if (events) { events.close(); events = null; }
+  showScreen("ended");
+  $("ended-title").textContent = title;
+  $("ended-text").textContent = text;
+  $("ended-action").textContent = action;
+  $("ended-action").onclick = onAction;
+}
+
+async function pair() {
+  const code = $("code").value.replace(/\D/g, "");
+  if (code.length !== 6) {
+    $("pair-error").textContent = "Enter all six digits.";
+    return;
+  }
+  $("pair-submit").disabled = true;
+  try {
+    const response = await post("/pair", code);
+    if (response.status === 204) {
+      startApp(true);
+    } else if (response.status === 403) {
+      const left = await response.text();
+      showPairing(`Wrong code. ${left} attempt${left === "1" ? "" : "s"} left.`);
+    } else {
+      showEnded("Pairing closed", "Too many wrong codes. Run /remote on the host to start again.",
+        "Try again", () => location.reload());
+    }
+  } catch {
+    $("pair-error").textContent = "Could not reach yawl.";
+  } finally {
+    $("pair-submit").disabled = false;
+  }
+}
+
+// `take` opens the stream even if another device has control; otherwise the
+// page offers to take it.
+function startApp(take) {
+  ended = false;
+  showScreen("app");
+  if (!term) {
+    term = new Terminal({
+      disableStdin: !DESKTOP,
+      cursorBlink: DESKTOP,
+      cursorStyle: "bar",
+      // Option-drag (or Shift-drag) makes a native selection for ⌘C even
+      // while Yawl receives mouse reports.
+      macOptionClickForcesSelection: true,
+      fontSize,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, "DejaVu Sans Mono", monospace',
+      scrollback: 0,
+      theme: { background: "#131419", foreground: "#d6d8e0", cursor: "#8ab4ff" },
+    });
+    fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open($("term"));
+    useWebgl();
+    if (DESKTOP) {
+      bindDesktopTerminal();
+    } else {
+      // #kbd owns the keyboard; the terminal only displays frames.
+      term.textarea.readOnly = true;
+      term.textarea.inputMode = "none";
+      term.textarea.tabIndex = -1;
+    }
+    term.onBell(ring);
+  }
+  size = "";
+  layout();
+  if (take) connect(true);
+  else showReplaced("Another device has control.");
+}
+
+// Desktop browsers type straight into xterm.js, which encodes keys, mouse
+// reports, and pastes exactly as a terminal would.
+function bindDesktopTerminal() {
+  term.write(DESKTOP_MODES);
+  term.onData(send);
+  term.attachCustomKeyEventHandler((event) => {
+    if (event.type !== "keydown" || event.key !== "Enter") return true;
+    // xterm.js sends a bare CR for modified Enter; use the kitty encodings
+    // Yawl reads: Shift/Alt+Enter insert a newline, Ctrl+Enter steers.
+    if (event.shiftKey || event.altKey) {
+      event.preventDefault();
+      send(ESC + "[13;2u");
+      return false;
+    }
+    if (event.ctrlKey) {
+      event.preventDefault();
+      send(ESC + "[13;5u");
+      return false;
+    }
+    return true;
+  });
+  term.focus();
+}
+
+// The GPU renderer repaints full-screen scroll frames far faster than the
+// DOM renderer, especially on phones. Software WebGL (no GPU) is slower than
+// the DOM renderer, so it keeps the default there.
+function useWebgl() {
+  if (typeof WebglAddon === "undefined" || !hardwareWebgl()) return;
+  try {
+    const renderer = new WebglAddon.WebglAddon();
+    renderer.onContextLoss(() => renderer.dispose());
+    term.loadAddon(renderer);
+  } catch {}
+}
+
+function hardwareWebgl() {
+  try {
+    const gl = document.createElement("canvas").getContext("webgl2");
+    if (!gl) return false;
+    const info = gl.getExtension("WEBGL_debug_renderer_info");
+    const renderer = info ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) : "";
+    gl.getExtension("WEBGL_lose_context")?.loseContext();
+    return !/swiftshader|llvmpipe|software/i.test(renderer);
+  } catch {
+    return false;
+  }
+}
+
+const TITLE = document.title;
+function ring() {
+  if (navigator.vibrate) navigator.vibrate(60);
+  if (document.hidden || !document.hasFocus()) document.title = "● " + TITLE;
+}
+
+// `take` asks for control even while another device holds it. Reconnects
+// only resume this device's previous stream, so a phone waking up never
+// silently takes control back from a computer.
+function connect(take) {
+  if (events) events.close();
+  ended = false;
+  replaced = false;
+  status("Connecting…", null, null, true);
+  const query = take ? "?take=1" : "?resume=" + encodeURIComponent(client);
+  const source = new EventSource("/events" + query);
+  events = source;
+  source.onopen = () => { if (connectionNotice) status(""); };
+  source.addEventListener("hello", (event) => {
+    client = JSON.parse(event.data);
+    size = "";
+    layout();
+    if (DESKTOP) term.focus();
+  });
+  source.addEventListener("frame", (event) => {
+    if (connectionNotice) status("");
+    term.write(JSON.parse(event.data));
+  });
+  source.addEventListener("clipboard", (event) => showClipboard(JSON.parse(event.data)));
+  source.addEventListener("bell", ring);
+  source.addEventListener("replaced", () => showReplaced("Another device took control."));
+  source.addEventListener("closed", () => {
+    showEnded("Remote control ended", "The host stopped remote control. Run /remote there to start again.",
+      "Reconnect", () => location.reload());
+  });
+  source.onerror = async () => {
+    if (ended || events !== source) return;
+    // EventSource would retry this URL by itself, `take` included; reconnect
+    // here instead so a retry can never take control.
+    source.close();
+    status("Reconnecting…", null, null, true);
+    let busy = false;
+    try {
+      const response = await fetch("/session", {
+        credentials: "same-origin",
+        headers: { "X-Yawl-Client": client },
+      });
+      if (response.status === 401) return showPairing("The session changed. Pair again.");
+      busy = response.status === 409;
+    } catch {}
+    if (ended || events !== source) return;
+    if (busy) return showReplaced("Another device has control.");
+    setTimeout(() => { if (!ended && events === source) connect(false); }, 1000);
+  };
+}
+
+function showReplaced(text) {
+  replaced = true;
+  client = "";
+  if (events) { events.close(); events = null; }
+  status(text, "Take control", () => connect(true));
+}
+
+// ---- Clipboard -----------------------------------------------------------
+
+function showClipboard(text) {
+  if (DESKTOP) {
+    // Plain HTTP cannot write the clipboard unprompted; a click can.
+    status("Selection ready", "Copy", () => {
+      const copied = copyText(text);
+      status(copied ? "Copied" : "Could not copy");
+      setTimeout(() => status(""), 1200);
+      term.focus();
+    });
+    return;
+  }
+  $("clip-text").value = text;
+  $("clip").hidden = false;
+}
+
+function copyText(text) {
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.append(area);
+  area.select();
+  let copied = false;
+  try { copied = document.execCommand("copy"); } catch {}
+  area.remove();
+  return copied;
+}
+
+async function copyClipboard() {
+  const text = $("clip-text").value;
+  let copied = false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    }
+  } catch {}
+  if (!copied) {
+    const box = $("clip-text");
+    box.focus();
+    box.setSelectionRange(0, text.length);
+    try { copied = document.execCommand("copy"); } catch {}
+  }
+  $("clip-copy").textContent = copied ? "Copied" : "Select and copy";
+  if (copied) setTimeout(() => { $("clip").hidden = true; $("clip-copy").textContent = "Copy"; }, 700);
+}
+
+// ---- Boot ----------------------------------------------------------------
+
+function bindUi() {
+  bindPointer();
+  if (!DESKTOP) {
+    buildKeys();
+    bindKeyboard();
+    $("compose-close").addEventListener("click", closeCompose);
+    $("compose-insert").addEventListener("click", () => submitCompose(false));
+    $("compose-send").addEventListener("click", () => submitCompose(true));
+  }
+  window.addEventListener("focus", () => { document.title = TITLE; });
+  $("pair-submit").addEventListener("click", pair);
+  $("pair-form").addEventListener("submit", (event) => { event.preventDefault(); pair(); });
+  $("code").addEventListener("input", () => {
+    if ($("code").value.replace(/\D/g, "").length === 6) pair();
+  });
+  $("clip-copy").addEventListener("click", copyClipboard);
+  $("clip-close").addEventListener("click", () => { $("clip").hidden = true; });
+
+  window.addEventListener("resize", scheduleLayout);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", scheduleLayout);
+    window.visualViewport.addEventListener("scroll", scheduleLayout);
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && term && !ended && !replaced
+        && (!events || events.readyState === EventSource.CLOSED)) {
+      connect(false);
+    }
+  });
+}
+
+async function boot() {
+  if (typeof Terminal === "undefined" || typeof FitAddon === "undefined") {
+    showEnded("Could not load the terminal", "This device needs internet access to load xterm.js from cdn.jsdelivr.net.",
+      "Retry", () => location.reload());
+    return;
+  }
+  bindUi();
+  // A shared link or scanned QR code carries the pairing code in its
+  // fragment, which never reaches the server. Drop it from the address bar.
+  const linked = (location.hash.match(/^#(\d{6})$/) || [])[1];
+  if (linked) history.replaceState(null, "", location.pathname);
+  try {
+    const response = await fetch("/session", { credentials: "same-origin" });
+    if (response.status === 204 || response.status === 409) {
+      startApp(response.status === 204);
+    } else if (linked) {
+      showScreen("pair");
+      $("code").value = linked;
+      pair();
+    } else {
+      showPairing();
+    }
+  } catch {
+    showEnded("Could not reach yawl", "Check that this device is on your tailnet.", "Retry", () => location.reload());
+  }
+}
+
+boot();
+</script>
+</body>
+</html>

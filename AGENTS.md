@@ -39,6 +39,8 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tui/git/repository.rs`, `git/jobs.rs`, `git/operations.rs`: Git subprocess execution and data loading, cancellable workers, UI result merging, and blocking repository actions
 - `src/tui/git/input.rs`, `git/init.rs`, `git/render.rs`, `git/diff.rs`: dashboard input and commit editing, repository initialization, panel rendering, and diff wrapping/highlighting
 - `src/tui/processes.rs`, `subagents.rs`, `connection.rs`, `dashboard.rs`: background-process and subagent dashboards, provider setup, and shared dashboard layout
+- `src/tui/remote.rs`: `/remote` command, merged host/remote input reader, and host lock screen
+- `src/tui/remote/hub.rs`, `remote/server.rs`, `remote/http.rs`, `remote/address.rs`, `remote/qr.rs`: shared session state and input wake-ups between UI and server threads, pairing and SSE/POST routes, minimal keep-alive HTTP/1.1, Tailscale address discovery with pairing secrets, and the QR encoder for the pairing link. `remote/index.html` is the embedded page for phones and computers
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
 - `src/tools/`: builtin registry and executable-tool discovery

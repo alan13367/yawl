@@ -113,6 +113,8 @@ pub(super) fn render_entry(
                 images: previews,
             });
         }
+        // Hidden notices keep their slot so entry indices stay stable.
+        Entry::Notice(_) if entry.is_hidden() => return None,
         Entry::Notice(content) if !expanded => render_collapsed("Notice", content, width),
         Entry::Notice(content) => {
             let mut lines = vec![yawl_label(accent_color)];

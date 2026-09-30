@@ -23,8 +23,8 @@ use super::picker::{
     web_search_provider_picker,
 };
 use super::state::{
-    COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_scroll_bar_mouse, handle_tool_click,
-    scroll, toggle_tool_expansion,
+    COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_jump_button_mouse,
+    handle_scroll_bar_mouse, handle_tool_click, scroll, toggle_tool_expansion,
 };
 use super::terminal::Terminal;
 
@@ -244,6 +244,9 @@ pub(super) fn pump_events<R: Read, T>(
                 _ => {}
             }
             needs_draw |= !matches!(&event, Event::Tick | Event::FocusGained | Event::FocusLost);
+            if matches!(&event, Event::Tick) {
+                needs_draw |= terminal.remote().poll(state);
+            }
             if matches!(&event, Event::Tick) && crate::interrupted() {
                 crate::set_interrupted(false);
                 if !super::git::handle_interrupt(state)
@@ -411,7 +414,7 @@ pub(super) fn pump_events<R: Read, T>(
                                 EditAction::Steer(input) => {
                                     if matches!(
                                         busy_command(&input.text),
-                                        Some(BusyCommand::Reasoning(_))
+                                        Some(BusyCommand::Reasoning(_) | BusyCommand::Remote(_))
                                     ) {
                                         if input.has_images() {
                                             state.notice("Images cannot accompany commands while a turn is running.");
@@ -578,6 +581,10 @@ pub(super) fn handle_mouse_selection(
     state: &mut ViewState,
     event: MouseEvent,
 ) -> Result<(), Error> {
+    if handle_jump_button_mouse(state, event) {
+        state.tool_click_press = None;
+        return Ok(());
+    }
     if handle_scroll_bar_mouse(state, event) {
         state.tool_click_press = None;
         return Ok(());
@@ -714,6 +721,8 @@ pub(super) fn handle_submission_while_busy(
         Some(BusyCommand::Usage) => super::commands::show_usage(state),
         Some(BusyCommand::Goal(argument)) => super::commands::goal_while_busy(&argument, state),
         Some(BusyCommand::Plan(argument)) => super::commands::plan_while_busy(&argument, state),
+        // Either side must be able to stop remote control mid-turn.
+        Some(BusyCommand::Remote(argument)) => super::remote::command(terminal, state, &argument),
         None => {
             state.queued_inputs.push_back(input);
             state.scroll_offset = 0;
@@ -757,6 +766,7 @@ pub(super) enum BusyCommand {
     Usage,
     Goal(String),
     Plan(String),
+    Remote(String),
 }
 
 pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
@@ -778,6 +788,7 @@ pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
         "usage" if argument.is_empty() => Some(BusyCommand::Usage),
         "goal" => Some(BusyCommand::Goal(argument.to_string())),
         "plan" => Some(BusyCommand::Plan(argument.to_string())),
+        "remote" => Some(BusyCommand::Remote(argument.to_string())),
         _ => None,
     }
 }
