@@ -192,6 +192,8 @@ Sessions live under `~/.yawl/sessions/projects/<project-key>/`. `yawl -c` resume
 
 Automatic compaction summarizes older conversation near the context limit, at 85% by default, while retaining recent exchanges. `/compact` requests it manually. The full transcript remains in the session log. `/usage` reports input, output, and prompt-cache usage.
 
+Provider requests are retried with backoff on rate limits, 5xx responses, and dropped connections. When an OpenAI-compatible server rejects a tool call it could not parse (`invalid_tool_call` or `incomplete_tool_call`, as oMLX reports), Yawl retries up to twice with a note asking the model to re-issue the call. The note is sent with the request but is not saved to the session.
+
 ## Web browsing
 
 Enable with `/settings web_browsing on`. DuckDuckGo search needs no key; Brave and Firecrawl require `BRAVE_API_KEY` or `FIRECRAWL_API_KEY`. If DuckDuckGo blocks automated searches, wait or switch providers in Settings > Web.

@@ -228,6 +228,16 @@ struct Decoder {
     finish_reason_required: bool,
 }
 
+/// Local servers such as oMLX report model output they could not parse into
+/// a tool call with these error codes instead of returning the raw text.
+fn malformed_tool_call(error: &Value) -> Option<Error> {
+    let code = error["code"].as_str()?;
+    matches!(code, "invalid_tool_call" | "incomplete_tool_call").then(|| {
+        let message = error["message"].as_str().unwrap_or(code);
+        Error::MalformedToolCall(message.to_string())
+    })
+}
+
 impl Decoder {
     fn new(compat: &OpenAiCompatibility) -> Self {
         Self {
@@ -259,6 +269,9 @@ impl Decoder {
                 .as_str()
                 .or_else(|| error["code"].as_str())
                 .unwrap_or("error");
+            if let Some(error) = malformed_tool_call(error) {
+                return Err(error);
+            }
             if kind.contains("rate_limit") {
                 return Err(Error::Http {
                     status: 429,
@@ -419,10 +432,14 @@ impl Provider for OpenAi {
         let mut response = request.send(body)?;
         let status = response.status().as_u16();
         if status != 200 {
-            return Err(Error::Http {
-                status,
-                body: error_body(&mut response),
-            });
+            let body = error_body(&mut response);
+            if let Some(error) = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|value| malformed_tool_call(&value["error"]))
+            {
+                return Err(error);
+            }
+            return Err(Error::Http { status, body });
         }
 
         let reader = BufReader::new(response.into_body().into_reader());
@@ -760,5 +777,26 @@ mod tests {
             })
         ));
         assert!(matches!(events[5], Event::Done));
+    }
+
+    #[test]
+    fn decoder_reports_unparseable_tool_calls_separately_from_server_errors() {
+        let mut decoder = Decoder::new(&OpenAiCompatibility::default());
+        let sse = SseEvent {
+            event: String::new(),
+            data: r#"{"error":{"message":"Model output contains an unrecoverable tool call.","type":"server_error","code":"invalid_tool_call"}}"#.into(),
+        };
+        let error = decoder.decode(sse, &mut |_| {}).unwrap_err();
+        assert!(
+            matches!(error, Error::MalformedToolCall(message) if message.contains("unrecoverable"))
+        );
+        assert!(!Error::MalformedToolCall(String::new()).is_retryable());
+
+        let sse = SseEvent {
+            event: String::new(),
+            data: r#"{"error":{"message":"busy","type":"server_error","code":null}}"#.into(),
+        };
+        let error = decoder.decode(sse, &mut |_| {}).unwrap_err();
+        assert!(matches!(error, Error::Http { status: 500, .. }));
     }
 }

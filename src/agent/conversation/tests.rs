@@ -24,6 +24,7 @@ enum ProviderStep {
     },
     Fail,
     ContextLimit,
+    MalformedToolCall,
 }
 
 struct ScriptedProvider {
@@ -79,6 +80,9 @@ impl Provider for ScriptedProvider {
                 status: 400,
                 body: "context_length_exceeded".into(),
             }),
+            ProviderStep::MalformedToolCall => {
+                Err(Error::MalformedToolCall("unparseable tool call".into()))
+            }
         }
     }
 }
@@ -1885,6 +1889,45 @@ fn context_limit_gets_at_most_one_compaction_retry() {
                 if repeat_error { 1 } else { 2 }
             );
         }
+    }
+}
+
+#[test]
+fn malformed_tool_calls_retry_with_a_transient_corrective_note() {
+    for (failures, succeeds) in [(2, true), (3, false)] {
+        let mut test = TestAgent::new("malformed-tool-call");
+        let mut script = VecDeque::new();
+        script.extend((0..failures).map(|_| ProviderStep::MalformedToolCall));
+        script.push_back(text_step("done"));
+        let steps = Rc::new(RefCell::new(script));
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
+        let mut warnings = 0;
+        let result = test.agent.run_turn_with(
+            Some("continue".into()),
+            &mut |event| {
+                if matches!(event, TurnEvent::Warning(_)) {
+                    warnings += 1;
+                }
+            },
+            &mut resolve,
+        );
+
+        assert_eq!(result.is_ok(), succeeds);
+        assert_eq!(warnings, 2);
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0], vec![Role::User]);
+        // One note, reused across retries.
+        assert_eq!(requests[1], vec![Role::User, Role::User]);
+        assert_eq!(requests[2], vec![Role::User, Role::User]);
+        let roles: Vec<_> = test.agent.messages().iter().map(|m| m.role).collect();
+        let expected = if succeeds {
+            vec![Role::User, Role::Assistant]
+        } else {
+            vec![Role::User]
+        };
+        assert_eq!(roles, expected);
     }
 }
 

@@ -11,6 +11,12 @@ use super::{Conversation, ConversationKind, last_undoable_user_index};
 use super::{context, goal};
 use crate::agent::events::{TurnEvent, forward};
 
+/// Corrective retries after the server rejects an unparseable tool call.
+const MALFORMED_TOOL_CALL_RETRIES: u32 = 2;
+const MALFORMED_TOOL_CALL_NOTE: &str = "[yawl] Your previous response contained a tool call \
+the server could not parse, so it was discarded and nothing ran. Continue the task: \
+re-issue the call with a valid tool name and JSON arguments, or answer in plain text.";
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TurnMode {
     Normal,
@@ -504,11 +510,15 @@ impl Conversation {
             }
             let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;
             let mut retried_context = false;
+            // Request-only history for malformed tool-call retries; never
+            // persisted, so the session keeps the clean transcript.
+            let mut corrected: Option<Vec<Message>> = None;
+            let mut tool_call_retries = 0;
             let out = loop {
                 let request = provider::Request {
                     model: &bare_model,
                     system: &system,
-                    messages: &self.messages,
+                    messages: corrected.as_deref().unwrap_or(&self.messages),
                     tools: &specs,
                     max_tokens: crate::model::max_tokens(&self.config, &self.model),
                     supports_images: crate::model::supports_images(&self.config, &self.model),
@@ -530,6 +540,22 @@ impl Conversation {
                             "Context limit reached; compacting before one retry".into(),
                         ));
                         self.compact_now_with(sink, resolve_provider)?;
+                        corrected = None;
+                    }
+                    Err(Error::MalformedToolCall(message))
+                        if tool_call_retries < MALFORMED_TOOL_CALL_RETRIES =>
+                    {
+                        tool_call_retries += 1;
+                        sink(TurnEvent::RetryReset);
+                        sink(TurnEvent::Warning(format!(
+                            "Model emitted a malformed tool call; asking it to retry \
+                             ({tool_call_retries}/{MALFORMED_TOOL_CALL_RETRIES}): {message}"
+                        )));
+                        corrected.get_or_insert_with(|| {
+                            let mut messages = self.messages.clone();
+                            messages.push(Message::user(MALFORMED_TOOL_CALL_NOTE));
+                            messages
+                        });
                     }
                     Err(error) => return Err(error),
                 }
