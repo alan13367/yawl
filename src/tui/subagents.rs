@@ -967,6 +967,7 @@ mod tests {
             queued_inputs: VecDeque::new(),
             pending_steers: VecDeque::new(),
             queue_paused: false,
+            continue_offered: false,
             active_goal: None,
             goal_running: false,
             active_plan: None,

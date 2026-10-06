@@ -38,12 +38,16 @@ pub enum StreamNotice<'a> {
     },
 }
 
-const MAX_ATTEMPTS: u32 = 3;
+const MAX_ATTEMPTS: u32 = 7;
+const FIRST_RETRY_DELAY: Duration = Duration::from_millis(500);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(15);
 
-/// Streams one assistant response with retries: exponential backoff, up to
-/// 3 attempts, on 429/5xx and I/O failures (including mid-stream
-/// disconnects). A retry restarts the whole request; `RetryReset` tells the
-/// consumer to drop partial output.
+/// Streams one assistant response with retries: exponential backoff from
+/// 500 ms to 15 s, up to 7 attempts (about 30 s of waiting), on 429/5xx and
+/// I/O failures, including mid-stream disconnects, stalled connections, and
+/// a network that is still reconnecting after the host wakes from sleep. A
+/// retry restarts the whole request; `RetryReset` tells the consumer to drop
+/// partial output.
 pub fn stream_turn(
     provider: &dyn Provider,
     req: &Request<'_>,
@@ -58,50 +62,60 @@ pub fn stream_turn(
         // discards timing along with the partial output.
         let mut open_reasoning: Option<(usize, Instant)> = None;
         let mut reasoning_durations_ms = Vec::new();
-        let result = provider.stream_once(req, &mut |event| match event {
-            Event::TextDelta(t) => {
-                close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
-                sink(StreamNotice::TextDelta(&t));
-                out.text.push_str(&t);
-            }
-            Event::ReasoningDelta { kind, text } => {
-                // Continuation requires a segment that is actually open: a
-                // text or tool boundary may have closed the last record even
-                // though its kind matches, and appending to it would merge
-                // separate segments and keep the stale duration.
-                let continuing = open_reasoning.is_some_and(|(index, _)| {
-                    out.reasoning
-                        .get(index)
-                        .is_some_and(|current| current.kind == kind)
-                });
-                if continuing {
-                    sink(StreamNotice::ReasoningDelta { kind, text: &text });
-                    super::append_reasoning(&mut out.reasoning, kind, &text);
-                } else {
+        let (result, stalled) = super::http::watch_stalls(|| {
+            provider.stream_once(req, &mut |event| match event {
+                Event::TextDelta(t) => {
                     close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
-                    open_reasoning = Some((out.reasoning.len(), Instant::now()));
-                    sink(StreamNotice::ReasoningDelta { kind, text: &text });
-                    out.reasoning.push(Reasoning {
-                        kind,
-                        content: text,
-                    });
-                    reasoning_durations_ms.push(None);
+                    sink(StreamNotice::TextDelta(&t));
+                    out.text.push_str(&t);
                 }
-            }
-            Event::ToolCallName(name) => {
-                close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
-                sink(StreamNotice::ToolPreparing { name: &name });
-            }
-            Event::ToolCall(tc) => {
-                close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
-                out.tool_calls.push(tc);
-            }
-            Event::Usage(usage) => out.usage = usage,
-            Event::ProviderData(value) => out.provider_data.push(value),
-            Event::Done => {
-                close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning)
-            }
+                Event::ReasoningDelta { kind, text } => {
+                    // Continuation requires a segment that is actually open: a
+                    // text or tool boundary may have closed the last record even
+                    // though its kind matches, and appending to it would merge
+                    // separate segments and keep the stale duration.
+                    let continuing = open_reasoning.is_some_and(|(index, _)| {
+                        out.reasoning
+                            .get(index)
+                            .is_some_and(|current| current.kind == kind)
+                    });
+                    if continuing {
+                        sink(StreamNotice::ReasoningDelta { kind, text: &text });
+                        super::append_reasoning(&mut out.reasoning, kind, &text);
+                    } else {
+                        close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
+                        open_reasoning = Some((out.reasoning.len(), Instant::now()));
+                        sink(StreamNotice::ReasoningDelta { kind, text: &text });
+                        out.reasoning.push(Reasoning {
+                            kind,
+                            content: text,
+                        });
+                        reasoning_durations_ms.push(None);
+                    }
+                }
+                Event::ToolCallName(name) => {
+                    close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
+                    sink(StreamNotice::ToolPreparing { name: &name });
+                }
+                Event::ToolCall(tc) => {
+                    close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
+                    out.tool_calls.push(tc);
+                }
+                Event::Usage(usage) => out.usage = usage,
+                Event::ProviderData(value) => out.provider_data.push(value),
+                Event::Done => {
+                    close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning)
+                }
+            })
         });
+        // A stall interrupts whatever read was blocked, including one inside
+        // the HTTP client, so report the cause rather than the wake-up.
+        let result = match result {
+            Err(_) if stalled && !crate::cancellation::interrupted() => {
+                Err(super::http::stall_error())
+            }
+            other => other,
+        };
         if result.is_ok() {
             close_reasoning_segment(&mut reasoning_durations_ms, &mut open_reasoning);
             if let Some(data) = reasoning_durations_data(&reasoning_durations_ms) {
@@ -112,20 +126,41 @@ pub fn stream_turn(
             Ok(()) => return Ok(out),
             Err(_) if crate::cancellation::interrupted() => return Err(Error::Interrupted),
             Err(e) if e.is_retryable() && attempt < MAX_ATTEMPTS => {
-                let delay_ms = 500u64 << (attempt - 1);
+                let delay = retry_delay(attempt);
                 sink(StreamNotice::Retrying {
                     attempt,
-                    delay_ms,
+                    delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                     error: e.to_string(),
                 });
-                std::thread::sleep(Duration::from_millis(delay_ms));
-                if crate::cancellation::interrupted() {
+                if !sleep_interruptibly(delay) {
                     return Err(Error::Interrupted);
                 }
                 sink(StreamNotice::RetryReset);
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+fn retry_delay(attempt: u32) -> Duration {
+    FIRST_RETRY_DELAY
+        .saturating_mul(1 << attempt.saturating_sub(1).min(16))
+        .min(MAX_RETRY_DELAY)
+}
+
+/// Waits out a retry backoff in short slices so cancellation stays prompt.
+/// Returns `false` when the wait was interrupted.
+fn sleep_interruptibly(delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
+    loop {
+        if crate::cancellation::interrupted() {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
     }
 }
 
@@ -195,6 +230,32 @@ mod tests {
             on_event(Event::Done);
             Ok(())
         }
+    }
+
+    #[test]
+    fn retry_backoff_spans_a_network_reconnect_and_stays_capped() {
+        let delays: Vec<Duration> = (1..MAX_ATTEMPTS).map(retry_delay).collect();
+        assert_eq!(delays[0], Duration::from_millis(500));
+        assert_eq!(delays[1], Duration::from_secs(1));
+        assert!(delays.iter().all(|delay| *delay <= MAX_RETRY_DELAY));
+        let total: Duration = delays.iter().sum();
+        assert!(
+            total >= Duration::from_secs(20),
+            "retries should outlast a Wi-Fi reconnect after wake: {total:?}"
+        );
+        assert_eq!(retry_delay(u32::MAX), MAX_RETRY_DELAY);
+    }
+
+    #[test]
+    fn retry_backoff_returns_promptly_when_canceled() {
+        crate::set_interrupted(false);
+        let token = crate::cancellation::CancellationToken::default();
+        token.cancel();
+        let started = Instant::now();
+        let completed =
+            crate::cancellation::scope(&token, || sleep_interruptibly(Duration::from_secs(10)));
+        assert!(!completed);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

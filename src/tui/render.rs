@@ -136,36 +136,84 @@ pub(super) fn render_copy_toast(frame: &mut [String], columns: usize, accent: Ui
 
 const JUMP_LABEL: &str = " ↓ Scroll to bottom ";
 
-/// Draws a "Scroll to bottom" pill centered on the last transcript row while
-/// the view is scrolled up, and records its hit area.
-pub(super) fn render_jump_button(region: &mut [String], state: &mut ViewState, columns: usize) {
-    let width = markdown::visible_width(JUMP_LABEL);
-    let Some(row) = region.len().checked_sub(1) else {
-        return;
-    };
-    if columns < width + 2 {
-        return;
-    }
-    let accent = state.accent_color;
-    let luminance =
-        u32::from(accent.red) * 299 + u32::from(accent.green) * 587 + u32::from(accent.blue) * 114;
-    let text = if luminance > 140_000 {
+/// Rec. 601 luminance above which the pill uses dark text. Hover uses the
+/// same cutoff to darken a light fill and lighten a dark one.
+const JUMP_LIGHT_LUMA: u32 = 140_000;
+
+/// How far a hovered pill moves toward black or white, in percent.
+const JUMP_HOVER_SHIFT: u8 = 24;
+
+fn luminance(color: UiColor) -> u32 {
+    u32::from(color.red) * 299 + u32::from(color.green) * 587 + u32::from(color.blue) * 114
+}
+
+fn mix_channel(value: u8, target: u8, percent: u8) -> u8 {
+    let value = u16::from(value);
+    let target = u16::from(target);
+    let percent = u16::from(percent);
+    let mixed = value * (100 - percent) + target * percent;
+    u8::try_from(mixed / 100).unwrap_or(u8::MAX)
+}
+
+fn jump_text_color(color: UiColor) -> &'static str {
+    if luminance(color) > JUMP_LIGHT_LUMA {
         "\x1b[38;2;18;18;22m"
     } else {
         "\x1b[38;2;245;245;245m"
+    }
+}
+
+fn jump_fill(accent: UiColor, hovered: bool) -> UiColor {
+    if !hovered {
+        return accent;
+    }
+    let target = if luminance(accent) > JUMP_LIGHT_LUMA {
+        0
+    } else {
+        255
     };
-    let pill = format!(
-        "\x1b[48;2;{};{};{}m{text}\x1b[1m{JUMP_LABEL}\x1b[0m",
-        accent.red, accent.green, accent.blue
-    );
+    UiColor::new(
+        mix_channel(accent.red, target, JUMP_HOVER_SHIFT),
+        mix_channel(accent.green, target, JUMP_HOVER_SHIFT),
+        mix_channel(accent.blue, target, JUMP_HOVER_SHIFT),
+    )
+}
+
+/// Draws a "Scroll to bottom" pill centered on the last transcript row while
+/// the view is scrolled up, and records its hit area. The pointer shifts the
+/// fill so the control reads as hovered without moving or resizing.
+pub(super) fn render_jump_button(region: &mut [String], state: &mut ViewState, columns: usize) {
+    let width = markdown::visible_width(JUMP_LABEL);
+    let Some(row) = region.len().checked_sub(1) else {
+        state.follow.pointer = None;
+        return;
+    };
+    if columns < width + 2 {
+        state.follow.pointer = None;
+        return;
+    }
     let left = (columns - width) / 2;
-    region[row] = markdown::overlay_at(&region[row], left, &pill);
-    state.follow.button = Some(JumpButton {
+    let button = JumpButton {
         top: row,
         bottom: row + 1,
         left,
         right: left + width,
-    });
+    };
+    let hovered = state
+        .follow
+        .pointer
+        .is_some_and(|(column, pointer_row)| button.contains(pointer_row, column));
+    let accent = state.accent_color;
+    let fill = jump_fill(accent, hovered);
+    let pill = format!(
+        "\x1b[48;2;{};{};{}m{}\x1b[1m{JUMP_LABEL}\x1b[0m",
+        fill.red,
+        fill.green,
+        fill.blue,
+        jump_text_color(accent)
+    );
+    region[row] = markdown::overlay_at(&region[row], left, &pill);
+    state.follow.button = Some(button);
 }
 
 /// Thumb shading as a fraction of the accent color.
@@ -220,6 +268,21 @@ pub(super) fn apply_scroll_bar(
     }
 }
 
+fn frame_without_jump_button(
+    state: &mut ViewState,
+    lines: Vec<String>,
+    cursor: (usize, usize),
+) -> RenderedFrame {
+    state.follow.button = None;
+    state.follow.pointer = None;
+    state.transcript_row_entries.clear();
+    RenderedFrame {
+        lines,
+        cursor,
+        images: Vec::new(),
+    }
+}
+
 pub(super) fn build_frame(
     state: &mut ViewState,
     editor: &Editor,
@@ -238,48 +301,35 @@ pub(super) fn build_frame_with_images(
     image_support: ImageSupport,
 ) -> RenderedFrame {
     // Only the transcript view draws the jump button; every other view must
-    // not leave a stale hit area behind.
+    // not leave a stale hit area or pointer cell behind. Motion tracking is
+    // off on those screens, so a saved cell would highlight the wrong place
+    // when the transcript returns.
     state.follow.button = None;
     if state.git_init.is_some() {
         let (lines, cursor) = super::git::render_init(state, editor, columns, rows);
-        state.transcript_row_entries.clear();
-        return RenderedFrame {
-            lines,
-            cursor,
-            images: Vec::new(),
-        };
+        return frame_without_jump_button(state, lines, cursor);
     }
     if state.process_view.is_some() {
         let (lines, cursor) = super::processes::render(state, columns, rows);
-        state.transcript_row_entries.clear();
-        return RenderedFrame {
-            lines,
-            cursor,
-            images: Vec::new(),
-        };
+        return frame_without_jump_button(state, lines, cursor);
     }
     if state.git_view.is_some() {
         let (lines, cursor) = super::git::render(state, editor, columns, rows);
-        state.transcript_row_entries.clear();
-        return RenderedFrame {
-            lines,
-            cursor,
-            images: Vec::new(),
-        };
+        return frame_without_jump_button(state, lines, cursor);
     }
     if state.subagent_view.is_some() {
         let (lines, cursor) = super::subagents::render(state, editor, columns, rows);
-        state.transcript_row_entries.clear();
-        return RenderedFrame {
-            lines,
-            cursor,
-            images: Vec::new(),
-        };
+        return frame_without_jump_button(state, lines, cursor);
     }
     let columns = columns.max(20);
     let rows = rows.max(8);
     if state.transcript.viewer_open() {
         let (lines, cursor) = render_block_viewer(state, columns, rows);
+        // A viewer that closed itself falls through to a transcript frame and
+        // owns the jump button that frame just recorded.
+        if state.transcript.viewer_open() {
+            return frame_without_jump_button(state, lines, cursor);
+        }
         state.transcript_row_entries.clear();
         return RenderedFrame {
             lines,
@@ -473,6 +523,11 @@ pub(super) fn build_frame_with_images(
     }
     if showing_transcript && state.scroll_offset > 0 {
         render_jump_button(&mut region, state, columns);
+    } else {
+        // The pill is the only transcript control that needs motion reports.
+        // Drop the cell while it is hidden so the next appearance starts
+        // unhovered until the pointer moves again.
+        state.follow.pointer = None;
     }
     apply_scroll_bar(
         &mut region,

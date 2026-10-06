@@ -69,7 +69,7 @@ With the transcript focused, arrows select blocks, `h`/`l` fold or unfold, `Ente
 
 Long pastes appear as compact markers but reach the model in full. Each prompt accepts up to five clipboard images in PNG, JPEG, GIF, or WebP format, up to 5 MB each. Linux clipboard images require `wl-paste` or `xclip`.
 
-Canceling a response pauses queued messages and pending steering. Use `/unqueue` to edit the queue and `Enter` to resume. Model questions appear in the composer; their countdown accepts recommended answers unless you intervene. Disable completion and question bells with `/settings bell off`.
+Canceling a response pauses queued messages and pending steering. Use `/unqueue` to edit the queue and `Enter` to resume. When a request fails, press `Enter` on an empty prompt to continue the turn from its saved history; `/continue` does the same after a failure or a cancel, keeping goal and plan modes. Model questions appear in the composer; their countdown accepts recommended answers unless you intervene. Disable completion and question bells with `/settings bell off`.
 
 ### Slash commands
 
@@ -83,6 +83,7 @@ Canceling a response pauses queued messages and pending steering. Use `/unqueue`
 | `/compact` | Summarize older messages now |
 | `/usage` | Show token and prompt-cache usage |
 | `/undo` | Restore files from before the last prompt and drop that turn |
+| `/continue` | Resume a turn that failed or was interrupted from where it stopped, without resending your prompt |
 | `/diff` | Show files changed through the file tools this session as diff cards |
 | `/init` | Create or update `AGENTS.md` with project guidance for coding agents |
 | `/copy`, `/copy-all` | Copy the last reply, or the whole conversation |
@@ -108,14 +109,14 @@ The Git dashboard supports keyboard and mouse navigation. Click a file or commit
 
 ### Remote control
 
-`/remote` lets another device in your [Tailscale](https://tailscale.com) network control the current session from a browser. Yawl listens only on this machine's Tailscale address, port 7474 by default. It looks for the address on Tailscale's tunnel interface (`utun*` on macOS, `tailscale*` on Linux), not just any address in the shared 100.64.0.0/10 range. It shows the address, a six-digit pairing code, and a QR code, and copies the link to the clipboard. This notice is removed once a device connects or remote control stops.
+`/remote` lets another device in your [Tailscale](https://tailscale.com) network control the current session from a browser. Yawl listens only on this machine's Tailscale address, port 7474 by default. Each session has its own server, so other sessions running `/remote` take the next free port, from 7475 to 7483, and then any free port. It looks for the address on Tailscale's tunnel interface (`utun*` on macOS, `tailscale*` on Linux), not just any address in the shared 100.64.0.0/10 range. It shows the address, a six-digit pairing code, and a QR code, and copies the link to the clipboard. This notice is removed once a device connects or remote control stops.
 - **Scan the QR code:** the phone opens the page and pairs automatically. The link carries the code in its `#fragment`, which browsers never send to the server.
 - **Use the clipboard:** with Universal Clipboard, paste the link on an iPhone.
 - **Type it:** open the address on the other device and enter the code.
 
 After five wrong codes, remote control stops.
 
-The page mirrors the full-screen interface at the device's size, so every command, picker, and dashboard works. On phones and tablets:
+The page mirrors the full-screen interface at the device's size, so every command, picker, and dashboard works. Once paired, the browser tab is named after the session: the project directory and the first line of its first prompt, such as `yawl · fix the remote pairing flow`. On phones and tablets:
 - Tap Yawl's composer, or `⌨`, to type with the phone keyboard. Keystrokes stream live, so completion menus, `@` mentions, and autocorrect all work.
 - `✎` opens a sheet for pasting or writing longer text.
 - A key bar provides `Esc`, `Enter`, `Backspace`, arrows, `Tab`, `Ctrl+C`, `Ctrl+O`, and paging.
@@ -192,7 +193,7 @@ Sessions live under `~/.yawl/sessions/projects/<project-key>/`. `yawl -c` resume
 
 Automatic compaction summarizes older conversation near the context limit, at 85% by default, while retaining recent exchanges. `/compact` requests it manually. The full transcript remains in the session log. `/usage` reports input, output, and prompt-cache usage.
 
-Provider requests are retried with backoff on rate limits, 5xx responses, and dropped connections. When an OpenAI-compatible server rejects a tool call it could not parse (`invalid_tool_call` or `incomplete_tool_call`, as oMLX reports), Yawl retries up to twice with a note asking the model to re-issue the call. The note is sent with the request but is not saved to the session.
+Provider requests are retried with backoff on rate limits, 5xx responses, dropped connections, and DNS or connect failures: up to seven attempts, waiting from 0.5 s up to 15 s between them, so a network that is reconnecting after sleep has about 30 s to return. `Esc` or `Ctrl+C` cancels during a wait. A response that sends nothing for five minutes is treated as a dead connection and retried. After the computer wakes from sleep, for example when you open the lid, a stream that stays silent for 15 s is retried at once instead of hanging on a socket that did not survive the suspend. When an OpenAI-compatible server rejects a tool call it could not parse (`invalid_tool_call` or `incomplete_tool_call`, as oMLX reports), Yawl retries up to twice with a note asking the model to re-issue the call. The note is sent with the request but is not saved to the session.
 
 ## Web browsing
 

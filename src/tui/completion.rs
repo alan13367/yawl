@@ -31,6 +31,7 @@ pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
         ("/compact", "Summarize older messages"),
         ("/usage", "Show token and prompt-cache usage"),
         ("/undo", "Undo the last turn"),
+        ("/continue", "Resume a failed or interrupted turn"),
         ("/init", "Create or update AGENTS.md"),
         ("/copy", "Copy the last assistant reply"),
         ("/copy-all", "Copy the conversation without reasoning"),

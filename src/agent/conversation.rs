@@ -112,6 +112,9 @@ pub(crate) struct Conversation {
     /// Set when a turn ends through plan_complete so the TUI can offer the
     /// implement/revise handoff only for freshly finished plans.
     plan_ready_this_turn: bool,
+    /// Mode of the last turn that stopped before the model finished, through
+    /// an error or an interrupt, so `/continue` can resume it in place.
+    unfinished_mode: Option<turn::TurnMode>,
     catalog_cache: CatalogCache,
     cancellation: CancellationToken,
     print_mode: bool,
@@ -154,6 +157,7 @@ impl Conversation {
             pending_tool_results: Default::default(),
             latest_turn_result: String::new(),
             plan_ready_this_turn: false,
+            unfinished_mode: None,
             catalog_cache: CatalogCache::default(),
             cancellation: CancellationToken::default(),
             print_mode: false,
@@ -183,6 +187,7 @@ impl Conversation {
             pending_tool_results: Default::default(),
             latest_turn_result: String::new(),
             plan_ready_this_turn: false,
+            unfinished_mode: None,
             catalog_cache: CatalogCache::default(),
             cancellation: CancellationToken::default(),
             print_mode: false,
@@ -435,6 +440,7 @@ impl Conversation {
         self.context_tokens = 0;
         self.context_usage = None;
         self.latest_turn_result.clear();
+        self.unfinished_mode = None;
         let _ = self.steers.drain();
         Checkpoints::remove(&self.config.home_dir, &old_id);
         if abandon_empty {
@@ -505,6 +511,7 @@ impl Conversation {
             .cloned();
         self.context_tokens = self.context_usage.as_ref().map_or(0, |usage| usage.tokens);
         self.latest_turn_result.clear();
+        self.unfinished_mode = None;
         let _ = self.steers.drain();
         self.recover_history()?;
         Ok(())

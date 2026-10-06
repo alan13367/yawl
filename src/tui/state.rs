@@ -54,6 +54,10 @@ pub(super) struct FollowState {
     pub(super) anchor: Option<(usize, usize)>,
     /// Screen rows and columns (end-exclusive) of the jump button.
     pub(super) button: Option<JumpButton>,
+    /// Last pointer cell (`column`, `row`) while the jump button is shown.
+    /// Cleared when the button hides or the terminal loses focus, because
+    /// motion tracking is off in those cases and a saved cell would be stale.
+    pub(super) pointer: Option<(usize, usize)>,
     /// The last press landed on the jump button, so its release belongs to
     /// it too.
     pub(super) pressed: bool,
@@ -143,6 +147,8 @@ pub(super) struct ViewState {
     pub(super) queued_inputs: std::collections::VecDeque<super::input::Submission>,
     pub(super) pending_steers: std::collections::VecDeque<super::input::Submission>,
     pub(super) queue_paused: bool,
+    /// Set after a turn fails, so Enter on an empty prompt continues it.
+    pub(super) continue_offered: bool,
     pub(super) active_goal: Option<String>,
     pub(super) goal_running: bool,
     pub(super) active_plan: Option<String>,
@@ -217,6 +223,7 @@ impl ViewState {
             queued_inputs: std::collections::VecDeque::new(),
             pending_steers: std::collections::VecDeque::new(),
             queue_paused: false,
+            continue_offered: false,
             active_goal: agent.active_goal().map(str::to_string),
             goal_running: false,
             active_plan: agent.active_plan().map(str::to_string),
@@ -388,7 +395,8 @@ impl ViewState {
                 error,
             } => {
                 self.activity = format!(
-                    "attempt {attempt} failed, retrying in {delay_ms}ms: {}",
+                    "attempt {attempt} failed, retrying in {:.1}s (Esc cancels): {}",
+                    delay_ms as f64 / 1000.0,
                     crate::error::truncate(&error, 80)
                 );
             }
@@ -591,10 +599,30 @@ pub(super) fn scroll_bar_position(travel: usize, max_scroll: usize, scroll_offse
     (viewport_top * travel / max_scroll).min(travel)
 }
 
+/// Whether the pointer cell from the last motion report lies on the jump button.
+pub(super) fn pointer_over_jump_button(state: &ViewState) -> bool {
+    state.follow.button.is_some_and(|button| {
+        state
+            .follow
+            .pointer
+            .is_some_and(|(column, row)| button.contains(row, column))
+    })
+}
+
+/// Drops a saved pointer cell. Returns whether one was stored, so focus loss
+/// can redraw a highlighted pill.
+pub(super) fn clear_jump_pointer(state: &mut ViewState) -> bool {
+    state.follow.pointer.take().is_some()
+}
+
 /// Handles a press on the "Scroll to bottom" button. Returns true when the
-/// event belongs to it: a press on the button, or the release that ends that
-/// press. Any other release reaches text selection.
+/// event belongs to it: a press on the button, the release that ends that
+/// press, or motion while the pointer is over it. Any other release reaches
+/// text selection.
 pub(super) fn handle_jump_button_mouse(state: &mut ViewState, event: MouseEvent) -> bool {
+    if event.kind == MouseKind::Move && state.follow.button.is_some() {
+        state.follow.pointer = Some((event.column, event.row));
+    }
     match event.kind {
         MouseKind::Press => {
             let hit = state
@@ -609,7 +637,8 @@ pub(super) fn handle_jump_button_mouse(state: &mut ViewState, event: MouseEvent)
             hit
         }
         MouseKind::Release => std::mem::take(&mut state.follow.pressed),
-        MouseKind::Drag | MouseKind::Move => false,
+        MouseKind::Drag => false,
+        MouseKind::Move => pointer_over_jump_button(state),
     }
 }
 

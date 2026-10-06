@@ -83,6 +83,11 @@ impl From<ureq::Error> for Error {
                 std::io::ErrorKind::TimedOut,
                 "request timed out",
             )),
+            // Transient while a network comes back, for example right after
+            // the host wakes from sleep, so these stay retryable.
+            ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => Error::Io(
+                std::io::Error::new(std::io::ErrorKind::NotConnected, e.to_string()),
+            ),
             other => Error::Protocol(other.to_string()),
         }
     }
@@ -98,6 +103,15 @@ pub(crate) fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_connection_failures_are_retryable() {
+        for error in [ureq::Error::HostNotFound, ureq::Error::ConnectionFailed] {
+            let error = Error::from(error);
+            assert!(error.is_retryable(), "{error}");
+        }
+        assert!(!Error::from(ureq::Error::BadUri("x".into())).is_retryable());
+    }
 
     #[test]
     fn truncate_respects_character_boundaries_and_exact_limits() {

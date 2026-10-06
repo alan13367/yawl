@@ -13,7 +13,7 @@ use super::commands::{
     promote_queued, unqueue,
 };
 use super::completion::handle_completion_key;
-use super::events::{Event, EventReader, Key, MouseEvent, MouseKind};
+use super::events::{Event, EventReader, Key, MouseEvent, MouseKind, event_requests_redraw};
 use super::input::{EditAction, Editor, Submission};
 use super::picker::{
     ActivePickers, PickerAction, SettingsCategory, SettingsItem, SettingsLocation,
@@ -23,8 +23,9 @@ use super::picker::{
     web_search_provider_picker,
 };
 use super::state::{
-    COPY_TOAST_TICKS, Update, ViewState, advance_ticks, handle_jump_button_mouse,
-    handle_scroll_bar_mouse, handle_tool_click, scroll, toggle_tool_expansion,
+    COPY_TOAST_TICKS, Update, ViewState, advance_ticks, clear_jump_pointer,
+    handle_jump_button_mouse, handle_scroll_bar_mouse, handle_tool_click, pointer_over_jump_button,
+    scroll, toggle_tool_expansion,
 };
 use super::terminal::Terminal;
 
@@ -36,6 +37,7 @@ pub(super) enum TurnKind {
     Plan,
     PlanFollowUp,
     PlanImplement,
+    Continue,
 }
 
 pub(super) fn turn_interactive<R: Read>(
@@ -68,6 +70,7 @@ pub(super) fn turn_interactive<R: Read>(
             TurnKind::PlanImplement => {
                 agent.run_plan_implementation_preserving_cancellation(input, sink)
             }
+            TurnKind::Continue => agent.run_continue_preserving_cancellation(sink),
         },
     );
     state.active_goal = agent.active_goal().map(str::to_string);
@@ -235,6 +238,7 @@ pub(super) fn pump_events<R: Read, T>(
                 Event::FocusLost => {
                     terminal.set_focused(false);
                     needs_draw |= super::git::clear_hover(state);
+                    needs_draw |= clear_jump_pointer(state);
                     if !events.has_pending() {
                         break;
                     }
@@ -243,7 +247,7 @@ pub(super) fn pump_events<R: Read, T>(
                 }
                 _ => {}
             }
-            needs_draw |= !matches!(&event, Event::Tick | Event::FocusGained | Event::FocusLost);
+            needs_draw |= event_requests_redraw(&event);
             if matches!(&event, Event::Tick) {
                 needs_draw |= terminal.remote().poll(state);
             }
@@ -257,6 +261,12 @@ pub(super) fn pump_events<R: Read, T>(
                     cancel_worker(worker.thread, &worker.cancellation, state);
                 }
                 needs_draw = true;
+            }
+            if matches!(&event, Event::Tick) && worker.cancellation.is_canceled() {
+                // Keep waking a canceled worker until it settles: a wake that
+                // lands just before it blocks in a read is otherwise lost and
+                // the turn would hang on "canceling".
+                interrupt_thread(worker.thread);
             }
             if state.git_init.is_some() {
                 needs_draw = true;
@@ -303,7 +313,9 @@ pub(super) fn pump_events<R: Read, T>(
                         needs_draw |= sync_question(terminal, state, &worker.questions);
                     }
                     Event::MouseScroll(amount) => scroll(state, amount),
-                    Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
+                    Event::Mouse(mouse) => {
+                        needs_draw |= handle_mouse_selection(terminal, state, mouse)?;
+                    }
                     Event::Paste(text) => paste_question_answer(state, &text),
                     Event::FocusGained | Event::FocusLost => {}
                 }
@@ -333,7 +345,9 @@ pub(super) fn pump_events<R: Read, T>(
                         }
                     }
                     Event::Paste(text) if picker_is_editing(state) => editor.paste(&text),
-                    Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
+                    Event::Mouse(mouse) => {
+                        needs_draw |= handle_mouse_selection(terminal, state, mouse)?;
+                    }
                     Event::Tick => {
                         needs_draw |= advance_ticks(state);
                         needs_draw |= super::connection::poll(state);
@@ -354,7 +368,9 @@ pub(super) fn pump_events<R: Read, T>(
                 }
                 Event::FocusGained | Event::FocusLost => {}
                 Event::MouseScroll(amount) => scroll(state, amount),
-                Event::Mouse(mouse) => handle_mouse_selection(terminal, state, mouse)?,
+                Event::Mouse(mouse) => {
+                    needs_draw |= handle_mouse_selection(terminal, state, mouse)?;
+                }
                 Event::Paste(text) => {
                     if state.transcript.search_active() {
                         state.transcript.search_paste(&text);
@@ -576,18 +592,21 @@ fn paste_question_answer(state: &mut ViewState, text: &str) {
     editor.paste(text);
 }
 
+/// Returns whether the scroll-to-bottom pill's hover state changed. Pointer
+/// motion does not otherwise redraw.
 pub(super) fn handle_mouse_selection(
     terminal: &mut Terminal,
     state: &mut ViewState,
     event: MouseEvent,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
+    let was_hovered = pointer_over_jump_button(state);
     if handle_jump_button_mouse(state, event) {
         state.tool_click_press = None;
-        return Ok(());
+        return Ok(pointer_over_jump_button(state) != was_hovered);
     }
     if handle_scroll_bar_mouse(state, event) {
         state.tool_click_press = None;
-        return Ok(());
+        return Ok(pointer_over_jump_button(state) != was_hovered);
     }
     match event.kind {
         MouseKind::Press => {
@@ -602,14 +621,14 @@ pub(super) fn handle_mouse_selection(
             if copied && !clicked {
                 state.copy_toast_ticks = COPY_TOAST_TICKS;
             }
-            return Ok(());
+            return Ok(pointer_over_jump_button(state) != was_hovered);
         }
         MouseKind::Drag | MouseKind::Move => {}
     }
     if terminal.handle_mouse(event)? {
         state.copy_toast_ticks = COPY_TOAST_TICKS;
     }
-    Ok(())
+    Ok(pointer_over_jump_button(state) != was_hovered)
 }
 
 pub(super) fn is_cancel_key(key: Key) -> bool {

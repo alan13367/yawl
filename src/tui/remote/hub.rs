@@ -26,6 +26,8 @@ pub(super) enum Outgoing {
     Frame(String),
     Clipboard(String),
     Bell,
+    /// The browser tab title changed.
+    Title(String),
     /// Another device took control; this client should stop reconnecting.
     Replaced,
 }
@@ -73,6 +75,9 @@ struct State {
     input: VecDeque<u8>,
     revision: u64,
     notices: Vec<String>,
+    /// Browser tab title, kept across sessions so a new stream starts with
+    /// it before the next draw.
+    title: String,
 }
 
 #[derive(Default)]
@@ -297,6 +302,22 @@ impl Hub {
                 false
             }
         }
+    }
+
+    /// Records the browser tab title, forwarding a change to the attached
+    /// client.
+    pub(super) fn set_title(&self, title: &str) {
+        let mut state = self.lock();
+        if state.title == title {
+            return;
+        }
+        state.title = title.to_string();
+        drop(state);
+        self.send(Outgoing::Title(title.to_string()));
+    }
+
+    pub(super) fn title(&self) -> String {
+        self.lock().title.clone()
     }
 
     pub(super) fn authorized(&self, generation: u64, token: &str) -> bool {

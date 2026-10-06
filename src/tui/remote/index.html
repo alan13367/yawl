@@ -901,7 +901,13 @@ function hardwareWebgl() {
   }
 }
 
-const TITLE = document.title;
+const DEFAULT_TITLE = document.title;
+let TITLE = DEFAULT_TITLE;
+function setTitle(title) {
+  const marked = document.title !== TITLE;
+  TITLE = title || DEFAULT_TITLE;
+  document.title = marked ? "● " + TITLE : TITLE;
+}
 function ring() {
   if (navigator.vibrate) navigator.vibrate(60);
   if (document.hidden || !document.hasFocus()) document.title = "● " + TITLE;
@@ -931,6 +937,7 @@ function connect(take) {
   });
   source.addEventListener("clipboard", (event) => showClipboard(JSON.parse(event.data)));
   source.addEventListener("bell", ring);
+  source.addEventListener("title", (event) => setTitle(JSON.parse(event.data)));
   source.addEventListener("replaced", () => showReplaced("Another device took control."));
   source.addEventListener("closed", () => {
     showEnded("Remote control ended", "The host stopped remote control. Run /remote there to start again.",

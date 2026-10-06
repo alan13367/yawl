@@ -89,6 +89,7 @@ fn test_state() -> ViewState {
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
         queue_paused: false,
+        continue_offered: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,

@@ -17,8 +17,15 @@ const MALFORMED_TOOL_CALL_NOTE: &str = "[yawl] Your previous response contained 
 the server could not parse, so it was discarded and nothing ran. Continue the task: \
 re-issue the call with a valid tool name and JSON arguments, or answer in plain text.";
 
+/// How a turn begins: with optional new input, or by resuming the history
+/// an unfinished turn left behind.
+enum TurnStart {
+    Input(Option<TurnInput>),
+    Resume,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TurnMode {
+pub(super) enum TurnMode {
     Normal,
     Init,
     Goal,
@@ -197,6 +204,65 @@ impl Conversation {
         })
     }
 
+    /// Whether the last turn stopped before the model finished answering,
+    /// so [`Self::run_continue_preserving_cancellation`] can pick it up.
+    pub(crate) fn can_continue(&self) -> bool {
+        self.continuable_mode().is_some()
+    }
+
+    fn continuable_mode(&self) -> Option<TurnMode> {
+        // A trailing user message or tool result, or a tool call whose result
+        // `recover_history` will repair, still owes the model a response.
+        let awaiting_model = self.messages.last().is_some_and(|message| {
+            message.role != provider::Role::Assistant || !message.tool_calls.is_empty()
+        });
+        match self.unfinished_mode {
+            // Goal and draft-plan turns re-enter through their own resume
+            // logic, whatever the transcript ends with.
+            Some(TurnMode::Goal) if self.active_goal().is_some() => Some(TurnMode::Goal),
+            Some(TurnMode::Plan)
+                if matches!(
+                    self.plan_state(),
+                    Some(crate::session::PlanState::Draft { .. })
+                ) =>
+            {
+                Some(TurnMode::Plan)
+            }
+            Some(mode) if awaiting_model => Some(mode),
+            // Sessions resumed from disk carry no mode; a dangling request
+            // continues as a normal turn.
+            None if awaiting_model => Some(TurnMode::Normal),
+            _ => None,
+        }
+    }
+
+    /// Re-drives the last unfinished turn from the saved history, in the
+    /// mode it stopped in, without adding a new user message.
+    pub(crate) fn run_continue_preserving_cancellation(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.run_continue_with(sink, &mut provider::resolve)
+    }
+
+    pub(super) fn run_continue_with<F>(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        self.recover_history()?;
+        let Some(mode) = self.continuable_mode() else {
+            return Err(Error::Config("nothing to continue".into()));
+        };
+        let cancellation = self.cancellation.clone();
+        crate::cancellation::scope(&cancellation, || {
+            self.run_turn_tracked(TurnStart::Resume, sink, resolve_provider, mode)
+        })
+    }
+
     /// Delivers settled subagent results and waits for still-running ones
     /// until nothing is pending. Blocking waits happen in `wait_slice_secs`
     /// slices so Ctrl+C stays responsive. Returns `false` when the pump was
@@ -366,11 +432,47 @@ impl Conversation {
         user_input: Option<TurnInput>,
         sink: &mut dyn FnMut(TurnEvent<'_>),
         resolve_provider: &mut F,
+        mode: TurnMode,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        self.run_turn_tracked(TurnStart::Input(user_input), sink, resolve_provider, mode)
+    }
+
+    /// Runs a turn and remembers whether it stopped short, so a failed or
+    /// interrupted turn can be continued.
+    fn run_turn_tracked<F>(
+        &mut self,
+        start: TurnStart,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+        mode: TurnMode,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        let result = self.drive_turn(start, sink, resolve_provider, mode);
+        if matches!(result, Ok(true)) {
+            self.unfinished_mode = None;
+        }
+        result
+    }
+
+    fn drive_turn<F>(
+        &mut self,
+        start: TurnStart,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
         mut mode: TurnMode,
     ) -> Result<bool, Error>
     where
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
     {
+        let (resuming, user_input) = match start {
+            TurnStart::Input(input) => (false, input),
+            TurnStart::Resume => (true, None),
+        };
         self.recover_history()?;
         if mode == TurnMode::Goal && self.active_goal().is_none() {
             return Err(Error::Config("no active goal to resume".into()));
@@ -392,7 +494,7 @@ impl Conversation {
         self.questions.begin_turn();
         self.plan_ready_this_turn = false;
         self.latest_turn_result.clear();
-        if mode == TurnMode::PlanImplement && user_input.is_none() {
+        if mode == TurnMode::PlanImplement && user_input.is_none() && !resuming {
             if let Some(Err(error)) = self.checkpoint_snapshot() {
                 sink(TurnEvent::Warning(format!(
                     "Could not checkpoint for /undo: {error}"
@@ -432,6 +534,7 @@ impl Conversation {
         // Uncapped: the loop ends when the model stops calling tools, or
         // when a goal completes through goal_complete.
         loop {
+            self.unfinished_mode = Some(mode);
             if crate::cancellation::interrupted() {
                 return Ok(false);
             }

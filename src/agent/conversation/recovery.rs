@@ -69,6 +69,7 @@ impl Conversation {
             self.context_usage = None;
             self.latest_turn_result.clear();
             self.plan_ready_this_turn = false;
+            self.unfinished_mode = None;
             restore
         };
         state.checkpoints.discard_restored(undo.checkpoint)?;

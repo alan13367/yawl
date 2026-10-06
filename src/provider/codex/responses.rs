@@ -360,7 +360,14 @@ impl Provider for Codex {
         &self,
         req: &Request<'_>,
     ) -> Result<Option<crate::provider::CompactionOutput>, Error> {
-        super::compaction::compact(self, req).map(Some)
+        let (result, stalled) =
+            crate::provider::http::watch_stalls(|| super::compaction::compact(self, req));
+        match result {
+            Err(_) if stalled && !crate::cancellation::interrupted() => {
+                Err(crate::provider::http::stall_error())
+            }
+            result => result.map(Some),
+        }
     }
 }
 

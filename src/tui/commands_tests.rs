@@ -210,6 +210,7 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
         queued_inputs: ["first".into(), "second".into()].into(),
         pending_steers: std::collections::VecDeque::new(),
         queue_paused: false,
+        continue_offered: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,

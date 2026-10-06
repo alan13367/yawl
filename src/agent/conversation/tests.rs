@@ -526,6 +526,81 @@ fn failed_provider_does_not_persist_partial_assistant() {
 }
 
 #[test]
+fn a_failed_turn_continues_from_saved_history_without_a_new_prompt() {
+    crate::set_interrupted(false);
+    let mut test = TestAgent::new("continue-after-failure");
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        ProviderStep::Fail,
+        text_step("recovered"),
+    ])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
+
+    assert!(
+        !test.agent.can_continue(),
+        "a fresh session has nothing to continue"
+    );
+    let failed = test
+        .agent
+        .run_turn_with(Some("hello".into()), &mut |_| {}, &mut resolve);
+    assert!(failed.is_err());
+    assert!(test.agent.can_continue());
+
+    let resumed = test
+        .agent
+        .run_continue_with(&mut |_| {}, &mut resolve)
+        .expect("continue should succeed");
+
+    assert!(resumed);
+    assert_eq!(
+        requests.borrow().last().map(Vec::as_slice),
+        Some([Role::User].as_slice()),
+        "continuing must resend the original prompt without a duplicate"
+    );
+    let roles: Vec<Role> = test.agent.messages.iter().map(|m| m.role).collect();
+    assert_eq!(roles, [Role::User, Role::Assistant]);
+    assert!(
+        !test.agent.can_continue(),
+        "a finished turn is not continuable"
+    );
+    let error = test
+        .agent
+        .run_continue_with(&mut |_| {}, &mut resolve)
+        .expect_err("nothing is left to continue");
+    assert!(matches!(error, Error::Config(_)));
+}
+
+#[test]
+fn a_session_left_mid_tool_call_can_continue_after_resume() {
+    crate::set_interrupted(false);
+    let mut test = TestAgent::new("continue-after-resume");
+    let assistant = Message::assistant(
+        String::new(),
+        vec![ToolCall {
+            id: "call-1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }],
+    );
+    test.agent.messages = vec![Message::user("run it"), assistant];
+
+    assert!(test.agent.can_continue());
+    let steps = Rc::new(RefCell::new(VecDeque::from([text_step("done")])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
+    assert!(
+        test.agent
+            .run_continue_with(&mut |_| {}, &mut resolve)
+            .expect("continue")
+    );
+    assert_eq!(
+        requests.borrow()[0],
+        [Role::User, Role::Assistant, Role::Tool],
+        "the missing tool result is repaired before the request"
+    );
+}
+
+#[test]
 fn provider_usage_saturates_instead_of_wrapping() {
     let mut test = TestAgent::new("saturating-usage");
     let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {

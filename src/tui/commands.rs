@@ -36,6 +36,7 @@ Commands
 | `/new`, `/clear` | Start a fresh session in the current directory |
 | `/resume [ID]` | Open session picker or resume directly |
 | `/undo` | Restore files and drop the last turn |
+| `/continue` | Resume a turn that failed or was interrupted |
 | `/diff` | Show files changed this session |
 | `/init` | Create or update project agent guidance |
 | `/quit` | Leave Yawl |
@@ -66,6 +67,7 @@ Commands
 Input
 
 - `Enter` submits when idle, or steers while a response runs
+- `Enter` on an empty prompt continues a turn that just failed
 - `Tab` completes in menus, or queues a message while busy
 - Run `/hotkeys` for all editing, transcript, and dashboard shortcuts
 ";

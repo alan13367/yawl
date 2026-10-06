@@ -336,6 +336,9 @@ impl Terminal {
 
     pub(super) fn draw(&mut self, state: &mut ViewState, editor: &Editor) -> Result<(), Error> {
         let remote = self.remote.snapshot();
+        if remote.address.is_some() {
+            self.remote.update_title(state);
+        }
         let ((columns, rows), to_remote) = self.sync_remote(&remote)?;
         if self.last_size != (columns, rows) {
             super::git::clear_hover(state);
@@ -395,10 +398,17 @@ impl Terminal {
             let git_visible = state.git_view.is_some()
                 && state.git_init.is_none()
                 && state.process_view.is_none();
+            // Any-event tracking reports motion without a held button. The
+            // Git dashboard uses it for row hover; the scroll-to-bottom pill
+            // uses it while that pill is on screen. Clicks and drags stay on
+            // button-event tracking the rest of the time.
+            let jump_visible = state.follow.button.is_some();
             self.mouse_mode.update(
                 &mut self.stdout,
-                git_visible,
-                self.focused && super::git::pointer_over_control(state),
+                git_visible || jump_visible,
+                self.focused
+                    && (super::git::pointer_over_control(state)
+                        || super::state::pointer_over_jump_button(state)),
             )?;
             self.stdout.flush()?;
         }

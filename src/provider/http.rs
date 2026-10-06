@@ -1,8 +1,127 @@
+use std::cell::RefCell;
 use std::io::{BufRead, Take};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::Error;
+
+/// Longest silence tolerated from a provider before its connection is
+/// presumed dead. Generous so slow models can think without streaming, yet
+/// bounded because a socket whose peer vanished never reports EOF.
+const STALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Silence tolerated after the host resumes from sleep. Connections that
+/// crossed a suspend are usually gone, but one that survived keeps going.
+const RESUME_GRACE: Duration = Duration::from_secs(15);
+/// How far the wall clock must outrun the monotonic clock before a gap counts
+/// as a suspend. Monotonic time stops while the host sleeps.
+const SUSPEND_THRESHOLD: Duration = Duration::from_secs(5);
+const WATCH_TICK: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct StallWatch {
+    progress: AtomicU64,
+    stalled: AtomicBool,
+}
+
+thread_local! {
+    static CURRENT_WATCH: RefCell<Option<Arc<StallWatch>>> = const { RefCell::new(None) };
+}
+
+struct WatchGuard(Option<Arc<StallWatch>>);
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        CURRENT_WATCH.with_borrow_mut(|current| *current = self.0.take());
+    }
+}
+
+/// Records that the current provider stream received bytes.
+fn note_progress() {
+    CURRENT_WATCH.with_borrow(|current| {
+        if let Some(watch) = current {
+            watch.progress.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+fn stalled() -> bool {
+    CURRENT_WATCH.with_borrow(|current| {
+        current
+            .as_ref()
+            .is_some_and(|watch| watch.stalled.load(Ordering::Acquire))
+    })
+}
+
+/// The retryable error reported when the stall watchdog abandons a request.
+pub(crate) fn stall_error() -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "connection stalled (no data from the provider)",
+    ))
+}
+
+/// Runs one provider request under a watchdog that wakes the calling thread
+/// when the response goes silent for too long, or shortly after the host
+/// resumes from sleep with a silent connection. Returns whether it fired; the
+/// interrupted read then fails with [`stall_error`] so the caller can retry
+/// on a fresh connection instead of waiting forever on a dead socket.
+pub(crate) fn watch_stalls<T>(run: impl FnOnce() -> T) -> (T, bool) {
+    watch_stalls_with(STALL_TIMEOUT, RESUME_GRACE, run)
+}
+
+fn watch_stalls_with<T>(idle: Duration, grace: Duration, run: impl FnOnce() -> T) -> (T, bool) {
+    // Without the wake handler a signal could not interrupt the read, and
+    // could terminate the process instead.
+    if !crate::cancellation::wake_handler_installed() {
+        return (run(), false);
+    }
+    let watch = Arc::new(StallWatch::default());
+    let thread = crate::cancellation::native_thread_id();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let result = std::thread::scope(|scope| {
+        let observed = Arc::clone(&watch);
+        scope.spawn(move || {
+            let mut seen = 0;
+            let mut limit = idle;
+            let mut quiet_since = Instant::now();
+            let (mut mono, mut wall) = (Instant::now(), SystemTime::now());
+            while let Err(mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(WATCH_TICK) {
+                let (now, now_wall) = (Instant::now(), SystemTime::now());
+                let progress = observed.progress.load(Ordering::Relaxed);
+                if progress != seen {
+                    seen = progress;
+                    quiet_since = now;
+                    limit = idle;
+                }
+                let slept = now_wall
+                    .duration_since(wall)
+                    .unwrap_or_default()
+                    .saturating_sub(now.duration_since(mono));
+                if slept > SUSPEND_THRESHOLD {
+                    quiet_since = now;
+                    limit = limit.min(grace);
+                }
+                (mono, wall) = (now, now_wall);
+                if now.duration_since(quiet_since) >= limit {
+                    observed.stalled.store(true, Ordering::Release);
+                }
+                if observed.stalled.load(Ordering::Acquire) {
+                    // Repeat the wake: one that lands just before the reader
+                    // blocks again would otherwise be lost.
+                    crate::cancellation::wake_thread(thread);
+                }
+            }
+        });
+        let previous = CURRENT_WATCH.with_borrow_mut(|current| current.replace(watch.clone()));
+        let guard = WatchGuard(previous);
+        let result = run();
+        drop(guard);
+        drop(done_tx);
+        result
+    });
+    (result, watch.stalled.load(Ordering::Acquire))
+}
 
 fn read_line_interruptible(
     reader: &mut impl BufRead,
@@ -14,12 +133,17 @@ fn read_line_interruptible(
         if crate::cancellation::interrupted() {
             return Err(Error::Interrupted);
         }
+        if stalled() {
+            return Err(stall_error());
+        }
         let (consumed, finished) = {
             let available = reader.fill_buf().map_err(|error| {
-                if error.kind() == std::io::ErrorKind::Interrupted
-                    && crate::cancellation::interrupted()
-                {
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    Error::Io(error)
+                } else if crate::cancellation::interrupted() {
                     Error::Interrupted
+                } else if stalled() {
+                    stall_error()
                 } else {
                     Error::Io(error)
                 }
@@ -27,6 +151,7 @@ fn read_line_interruptible(
             if available.is_empty() {
                 break;
             }
+            note_progress();
             let consumed = available
                 .iter()
                 .position(|byte| *byte == b'\n')
@@ -65,6 +190,9 @@ pub(crate) fn http_agent() -> ureq::Agent {
             ureq::Agent::config_builder()
                 .http_status_as_error(false)
                 .timeout_global(None)
+                // Bounded so a lookup on a network that is still waking up
+                // cannot hold a turn past cancellation for long.
+                .timeout_resolve(Some(Duration::from_secs(10)))
                 .timeout_connect(Some(Duration::from_secs(20)))
                 .build()
                 .into()
@@ -403,6 +531,97 @@ mod pooling_tests {
             elapsed < Duration::from_secs(2),
             "completion waited for peer EOF: {elapsed:?}"
         );
+    }
+
+    /// Serves one streaming response: headers, then `chunks` written with
+    /// `gap` between them, then the connection is held open without data.
+    fn serve_stream(chunks: Vec<&'static str>, gap: Duration) -> (String, impl FnOnce()) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+        let address = listener.local_addr().expect("address");
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut request = BufReader::new(socket.try_clone().expect("clone"));
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                request.read_line(&mut line).expect("header");
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse::<usize>().expect("length");
+                }
+            }
+            request.read_exact(&mut vec![0; length]).expect("body");
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").expect("headers");
+            for chunk in chunks {
+                std::thread::sleep(gap);
+                if write!(socket, "{:x}\r\n{chunk}\r\n", chunk.len()).is_err() {
+                    return;
+                }
+                let _ = socket.flush();
+            }
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+        });
+        (format!("http://{address}"), move || {
+            let _ = release.send(());
+            server.join().expect("server");
+        })
+    }
+
+    fn empty_request() -> Request<'static> {
+        Request {
+            model: "test",
+            system: "",
+            messages: &[],
+            tools: &[],
+            max_tokens: 1,
+            supports_images: false,
+            prompt_cache_control: false,
+            prompt_cache_key: None,
+        }
+    }
+
+    #[test]
+    fn a_silent_connection_is_abandoned_as_a_retryable_stall() {
+        crate::install_interrupt_handler().expect("interrupt handler");
+        crate::cancellation::scope(&crate::cancellation::CancellationToken::default(), || {
+            let (url, stop) = serve_stream(vec![": opened\n\n"], Duration::ZERO);
+            let started = Instant::now();
+            let (result, stalled) = watch_stalls_with(
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+                || OpenAi::new(url, String::new()).stream_once(&empty_request(), &mut |_| {}),
+            );
+            let elapsed = started.elapsed();
+            stop();
+            assert!(stalled, "the watchdog should fire on a silent stream");
+            let error = result.expect_err("a stalled stream must not succeed");
+            assert!(error.is_retryable(), "stalls must be retryable: {error}");
+            assert!(error.to_string().contains("stalled"), "{error}");
+            assert!(elapsed < Duration::from_secs(3), "stall took {elapsed:?}");
+        });
+    }
+
+    #[test]
+    fn keep_alive_traffic_holds_off_the_stall_watchdog() {
+        crate::install_interrupt_handler().expect("interrupt handler");
+        crate::cancellation::scope(&crate::cancellation::CancellationToken::default(), || {
+            let mut chunks = vec![": ping\n\n"; 6];
+            chunks.push("data: [DONE]\n\n");
+            let (url, stop) = serve_stream(chunks, Duration::from_millis(150));
+            let (result, stalled) = watch_stalls_with(
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+                || OpenAi::new(url, String::new()).stream_once(&empty_request(), &mut |_| {}),
+            );
+            stop();
+            assert!(!stalled, "regular traffic must keep the stream alive");
+            result.expect("stream should complete");
+        });
     }
 
     #[test]

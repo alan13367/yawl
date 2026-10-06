@@ -276,11 +276,13 @@ impl Server {
         let result = (|| {
             start_event_stream(&mut *stream)?;
             write_event(&mut *stream, "hello", &client)?;
+            write_event(&mut *stream, "title", &self.hub.title())?;
             loop {
                 match receiver.recv_timeout(KEEPALIVE) {
                     Ok(Outgoing::Frame(frame)) => write_event(&mut *stream, "frame", &frame)?,
                     Ok(Outgoing::Clipboard(text)) => write_event(&mut *stream, "clipboard", &text)?,
                     Ok(Outgoing::Bell) => write_event(&mut *stream, "bell", "")?,
+                    Ok(Outgoing::Title(title)) => write_event(&mut *stream, "title", &title)?,
                     Ok(Outgoing::Replaced) => return write_event(&mut *stream, "replaced", ""),
                     Err(RecvTimeoutError::Timeout) => {
                         stream.write_all(b": ping\n\n")?;
@@ -524,6 +526,9 @@ mod tests {
         assert!(post(address, "/input", &cookie, &client, "hi")?.starts_with("HTTP/1.1 204"));
         let mut buf = [0u8; 8];
         assert_eq!(hub.take_input(&mut buf), 2);
+
+        hub.set_title("yawl · renamed-title");
+        assert!(read_until(&mut events, "renamed-title")?.contains("event: title"));
 
         assert!(hub.send(Outgoing::Frame("\x1b[1;1Hframe-text".into())));
         assert!(read_until(&mut events, "frame-text")?.contains("event: frame"));

@@ -52,13 +52,15 @@ use self::commands::{
     plan_handoff_picker, reasoning, resume, settings, show_diff, show_skills, unqueue,
 };
 use self::completion::handle_completion_key;
-use self::events::{Event, EventReader, Key};
+use self::events::{Event, EventReader, Key, event_requests_redraw};
 use self::input::{EditAction, Editor, Submission};
 use self::picker::{
     open_model_picker, open_settings_picker, picker_is_editing, picker_is_plan_handoff,
     poll_model_picker, sync_color_preview, take_picker_action,
 };
-use self::state::{Update, ViewState, advance_ticks, scroll, toggle_tool_expansion};
+use self::state::{
+    Update, ViewState, advance_ticks, clear_jump_pointer, scroll, toggle_tool_expansion,
+};
 use self::subagents::open_dashboard as open_subagent_dashboard;
 use self::terminal::Terminal;
 use self::transcript::Transcript;
@@ -191,6 +193,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                 Event::FocusLost => {
                     terminal.set_focused(false);
                     needs_draw |= git::clear_hover(&mut state);
+                    needs_draw |= clear_jump_pointer(&mut state);
                     if !events.has_pending() {
                         break;
                     }
@@ -199,7 +202,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                 }
                 _ => {}
             }
-            needs_draw |= !matches!(&event, Event::Tick | Event::FocusGained | Event::FocusLost);
+            needs_draw |= event_requests_redraw(&event);
             if matches!(&event, Event::Tick) {
                 needs_draw |= terminal.remote().poll(&mut state);
             }
@@ -250,7 +253,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                     Event::Paste(text) if picker_is_editing(&state) => editor.paste(&text),
                     Event::MouseScroll(amount) if plan_handoff => scroll(&mut state, amount),
                     Event::Mouse(mouse) => {
-                        handle_mouse_selection(&mut terminal, &mut state, mouse)?
+                        needs_draw |= handle_mouse_selection(&mut terminal, &mut state, mouse)?;
                     }
                     Event::Tick => {
                         needs_draw |= advance_ticks(&mut state);
@@ -272,7 +275,9 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                 }
                 Event::FocusGained | Event::FocusLost => {}
                 Event::MouseScroll(amount) => scroll(&mut state, amount),
-                Event::Mouse(mouse) => handle_mouse_selection(&mut terminal, &mut state, mouse)?,
+                Event::Mouse(mouse) => {
+                    needs_draw |= handle_mouse_selection(&mut terminal, &mut state, mouse)?;
+                }
                 Event::Paste(text) => {
                     if state.transcript.search_active() {
                         state.transcript.search_paste(&text);
@@ -306,6 +311,15 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                                 // The completion menu consumed navigation or Tab.
                             }
                             Key::Tab => navigation::focus_transcript(&mut state),
+                            Key::Enter if state.continue_offered && editor.is_empty() => {
+                                continue_turn(
+                                    agent,
+                                    &mut state,
+                                    &mut editor,
+                                    &mut terminal,
+                                    &mut events,
+                                )?;
+                            }
                             _ => match editor.handle_key(key) {
                                 EditAction::Submit(input)
                                 | EditAction::Queue(input)
@@ -344,6 +358,30 @@ fn rebuild_transcript_after_deferred_follow_up(
 ) {
     state.transcript = Transcript::from_messages(messages);
     state.render_cache.invalidate();
+}
+
+/// Re-drives a turn that stopped through an error or interrupt.
+fn continue_turn<R: Read>(
+    agent: &mut Agent,
+    state: &mut ViewState,
+    editor: &mut Editor,
+    terminal: &mut Terminal,
+    events: &mut EventReader<R>,
+) -> Result<(), Error> {
+    if !agent.can_continue() {
+        state.continue_offered = false;
+        state.notice("Nothing to continue: the last turn finished.");
+        return Ok(());
+    }
+    run_agent_turn(
+        agent,
+        None,
+        TurnDispatch::Continue,
+        state,
+        editor,
+        terminal,
+        events,
+    )
 }
 
 /// Announces a settled turn through the terminal bell when the user may be
@@ -434,6 +472,7 @@ fn handle_submission<R: Read>(
             "help" => state.notice(HELP),
             "hotkeys" => state.notice(HOTKEYS),
             "diff" => show_diff(agent, state),
+            "continue" => continue_turn(agent, state, editor, terminal, events)?,
             "init" => match commands::init(argument) {
                 Ok(input) => {
                     run_agent_turn(
@@ -615,6 +654,7 @@ enum TurnDispatch {
     Plan,
     PlanFollowUp(crate::provider::TurnInput),
     PlanImplement(Option<crate::provider::TurnInput>),
+    Continue,
 }
 
 fn prepare_goal_submission(editor: &Editor, argument: &str) -> (String, String) {
@@ -654,7 +694,9 @@ fn run_agent_turn<R: Read>(
         TurnDispatch::Plan => TurnKind::Plan,
         TurnDispatch::PlanFollowUp(_) => TurnKind::PlanFollowUp,
         TurnDispatch::PlanImplement(_) => TurnKind::PlanImplement,
+        TurnDispatch::Continue => TurnKind::Continue,
     };
+    state.continue_offered = false;
     if let Some(displayed_input) = displayed_input {
         state.transcript.push_user(displayed_input);
     }
@@ -676,17 +718,29 @@ fn run_agent_turn<R: Read>(
         TurnDispatch::Plan => None,
         TurnDispatch::PlanFollowUp(input) => Some(input),
         TurnDispatch::PlanImplement(input) => input,
+        TurnDispatch::Continue => None,
     };
     let result = turn_interactive(agent, agent_input, kind, state, editor, terminal, events);
     state.transcript.finish_streaming_response();
     let completed = match result {
         Ok(true) => true,
         Ok(false) | Err(Error::Interrupted) => {
-            state.notice("Turn interrupted.");
+            if agent.can_continue() {
+                state.notice("Turn interrupted. Type /continue to pick it up again.");
+            } else {
+                state.notice("Turn interrupted.");
+            }
             false
         }
         Err(error) => {
-            state.notice(format!("Request failed: {error}"));
+            state.continue_offered = agent.can_continue();
+            if state.continue_offered {
+                state.notice(format!(
+                    "Request failed: {error}\nPress Enter to continue where it stopped, or type a new message."
+                ));
+            } else {
+                state.notice(format!("Request failed: {error}"));
+            }
             false
         }
     };

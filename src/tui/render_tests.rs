@@ -81,6 +81,7 @@ fn frame_keeps_input_and_status_pinned() {
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
         queue_paused: false,
+        continue_offered: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -732,6 +733,7 @@ fn loading_state_appears_under_user_prompt_and_animates() {
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
         queue_paused: false,
+        continue_offered: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -835,6 +837,7 @@ fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
         queue_paused: false,
+        continue_offered: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -968,6 +971,7 @@ fn loading_state_ignores_status_activity() {
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
         queue_paused: false,
+        continue_offered: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -1049,6 +1053,7 @@ fn overflow_state() -> ViewState {
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
         queue_paused: false,
+        continue_offered: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -1372,6 +1377,7 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
         queue_paused: false,
+        continue_offered: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -1598,6 +1604,7 @@ fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
         queue_paused: false,
+        continue_offered: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -1766,6 +1773,7 @@ fn mention_menu_lists_matching_files_below_the_input_box() {
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
         queue_paused: false,
+        continue_offered: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -2360,6 +2368,7 @@ fn empty_session_state() -> ViewState {
         queued_inputs: std::collections::VecDeque::new(),
         pending_steers: std::collections::VecDeque::new(),
         queue_paused: false,
+        continue_offered: false,
         active_goal: None,
         goal_running: false,
         active_plan: None,
@@ -2800,6 +2809,114 @@ fn jump_button_appears_when_scrolled_up_and_returns_to_the_bottom() {
     state.transcript.focus();
     state.transcript.open_viewer();
     build_frame(&mut state, &editor, 40, 16);
+    assert!(state.follow.button.is_none());
+}
+
+#[test]
+fn jump_button_highlights_under_the_pointer() {
+    let mut state = overflow_state();
+    let editor = Editor::default();
+    state.scroll_offset = 4;
+    let (resting, _) = build_frame(&mut state, &editor, 40, 16);
+    let button = state.follow.button.expect("jump button");
+    assert!(resting[button.top].contains("\x1b[48;2;238;238;238m"));
+    assert!(resting[button.top].contains("\x1b[38;2;18;18;22m"));
+    assert_eq!(markdown::visible_width(&resting[button.top]), 40);
+
+    let motion = |column, row, kind| crate::tui::events::MouseEvent { kind, column, row };
+    let move_at = |column, row| motion(column, row, crate::tui::events::MouseKind::Move);
+    assert!(!super::state::handle_jump_button_mouse(
+        &mut state,
+        move_at(0, 0)
+    ));
+    assert_eq!(state.scroll_offset, 4);
+    let (still, _) = build_frame(&mut state, &editor, 40, 16);
+    let button = state.follow.button.expect("jump button");
+    assert!(still[button.top].contains("\x1b[48;2;238;238;238m"));
+
+    assert!(super::state::handle_jump_button_mouse(
+        &mut state,
+        move_at(button.left + 2, button.top)
+    ));
+    assert!(super::state::pointer_over_jump_button(&state));
+    let (hovered, _) = build_frame(&mut state, &editor, 40, 16);
+    let hovered_button = state.follow.button.expect("button stays put");
+    assert_eq!(hovered_button, button);
+    // White 238 shifted 24% toward black.
+    assert!(hovered[button.top].contains("\x1b[48;2;180;180;180m"));
+    assert!(hovered[button.top].contains("\x1b[38;2;18;18;22m"));
+    assert!(!hovered[button.top].contains("\x1b[48;2;238;238;238m"));
+    assert_eq!(markdown::visible_width(&hovered[button.top]), 40);
+    assert!(markdown::strip_ansi(&hovered[button.top]).contains("↓ Scroll to bottom"));
+
+    assert!(super::state::handle_jump_button_mouse(
+        &mut state,
+        move_at(button.right - 1, button.top)
+    ));
+    let (still_hovered, _) = build_frame(&mut state, &editor, 40, 16);
+    assert_eq!(still_hovered[button.top], hovered[button.top]);
+
+    // A selection drag keeps the last hover cell instead of tracking the drag.
+    assert!(!super::state::handle_jump_button_mouse(
+        &mut state,
+        motion(0, 0, crate::tui::events::MouseKind::Drag)
+    ));
+    assert!(super::state::pointer_over_jump_button(&state));
+
+    assert!(!super::state::handle_jump_button_mouse(
+        &mut state,
+        move_at(0, 0)
+    ));
+    assert!(!super::state::pointer_over_jump_button(&state));
+    let (left, _) = build_frame(&mut state, &editor, 40, 16);
+    let button = state.follow.button.expect("jump button");
+    assert!(left[button.top].contains("\x1b[48;2;238;238;238m"));
+
+    // A dark accent lightens, and the text color stays the light one.
+    state.accent_color = UiColor::new(20, 40, 80);
+    let (dark_rest, _) = build_frame(&mut state, &editor, 40, 16);
+    let dark_button = state.follow.button.expect("dark button");
+    assert!(dark_rest[dark_button.top].contains("\x1b[48;2;20;40;80m"));
+    assert!(dark_rest[dark_button.top].contains("\x1b[38;2;245;245;245m"));
+    state.follow.pointer = Some((dark_button.left + 1, dark_button.top));
+    let (dark_hover, _) = build_frame(&mut state, &editor, 40, 16);
+    let dark_button = state.follow.button.expect("dark button");
+    assert!(dark_hover[dark_button.top].contains("\x1b[48;2;76;91;122m"));
+    assert!(dark_hover[dark_button.top].contains("\x1b[38;2;245;245;245m"));
+    assert!(!dark_hover[dark_button.top].contains("\x1b[48;2;20;40;80m"));
+
+    // Recentering the pill moves it off a stationary pointer.
+    let (column, row) = state.follow.pointer.expect("pointer");
+    let (wide, _) = build_frame(&mut state, &editor, 120, 16);
+    let wide_button = state.follow.button.expect("wide button");
+    assert!(!wide_button.contains(row, column));
+    assert!(wide[wide_button.top].contains("\x1b[48;2;20;40;80m"));
+    assert!(!wide[wide_button.top].contains("\x1b[48;2;76;91;122m"));
+
+    state.scroll_offset = 0;
+    build_frame(&mut state, &editor, 120, 16);
+    assert!(state.follow.pointer.is_none());
+    assert!(state.follow.button.is_none());
+
+    state.scroll_offset = 4;
+    state.accent_color = UiColor::WHITE;
+    build_frame(&mut state, &editor, 40, 16);
+    let button = state.follow.button.expect("jump button");
+    state.follow.pointer = Some((button.left, button.top));
+    let (again, _) = build_frame(&mut state, &editor, 40, 16);
+    let button = state.follow.button.expect("jump button");
+    assert!(again[button.top].contains("\x1b[48;2;180;180;180m"));
+    assert!(super::state::clear_jump_pointer(&mut state));
+    let (blurred, _) = build_frame(&mut state, &editor, 40, 16);
+    let button = state.follow.button.expect("jump button");
+    assert!(blurred[button.top].contains("\x1b[48;2;238;238;238m"));
+    assert!(!super::state::clear_jump_pointer(&mut state));
+
+    state.follow.pointer = Some((button.left, button.top));
+    state.transcript.focus();
+    state.transcript.open_viewer();
+    build_frame(&mut state, &editor, 40, 16);
+    assert!(state.follow.pointer.is_none());
     assert!(state.follow.button.is_none());
 }
 

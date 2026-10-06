@@ -262,6 +262,19 @@ impl Agent {
             .run_plan_implementation_preserving_cancellation(input, sink)
     }
 
+    /// Whether the last turn stopped early through an error or interrupt
+    /// and can be continued from the saved history.
+    pub(crate) fn can_continue(&self) -> bool {
+        self.conversation.can_continue()
+    }
+
+    pub(crate) fn run_continue_preserving_cancellation(
+        &mut self,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.conversation.run_continue_preserving_cancellation(sink)
+    }
+
     pub(crate) fn has_deferred_subagent_results(&self) -> bool {
         self.subagents().has_deferred()
     }

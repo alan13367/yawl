@@ -59,6 +59,21 @@ pub enum Event {
     Tick,
 }
 
+/// Whether `event` changes the picture by itself. Pointer motion is excluded:
+/// the scroll-to-bottom button redraws only when its hover state changes.
+pub(super) fn event_requests_redraw(event: &Event) -> bool {
+    !matches!(
+        event,
+        Event::Tick
+            | Event::FocusGained
+            | Event::FocusLost
+            | Event::Mouse(MouseEvent {
+                kind: MouseKind::Move,
+                ..
+            })
+    )
+}
+
 pub struct EventReader<R> {
     input: R,
     pending: VecDeque<u8>,
@@ -534,5 +549,21 @@ mod tests {
         assert_eq!(reader.read_event()?, Event::FocusGained);
         assert_eq!(reader.read_event()?, Event::FocusLost);
         Ok(())
+    }
+
+    #[test]
+    fn pointer_motion_does_not_redraw_on_its_own() {
+        assert!(!event_requests_redraw(&Event::Mouse(MouseEvent {
+            kind: MouseKind::Move,
+            column: 1,
+            row: 1,
+        })));
+        assert!(event_requests_redraw(&Event::Mouse(MouseEvent {
+            kind: MouseKind::Press,
+            column: 1,
+            row: 1,
+        })));
+        assert!(!event_requests_redraw(&Event::Tick));
+        assert!(event_requests_redraw(&Event::Key(Key::Enter)));
     }
 }

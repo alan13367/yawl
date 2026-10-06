@@ -18,9 +18,12 @@ use self::hub::{Hub, Outgoing};
 
 use super::ViewState;
 use super::terminal::Terminal;
+use super::transcript::Entry;
 
 /// Size used until the controlling device reports its own.
 pub(super) const DEFAULT_SIZE: (u16, u16) = (48, 32);
+/// Characters of the first prompt kept in the browser tab title.
+const TITLE_PROMPT_CHARS: usize = 48;
 
 /// A consistent view of the remote session for one draw.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -43,6 +46,8 @@ pub(super) struct Remote {
     /// The pairing notice's transcript index and text, hidden once a device
     /// connects or the session ends. Only the UI thread touches it.
     pairing_notice: RefCell<Option<(usize, String)>>,
+    /// Working directory name, which leads the browser tab title.
+    directory: String,
 }
 
 impl Remote {
@@ -50,6 +55,13 @@ impl Remote {
         Self {
             hub: Arc::new(Hub::with_wake()),
             pairing_notice: RefCell::new(None),
+            directory: std::env::current_dir()
+                .ok()
+                .and_then(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -91,6 +103,13 @@ impl Remote {
 
     pub(super) fn send_bell(&self) -> bool {
         self.hub.send(Outgoing::Bell)
+    }
+
+    /// Names the browser tab after this session so several remote sessions
+    /// can be told apart. Unchanged titles are not resent.
+    pub(super) fn update_title(&self, state: &ViewState) {
+        self.hub
+            .set_title(&session_title(&self.directory, state.transcript.entries()));
     }
 
     /// Moves session notices (such as a host Ctrl+C or a pairing lockout)
@@ -275,6 +294,29 @@ fn start(remote: &Remote) -> Result<(), String> {
         .map_err(|error| format!("Could not start remote control: {error}"))
 }
 
+/// The working directory name and the first line of the session's first
+/// prompt, as the resume picker identifies sessions.
+fn session_title(directory: &str, entries: &[Entry]) -> String {
+    let prompt = entries.iter().find_map(|entry| match entry {
+        Entry::User(text) => text.lines().map(str::trim).find(|line| !line.is_empty()),
+        _ => None,
+    });
+    let prompt = prompt.map(|prompt| {
+        let mut chars = prompt.chars();
+        let mut short: String = chars.by_ref().take(TITLE_PROMPT_CHARS).collect();
+        if chars.next().is_some() {
+            short.push('…');
+        }
+        short
+    });
+    match (directory.is_empty(), prompt) {
+        (false, Some(prompt)) => format!("{directory} · {prompt}"),
+        (true, Some(prompt)) => prompt,
+        (false, None) => directory.to_string(),
+        (true, None) => String::new(),
+    }
+}
+
 /// The page URL with the pairing code in its fragment. Browsers never send
 /// the fragment to the server; the page reads it and pairs automatically.
 fn pairing_link(address: SocketAddr, code: &str) -> String {
@@ -366,6 +408,30 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("waiting for it to reconnect"));
         assert!(text.contains("Ctrl+C"));
+    }
+
+    #[test]
+    fn session_title_names_the_directory_and_first_prompt() {
+        let entries = [
+            Entry::Assistant("hello".into()),
+            Entry::User("\n  fix the remote pairing flow  \nmore detail".into()),
+            Entry::User("second".into()),
+        ];
+        assert_eq!(
+            session_title("yawl", &entries),
+            "yawl · fix the remote pairing flow"
+        );
+        assert_eq!(session_title("yawl", &[]), "yawl");
+        assert_eq!(
+            session_title("", &entries[1..]),
+            "fix the remote pairing flow"
+        );
+
+        let long = [Entry::User("x".repeat(TITLE_PROMPT_CHARS + 5))];
+        assert_eq!(
+            session_title("yawl", &long),
+            format!("yawl · {}…", "x".repeat(TITLE_PROMPT_CHARS))
+        );
     }
 
     #[test]
