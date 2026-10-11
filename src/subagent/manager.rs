@@ -38,8 +38,13 @@ struct Shared {
 struct State {
     session_id: String,
     next_id: u64,
+    /// Entries that have not settled, including those queued for a slot.
     active: usize,
+    /// Entries holding one of the `limit` concurrency slots.
+    running: usize,
     limit: usize,
+    /// Orders queued entries so freed slots go to the oldest first.
+    queue_sequence: u64,
     entries: Vec<Entry>,
     deferred: VecDeque<DeferredResult>,
     settlement_sequence: u64,
@@ -60,9 +65,10 @@ struct Entry {
     pending_delivery: Vec<PendingDelivery>,
     suppress_delivery: bool,
     steers: crate::agent::SteerInbox,
-    steer_origins: VecDeque<RunOrigin>,
     /// An accepted orchestrator steer makes this turn eligible for delivery.
     model_steer_accepted: bool,
+    holds_slot: bool,
+    queued_sequence: u64,
 }
 
 #[derive(Clone)]
@@ -98,7 +104,9 @@ impl SubagentManager {
                     session_id,
                     next_id: 1,
                     active: 0,
+                    running: 0,
                     limit: limit.clamp(1, 16),
+                    queue_sequence: 0,
                     entries: Vec::new(),
                     deferred: VecDeque::new(),
                     settlement_sequence: 0,

@@ -203,9 +203,11 @@ Enable with `/settings web_browsing on`. DuckDuckGo search needs no key; Brave a
 
 ## Subagents
 
-Enable with `/settings subagents on`. Children share the working directory, run separate in-memory conversations, and cannot spawn further children. `/subagents` shows their progress; `Enter` lets you take over a child.
+Enable with `/settings subagents on`. Children share the working directory, run separate in-memory conversations, and cannot spawn further children. The main agent delegates substantial work by default, then blocks until every child settles before it continues.
 
-Settings > Subagents controls the default model, concurrency, request budget, and timeout. JSON presets in `~/.yawl/agents/` or `./.yawl/agents/` define roles, models, and tool access. The bundled `scout` preset provides read-only file search and Git inspection. Restricted tools limit available operations; they are not an OS sandbox.
+`/subagents` shows their progress; `Enter` takes over a child. The takeover mirrors the main screen under a `Subagent` header: `Enter` steers a running child or messages a settled one, `Tab` queues a private turn, `Ctrl+O` expands all tool output and thinking (or click one thinking tag or tool card), `Ctrl+C` cancels the run, and `Esc` returns to the dashboard. Steers show who sent them and are marked delivered once the child accepts them.
+
+Settings > Subagents controls the default model, concurrency, request budget, and timeout. Children spawned past the concurrency limit queue and start in order as running ones settle. JSON presets in `~/.yawl/agents/` or `./.yawl/agents/` define roles, models, and tool access. The bundled `scout` preset provides read-only file search and Git inspection. Restricted tools limit available operations; they are not an OS sandbox. A restricted child's prompt lists its allowed tools, and any other call is rejected with that list and what to do instead, so weaker local models stop retrying.
 
 Long reports are saved under `~/.yawl/artifacts/subagents/`, with a summary and path returned to the parent. These files persist until manually removed.
 

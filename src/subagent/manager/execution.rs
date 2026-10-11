@@ -10,6 +10,7 @@ use crate::subagent::types::{
     RunOutcome, SubagentId, SubagentStatus, bounded,
 };
 
+use super::capacity::release_slot;
 use super::delivery::flush_pending_deliveries;
 use super::format::salvage_result;
 use super::{Entry, PendingDelivery, Shared, State, SubagentManager, WorkItem};
@@ -62,6 +63,7 @@ impl SubagentManager {
                     );
                     entry.snapshot.settled_at = Some(Instant::now());
                     state.active = state.active.saturating_sub(1);
+                    release_slot(&mut state, index);
                 }
                 self.shared.changed.notify_all();
                 Err(format!("failed to create subagent worker: {error}"))
@@ -77,7 +79,6 @@ impl SubagentManager {
             .find(|entry| entry.snapshot.id == *id)
         {
             entry.thread_id = Some(crate::cancellation::native_thread_id());
-            entry.snapshot.started_at = Some(Instant::now());
         }
         self.shared.changed.notify_all();
     }
@@ -157,14 +158,14 @@ impl SubagentManager {
                         .map_or_else(String::new, |text| bounded(text, MAX_ERROR_BYTES)),
                 });
             }
-            entry.snapshot.pending_steers.clear();
+            let pending_steers = std::mem::take(&mut entry.snapshot.pending_steers);
             let canceling = entry.snapshot.status == SubagentStatus::Canceling;
             if canceling {
                 leftovers.clear();
                 entry.work.clear();
                 entry.snapshot.queued_messages.clear();
             }
-            requeue_unaccepted_steers(entry, leftovers);
+            requeue_unaccepted_steers(entry, leftovers, pending_steers);
             let next = entry.work.pop_front();
             if !entry.snapshot.queued_messages.is_empty() {
                 entry.snapshot.queued_messages.remove(0);
@@ -213,25 +214,39 @@ impl SubagentManager {
         }
     }
 
+    /// Waits until the entry holds a concurrency slot, then starts the run.
+    /// Returns false when the entry was canceled or the manager shut down.
     pub(super) fn begin_work(&self, id: &SubagentId, work: &WorkItem) -> bool {
         let mut state = self.lock();
-        let Some(index) = state
-            .entries
-            .iter()
-            .position(|entry| entry.snapshot.id == *id)
-        else {
-            return false;
+        let index = loop {
+            let Some(index) = state
+                .entries
+                .iter()
+                .position(|entry| entry.snapshot.id == *id)
+            else {
+                return false;
+            };
+            if state.entries[index].snapshot.status == SubagentStatus::Canceling {
+                state.entries[index].snapshot.latest_outcome = Some(RunOutcome::Interrupted);
+                settle_entry(
+                    &mut state,
+                    index,
+                    RunOutcome::Interrupted,
+                    self.shared.as_ref(),
+                );
+                return false;
+            }
+            if state.shutting_down {
+                return false;
+            }
+            if state.entries[index].holds_slot {
+                break index;
+            }
+            state = match self.shared.changed.wait(state) {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
         };
-        if state.entries[index].snapshot.status == SubagentStatus::Canceling {
-            state.entries[index].snapshot.latest_outcome = Some(RunOutcome::Interrupted);
-            settle_entry(
-                &mut state,
-                index,
-                RunOutcome::Interrupted,
-                self.shared.as_ref(),
-            );
-            return false;
-        }
         state.entries[index].model_steer_accepted = false;
         state.entries[index]
             .snapshot
@@ -285,23 +300,26 @@ impl SubagentManager {
         if was_active {
             state.active = state.active.saturating_sub(1);
         }
+        release_slot(&mut state, index);
         flush_pending_deliveries(&mut state, index);
         self.shared.changed.notify_all();
     }
 }
 
+/// Turns steers the finished run never accepted into queued turns. The
+/// inbox and the pending list hold the same steers in the same order, so the
+/// remaining pending entries name each leftover's sender.
 pub(super) fn requeue_unaccepted_steers(
     entry: &mut Entry,
     leftovers: Vec<crate::provider::TurnInput>,
+    pending: Vec<QueuedSubagentMessage>,
 ) {
+    let mut origins = pending.into_iter().map(|steer| steer.origin);
     for leftover in leftovers {
         if entry.work.len() >= MAX_QUEUE_MESSAGES {
             break;
         }
-        let origin = entry
-            .steer_origins
-            .pop_front()
-            .unwrap_or(RunOrigin::PrivateUser);
+        let origin = origins.next().unwrap_or(RunOrigin::PrivateUser);
         let run_number = entry.next_run_number;
         entry.next_run_number = entry.next_run_number.saturating_add(1);
         entry.work.push_back(WorkItem {
@@ -314,7 +332,6 @@ pub(super) fn requeue_unaccepted_steers(
             origin,
         });
     }
-    entry.steer_origins.clear();
 }
 
 pub(super) fn apply_turn_event(
@@ -338,7 +355,12 @@ pub(super) fn apply_turn_event(
         }
         crate::agent::TurnEvent::SteerAccepted { .. } => {
             let entry = &mut state.entries[index];
-            if entry.steer_origins.pop_front() == Some(RunOrigin::Model) {
+            if entry
+                .snapshot
+                .pending_steers
+                .first()
+                .is_some_and(|steer| steer.origin == RunOrigin::Model)
+            {
                 entry.model_steer_accepted = true;
             }
         }
@@ -362,11 +384,13 @@ fn settle_entry(state: &mut State, index: usize, outcome: RunOutcome, shared: &S
     entry.snapshot.live_reasoning.clear();
     entry.snapshot.current_activity.clear();
     entry.snapshot.pending_steers.clear();
-    entry.steer_origins.clear();
+    entry.snapshot.live_reasoning_started = None;
+    entry.snapshot.live_reasoning_duration = None;
     if shutting_down {
         entry.pending_delivery.clear();
     }
     state.active = state.active.saturating_sub(1);
+    release_slot(state, index);
     if !shutting_down {
         flush_pending_deliveries(state, index);
     }

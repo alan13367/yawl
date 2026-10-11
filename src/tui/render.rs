@@ -12,13 +12,14 @@ mod reasoning;
 mod transcript;
 mod welcome;
 
+pub(super) use activity::activity_color;
 use activity::render_activity_rows;
 pub(super) use cache::{LineOwner, RenderCache};
 use entries::render_entry;
 pub(super) use entries::{entry_default_expanded, render_user_panel};
 #[cfg(test)]
 pub(super) use entries::{render_entries, render_expanded, render_queued_panel};
-pub(super) use reasoning::render_reasoning;
+pub(super) use reasoning::{render_reasoning, render_thinking_tag};
 use transcript::subagent_labels;
 #[cfg(test)]
 pub(super) use transcript::{MODEL_STREAM_STALL, render_loading_state};
@@ -39,7 +40,7 @@ use super::picker::{Picker, PickerAction, picker_is_plan_handoff, render_picker}
 use super::state::{JumpButton, ScrollGeometry, scroll_bar_position, scroll_bar_span};
 use super::{ViewState, markdown};
 
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub(super) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Invalid one-based terminal coordinates signal views that have no editor
 /// and must leave the hardware cursor hidden.
@@ -625,7 +626,7 @@ pub(super) fn build_frame_with_images(
     }
 }
 
-fn composer_top_border(width: usize, label: Option<&str>) -> String {
+pub(super) fn composer_top_border(width: usize, label: Option<&str>) -> String {
     let Some(label) = label else {
         return "─".repeat(width);
     };

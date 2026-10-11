@@ -3,11 +3,13 @@
 //! unknown languages.
 
 const RESET: &str = "\x1b[0m";
-const KEYWORD: &str = "\x1b[1;34m";
-const STRING: &str = "\x1b[32m";
-const NUMBER: &str = "\x1b[35m";
-const COMMENT: &str = "\x1b[2;36m";
-const LITERAL: &str = "\x1b[36m";
+// Truecolor tuned for the dark code background: basic ANSI blue and dim
+// styles fall below readable contrast in many terminal themes.
+pub(super) const KEYWORD: &str = "\x1b[1;38;2;198;160;246m";
+pub(super) const STRING: &str = "\x1b[38;2;166;209;137m";
+pub(super) const NUMBER: &str = "\x1b[38;2;239;159;118m";
+pub(super) const COMMENT: &str = "\x1b[3;38;2;140;146;160m";
+pub(super) const LITERAL: &str = "\x1b[38;2;133;193;220m";
 
 pub fn render_line(language: &str, line: &str) -> String {
     let language = normalize_language(language);
@@ -416,9 +418,9 @@ mod tests {
     #[test]
     fn rust_keywords_strings_and_comments_are_styled() {
         let rendered = render_line("rust", "let name = \"yawl\"; // note");
-        assert!(rendered.contains("\x1b[1;34mlet\x1b[0m"));
-        assert!(rendered.contains("\x1b[32m\"yawl\"\x1b[0m"));
-        assert!(rendered.contains("\x1b[2;36m// note\x1b[0m"));
+        assert!(rendered.contains(&format!("{KEYWORD}let{RESET}")));
+        assert!(rendered.contains(&format!("{STRING}\"yawl\"{RESET}")));
+        assert!(rendered.contains(&format!("{COMMENT}// note{RESET}")));
     }
 
     #[test]

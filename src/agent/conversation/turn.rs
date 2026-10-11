@@ -17,6 +17,20 @@ const MALFORMED_TOOL_CALL_NOTE: &str = "[yawl] Your previous response contained 
 the server could not parse, so it was discarded and nothing ran. Continue the task: \
 re-issue the call with a valid tool name and JSON arguments, or answer in plain text.";
 
+/// Weaker models often invent tool names, so the retry note names the
+/// tools that actually exist.
+fn malformed_tool_call_note(specs: &[std::sync::Arc<crate::provider::ToolSpec>]) -> String {
+    if specs.is_empty() {
+        return format!("{MALFORMED_TOOL_CALL_NOTE} No tools are available; answer in plain text.");
+    }
+    let names = specs
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{MALFORMED_TOOL_CALL_NOTE} Available tools: {names}.")
+}
+
 /// How a turn begins: with optional new input, or by resuming the history
 /// an unfinished turn left behind.
 enum TurnStart {
@@ -595,6 +609,7 @@ impl Conversation {
                 ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(
                     &self.config.home_dir,
                     self.role_fragment(),
+                    registry.restriction_summary().as_deref(),
                     registry.has_web_tools(),
                     registry.skills(),
                 ),
@@ -656,7 +671,7 @@ impl Conversation {
                         )));
                         corrected.get_or_insert_with(|| {
                             let mut messages = self.messages.clone();
-                            messages.push(Message::user(MALFORMED_TOOL_CALL_NOTE));
+                            messages.push(Message::user(malformed_tool_call_note(&specs)));
                             messages
                         });
                     }
@@ -1286,6 +1301,7 @@ impl Conversation {
             ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(
                 &self.config.home_dir,
                 self.role_fragment(),
+                registry.restriction_summary().as_deref(),
                 registry.has_web_tools(),
                 registry.skills(),
             ),
@@ -1363,5 +1379,25 @@ impl Conversation {
         });
         sink(TurnEvent::Compacted { replaced });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod note_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_call_notes_name_the_available_tools() {
+        let spec = |name: &str| {
+            std::sync::Arc::new(crate::provider::ToolSpec {
+                name: name.into(),
+                description: String::new(),
+                input_schema: serde_json::json!({}),
+            })
+        };
+        let note = malformed_tool_call_note(&[spec("read_file"), spec("list_files")]);
+        assert!(note.starts_with(MALFORMED_TOOL_CALL_NOTE));
+        assert!(note.ends_with("Available tools: read_file, list_files."));
+        assert!(malformed_tool_call_note(&[]).ends_with("answer in plain text."));
     }
 }

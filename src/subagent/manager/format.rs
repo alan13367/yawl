@@ -7,28 +7,78 @@ use std::time::{Duration, Instant};
 
 use super::DeferredResult;
 use crate::subagent::types::{
-    MAX_FINAL_RESULT_BYTES, RunOutcome, SubagentSnapshot, SubagentTranscriptItem, bounded,
+    MAX_FINAL_RESULT_BYTES, RunOutcome, SubagentSnapshot, SubagentStatus, SubagentTranscriptItem,
+    bounded,
 };
 
 const SALVAGE_SNIPPET_BYTES: usize = 500;
 
+/// Wait and cancel results. The orchestrator wrote each task and chose its
+/// model, so sections carry only identity, progress, and the full result.
 pub(super) fn format_snapshots(snapshots: &[SubagentSnapshot]) -> String {
+    let now = Instant::now();
     let mut output = String::new();
     for snapshot in snapshots {
         if !output.is_empty() {
             output.push_str("\n\n");
         }
-        output.push_str(&format_detailed_snapshot(snapshot));
+        output.push_str(&format_result_snapshot(snapshot, now));
     }
     output
 }
 
-pub(super) fn format_deferred_result(delivery: &DeferredResult) -> String {
-    let status = match delivery.outcome {
+fn format_result_snapshot(snapshot: &SubagentSnapshot, now: Instant) -> String {
+    let (label, progress) = if snapshot.status.is_active() {
+        let activity = match snapshot.status {
+            SubagentStatus::Queued => "waiting for a free slot",
+            _ if snapshot.current_activity.is_empty() => snapshot.status.label(),
+            _ => &snapshot.current_activity,
+        };
+        (snapshot.status.label(), Some(activity))
+    } else {
+        (
+            snapshot
+                .latest_outcome
+                .map_or(snapshot.status.label(), outcome_label),
+            None,
+        )
+    };
+    let mut output = format!("{} [{label}] {}", snapshot.id, snapshot.name);
+    if let Some(progress) = progress {
+        output.push_str(" · ");
+        output.push_str(progress);
+    }
+    output.push_str(&format!(
+        " · {} · {} request{}",
+        format_duration(snapshot.elapsed(now)),
+        snapshot.requests,
+        if snapshot.requests == 1 { "" } else { "s" }
+    ));
+    if !snapshot.queued_messages.is_empty() {
+        output.push_str(&format!(" · {} queued", snapshot.queued_messages.len()));
+    }
+    if !snapshot.error.is_empty() {
+        output.push_str("\nerror: ");
+        output.push_str(&snapshot.error);
+    }
+    let result = final_output(snapshot);
+    if !result.is_empty() && result != snapshot.error {
+        output.push_str("\nresult:\n");
+        output.push_str(&result);
+    }
+    output
+}
+
+fn outcome_label(outcome: RunOutcome) -> &'static str {
+    match outcome {
         RunOutcome::Completed => "completed",
         RunOutcome::Failed => "failed",
         RunOutcome::Interrupted => "interrupted",
-    };
+    }
+}
+
+pub(super) fn format_deferred_result(delivery: &DeferredResult) -> String {
+    let status = outcome_label(delivery.outcome);
     let body = if delivery.error.is_empty() {
         delivery.result.clone()
     } else if delivery.result.is_empty() {
@@ -65,12 +115,7 @@ pub(super) fn format_detailed_snapshot(snapshot: &SubagentSnapshot) -> String {
         } else {
             &snapshot.current_activity
         },
-        match snapshot.latest_outcome {
-            Some(RunOutcome::Completed) => "completed",
-            Some(RunOutcome::Failed) => "failed",
-            Some(RunOutcome::Interrupted) => "interrupted",
-            None => "pending",
-        },
+        snapshot.latest_outcome.map_or("pending", outcome_label),
         snapshot.completed_turns,
         snapshot.requests,
         snapshot.queued_messages.len()
@@ -147,7 +192,7 @@ pub(super) fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subagent::types::{MAX_TRACKED_SUBAGENTS, SubagentId, SubagentStatus};
+    use crate::subagent::types::{MAX_TRACKED_SUBAGENTS, SubagentId};
 
     #[test]
     fn wait_format_reports_every_id_with_complete_results() {

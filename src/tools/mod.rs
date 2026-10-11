@@ -30,6 +30,24 @@ use crate::subagent::SubagentManager;
 pub use catalog::CatalogCache;
 pub use exec::DescribeCache;
 pub(crate) use user_input::{QuestionBroker, QuestionSnapshot};
+/// Short plain-language purposes for builtin tools named in restriction
+/// notices.
+fn capability(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "read_file" => "read files",
+        "list_files" => "list files",
+        "search_files" => "search file contents",
+        "git_inspect" => "read-only Git status, diffs, and history",
+        "read_skill" => "load skill instructions",
+        "shell" => "run shell commands",
+        "write_file" => "create or overwrite files",
+        "edit_file" => "edit files",
+        "web_search" => "search the web",
+        "web_fetch" => "fetch web pages",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 pub(crate) use user_input::{QuestionOption, UserQuestion};
 
@@ -154,6 +172,8 @@ pub struct Registry {
     background: Option<BackgroundProcessManager>,
     web: Option<web::WebTools>,
     planning_only: bool,
+    /// Set for preset children whose tools come from an allowlist.
+    restricted: bool,
 }
 
 impl Registry {
@@ -177,8 +197,55 @@ impl Registry {
                 .extend(files::entries().into_iter().map(Arc::new));
             registry.entries.push(Arc::new(git::entry()));
             registry.retain_names(allowed);
+            registry.restricted = true;
         }
         registry
+    }
+
+    /// For restricted children, a plain statement of the only tools they
+    /// may call and what that rules out. It goes into the child's system
+    /// prompt and into every rejected call, so weaker models stop retrying.
+    pub(crate) fn restriction_summary(&self) -> Option<String> {
+        if !self.restricted {
+            return None;
+        }
+        let names = self
+            .entries
+            .iter()
+            .map(|entry| entry.spec.name.as_str())
+            .collect::<Vec<_>>();
+        let allowed = if names.is_empty() {
+            "no tools; answer in plain text".to_string()
+        } else {
+            names
+                .iter()
+                .map(|name| match capability(name) {
+                    Some(purpose) => format!("{name} ({purpose})"),
+                    None => (*name).to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut limits = Vec::new();
+        if !names.contains(&"shell") {
+            limits.push("run shell commands or programs");
+        }
+        if !names
+            .iter()
+            .any(|name| matches!(*name, "write_file" | "edit_file"))
+        {
+            limits.push("create, edit, or delete files");
+        }
+        let mut summary = format!("This subagent may use only these tools: {allowed}.");
+        if !limits.is_empty() {
+            summary.push_str(&format!(" It cannot {}.", limits.join(" or ")));
+        }
+        summary.push_str(
+            " Any other tool call fails. When the task needs more, finish with the listed tools \
+             and end with a final answer that reports your findings and states exactly which \
+             change or command the parent agent should make.",
+        );
+        Some(summary)
     }
 
     /// Scans the tools advertised by the persistent main agent without
@@ -212,6 +279,7 @@ impl Registry {
             background,
             web: config.web_browsing.then(|| web::WebTools::new(config)),
             planning_only: false,
+            restricted: false,
         };
         let (skills, warnings) = cache.skills(config);
         registry.warnings.extend(warnings);
@@ -393,6 +461,12 @@ impl Registry {
         supports_images: bool,
     ) -> ToolOutcome {
         let Some(entry) = self.entries.iter().find(|e| e.spec.name == name) else {
+            if let Some(summary) = self.restriction_summary() {
+                return ToolOutcome::error(format!(
+                    "'{name}' is not available to this subagent, so nothing ran. {summary} \
+                     Do not call '{name}' again; it will fail the same way."
+                ));
+            }
             return ToolOutcome::error(format!(
                 "unknown tool '{name}'; available: {}",
                 self.entries
@@ -917,6 +991,53 @@ fi
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, ["read_file", "shell"]);
+    }
+
+    #[test]
+    fn restricted_children_learn_what_they_can_do_when_a_call_is_rejected() {
+        let root = temp_path("restricted-rejection");
+        let config = registry_config(root.join("home"), root.join("project"));
+        let scout = crate::subagent::presets::bundled()
+            .remove(0)
+            .tools
+            .expect("scout allowlist");
+        let registry =
+            Registry::scan_for_child(&config, &mut CatalogCache::default(), Some(&scout));
+
+        let rejected = registry.execute("shell", r#"{"command":"ls"}"#, "session");
+        assert!(rejected.is_error);
+        for expected in [
+            "'shell' is not available to this subagent, so nothing ran.",
+            "read_file (read files)",
+            "git_inspect (read-only Git status, diffs, and history)",
+            "It cannot run shell commands or programs or create, edit, or delete files.",
+            "states exactly which change or command the parent agent should make",
+            "Do not call 'shell' again",
+        ] {
+            assert!(rejected.content.contains(expected), "{}", rejected.content);
+        }
+        let summary = registry.restriction_summary().expect("restricted summary");
+        assert!(summary.starts_with("This subagent may use only these tools:"));
+
+        let mut allowed = scout.clone();
+        allowed.push("shell".into());
+        let with_shell =
+            Registry::scan_for_child(&config, &mut CatalogCache::default(), Some(&allowed));
+        let summary = with_shell
+            .restriction_summary()
+            .expect("restricted summary");
+        assert!(summary.contains("shell (run shell commands)"));
+        assert!(!summary.contains("run shell commands or programs"));
+        assert!(summary.contains("It cannot create, edit, or delete files."));
+
+        let unrestricted = Registry::scan_for_child(&config, &mut CatalogCache::default(), None);
+        assert!(unrestricted.restriction_summary().is_none());
+        let unknown = unrestricted.execute("missing_tool", "{}", "session");
+        assert!(
+            unknown
+                .content
+                .starts_with("unknown tool 'missing_tool'; available:")
+        );
     }
 
     #[test]

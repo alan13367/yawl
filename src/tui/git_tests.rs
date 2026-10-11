@@ -1237,17 +1237,17 @@ fn wrapped_diff_tokens_keep_their_style_when_scrolled() {
             (
                 "a.rs",
                 "// for true 123 let return comment continues here",
-                "\x1b[2;36m",
+                crate::tui::highlight::COMMENT,
             ),
             (
                 "a.py",
                 "# for True 123 def return comment continues here",
-                "\x1b[2;36m",
+                crate::tui::highlight::COMMENT,
             ),
             (
                 "a.rs",
                 "\"for true 123 let return string continues here\"",
-                "\x1b[32m",
+                crate::tui::highlight::STRING,
             ),
         ] {
             let mut state = state();
@@ -1266,10 +1266,13 @@ fn wrapped_diff_tokens_keep_their_style_when_scrolled() {
             for row in &rows[1..] {
                 assert!(row.contains(style), "missing token style in {row:?}");
                 assert!(
-                    !row.contains("\x1b[1;34m"),
+                    !row.contains(crate::tui::highlight::KEYWORD),
                     "token became a keyword: {row:?}"
                 );
-                assert!(!row.contains("\x1b[35m"), "token became a number: {row:?}");
+                assert!(
+                    !row.contains(crate::tui::highlight::NUMBER),
+                    "token became a number: {row:?}"
+                );
                 assert!(markdown::strip_ansi(row).starts_with(&" ".repeat(12)));
             }
         }

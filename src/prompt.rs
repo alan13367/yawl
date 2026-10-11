@@ -77,13 +77,23 @@ fn build_main_system_prompt_from(
     prompt
 }
 
+/// `restriction` states a preset child's allowed tools inside its role
+/// block, so it knows its limits before it tries anything else.
 pub(crate) fn build_subagent_system_prompt(
     global_dir: &Path,
     role_fragment: Option<&str>,
+    restriction: Option<&str>,
     web_browsing: bool,
     skills: &[Skill],
 ) -> String {
     let cwd = std::env::current_dir().ok();
+    let fragment = [role_fragment, restriction]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     build_system_prompt_from(
         cwd.as_deref(),
         global_dir,
@@ -92,7 +102,7 @@ pub(crate) fn build_subagent_system_prompt(
             web_browsing,
             ..PromptOptions::default()
         },
-        role_fragment,
+        (!fragment.is_empty()).then_some(fragment.as_str()),
         skills,
         None,
     )
@@ -238,16 +248,14 @@ Tools:
     if options.subagents {
         prompt.push_str(r#"
 <subagent_guidance>
-- Delegate directly when the task has enough scope; inspect only to resolve missing scope. Use scout for scoped code discovery.
-- Delegate only useful, self-contained work: children lack this conversation and cannot delegate. Give parallel agents disjoint scopes and keep working.
+- Delegate substantial or parallelizable work by default; keep small, tightly coupled steps yourself. Delegate directly when the task has enough scope; inspect only to resolve missing scope. Use scout for scoped code discovery.
+- Delegate self-contained work: children lack this conversation and cannot delegate. Give parallel agents disjoint scopes.
 - Children that change files need write_file or edit_file in required_tools. They skip project-wide formatting, linting, builds, and tests; validate once after all finish. Use paged read_file for long reports.
 - Settled does not mean completed. Resolve missing capabilities or finish the work yourself; do not just relay suggested commands.
-- Before your final response, wait for every spawned subagent and consider each result. "#);
-        prompt.push_str(if options.print_mode {
-            "Print mode delivers settled results after the turn."
-        } else {
-            "TUI results also arrive automatically."
-        });
+- After delegating, wait for every spawned subagent and consider each result before you continue or respond; never redo their work meanwhile."#);
+        if options.print_mode {
+            prompt.push_str(" Print mode delivers settled results after the turn.");
+        }
         prompt.push_str("\n</subagent_guidance>\n");
     }
     if options.is_subagent {
@@ -675,7 +683,30 @@ mod tests {
             block_start < fragment_at && fragment_at < block_end,
             "the preset fragment must land inside the role block"
         );
-        let plain = build_subagent_system_prompt(&dirs.0, None, false, &[]);
+        let plain = build_subagent_system_prompt(&dirs.0, None, None, false, &[]);
+        assert!(!plain.contains("may use only"));
+        let restricted = build_subagent_system_prompt(
+            &dirs.0,
+            Some("You are a scout."),
+            Some("This subagent may use only these tools: read_file (read files)."),
+            false,
+            &[],
+        );
+        let block_start = restricted
+            .find("<subagent_role>")
+            .expect("role block opens");
+        let block_end = restricted
+            .find("</subagent_role>")
+            .expect("role block closes");
+        let limits = restricted
+            .find("may use only these tools")
+            .expect("restriction is present");
+        assert!(block_start < limits && limits < block_end);
+        assert!(
+            restricted
+                .find("You are a scout.")
+                .is_some_and(|role| role < limits)
+        );
         assert!(!plain.contains("You are a scout"));
     }
 

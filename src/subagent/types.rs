@@ -35,6 +35,8 @@ impl fmt::Display for SubagentId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubagentStatus {
+    /// Accepted but waiting for a free concurrency slot.
+    Queued,
     Starting,
     Running,
     Canceling,
@@ -44,11 +46,15 @@ pub(crate) enum SubagentStatus {
 
 impl SubagentStatus {
     pub(crate) fn is_active(self) -> bool {
-        matches!(self, Self::Starting | Self::Running | Self::Canceling)
+        matches!(
+            self,
+            Self::Queued | Self::Starting | Self::Running | Self::Canceling
+        )
     }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::Queued => "queued",
             Self::Starting => "starting",
             Self::Running => "running",
             Self::Canceling => "canceling",
@@ -77,11 +83,16 @@ pub(crate) enum SubagentTranscriptItem {
         text: String,
         private: bool,
     },
-    Steer(String),
+    /// A steer the running turn accepted; `private` marks one from the user.
+    Steer {
+        text: String,
+        private: bool,
+    },
     Assistant(String),
     Reasoning {
         kind: ReasoningKind,
         text: String,
+        duration: Option<Duration>,
     },
     Tool {
         name: String,
@@ -103,6 +114,7 @@ pub(crate) struct LiveTool {
     pub(crate) arguments: String,
     pub(crate) output: String,
     pub(crate) is_error: bool,
+    pub(crate) started: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -131,9 +143,13 @@ pub(crate) struct SubagentSnapshot {
     pub(crate) live_assistant: String,
     pub(crate) live_reasoning: String,
     pub(crate) live_reasoning_kind: Option<ReasoningKind>,
+    pub(crate) live_reasoning_started: Option<Instant>,
+    /// Set once the reply or a tool call follows the live reasoning.
+    pub(crate) live_reasoning_duration: Option<Duration>,
     pub(crate) current_tool: Option<LiveTool>,
     pub(crate) queued_messages: Vec<QueuedSubagentMessage>,
-    pub(crate) pending_steers: Vec<String>,
+    /// Steers waiting for a safe boundary, oldest first.
+    pub(crate) pending_steers: Vec<QueuedSubagentMessage>,
     pub(crate) latest_final_result: String,
     pub(crate) error: String,
     pub(crate) completed_turns: u64,
@@ -172,6 +188,8 @@ impl SubagentSnapshot {
             live_assistant: String::new(),
             live_reasoning: String::new(),
             live_reasoning_kind: None,
+            live_reasoning_started: None,
+            live_reasoning_duration: None,
             current_tool: None,
             queued_messages: Vec::new(),
             pending_steers: Vec::new(),
@@ -195,11 +213,20 @@ impl SubagentSnapshot {
             self.model.clone(),
             self.context_window,
         );
+        result.origin = self.origin;
         result.status = self.status;
         result.created_at = self.created_at;
         result.started_at = self.started_at;
         result.settled_at = self.settled_at;
         result.context_tokens = self.context_tokens;
+        result.requests = self.requests;
+        result.run_tokens = self.run_tokens;
+        result.run_usage = self.run_usage;
+        result.usage = self.usage;
+        result.completed_turns = self.completed_turns;
+        result.current_activity.clone_from(&self.current_activity);
+        result.latest_outcome = self.latest_outcome;
+        result.run_number = self.run_number;
         result.queued_messages = self
             .queued_messages
             .iter()
@@ -217,6 +244,8 @@ impl SubagentSnapshot {
             result.live_assistant.clone_from(&self.live_assistant);
             result.live_reasoning.clone_from(&self.live_reasoning);
             result.live_reasoning_kind = self.live_reasoning_kind;
+            result.live_reasoning_started = self.live_reasoning_started;
+            result.live_reasoning_duration = self.live_reasoning_duration;
             result.current_tool.clone_from(&self.current_tool);
             result.pending_steers.clone_from(&self.pending_steers);
             result.error.clone_from(&self.error);
@@ -253,6 +282,7 @@ impl SubagentSnapshot {
         match event {
             TurnEvent::TextDelta(text) => {
                 self.current_activity = "responding".into();
+                self.end_live_reasoning();
                 append_bounded(&mut self.live_assistant, text, MAX_LIVE_TEXT_BYTES);
             }
             TurnEvent::ReasoningDelta { kind, text } => {
@@ -265,12 +295,15 @@ impl SubagentSnapshot {
                     self.finalize_reasoning();
                 }
                 self.live_reasoning_kind = Some(kind);
+                self.live_reasoning_started.get_or_insert_with(Instant::now);
                 append_bounded(&mut self.live_reasoning, text, MAX_LIVE_TEXT_BYTES);
             }
             TurnEvent::RetryReset => {
                 self.live_assistant.clear();
                 self.live_reasoning.clear();
                 self.live_reasoning_kind = None;
+                self.live_reasoning_started = None;
+                self.live_reasoning_duration = None;
                 self.current_tool = None;
                 self.current_activity = "retrying".into();
             }
@@ -289,12 +322,20 @@ impl SubagentSnapshot {
                 self.live_assistant = bounded(text, MAX_LIVE_TEXT_BYTES);
             }
             TurnEvent::SteerAccepted { text } => {
-                if !self.pending_steers.is_empty() {
-                    self.pending_steers.remove(0);
-                }
-                self.push_transcript(SubagentTranscriptItem::Steer(text.to_string()));
+                // Steers are accepted oldest first, so the front pending
+                // entry names this steer's sender.
+                let origin = if self.pending_steers.is_empty() {
+                    RunOrigin::PrivateUser
+                } else {
+                    self.pending_steers.remove(0).origin
+                };
+                self.push_transcript(SubagentTranscriptItem::Steer {
+                    text: text.to_string(),
+                    private: origin == RunOrigin::PrivateUser,
+                });
             }
             TurnEvent::ToolPreparing { name } => {
+                self.end_live_reasoning();
                 self.current_activity = match name {
                     "write_file" => "preparing write".into(),
                     "edit_file" => "preparing edit".into(),
@@ -303,6 +344,7 @@ impl SubagentSnapshot {
                 };
             }
             TurnEvent::ToolStart { name, args } => {
+                self.end_live_reasoning();
                 self.current_activity = if name == "read_skill" {
                     "loading skill".into()
                 } else {
@@ -313,6 +355,7 @@ impl SubagentSnapshot {
                     arguments: sanitize_preview(args, MAX_TRANSCRIPT_TEXT_BYTES),
                     output: String::new(),
                     is_error: false,
+                    started: Instant::now(),
                 });
             }
             TurnEvent::ToolEnd {
@@ -325,10 +368,12 @@ impl SubagentSnapshot {
                     .current_tool
                     .take()
                     .map_or_else(String::new, |tool| tool.arguments);
+                // Output keeps its line structure; tool cards strip escapes
+                // and control characters per line when they render.
                 self.push_transcript(SubagentTranscriptItem::Tool {
                     name: sanitize_preview(name, MAX_TRANSCRIPT_TEXT_BYTES),
                     arguments,
-                    output: sanitize_preview(output, MAX_TRANSCRIPT_TEXT_BYTES),
+                    output: bounded(output, MAX_TRANSCRIPT_TEXT_BYTES),
                     is_error,
                 });
                 self.current_activity = "sending".into();
@@ -369,7 +414,22 @@ impl SubagentSnapshot {
         self.current_activity.clear();
     }
 
+    /// Stops the thinking timer when the reply or a tool call begins. The
+    /// text stays live until the response ends so a retry can discard it.
+    fn end_live_reasoning(&mut self) {
+        if self.live_reasoning_duration.is_none()
+            && let Some(started) = self.live_reasoning_started
+        {
+            self.live_reasoning_duration = Some(started.elapsed());
+        }
+    }
+
     fn finalize_reasoning(&mut self) {
+        let started = self.live_reasoning_started.take();
+        let duration = self
+            .live_reasoning_duration
+            .take()
+            .or_else(|| started.map(|started| started.elapsed()));
         let Some(kind) = self.live_reasoning_kind.take() else {
             return;
         };
@@ -377,13 +437,17 @@ impl SubagentSnapshot {
             return;
         }
         let text = std::mem::take(&mut self.live_reasoning);
-        self.push_transcript(SubagentTranscriptItem::Reasoning { kind, text });
+        self.push_transcript(SubagentTranscriptItem::Reasoning {
+            kind,
+            text,
+            duration,
+        });
     }
 
     pub(super) fn push_transcript(&mut self, mut item: SubagentTranscriptItem) {
         match &mut item {
             SubagentTranscriptItem::User { text, .. }
-            | SubagentTranscriptItem::Steer(text)
+            | SubagentTranscriptItem::Steer { text, .. }
             | SubagentTranscriptItem::Assistant(text)
             | SubagentTranscriptItem::Reasoning { text, .. } => {
                 *text = bounded(text, MAX_TRANSCRIPT_TEXT_BYTES);
@@ -605,7 +669,103 @@ mod tests {
         }));
         assert!(snapshot.transcript.iter().any(|item| {
             matches!(item.as_ref(), SubagentTranscriptItem::Tool { arguments, output, .. }
-                if arguments == "echo red" && output == "ok next")
+                if arguments == "echo red" && output == "ok\nnext")
         }));
+    }
+
+    #[test]
+    fn accepted_steers_record_their_sender_in_acceptance_order() {
+        let mut snapshot = snapshot();
+        for (text, origin) in [
+            ("from the parent", RunOrigin::Model),
+            ("from the user", RunOrigin::PrivateUser),
+        ] {
+            snapshot.pending_steers.push(QueuedSubagentMessage {
+                text: text.into(),
+                origin,
+            });
+        }
+        snapshot.apply_event(TurnEvent::SteerAccepted {
+            text: "from the parent",
+        });
+        assert_eq!(snapshot.pending_steers.len(), 1);
+        snapshot.apply_event(TurnEvent::SteerAccepted {
+            text: "from the user",
+        });
+        assert!(snapshot.pending_steers.is_empty());
+        assert_eq!(
+            snapshot
+                .transcript
+                .iter()
+                .map(|item| item.as_ref().clone())
+                .collect::<Vec<_>>(),
+            [
+                SubagentTranscriptItem::Steer {
+                    text: "from the parent".into(),
+                    private: false,
+                },
+                SubagentTranscriptItem::Steer {
+                    text: "from the user".into(),
+                    private: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn thinking_time_stops_when_the_reply_starts_and_retries_discard_it() {
+        let mut snapshot = snapshot();
+        snapshot.apply_event(TurnEvent::ReasoningDelta {
+            kind: ReasoningKind::Full,
+            text: "plan",
+        });
+        let started = snapshot.live_reasoning_started.expect("thinking timer");
+        snapshot.apply_event(TurnEvent::TextDelta("partial"));
+        let measured = snapshot.live_reasoning_duration.expect("stopped timer");
+        assert!(measured <= started.elapsed());
+        assert_eq!(
+            snapshot.live_reasoning, "plan",
+            "the text stays live so a retry can discard it"
+        );
+
+        snapshot.apply_event(TurnEvent::RetryReset);
+        assert!(snapshot.live_reasoning_started.is_none());
+        assert!(snapshot.live_reasoning_duration.is_none());
+
+        snapshot.apply_event(TurnEvent::ReasoningDelta {
+            kind: ReasoningKind::Full,
+            text: "second plan",
+        });
+        snapshot.apply_event(TurnEvent::ToolStart {
+            name: "shell",
+            args: "{}",
+        });
+        let measured = snapshot.live_reasoning_duration;
+        snapshot.apply_event(TurnEvent::AssistantDone);
+        assert!(matches!(
+            snapshot.transcript.as_slice(),
+            [item] if matches!(item.as_ref(), SubagentTranscriptItem::Reasoning {
+                text, duration, ..
+            } if text == "second plan" && *duration == measured && duration.is_some())
+        ));
+    }
+
+    #[test]
+    fn display_summaries_keep_progress_fields_for_the_dashboard() {
+        let mut source = snapshot();
+        source.begin_turn("task", RunOrigin::Model, 3);
+        source.apply_event(TurnEvent::ToolStart {
+            name: "shell",
+            args: "{}",
+        });
+        source.requests = 4;
+        let summary = source.display_snapshot(false);
+        assert_eq!(summary.current_activity, "running shell");
+        assert_eq!(summary.requests, 4);
+        assert_eq!(summary.run_number, 3);
+        assert!(
+            summary.current_tool.is_none(),
+            "live tools stay detail-only"
+        );
     }
 }

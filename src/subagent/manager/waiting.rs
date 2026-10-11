@@ -82,8 +82,21 @@ impl SubagentManager {
             .iter()
             .filter(|snapshot| snapshot.status.is_active())
             .count();
+        // An interrupt that also stopped the children (the TUI's Ctrl+C)
+        // leaves them canceling; their results are suppressed, not deferred.
+        let canceling = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.status == SubagentStatus::Canceling)
+            .count();
         if active > 0 {
-            if crate::cancellation::interrupted() {
+            if crate::cancellation::interrupted() && canceling == active {
+                output = format!(
+                    "Wait interrupted: the user stopped this turn and {active} of {} \
+                     subagent(s) with it. Their partial work is below and no further results \
+                     will arrive. Do not restart them unless the user asks.\n\n{output}",
+                    snapshots.len()
+                );
+            } else if crate::cancellation::interrupted() {
                 output = format!(
                     "Wait interrupted with {active} of {} subagent(s) still \
                      running. This turn was canceled; the wait ended, not the work. \
@@ -94,9 +107,10 @@ impl SubagentManager {
             } else if let Some(timeout_secs) = timeout_secs {
                 output = format!(
                     "Wait ended after {timeout_secs}s with {active} of {} subagent(s) still \
-                     running. This is normal: subagent tasks often take 10+ minutes. Their results \
-                     arrive automatically when they settle, so wait again or continue other work. \
-                     Do not cancel a subagent because a wait timed out.\n\n{output}",
+                     running. This is normal: subagent tasks often take 10+ minutes. Call \
+                     subagent_wait again without timeout_secs to block until they finish, and do \
+                     not redo their work meanwhile. Do not cancel a subagent because a wait timed \
+                     out.\n\n{output}",
                     snapshots.len()
                 );
             }
@@ -145,6 +159,9 @@ impl SubagentManager {
                 }
             }
         }
+        // Workers queued for a slot block on the condition variable rather
+        // than in I/O, so they need a notification to observe the cancel.
+        self.shared.changed.notify_all();
         if !private {
             state
                 .deferred
@@ -321,6 +338,7 @@ impl SubagentManager {
         state.entries.clear();
         state.deferred.clear();
         state.active = 0;
+        state.running = 0;
         self.shared.changed.notify_all();
     }
 

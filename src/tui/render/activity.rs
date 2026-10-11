@@ -211,7 +211,9 @@ fn ellipsize(text: &str, width: usize) -> String {
     }
 }
 
-fn activity_color(accent: UiColor) -> UiColor {
+/// Subagent activity ink: cyan or amber, whichever stays farther from the
+/// accent. The takeover view uses it to mark subagent chrome.
+pub(in crate::tui) fn activity_color(accent: UiColor) -> UiColor {
     if perceptual_color_distance(accent, CYAN) >= perceptual_color_distance(accent, AMBER) {
         CYAN
     } else {

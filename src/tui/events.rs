@@ -131,6 +131,9 @@ impl<R: Read> EventReader<R> {
                     Some(b'D') => Key::Left,
                     Some(b'H') => Key::Home,
                     Some(b'F') => Key::End,
+                    // F1-F4 have no binding; swallow them instead of reporting
+                    // Esc followed by a typed letter.
+                    Some(b'P'..=b'S') => return Ok(Event::Tick),
                     Some(other) => {
                         self.pending.push_front(other);
                         Key::Escape
@@ -140,6 +143,18 @@ impl<R: Read> EventReader<R> {
                 Ok(Event::Key(key))
             }
             b'\r' | b'\n' => Ok(Event::Key(Key::Newline)),
+            // A lone Esc followed within the read timeout by another escape
+            // sequence, such as a mouse motion or wheel report. Keep both.
+            0x1b => {
+                self.pending.push_front(next);
+                Ok(Event::Key(Key::Escape))
+            }
+            // Alt-modified control keys (Alt+Backspace sends ESC DEL) act as
+            // the plain control key instead of inserting a control character.
+            0x00..=0x1f | 0x7f => {
+                self.pending.push_front(next);
+                self.read_event()
+            }
             other => {
                 // Alt-modified printable keys are inserted as their base
                 // character. Alt+Enter is handled above as the multiline
@@ -155,6 +170,7 @@ impl<R: Read> EventReader<R> {
 
     fn read_csi(&mut self) -> io::Result<Event> {
         let mut body = Vec::new();
+        let mut overflowed = false;
         let final_byte = loop {
             let Some(byte) = self.read_byte()? else {
                 return Ok(Event::Key(Key::Escape));
@@ -162,11 +178,16 @@ impl<R: Read> EventReader<R> {
             if (0x40..=0x7e).contains(&byte) {
                 break byte;
             }
-            body.push(byte);
-            if body.len() > 64 {
-                return Ok(Event::Key(Key::Escape));
+            // Consume oversized sequences whole so their tail is not typed.
+            if body.len() < 64 {
+                body.push(byte);
+            } else {
+                overflowed = true;
             }
         };
+        if overflowed {
+            return Ok(Event::Tick);
+        }
         let body = String::from_utf8_lossy(&body);
         if final_byte == b'~' && body == "200" {
             return self.read_paste();
@@ -180,7 +201,7 @@ impl<R: Read> EventReader<R> {
             return Ok(parse_mouse(&body, final_byte).unwrap_or(Event::Tick));
         }
         if final_byte == b'u' {
-            return Ok(Event::Key(parse_kitty_key(&body).unwrap_or(Key::Escape)));
+            return Ok(parse_kitty_key(&body).map_or(Event::Tick, Event::Key));
         }
         if body.is_empty() {
             if final_byte == b'I' {
@@ -190,6 +211,8 @@ impl<R: Read> EventReader<R> {
                 return Ok(Event::FocusLost);
             }
         }
+        // Unbound sequences (Shift+Tab, Insert, function keys) are ignored:
+        // a spurious Esc would close views, clear drafts, or cancel questions.
         let key = match (body.as_ref(), final_byte) {
             (_, b'A') => Key::Up,
             (_, b'B') => Key::Down,
@@ -200,7 +223,7 @@ impl<R: Read> EventReader<R> {
             ("3", b'~') => Key::Delete,
             ("5", b'~') => Key::PageUp,
             ("6", b'~') => Key::PageDown,
-            _ => Key::Escape,
+            _ => return Ok(Event::Tick),
         };
         Ok(Event::Key(key))
     }
@@ -324,6 +347,12 @@ fn key_from_encoded(code: u32, modifier: u8) -> Option<Key> {
     if code == 27 {
         return Some(Key::Escape);
     }
+    if code == 9 {
+        return Some(Key::Tab);
+    }
+    if code == 8 || code == 127 {
+        return Some(Key::Backspace);
+    }
     if ctrl
         && let Some(character) = char::from_u32(code)
         && character.is_ascii_alphabetic()
@@ -336,7 +365,13 @@ fn key_from_encoded(code: u32, modifier: u8) -> Option<Key> {
     {
         return Some(Key::Super(character.to_ascii_lowercase()));
     }
-    char::from_u32(code).map(Key::Char)
+    // Control characters and kitty's private-use functional keys (keypad,
+    // media, lone modifiers) have no text to insert.
+    char::from_u32(code)
+        .filter(|character| {
+            !character.is_control() && !('\u{e000}'..='\u{f8ff}').contains(character)
+        })
+        .map(Key::Char)
 }
 
 fn parse_mouse(body: &str, final_byte: u8) -> Option<Event> {
@@ -407,6 +442,65 @@ mod tests {
         let mut reader = EventReader::new(&b"\x1b[27u\x1b[A"[..]);
         assert_eq!(reader.read_event()?, Event::Key(Key::Escape));
         assert_eq!(reader.read_event()?, Event::Key(Key::Up));
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_escape_followed_by_a_mouse_report() -> std::io::Result<()> {
+        let mut reader = EventReader::new(&b"\x1b\x1b[<35;4;2M\x1b\x1b[<64;4;2M"[..]);
+        assert_eq!(reader.read_event()?, Event::Key(Key::Escape));
+        assert_eq!(
+            reader.read_event()?,
+            Event::Mouse(MouseEvent {
+                kind: MouseKind::Move,
+                column: 3,
+                row: 1,
+            })
+        );
+        assert_eq!(reader.read_event()?, Event::Key(Key::Escape));
+        assert_eq!(reader.read_event()?, Event::MouseScroll(3));
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_unbound_sequences_instead_of_reporting_escape() -> std::io::Result<()> {
+        let mut reader = EventReader::new(&b"\x1b[Z\x1b[2~\x1b[15~\x1b[P\x1bOPa"[..]);
+        for _ in 0..5 {
+            assert_eq!(reader.read_event()?, Event::Tick);
+        }
+        assert_eq!(reader.read_event()?, Event::Key(Key::Char('a')));
+        Ok(())
+    }
+
+    #[test]
+    fn consumes_oversized_sequences_whole() -> std::io::Result<()> {
+        let mut bytes = b"\x1b[<".to_vec();
+        bytes.extend([b'1'; 80]);
+        bytes.extend(b"Ma");
+        let mut reader = EventReader::new(&bytes[..]);
+        assert_eq!(reader.read_event()?, Event::Tick);
+        assert_eq!(reader.read_event()?, Event::Key(Key::Char('a')));
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_alt_control_keys_as_the_control_key() -> std::io::Result<()> {
+        let mut reader = EventReader::new(&b"\x1b\x7f\x1b\x03\x1b\t"[..]);
+        assert_eq!(reader.read_event()?, Event::Key(Key::Backspace));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Ctrl('c')));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Tab));
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_kitty_control_and_functional_keys_without_inserting_them() -> std::io::Result<()> {
+        let mut reader =
+            EventReader::new(&b"\x1b[127;3u\x1b[9;5u\x1b[27;5;9~\x1b[57399u\x1b[1u"[..]);
+        assert_eq!(reader.read_event()?, Event::Key(Key::Backspace));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Tab));
+        assert_eq!(reader.read_event()?, Event::Key(Key::Tab));
+        assert_eq!(reader.read_event()?, Event::Tick);
+        assert_eq!(reader.read_event()?, Event::Tick);
         Ok(())
     }
 

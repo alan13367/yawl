@@ -15,9 +15,19 @@ use crate::subagent::types::{
 use super::validation::{find_index, resolve_model, validate_message, validate_name};
 use super::{Entry, State, SubagentManager, WorkItem};
 
+/// A tracked child. Children beyond the concurrency limit wait in FIFO order
+/// and start automatically when an earlier child settles.
+pub(crate) struct Spawned {
+    pub(crate) id: SubagentId,
+    pub(crate) queued: bool,
+}
+
 impl SubagentManager {
     pub(crate) fn set_limit(&self, limit: usize) {
-        self.lock().limit = limit.clamp(1, 16);
+        let mut state = self.lock();
+        state.limit = limit.clamp(1, 16);
+        promote_queued(&mut state);
+        self.shared.changed.notify_all();
     }
 
     #[cfg(test)]
@@ -30,6 +40,7 @@ impl SubagentManager {
         preset: Option<&AgentPreset>,
     ) -> Result<SubagentId, String> {
         self.spawn_with_model(config, parent_model, name, prompt, preset, None)
+            .map(|spawned| spawned.id)
     }
 
     pub(crate) fn spawn_with_model(
@@ -40,7 +51,7 @@ impl SubagentManager {
         prompt: &str,
         preset: Option<&AgentPreset>,
         explicit_model: Option<&str>,
-    ) -> Result<SubagentId, String> {
+    ) -> Result<Spawned, String> {
         let supplied_name = match name.map(str::trim) {
             Some(name) if !name.is_empty() => Some(validate_name(name)?),
             _ => None,
@@ -52,7 +63,7 @@ impl SubagentManager {
             .filter(|model| !model.is_empty() && *model != "inherit");
         let model = resolve_model(&config, parent_model, preset_model, explicit_model)?;
 
-        let (id, conversation, work) = {
+        let (id, conversation, work, queued) = {
             let mut state = self.lock();
             if state.shutting_down {
                 return Err("subagent manager is shutting down".into());
@@ -61,12 +72,6 @@ impl SubagentManager {
             if state.entries.len() >= MAX_TRACKED_SUBAGENTS {
                 return Err(format!(
                     "cannot track more than {MAX_TRACKED_SUBAGENTS} subagents; no settled entry is eligible for pruning"
-                ));
-            }
-            if state.active >= state.limit {
-                return Err(format!(
-                    "subagent capacity is full ({}/{} running)",
-                    state.active, state.limit
                 ));
             }
             let id = SubagentId::new(state.next_id);
@@ -119,7 +124,6 @@ impl SubagentManager {
                 model.clone(),
                 crate::model::context_window(&config, &model),
             );
-            state.active = state.active.saturating_add(1);
             state.entries.push(Entry {
                 snapshot,
                 cancellation,
@@ -131,13 +135,16 @@ impl SubagentManager {
                 pending_delivery: Vec::new(),
                 suppress_delivery: false,
                 steers,
-                steer_origins: VecDeque::new(),
                 model_steer_accepted: false,
+                holds_slot: false,
+                queued_sequence: 0,
             });
-            (id, conversation, work)
+            let index = state.entries.len() - 1;
+            let queued = !admit(&mut state, index);
+            (id, conversation, work, queued)
         };
         self.start_worker(id.clone(), conversation, work)?;
-        Ok(id)
+        Ok(Spawned { id, queued })
     }
 
     pub(crate) fn steer(&self, id: &str, message: &str) -> Result<String, String> {
@@ -151,12 +158,11 @@ impl SubagentManager {
         origin: RunOrigin,
     ) -> Result<String, String> {
         let message = validate_message(message, "message")?;
-        let (enqueue, send_instead) = {
+        {
             let mut state = self.lock();
             let index = find_index(&state, id)?;
-            let is_active = state.entries[index].snapshot.status.is_active();
-            if is_active {
-                let entry = &mut state.entries[index];
+            let entry = &mut state.entries[index];
+            if entry.snapshot.status.is_active() {
                 if entry.snapshot.status == SubagentStatus::Canceling {
                     return Err(format!("{id} is canceling"));
                 }
@@ -165,23 +171,21 @@ impl SubagentManager {
                         "{id} already has {MAX_QUEUE_MESSAGES} queued or steering messages"
                     ));
                 }
+                // The inbox and the pending list change together under the
+                // manager lock, so acceptance order matches pending order.
                 entry.steers.push(crate::provider::TurnInput {
                     text: message.clone(),
                     images: Vec::new(),
                 });
-                entry.snapshot.pending_steers.push(message.clone());
-                entry.steer_origins.push_back(origin);
+                entry.snapshot.pending_steers.push(QueuedSubagentMessage {
+                    text: message,
+                    origin,
+                });
                 self.shared.changed.notify_all();
-                (true, false)
-            } else {
-                (false, true)
+                return Ok(format!("steering {id}"));
             }
-        };
-        if send_instead {
-            return self.send(id, &message, origin);
         }
-        let _ = enqueue;
-        Ok(format!("steering {id}"))
+        self.send(id, &message, origin)
     }
 
     pub(crate) fn send(
@@ -191,7 +195,7 @@ impl SubagentManager {
         origin: RunOrigin,
     ) -> Result<String, String> {
         let message = validate_message(message, "message")?;
-        let id = {
+        let (id, queued) = {
             let mut state = self.lock();
             let index = find_index(&state, id)?;
             let is_active = state.entries[index].snapshot.status.is_active();
@@ -219,16 +223,10 @@ impl SubagentManager {
                 self.shared.changed.notify_all();
                 return Ok(format!("queued message for {id}"));
             }
-            if state.active >= state.limit {
-                return Err(format!(
-                    "subagent capacity is full ({}/{} running)",
-                    state.active, state.limit
-                ));
-            }
-            let entry = &mut state.entries[index];
-            if entry.thread_id.is_none() {
+            if state.entries[index].thread_id.is_none() {
                 return Err(format!("{id} has no live worker"));
             }
+            let entry = &mut state.entries[index];
             let run_number = entry.next_run_number;
             entry.next_run_number = entry.next_run_number.saturating_add(1);
             entry.work.push_back(WorkItem {
@@ -236,17 +234,78 @@ impl SubagentManager {
                 origin,
                 run_number,
             });
-            entry.snapshot.status = SubagentStatus::Starting;
-            entry.snapshot.current_activity = "starting".into();
             entry.snapshot.settled_at = None;
             entry.cancellation.clear();
             entry.suppress_delivery = false;
             let id = entry.snapshot.id.clone();
-            state.active = state.active.saturating_add(1);
+            let queued = !admit(&mut state, index);
             self.shared.changed.notify_all();
-            id
+            (id, queued)
         };
-        Ok(format!("restarted {id}"))
+        Ok(if queued {
+            format!("queued restart for {id}; it starts when a running subagent settles")
+        } else {
+            format!("restarted {id}")
+        })
+    }
+}
+
+/// Gives the entry at `index` a free concurrency slot, or a FIFO queue
+/// position when every slot is busy or an earlier child is already waiting.
+/// Returns whether it holds a slot.
+fn admit(state: &mut State, index: usize) -> bool {
+    let waiting = state
+        .entries
+        .iter()
+        .any(|entry| entry.snapshot.status == SubagentStatus::Queued);
+    let holds_slot = !waiting && state.running < state.limit;
+    if holds_slot {
+        state.running += 1;
+    } else {
+        state.queue_sequence = state.queue_sequence.saturating_add(1);
+    }
+    let queued_sequence = state.queue_sequence;
+    state.active = state.active.saturating_add(1);
+    let entry = &mut state.entries[index];
+    entry.holds_slot = holds_slot;
+    entry.queued_sequence = queued_sequence;
+    entry.snapshot.status = if holds_slot {
+        SubagentStatus::Starting
+    } else {
+        SubagentStatus::Queued
+    };
+    entry.snapshot.current_activity = entry.snapshot.status.label().into();
+    holds_slot
+}
+
+/// Returns a slot held by the entry at `index` and hands free slots to the
+/// oldest queued children. Callers notify waiters afterwards.
+pub(super) fn release_slot(state: &mut State, index: usize) {
+    let entry = &mut state.entries[index];
+    if entry.holds_slot {
+        entry.holds_slot = false;
+        state.running = state.running.saturating_sub(1);
+    }
+    promote_queued(state);
+}
+
+pub(super) fn promote_queued(state: &mut State) {
+    while state.running < state.limit {
+        let Some(index) = state
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.snapshot.status == SubagentStatus::Queued)
+            .min_by_key(|(_, entry)| entry.queued_sequence)
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        state.running += 1;
+        let entry = &mut state.entries[index];
+        entry.holds_slot = true;
+        entry.snapshot.status = SubagentStatus::Starting;
+        entry.snapshot.current_activity = SubagentStatus::Starting.label().into();
     }
 }
 

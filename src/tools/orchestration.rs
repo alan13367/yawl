@@ -72,11 +72,11 @@ pub(super) fn entries(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         .map(|preset| preset.name.clone())
         .collect::<Vec<_>>();
     let spawn_description = format!(
-        "Start a background subagent and return its ID. Prompt contract: # Target (paths, \
-         ownership, non-goals), # Change, # Acceptance. Declare all required tools; omit agent for \
-         writes, commands, or unsupported tools. scout is read-only. Set model only when the \
-         user explicitly requests a listed model; it overrides preset and default models. \
-         Agents: {available_agents}."
+        "Start a background subagent and return its ID; it queues while every slot is busy. \
+         Spawn every parallel task, then wait on all IDs at once. Prompt contract: # Target \
+         (paths, ownership, non-goals), # Change, # Acceptance. Declare all required tools; omit \
+         agent for writes, commands, or unsupported tools. Set model only when the user \
+         explicitly requests a listed model. Agents: {available_agents}."
     );
     vec![
         tool(
@@ -123,13 +123,14 @@ pub(super) fn entries(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         ),
         tool(
             "subagent_wait",
-            "Wait for every ID to finish or fail. Omit timeout_secs to block; set it only for a \
-             bounded status check. Long results include an excerpt and a full report path.",
+            "Wait for every ID to finish or fail. Omit timeout_secs to block until all settle, \
+             however long; set it only for a status check the user asked for. Long results \
+             include an excerpt and a report path.",
             json!({
                 "type": "object",
                 "properties": {
                     "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64},
-                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 300, "description": "Optional bounded wait; omit to block until every ID settles."}
+                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 300, "description": "Omit to block until all settle."}
                 },
                 "required": ["ids"]
             }),
@@ -137,8 +138,8 @@ pub(super) fn entries(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         ),
         tool(
             "subagent_cancel",
-            "Cancel runs and queued work for the IDs, retaining partial transcripts. Use only when \
-             the work is no longer needed.",
+            "Cancel runs and queued work, keeping partial transcripts. Use only when the work is \
+             no longer needed.",
             json!({
                 "type": "object",
                 "properties": {
@@ -150,7 +151,7 @@ pub(super) fn entries(presets: &[AgentPreset]) -> Vec<ToolEntry> {
         ),
         tool(
             "subagent_list",
-            "List all subagents, or status and result for one ID; long results link to full reports.",
+            "List all subagents, or status and result for one ID.",
             json!({
                 "type": "object",
                 "properties": {"id": {"type": "string"}}
@@ -268,7 +269,17 @@ pub(super) fn execute(
                                 preset,
                                 model,
                             )
-                            .map(|id| format!("started {id}"))
+                            .map(|spawned| {
+                                if spawned.queued {
+                                    format!(
+                                        "queued {}; every concurrency slot is busy, so it starts \
+                                         automatically when a running subagent settles",
+                                        spawned.id
+                                    )
+                                } else {
+                                    format!("started {}", spawned.id)
+                                }
+                            })
                     })
                 })
             })
@@ -365,7 +376,16 @@ mod tests {
             .iter()
             .find(|spec| spec.name == "subagent_wait")
             .expect("wait tool present");
-        assert!(wait.description.contains("Omit timeout_secs to block"));
+        assert!(
+            wait.description
+                .contains("Omit timeout_secs to block until all settle")
+        );
+        assert!(
+            spawn
+                .description
+                .contains("Spawn every parallel task, then wait on all IDs at once"),
+            "the orchestrator should fan out before one blocking wait"
+        );
         let cancel = specs
             .iter()
             .find(|spec| spec.name == "subagent_cancel")
@@ -475,7 +495,9 @@ mod tests {
         assert_eq!(default.content, format!("steering {id}"));
         assert!(!queued.is_error, "{}", queued.content);
         assert_eq!(queued.content, format!("queued message for {id}"));
-        assert_eq!(snapshot.pending_steers, ["finish with a summary"]);
+        assert_eq!(snapshot.pending_steers.len(), 1);
+        assert_eq!(snapshot.pending_steers[0].text, "finish with a summary");
+        assert_eq!(snapshot.pending_steers[0].origin, RunOrigin::Model);
         assert_eq!(snapshot.queued_messages.len(), 1);
         assert_eq!(snapshot.queued_messages[0].text, "another turn");
         let invalid = execute(

@@ -67,8 +67,9 @@ fn test_entry(status: SubagentStatus) -> Entry {
         pending_delivery: Vec::new(),
         suppress_delivery: false,
         steers: crate::agent::SteerInbox::default(),
-        steer_origins: VecDeque::new(),
         model_steer_accepted: false,
+        holds_slot: status.is_active(),
+        queued_sequence: 0,
     }
 }
 
@@ -568,10 +569,15 @@ fn active_capacity_and_queue_limits_are_reserved_synchronously() {
         .recv_timeout(Duration::from_secs(5))
         .expect("first worker should reach the provider");
 
-    let error = manager
-        .spawn(config, "local:model", Some("second"), "work", None)
-        .expect_err("a simultaneous spawn must not exceed capacity");
-    assert!(error.contains("capacity is full"));
+    let second = manager
+        .spawn_with_model(config, "local:model", Some("second"), "work", None, None)
+        .expect("a spawn past the limit must queue instead of failing");
+    assert!(second.queued);
+    {
+        let state = manager.lock();
+        assert_eq!((state.active, state.running), (2, 1));
+        assert_eq!(state.entries[1].snapshot.status, SubagentStatus::Queued);
+    }
     for index in 0..MAX_QUEUE_MESSAGES {
         manager
             .send(id.as_str(), &format!("queued {index}"), RunOrigin::Model)
@@ -586,9 +592,120 @@ fn active_capacity_and_queue_limits_are_reserved_synchronously() {
     manager.interrupt_all();
     release_tx.send(()).expect("release provider response");
     manager
-        .wait(&[id.to_string()], Some(5))
-        .expect("canceled worker should settle");
+        .wait(&[id.to_string(), second.id.to_string()], Some(5))
+        .expect("canceled workers should settle");
+    assert_eq!(manager.active_count(), 0);
+    assert_eq!(manager.lock().running, 0);
     server.join().expect("provider server should exit");
+    manager.shutdown_and_discard();
+}
+
+#[test]
+fn spawns_past_the_limit_start_in_order_as_slots_free() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
+    let base_url = format!(
+        "http://{}/v1",
+        listener.local_addr().expect("test provider address")
+    );
+    let (task_tx, task_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        for index in 0..3 {
+            let (mut stream, _) = listener.accept().expect("subagent provider connection");
+            let request = read_request(&mut stream).expect("subagent provider request");
+            let task = ["task alpha", "task beta", "task gamma"]
+                .into_iter()
+                .find(|task| request.contains(task))
+                .unwrap_or("unknown");
+            task_tx.send(task).expect("task order receiver");
+            if index == 0 {
+                release_rx.recv().expect("release signal");
+            }
+            write_response(&mut stream, &format!("{task} done")).expect("provider response");
+        }
+    });
+    let config = provider_config(base_url);
+    let manager = SubagentManager::new("session".into(), 1);
+    let spawn = |name: &str, task: &str| {
+        manager
+            .spawn_with_model(config.clone(), "local:model", Some(name), task, None, None)
+            .expect("spawn")
+    };
+    let alpha = spawn("alpha", "task alpha");
+    assert!(!alpha.queued);
+    assert_eq!(
+        task_rx.recv_timeout(Duration::from_secs(5)),
+        Ok("task alpha")
+    );
+    let beta = spawn("beta", "task beta");
+    let dropped = spawn("dropped", "task dropped");
+    let gamma = spawn("gamma", "task gamma");
+    assert!(beta.queued && dropped.queued && gamma.queued);
+
+    let canceled = manager
+        .cancel(&[dropped.id.to_string()], false)
+        .expect("cancel a queued child");
+    assert!(
+        canceled.contains("[interrupted] dropped"),
+        "a queued child cancels without running: {canceled}"
+    );
+    let waited = manager
+        .wait(&[beta.id.to_string()], Some(1))
+        .expect("bounded wait on a queued child");
+    assert!(
+        waited.contains("[queued] beta · waiting for a free slot"),
+        "{waited}"
+    );
+
+    release_tx.send(()).expect("release the first child");
+    let ids = [alpha.id, beta.id, gamma.id]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let output = manager.wait(&ids, Some(10)).expect("queued children run");
+    assert_eq!(
+        task_rx.recv_timeout(Duration::from_secs(5)),
+        Ok("task beta")
+    );
+    assert_eq!(
+        task_rx.recv_timeout(Duration::from_secs(5)),
+        Ok("task gamma")
+    );
+    for name in ["alpha", "beta", "gamma"] {
+        assert!(output.contains(&format!("[completed] {name}")), "{output}");
+        assert!(output.contains(&format!("task {name} done")), "{output}");
+    }
+    assert!(
+        !output.contains("initial task:") && !output.contains("model:"),
+        "wait results stay compact: {output}"
+    );
+    let state = manager.lock();
+    assert_eq!((state.active, state.running), (0, 0));
+    drop(state);
+    server.join().expect("provider server should exit");
+    manager.shutdown_and_discard();
+}
+
+#[test]
+fn raising_the_limit_starts_queued_children() {
+    let manager = SubagentManager::new("session".into(), 1);
+    {
+        let mut state = manager.lock();
+        state.active = 2;
+        state.running = 1;
+        state.entries.push(test_entry(SubagentStatus::Running));
+        let mut queued = test_entry(SubagentStatus::Queued);
+        queued.snapshot.id = SubagentId::new(2);
+        queued.holds_slot = false;
+        queued.queued_sequence = 1;
+        state.entries.push(queued);
+    }
+    manager.set_limit(2);
+    let state = manager.lock();
+    assert_eq!(state.running, 2);
+    assert!(state.entries[1].holds_slot);
+    assert_eq!(state.entries[1].snapshot.status, SubagentStatus::Starting);
+    drop(state);
     manager.shutdown_and_discard();
 }
 
@@ -719,6 +836,34 @@ fn interrupted_wait_explains_that_the_work_continues() {
         .wait(&[id.to_string()], Some(5))
         .expect("released subagent should settle");
     server.join().expect("provider server should exit");
+    manager.shutdown_and_discard();
+}
+
+#[test]
+fn interrupted_wait_reports_children_stopped_with_the_turn() {
+    let manager = SubagentManager::new("session".into(), 1);
+    {
+        let mut state = manager.lock();
+        state.active = 1;
+        state.entries.push(test_entry(SubagentStatus::Canceling));
+    }
+    let token = CancellationToken::default();
+    token.cancel();
+    let output = crate::cancellation::scope(&token, || manager.wait(&["sa-1".into()], None))
+        .expect("an interrupted wait still reports status");
+    assert!(
+        output.contains("the user stopped this turn and 1 of 1 subagent(s) with it"),
+        "{output}"
+    );
+    assert!(
+        output.contains("no further results will arrive"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("Their results arrive automatically"),
+        "stopped children must not promise later results: {output}"
+    );
+    manager.lock().shutting_down = true;
     manager.shutdown_and_discard();
 }
 
@@ -986,8 +1131,9 @@ fn pruning_keeps_active_waited_and_undelivered_entries() {
             pending_delivery: Vec::new(),
             suppress_delivery: false,
             steers: crate::agent::SteerInbox::default(),
-            steer_origins: VecDeque::new(),
             model_steer_accepted: false,
+            holds_slot: false,
+            queued_sequence: 0,
         });
     }
     state.deferred.push_back(DeferredResult {
@@ -1159,7 +1305,11 @@ fn accepted_model_steers_deliver_a_private_turn_once_without_queueing() {
         "keep the initiating origin"
     );
     assert!(snapshot.transcript.iter().any(|item| matches!(
-        item.as_ref(), SubagentTranscriptItem::Steer(text) if text == "first model steer"
+        item.as_ref(), SubagentTranscriptItem::Steer { text, private: false } if text == "first model steer"
+    )));
+    assert!(snapshot.transcript.iter().any(|item| matches!(
+        item.as_ref(),
+        SubagentTranscriptItem::Steer { text, private: true } if text == "private steer after model steers"
     )));
     let deliveries = manager.drain_deferred();
     // A later private turn must not inherit the model steer's delivery obligation.
@@ -1443,17 +1593,26 @@ fn unaccepted_model_steers_keep_their_origin_when_requeued() {
         },
     );
     let entry = &mut state.entries[0];
+    assert!(matches!(
+        entry.snapshot.transcript.last().map(Arc::as_ref),
+        Some(SubagentTranscriptItem::Steer { text, private: true }) if text == "accepted private steer"
+    ));
+    assert!(
+        !entry.model_steer_accepted,
+        "a private steer must not make the run deliverable"
+    );
+    let pending = std::mem::take(&mut entry.snapshot.pending_steers);
     requeue_unaccepted_steers(
         entry,
         vec![crate::provider::TurnInput {
             text: "late model steer".into(),
             images: Vec::new(),
         }],
+        pending,
     );
     assert_eq!(entry.work.len(), 1);
     assert_eq!(entry.work[0].origin, RunOrigin::Model);
     assert_eq!(entry.snapshot.queued_messages[0].origin, RunOrigin::Model);
-    assert!(entry.steer_origins.is_empty());
 }
 
 #[test]
@@ -1602,7 +1761,8 @@ fn explicit_listed_model_overrides_preset_and_config_without_removing_preset_lim
             Some(&preset),
             Some("local:requested"),
         )
-        .expect("explicit model spawn");
+        .expect("explicit model spawn")
+        .id;
     let snapshot = manager
         .snapshots()
         .into_iter()

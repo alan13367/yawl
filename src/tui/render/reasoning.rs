@@ -10,7 +10,7 @@ use super::{SPINNER_FRAMES, foreground_color};
 /// reasoning streams (the timer is not shown until it settles), then
 /// `+ Thought: 4.2s` in an accent-derived colour, `- Thought: 4.2s` dimmed when
 /// expanded.
-pub(super) fn render_thinking_tag(
+pub(in crate::tui) fn render_thinking_tag(
     elapsed: Option<std::time::Duration>,
     streaming: bool,
     expanded: bool,

@@ -13,29 +13,46 @@ const INLINE_CODE: &str = "\x1b[38;2;155;188;198m";
 /// skill cards. Background ANSI never survives `strip_ansi`, so drag-select
 /// copies stay clean.
 const CODE_BACKGROUND: &str = "\x1b[48;2;36;34;30m";
+/// Truecolor so headings and markers read the same in every terminal theme;
+/// basic ANSI blue renders near-black on many dark palettes.
+const HEADING_MAJOR: &str = "\x1b[1;38;2;137;180;250m";
+const HEADING_MINOR: &str = "\x1b[1;38;2;180;205;250m";
+const HEADING: &str = "\x1b[1m";
+const MARKER: &str = "\x1b[38;2;116;199;213m";
+const MUTED: &str = "\x1b[38;2;140;146;160m";
+const BOLD: &str = "\x1b[1m";
+const ITALIC: &str = "\x1b[3m";
+const STRIKE: &str = "\x1b[9m";
+const UNDERLINE: &str = "\x1b[4m";
+/// Lists nest visibly without letting deep indentation eat narrow panes.
+const MAX_INDENT: usize = 12;
+/// Bounds the `<url>` lookahead so text full of `<` stays linear.
+const MAX_AUTOLINK_CHARS: usize = 2048;
 
 pub fn render(markdown: &str, width: usize) -> Vec<String> {
     let width = width.max(8);
     let source: Vec<&str> = markdown.lines().collect();
     let mut output = Vec::new();
     let mut index = 0usize;
-    let mut code_language: Option<String> = None;
+    let mut fence: Option<Fence> = None;
+    // Content column of the latest list item; indented lines that follow it
+    // continue the item instead of starting a flush-left paragraph.
+    let mut list_content: Option<usize> = None;
 
     while index < source.len() {
         let line = source[index];
         let trimmed = line.trim_start();
-        if let Some(language) = &code_language {
-            if trimmed.starts_with("```") {
-                code_language = None;
+        if let Some(open) = &fence {
+            if open.closes(trimmed) {
+                fence = None;
             } else {
-                render_code_line(language, line, width, &mut output);
+                render_code_line(&open.language, open.strip_indent(line), width, &mut output);
             }
             index += 1;
             continue;
         }
-        if let Some(info) = trimmed.strip_prefix("```") {
-            let language = info.split_whitespace().next().unwrap_or("").to_string();
-            code_language = Some(language);
+        if let Some(open) = Fence::open(line) {
+            fence = Some(open);
             index += 1;
             continue;
         }
@@ -48,42 +65,35 @@ pub fn render(markdown: &str, width: usize) -> Vec<String> {
                 index += 1;
             }
             render_table(&rows, width, &mut output);
+            list_content = None;
             continue;
         }
 
+        let indent = leading_columns(line).min(MAX_INDENT);
         if trimmed.is_empty() {
             output.push(String::new());
         } else if let Some((level, content)) = heading(trimmed) {
-            let prefix = format!("{} ", "#".repeat(level));
-            let styled = format!("\x1b[1;34m{}\x1b[0m", render_inline(content));
-            push_wrapped(
-                &prefix,
-                &" ".repeat(visible_width(&prefix)),
-                &styled,
-                width,
-                &mut output,
-            );
-        } else if let Some(content) = trimmed
-            .strip_prefix("> ")
-            .or_else(|| trimmed.strip_prefix('>'))
-        {
-            push_wrapped(
-                "\x1b[36m│\x1b[0m ",
-                "  ",
-                &render_inline(content.trim_start()),
-                width,
-                &mut output,
-            );
-        } else if let Some(content) = unordered_item(trimmed) {
-            push_wrapped(
-                "\x1b[36m•\x1b[0m ",
-                "  ",
-                &render_inline(content),
-                width,
-                &mut output,
-            );
-        } else if let Some((prefix, content)) = ordered_item(trimmed) {
-            let continuation = " ".repeat(visible_width(&prefix));
+            let style = match level {
+                1 => HEADING_MAJOR,
+                2 => HEADING_MINOR,
+                _ => HEADING,
+            };
+            let styled = format!("{style}{}{RESET}", render_inline_styled(content, style));
+            push_wrapped("", "", &styled, width, &mut output);
+            list_content = None;
+        } else if is_rule(trimmed) {
+            output.push(format!("{MUTED}{}{RESET}", "─".repeat(width)));
+            list_content = None;
+        } else if let Some((depth, content)) = blockquote(trimmed) {
+            let bars = format!("{MARKER}{}{RESET}", "│ ".repeat(depth));
+            let blank = " ".repeat(depth * 2);
+            let styled = format!("{MUTED}{}{RESET}", render_inline_styled(content, MUTED));
+            push_wrapped(&bars, &blank, &styled, width, &mut output);
+        } else if let Some((marker, content)) = list_item(trimmed, indent) {
+            let pad = " ".repeat(indent);
+            let prefix = format!("{pad}{MARKER}{marker}{RESET} ");
+            let continuation = " ".repeat(indent + visible_width(&marker) + 1);
+            list_content = Some(continuation.len());
             push_wrapped(
                 &prefix,
                 &continuation,
@@ -91,10 +101,12 @@ pub fn render(markdown: &str, width: usize) -> Vec<String> {
                 width,
                 &mut output,
             );
-        } else if is_rule(trimmed) {
-            output.push(format!("\x1b[2m{}\x1b[0m", "─".repeat(width)));
+        } else if let Some(column) = list_content.filter(|_| indent > 0) {
+            let pad = " ".repeat(column);
+            push_wrapped(&pad, &pad, &render_inline(trimmed), width, &mut output);
         } else {
             push_wrapped("", "", &render_inline(trimmed), width, &mut output);
+            list_content = None;
         }
         index += 1;
     }
@@ -105,33 +117,122 @@ pub fn render(markdown: &str, width: usize) -> Vec<String> {
     output
 }
 
+/// An open fenced code block: its marker, minimum length, opening indent,
+/// and info-string language.
+struct Fence {
+    marker: char,
+    length: usize,
+    indent: usize,
+    language: String,
+}
+
+impl Fence {
+    fn open(line: &str) -> Option<Self> {
+        let trimmed = line.trim_start();
+        let marker = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+        let length = trimmed.chars().take_while(|c| *c == marker).count();
+        if length < 3 {
+            return None;
+        }
+        let info = trimmed[length..].trim();
+        // Backtick fences cannot carry backticks in their info string, so
+        // inline code that starts a line is not mistaken for a fence.
+        if marker == '`' && info.contains('`') {
+            return None;
+        }
+        Some(Self {
+            marker,
+            length,
+            indent: line.len() - trimmed.len(),
+            language: info.split_whitespace().next().unwrap_or("").to_string(),
+        })
+    }
+
+    fn closes(&self, trimmed: &str) -> bool {
+        let run = trimmed.chars().take_while(|c| *c == self.marker).count();
+        run >= self.length && trimmed[run..].trim().is_empty()
+    }
+
+    /// Fences nested in list items are indented; drop that shared indent so
+    /// the code keeps its own alignment.
+    fn strip_indent<'a>(&self, line: &'a str) -> &'a str {
+        let removable = line
+            .bytes()
+            .take(self.indent)
+            .take_while(|byte| *byte == b' ')
+            .count();
+        &line[removable..]
+    }
+}
+
+fn leading_columns(line: &str) -> usize {
+    line.chars()
+        .take_while(|character| character.is_whitespace())
+        .map(|character| if character == '\t' { 4 } else { 1 })
+        .sum()
+}
+
 fn heading(line: &str) -> Option<(usize, &str)> {
     let level = line
         .chars()
         .take_while(|character| *character == '#')
         .count();
-    if (1..=6).contains(&level) && line.as_bytes().get(level) == Some(&b' ') {
-        Some((level, line[level + 1..].trim()))
-    } else {
-        None
+    if !(1..=6).contains(&level) {
+        return None;
     }
+    let rest = &line[level..];
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    // Closing hashes are decoration: `## Title ##`.
+    let content = rest.trim();
+    let content = content
+        .trim_end_matches('#')
+        .strip_suffix(' ')
+        .map_or(content, str::trim_end);
+    Some((level, content))
 }
 
-fn unordered_item(line: &str) -> Option<&str> {
-    ["- ", "* ", "+ "]
+fn blockquote(line: &str) -> Option<(usize, &str)> {
+    let mut depth = 0;
+    let mut rest = line;
+    while let Some(after) = rest.strip_prefix('>') {
+        depth += 1;
+        rest = after.trim_start();
+    }
+    (depth > 0).then_some((depth, rest))
+}
+
+/// Bullet or ordered list item, with task-list checkboxes. Nested bullets
+/// switch glyphs so depth stays readable without the source indentation.
+fn list_item(line: &str, indent: usize) -> Option<(String, &str)> {
+    if let Some(content) = ["- ", "* ", "+ "]
         .iter()
         .find_map(|prefix| line.strip_prefix(prefix))
-}
-
-fn ordered_item(line: &str) -> Option<(String, &str)> {
+    {
+        let bullet = if indent == 0 { "•" } else { "◦" };
+        if let Some(rest) = content.strip_prefix("[ ] ") {
+            return Some(("☐".into(), rest));
+        }
+        if let Some(rest) = content
+            .strip_prefix("[x] ")
+            .or_else(|| content.strip_prefix("[X] "))
+        {
+            return Some(("☑".into(), rest));
+        }
+        return Some((bullet.into(), content));
+    }
     let digits = line
         .chars()
         .take_while(|character| character.is_ascii_digit())
         .count();
-    if digits == 0 || !line[digits..].starts_with(". ") {
+    if digits == 0 || digits > 9 {
         return None;
     }
-    Some((format!("{} ", &line[..=digits]), &line[digits + 2..]))
+    let rest = &line[digits..];
+    let delimiter = rest.chars().next().filter(|c| matches!(c, '.' | ')'))?;
+    let content = rest[1..].strip_prefix(' ')?;
+    Some((format!("{}{delimiter}", &line[..digits]), content))
 }
 
 fn is_rule(line: &str) -> bool {
@@ -139,10 +240,12 @@ fn is_rule(line: &str) -> bool {
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
+    let Some(first) = compact.chars().next() else {
+        return false;
+    };
     compact.len() >= 3
-        && compact
-            .chars()
-            .all(|character| character == '-' || character == '*' || character == '_')
+        && matches!(first, '-' | '*' | '_')
+        && compact.chars().all(|character| character == first)
 }
 
 fn render_code_line(language: &str, line: &str, width: usize, output: &mut Vec<String>) {
@@ -166,62 +269,229 @@ fn render_code_line(language: &str, line: &str, width: usize, output: &mut Vec<S
 }
 
 fn render_inline(text: &str) -> String {
+    render_inline_styled(text, "")
+}
+
+/// Renders inline markdown inside a block whose own style is `base`. Each
+/// span ends with a reset followed by `base`, so a bold word or code span in
+/// a heading or quote returns to the surrounding style instead of plain text.
+fn render_inline_styled(text: &str, base: &str) -> String {
     let chars: Vec<char> = sanitize(text).chars().collect();
     let mut output = String::new();
-    let mut index = 0usize;
+    render_spans(&chars, base, &mut output);
+    output
+}
+
+/// Emphasis delimiters, longest first so `***` is not read as `**` + `*`.
+const EMPHASIS: [(&str, &str); 7] = [
+    ("***", "\x1b[1;3m"),
+    ("___", "\x1b[1;3m"),
+    ("**", BOLD),
+    ("__", BOLD),
+    ("~~", STRIKE),
+    ("*", ITALIC),
+    ("_", ITALIC),
+];
+
+fn render_spans(chars: &[char], base: &str, output: &mut String) {
+    let code = code_spans(chars);
+    let closers = EMPHASIS.map(|(marker, _)| emphasis_closers(chars, marker, &code));
     let mut labels = DelimiterSearch::default();
     let mut urls = DelimiterSearch::default();
-    while index < chars.len() {
-        if starts_with(&chars, index, "**")
-            && let Some(end) = find_marker(&chars, index + 2, "**")
-        {
-            output.push_str("\x1b[1m");
-            output.extend(&chars[index + 2..end]);
-            output.push_str(RESET);
-            index = end + 2;
-        } else if chars[index] == '`'
-            && let Some(end) = chars[index + 1..]
-                .iter()
-                .position(|character| *character == '`')
-        {
-            let end = index + 1 + end;
+    let mut code_index = 0usize;
+    let mut index = 0usize;
+    'scan: while index < chars.len() {
+        while code.get(code_index).is_some_and(|span| span.end <= index) {
+            code_index += 1;
+        }
+        if let Some(span) = code.get(code_index).filter(|span| span.start == index) {
             output.push_str(INLINE_CODE);
-            output.extend(&chars[index + 1..end]);
+            output.extend(trim_code(&chars[span.content.clone()]));
             output.push_str(RESET);
-            index = end + 1;
-        } else if chars[index] == '['
-            && let Some(close_label) = labels.find(&chars, index + 1, ']')
+            output.push_str(base);
+            index = span.end;
+            continue;
+        }
+        let character = chars[index];
+        if character == '\\'
+            && let Some(next) = chars.get(index + 1).filter(|c| c.is_ascii_punctuation())
+        {
+            output.push(*next);
+            index += 2;
+            continue;
+        }
+        if character == '['
+            && let Some(close_label) = labels.find(chars, index + 1, ']')
         {
             if chars.get(close_label + 1) == Some(&'(')
-                && let Some(close_url) = urls.find(&chars, close_label + 2, ')')
+                && let Some(close_url) = urls.find(chars, close_label + 2, ')')
             {
-                output.push_str("\x1b[4m");
-                output.extend(&chars[index + 1..close_label]);
+                let underlined = format!("{base}{UNDERLINE}");
+                output.push_str(UNDERLINE);
+                render_spans(&chars[index + 1..close_label], &underlined, output);
                 output.push_str(RESET);
+                output.push_str(base);
                 output.push_str(" \x1b[2m(");
                 output.extend(&chars[close_label + 2..close_url]);
-                output.push_str(")\x1b[0m");
+                output.push(')');
+                output.push_str(RESET);
+                output.push_str(base);
                 index = close_url + 1;
                 continue;
             }
-            output.push(chars[index]);
+            output.push(character);
             index += 1;
-        } else if matches!(chars[index], '*' | '_')
-            && let Some(end) = chars[index + 1..]
+            continue;
+        }
+        if character == '<'
+            && let Some(close) = chars[index + 1..]
                 .iter()
-                .position(|character| *character == chars[index])
+                .take(MAX_AUTOLINK_CHARS)
+                .position(|c| *c == '>')
         {
-            let end = index + 1 + end;
-            output.push_str("\x1b[3m");
-            output.extend(&chars[index + 1..end]);
+            let inner = &chars[index + 1..index + 1 + close];
+            let link = inner.iter().collect::<String>();
+            if (link.starts_with("http://") || link.starts_with("https://"))
+                && !inner.iter().any(|c| c.is_whitespace())
+            {
+                output.push_str(UNDERLINE);
+                output.push_str(&link);
+                output.push_str(RESET);
+                output.push_str(base);
+                index += close + 2;
+                continue;
+            }
+        }
+        for (slot, (marker, style)) in EMPHASIS.iter().enumerate() {
+            let length = marker.chars().count();
+            if !opens_emphasis(chars, index, marker) {
+                continue;
+            }
+            let first_closer =
+                closers[slot].partition_point(|position| *position < index + length + 1);
+            let Some(&close) = closers[slot].get(first_closer) else {
+                continue;
+            };
+            let nested = format!("{base}{style}");
+            output.push_str(style);
+            render_spans(&chars[index + length..close], &nested, output);
             output.push_str(RESET);
-            index = end + 1;
+            output.push_str(base);
+            index = close + length;
+            continue 'scan;
+        }
+        output.push(character);
+        index += 1;
+    }
+}
+
+struct CodeSpan {
+    start: usize,
+    end: usize,
+    content: std::ops::Range<usize>,
+}
+
+/// Backtick runs pair with the next run of the same length, as in CommonMark.
+fn code_spans(chars: &[char]) -> Vec<CodeSpan> {
+    let mut runs = Vec::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] == '`' && (index == 0 || chars[index - 1] != '\\') {
+            let length = chars[index..].iter().take_while(|c| **c == '`').count();
+            runs.push((index, length));
+            index += length;
         } else {
-            output.push(chars[index]);
             index += 1;
         }
     }
-    output
+    let mut spans = Vec::new();
+    let mut run = 0usize;
+    while run < runs.len() {
+        let (start, length) = runs[run];
+        match runs[run + 1..]
+            .iter()
+            .position(|(_, other)| *other == length)
+        {
+            Some(offset) => {
+                let (close, _) = runs[run + 1 + offset];
+                spans.push(CodeSpan {
+                    start,
+                    end: close + length,
+                    content: start + length..close,
+                });
+                run += offset + 2;
+            }
+            None => run += 1,
+        }
+    }
+    spans
+}
+
+/// Strips one space from both ends when both are present, so `` ` `x` ` ``
+/// can show backticks at its edges.
+fn trim_code(content: &[char]) -> &[char] {
+    if content.len() >= 2
+        && content[0] == ' '
+        && content[content.len() - 1] == ' '
+        && content.iter().any(|c| *c != ' ')
+    {
+        &content[1..content.len() - 1]
+    } else {
+        content
+    }
+}
+
+/// Opening delimiters must touch the text they wrap. Underscores inside
+/// words (`snake_case`) and lone operators (`2 * 3`) stay literal.
+fn opens_emphasis(chars: &[char], index: usize, marker: &str) -> bool {
+    if !starts_with(chars, index, marker) {
+        return false;
+    }
+    let length = marker.chars().count();
+    let delimiter = marker.chars().next().unwrap_or('*');
+    let before = index.checked_sub(1).map(|before| chars[before]);
+    let after = chars.get(index + length).copied();
+    if before == Some(delimiter) {
+        return false;
+    }
+    let Some(after) = after else {
+        return false;
+    };
+    if after.is_whitespace() || (length < 3 && after == delimiter && marker != "~~") {
+        return false;
+    }
+    !(delimiter == '_' && before.is_some_and(char::is_alphanumeric))
+}
+
+fn emphasis_closers(chars: &[char], marker: &str, code: &[CodeSpan]) -> Vec<usize> {
+    let length = marker.chars().count();
+    let delimiter = marker.chars().next().unwrap_or('*');
+    let mut positions = Vec::new();
+    let mut span = 0usize;
+    for index in 1..chars.len() {
+        while code.get(span).is_some_and(|code| code.end <= index) {
+            span += 1;
+        }
+        if code
+            .get(span)
+            .is_some_and(|code| code.start <= index && index < code.end)
+        {
+            continue;
+        }
+        if !starts_with(chars, index, marker) {
+            continue;
+        }
+        let before = chars[index - 1];
+        let after = chars.get(index + length).copied();
+        if before.is_whitespace() || before == delimiter || after == Some(delimiter) {
+            continue;
+        }
+        if delimiter == '_' && after.is_some_and(char::is_alphanumeric) {
+            continue;
+        }
+        positions.push(index);
+    }
+    positions
 }
 
 /// Searches only forwards. Failed link parses can revisit the same closing
@@ -242,10 +512,6 @@ impl DelimiterSearch {
         }
         None
     }
-}
-
-fn find_marker(chars: &[char], start: usize, marker: &str) -> Option<usize> {
-    (start..chars.len()).find(|index| starts_with(chars, *index, marker))
 }
 
 fn starts_with(chars: &[char], index: usize, marker: &str) -> bool {
@@ -321,7 +587,8 @@ fn is_row_separator(row: &[String]) -> bool {
 
 fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let available = width.saturating_sub(columns + 1);
+    // Borders plus one space of padding on each side of every cell.
+    let available = width.saturating_sub(columns + 1 + columns * 2);
     if columns == 0 || available < columns {
         for row in rows {
             push_wrapped("", "", &render_inline(&row.join(" | ")), width, output);
@@ -361,22 +628,22 @@ fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
             .enumerate()
             .map(|(column, cell_width)| {
                 let cell = row.get(column).map_or("", String::as_str);
-                let rendered = render_inline(cell);
                 let rendered = if row_index == 0 {
-                    format!("\x1b[1m{rendered}\x1b[0m")
+                    format!("{BOLD}{}{RESET}", render_inline_styled(cell, BOLD))
                 } else {
-                    rendered
+                    render_inline(cell)
                 };
                 wrap_ansi(&rendered, cell_width)
             })
             .collect::<Vec<_>>();
         let row_height = cells.iter().map(Vec::len).max().unwrap_or(1);
         for physical_row in 0..row_height {
-            let mut line = String::from("│");
+            let mut line = format!("{MUTED}│{RESET}");
             for (cell, cell_width) in cells.iter().zip(widths.iter().copied()) {
                 let content = cell.get(physical_row).map_or("", String::as_str);
+                line.push(' ');
                 line.push_str(&fit_width(content, cell_width));
-                line.push('│');
+                line.push_str(&format!(" {MUTED}│{RESET}"));
             }
             output.push(line);
         }
@@ -388,16 +655,17 @@ fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
 }
 
 fn table_border(left: char, join: char, right: char, widths: &[usize]) -> String {
-    let mut line = String::new();
+    let mut line = String::from(MUTED);
     line.push(left);
     for (index, width) in widths.iter().copied().enumerate() {
-        line.push_str(&"─".repeat(width));
+        line.push_str(&"─".repeat(width + 2));
         line.push(if index + 1 == widths.len() {
             right
         } else {
             join
         });
     }
+    line.push_str(RESET);
     line
 }
 
@@ -1138,16 +1406,20 @@ mod tests {
             .map(|line| strip_ansi(line))
             .collect::<Vec<_>>();
 
-        assert!(plain.iter().any(|line| line.contains("│one │hello")));
-        assert!(plain.iter().any(|line| line.contains("│    │wonderful")));
-        assert!(plain.iter().any(|line| line.contains("│    │world")));
+        assert!(plain.iter().any(|line| line.contains("│ one  │ hello")));
+        assert!(plain.iter().any(|line| line.contains("│      │ wonderful")));
+        assert!(plain.iter().any(|line| line.contains("│      │ world")));
         assert!(plain.iter().all(|line| visible_width(line) == 20));
     }
 
     #[test]
     fn highlights_fenced_rust() {
         let lines = render("```rust\nfn main() {}\n```", 40);
-        assert!(lines.join("\n").contains("\x1b[1;34mfn\x1b[0m"));
+        assert!(
+            lines
+                .join("\n")
+                .contains(&format!("{}fn{RESET}", highlight::KEYWORD))
+        );
     }
 
     #[test]
@@ -1215,5 +1487,134 @@ mod tests {
     fn strips_untrusted_terminal_escapes() {
         let lines = render("unsafe \x1b[2J text", 40);
         assert!(!lines.join("").contains("\x1b[2J"));
+    }
+
+    fn plain(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| strip_ansi(line).trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn headings_drop_markers_and_keep_their_style_around_inline_spans() {
+        let lines = render("# Target\n## Notes ##\n### Deep `code` **bold** tail", 60);
+        assert_eq!(plain(&lines), ["Target", "Notes", "Deep code bold tail"]);
+        assert!(lines[0].starts_with(HEADING_MAJOR), "{:?}", lines[0]);
+        assert!(lines[1].starts_with(HEADING_MINOR), "{:?}", lines[1]);
+        assert!(!lines.join("").contains("\x1b[1;34m"));
+        // After the code and bold spans the heading style comes back.
+        assert!(
+            lines[2].contains(&format!("{RESET}{HEADING} tail")),
+            "{:?}",
+            lines[2]
+        );
+        assert_eq!(plain(&render("#hashtag", 40)), ["#hashtag"]);
+    }
+
+    #[test]
+    fn emphasis_needs_flanking_delimiters() {
+        for literal in [
+            "snake_case_name and other_name",
+            "2 * 3 * 4",
+            "a ** b ** c",
+            "foo__bar__baz",
+        ] {
+            assert_eq!(render_inline(literal), literal, "{literal}");
+        }
+        assert_eq!(render_inline("*soft*"), format!("{ITALIC}soft{RESET}"));
+        assert_eq!(render_inline("_soft_"), format!("{ITALIC}soft{RESET}"));
+        assert_eq!(render_inline("***both***"), format!("\x1b[1;3mboth{RESET}"));
+        assert_eq!(render_inline("~~gone~~"), format!("{STRIKE}gone{RESET}"));
+        assert_eq!(render_inline(r"\*literal\*"), "*literal*");
+        assert_eq!(
+            render_inline("**bold `code` end**"),
+            format!("{BOLD}bold {INLINE_CODE}code{RESET}{BOLD} end{RESET}")
+        );
+    }
+
+    #[test]
+    fn code_spans_pair_matching_runs_and_shield_their_contents() {
+        assert_eq!(
+            render_inline("``a ` b``"),
+            format!("{INLINE_CODE}a ` b{RESET}")
+        );
+        assert_eq!(
+            render_inline("*see `a*b` here*"),
+            format!("{ITALIC}see {INLINE_CODE}a*b{RESET}{ITALIC} here{RESET}")
+        );
+        assert_eq!(render_inline("unpaired ` tick"), "unpaired ` tick");
+    }
+
+    #[test]
+    fn nested_lists_keep_depth_tasks_and_continuations() {
+        let lines = render(
+            "- top\n  - nested\n    more nested text\n1) first\n- [ ] todo\n- [x] done\n\nAfter",
+            40,
+        );
+        assert_eq!(
+            plain(&lines),
+            [
+                "• top",
+                "  ◦ nested",
+                "    more nested text",
+                "1) first",
+                "☐ todo",
+                "☑ done",
+                "",
+                "After",
+            ]
+        );
+    }
+
+    #[test]
+    fn rules_quotes_and_tilde_fences_render_as_blocks() {
+        let lines = render(
+            "* * *\n> quoted **bold**\n>> deeper\n~~~python\nx = 1\n~~~\n- item\n  ```sh\n  echo hi\n  ```",
+            30,
+        );
+        let plain = plain(&lines);
+        assert_eq!(plain[0], "─".repeat(30));
+        assert_eq!(plain[1], "│ quoted bold");
+        assert_eq!(plain[2], "│ │ deeper");
+        assert_eq!(plain[3], "x = 1");
+        assert!(lines[3].contains(CODE_BACKGROUND));
+        assert_eq!(plain[4], "• item");
+        assert_eq!(plain[5], "echo hi", "fence indentation is stripped");
+        assert_eq!(plain.len(), 6);
+    }
+
+    #[test]
+    fn inline_rendering_stays_linear_on_delimiter_floods() {
+        let started = std::time::Instant::now();
+        for text in [
+            "a_".repeat(20_000),
+            "* ".repeat(20_000),
+            format!("`{}", "x`y".repeat(10_000)),
+            "<".repeat(40_000),
+        ] {
+            let _ = render(&text, 120);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn panel_headings_keep_the_panel_background() {
+        let lines = super::super::render::render_user_panel("# Target\nbody **bold** text", 40);
+        for line in &lines {
+            // Every reset must be followed by the panel style again.
+            for (index, _) in line.match_indices(RESET) {
+                let after = &line[index + RESET.len()..];
+                assert!(
+                    after.is_empty() || after.starts_with(super::super::USER_BACKGROUND),
+                    "{line:?}"
+                );
+            }
+        }
+        assert_eq!(strip_ansi(&lines[1]).trim(), "Target");
     }
 }

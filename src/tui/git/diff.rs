@@ -376,7 +376,10 @@ mod tests {
         assert_eq!(markdown::visible_width(added_row), 44);
         assert_eq!(markdown::visible_width(removed_row), 44);
         // Syntax highlighting survives under the background tint.
-        assert!(added_row.contains("1;34m") || added_row.contains("32m"));
+        assert!(
+            added_row.contains(crate::tui::highlight::KEYWORD)
+                || added_row.contains(crate::tui::highlight::STRING)
+        );
     }
 
     #[test]
