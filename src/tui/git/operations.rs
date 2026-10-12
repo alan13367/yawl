@@ -7,8 +7,8 @@ use super::repository::{
     load_history_limit, load_status, run_git, run_git_files, target_paths,
 };
 use super::{
-    CommitMode, Confirm, GitFocus, GitSection, GitStatus, GitView, HISTORY_PAGE_SIZE,
-    refresh_visible_diff,
+    CommitMode, Confirm, GitFile, GitFocus, GitSection, GitStatus, GitView, HISTORY_PAGE_SIZE,
+    HistoryEntry, LoadedDiff, refresh_visible_diff,
 };
 use std::time::Instant;
 
@@ -79,35 +79,36 @@ fn apply_status(view: &mut GitView, status: GitStatus, raw: String) {
     view.last_poll = Some(Instant::now());
     view.status = status;
     view.flat = view.status.flat();
-    if view.flat.is_empty() {
-        view.selected = 0;
-    } else if let Some(path) = selected_path {
-        view.selected = view
-            .flat
-            .iter()
-            .position(|file| file.path == path)
-            .unwrap_or(0);
-    } else {
-        view.selected = view.selected.min(view.flat.len() - 1);
-    }
+    view.selected = reselect(
+        &view.flat,
+        view.selected,
+        selected_path.map(|path| move |file: &GitFile| file.path == path),
+    );
     view.commit = commit;
     view.commit_cursor = commit_cursor.min(view.commit.chars().count());
     let (history, has_more) = load_history_limit(&view.root, view.history_limit);
     view.history = history;
     view.history_has_more = has_more;
-    if view.history.is_empty() {
-        view.history_selected = 0;
-    } else if let Some(hash) = history_hash {
-        view.history_selected = view
-            .history
-            .iter()
-            .position(|entry| entry.hash == hash)
-            .unwrap_or(0);
-    } else {
-        view.history_selected = view.history_selected.min(view.history.len() - 1);
-    }
+    view.history_selected = reselect(
+        &view.history,
+        view.history_selected,
+        history_hash.map(|hash| move |entry: &HistoryEntry| entry.hash == hash),
+    );
     if let Err(error) = refresh_visible_diff(view) {
         view.set_notice(error, true);
+    }
+}
+
+/// Selection after a list reloads: the row the previous selection matched,
+/// the first row when it disappeared, or the old index clamped to the list
+/// when nothing was selected.
+fn reselect<T>(items: &[T], previous: usize, selected: Option<impl Fn(&T) -> bool>) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
+    match selected {
+        Some(selected) => items.iter().position(selected).unwrap_or(0),
+        None => previous.min(items.len() - 1),
     }
 }
 
@@ -195,26 +196,14 @@ pub(super) fn open_selected_diff(state: &mut OperationState) {
             None => return,
         }
     };
-    match load_diff(&root, &file) {
-        Ok(mut diff) => {
-            // Land on the first change with a couple of context lines above
-            // it instead of the top of the file. The anchor resolves to
-            // visual rows on the next render, when the pane width is known.
-            diff.scroll = SCROLL_ANCHOR_PENDING;
-            if let Some(view) = state.git_view.as_mut() {
-                view.diff = Some(diff);
-                view.show_log = false;
-                view.show_branches = false;
-                view.focus = GitFocus::Diff;
-                view.set_notice(String::new(), false);
-            }
-        }
-        Err(error) => {
-            if let Some(view) = state.git_view.as_mut() {
-                view.set_notice(error, true);
-            }
-        }
-    }
+    // Land on the first change with a couple of context lines above it
+    // instead of the top of the file. The anchor resolves to visual rows on
+    // the next render, when the pane width is known.
+    let loaded = load_diff(&root, &file).map(|mut diff| {
+        diff.scroll = SCROLL_ANCHOR_PENDING;
+        diff
+    });
+    show_diff(state, loaded);
 }
 
 pub(super) fn open_commit_diff(state: &mut OperationState) {
@@ -227,21 +216,23 @@ pub(super) fn open_commit_diff(state: &mut OperationState) {
             None => return,
         }
     };
-    match load_commit_diff(&root, &entry) {
+    show_diff(state, load_commit_diff(&root, &entry));
+}
+
+/// Opens a loaded diff in the diff pane, or reports why it failed.
+fn show_diff(state: &mut OperationState, loaded: Result<LoadedDiff, String>) {
+    let Some(view) = state.git_view.as_mut() else {
+        return;
+    };
+    match loaded {
         Ok(diff) => {
-            if let Some(view) = state.git_view.as_mut() {
-                view.diff = Some(diff);
-                view.show_log = false;
-                view.show_branches = false;
-                view.focus = GitFocus::Diff;
-                view.set_notice(String::new(), false);
-            }
+            view.diff = Some(diff);
+            view.show_log = false;
+            view.show_branches = false;
+            view.focus = GitFocus::Diff;
+            view.set_notice(String::new(), false);
         }
-        Err(error) => {
-            if let Some(view) = state.git_view.as_mut() {
-                view.set_notice(error, true);
-            }
-        }
+        Err(error) => view.set_notice(error, true),
     }
 }
 
@@ -472,18 +463,11 @@ pub(super) fn load_more_history(state: &mut OperationState) {
     view.history_limit = next_limit;
     view.history = history;
     view.history_has_more = has_more;
-    if view.history.is_empty() {
-        view.history_selected = 0;
-        view.history_scroll = 0;
-    } else if let Some(hash) = selected_hash {
-        view.history_selected = view
-            .history
-            .iter()
-            .position(|entry| entry.hash == hash)
-            .unwrap_or(0);
-    } else {
-        view.history_selected = view.history_selected.min(view.history.len() - 1);
-    }
+    view.history_selected = reselect(
+        &view.history,
+        view.history_selected,
+        selected_hash.map(|hash| move |entry: &HistoryEntry| entry.hash == hash),
+    );
     view.history_scroll = view
         .history_scroll
         .min(view.history.len().saturating_sub(1));

@@ -1,31 +1,41 @@
 //! Full-screen frame composition and transcript presentation.
 //!
 //! This facade owns frame composition. Private children separate cache reuse,
-//! entry presentation, reasoning blocks, transcript windows, and overlays.
-//! TUI callers keep the entry points here.
+//! entry presentation, reasoning blocks, transcript windows, composer chrome,
+//! the scroll bar, and overlays. TUI callers keep the entry points here.
 
 mod activity;
 mod cache;
+mod composer;
 mod entries;
 mod questions;
 mod reasoning;
+mod scroll;
 mod transcript;
 mod welcome;
 
 pub(super) use activity::activity_color;
 use activity::render_activity_rows;
 pub(super) use cache::{LineOwner, RenderCache};
+pub(super) use composer::composer_top_border;
+use composer::{
+    bounded_input_view, busy_composer_hint, render_choice_lines, render_plan_handoff_input,
+};
 use entries::render_entry;
 pub(super) use entries::{entry_default_expanded, render_user_panel};
 #[cfg(test)]
 pub(super) use entries::{render_entries, render_expanded, render_queued_panel};
 pub(super) use reasoning::{render_reasoning, render_thinking_tag};
+use scroll::{apply_scroll_bar, render_jump_button};
 use transcript::subagent_labels;
 #[cfg(test)]
 pub(super) use transcript::{MODEL_STREAM_STALL, render_loading_state};
 pub(super) use transcript::{loading_label, render_transcript_window};
 pub(super) use welcome::WELCOME_ANIMATION_TICKS;
+pub(super) use welcome::WelcomeDetails;
 use welcome::render_welcome;
+
+pub(super) use super::status_bar::format_token_count;
 
 use std::sync::Arc;
 
@@ -36,9 +46,8 @@ use super::completion::{
     COMPLETION_MENU_ROWS, completion_window, menu_rows, sync_completion_filter,
 };
 use super::input::Editor;
-use super::picker::{Picker, PickerAction, picker_is_plan_handoff, render_picker};
-use super::state::{JumpButton, ScrollGeometry, scroll_bar_position, scroll_bar_span};
-use super::{ViewState, markdown};
+use super::picker::{picker_is_plan_handoff, render_picker};
+use super::{ViewState, markdown, theme};
 
 pub(super) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -82,7 +91,10 @@ pub(super) struct RenderedFrame {
     pub(super) images: Vec<FrameImage>,
 }
 
+/// Foreground escape for an interface color, darkened on light
+/// backgrounds when it would be too pale to read.
 pub(super) fn foreground_color(color: UiColor) -> String {
+    let color = theme::ink(color);
     format!("\x1b[38;2;{};{};{}m", color.red, color.green, color.blue)
 }
 
@@ -92,6 +104,8 @@ pub(super) fn foreground_color(color: UiColor) -> String {
 /// where both text choices contrast about equally, so every color keeps the
 /// selected row readable.
 pub(super) fn selection_style(color: UiColor) -> String {
+    // A pale highlight would vanish on a light background.
+    let color = theme::ink(color);
     let luminance =
         u32::from(color.red) * 299 + u32::from(color.green) * 587 + u32::from(color.blue) * 114;
     let text = if luminance >= 120_000 { 16 } else { 250 };
@@ -113,12 +127,11 @@ pub(super) fn selected_row(line: &str, style: &str) -> String {
 /// toward light gray so dark accents stay legible without a background.
 pub(super) fn status_style(color: UiColor) -> String {
     let channel = |value: u8| ((u16::from(value) + 200) / 2) as u8;
-    format!(
-        "\x1b[38;2;{};{};{}m",
+    foreground_color(UiColor::new(
         channel(color.red),
         channel(color.green),
-        channel(color.blue)
-    )
+        channel(color.blue),
+    ))
 }
 
 pub(super) fn render_copy_toast(frame: &mut [String], columns: usize, accent: UiColor) {
@@ -132,140 +145,6 @@ pub(super) fn render_copy_toast(frame: &mut [String], columns: usize, accent: Ui
     let left_width = columns.saturating_sub(WIDTH);
     for (line, toast_line) in frame.iter_mut().zip(toast) {
         *line = format!("{}{toast_line}", markdown::fit_width(line, left_width));
-    }
-}
-
-const JUMP_LABEL: &str = " ↓ Scroll to bottom ";
-
-/// Rec. 601 luminance above which the pill uses dark text. Hover uses the
-/// same cutoff to darken a light fill and lighten a dark one.
-const JUMP_LIGHT_LUMA: u32 = 140_000;
-
-/// How far a hovered pill moves toward black or white, in percent.
-const JUMP_HOVER_SHIFT: u8 = 24;
-
-fn luminance(color: UiColor) -> u32 {
-    u32::from(color.red) * 299 + u32::from(color.green) * 587 + u32::from(color.blue) * 114
-}
-
-fn mix_channel(value: u8, target: u8, percent: u8) -> u8 {
-    let value = u16::from(value);
-    let target = u16::from(target);
-    let percent = u16::from(percent);
-    let mixed = value * (100 - percent) + target * percent;
-    u8::try_from(mixed / 100).unwrap_or(u8::MAX)
-}
-
-fn jump_text_color(color: UiColor) -> &'static str {
-    if luminance(color) > JUMP_LIGHT_LUMA {
-        "\x1b[38;2;18;18;22m"
-    } else {
-        "\x1b[38;2;245;245;245m"
-    }
-}
-
-fn jump_fill(accent: UiColor, hovered: bool) -> UiColor {
-    if !hovered {
-        return accent;
-    }
-    let target = if luminance(accent) > JUMP_LIGHT_LUMA {
-        0
-    } else {
-        255
-    };
-    UiColor::new(
-        mix_channel(accent.red, target, JUMP_HOVER_SHIFT),
-        mix_channel(accent.green, target, JUMP_HOVER_SHIFT),
-        mix_channel(accent.blue, target, JUMP_HOVER_SHIFT),
-    )
-}
-
-/// Draws a "Scroll to bottom" pill centered on the last transcript row while
-/// the view is scrolled up, and records its hit area. The pointer shifts the
-/// fill so the control reads as hovered without moving or resizing.
-pub(super) fn render_jump_button(region: &mut [String], state: &mut ViewState, columns: usize) {
-    let width = markdown::visible_width(JUMP_LABEL);
-    let Some(row) = region.len().checked_sub(1) else {
-        state.follow.pointer = None;
-        return;
-    };
-    if columns < width + 2 {
-        state.follow.pointer = None;
-        return;
-    }
-    let left = (columns - width) / 2;
-    let button = JumpButton {
-        top: row,
-        bottom: row + 1,
-        left,
-        right: left + width,
-    };
-    let hovered = state
-        .follow
-        .pointer
-        .is_some_and(|(column, pointer_row)| button.contains(pointer_row, column));
-    let accent = state.accent_color;
-    let fill = jump_fill(accent, hovered);
-    let pill = format!(
-        "\x1b[48;2;{};{};{}m{}\x1b[1m{JUMP_LABEL}\x1b[0m",
-        fill.red,
-        fill.green,
-        fill.blue,
-        jump_text_color(accent)
-    );
-    region[row] = markdown::overlay_at(&region[row], left, &pill);
-    state.follow.button = Some(button);
-}
-
-/// Thumb shading as a fraction of the accent color.
-const SCROLL_THUMB_INTENSITY: f32 = 0.65;
-
-fn shaded_background(color: UiColor, intensity: f32) -> String {
-    let channel = |value: u8| (f32::from(value) * intensity).round() as u8;
-    format!(
-        "\x1b[48;2;{};{};{}m",
-        channel(color.red),
-        channel(color.green),
-        channel(color.blue)
-    )
-}
-
-pub(super) fn apply_scroll_bar(
-    region: &mut [String],
-    state: &mut ViewState,
-    total_lines: usize,
-    max_scroll: usize,
-    columns: usize,
-) {
-    let height = region.len();
-    if !state.show_scroll_bar
-        || state
-            .picker
-            .as_ref()
-            .is_some_and(|picker| !picker_is_plan_handoff(picker))
-        || max_scroll == 0
-        || height == 0
-        || total_lines <= height
-        || columns == 0
-    {
-        state.scroll_geometry = None;
-        return;
-    }
-    let (thumb_length, travel) = scroll_bar_span(height, total_lines);
-    state.scroll_geometry = Some(ScrollGeometry {
-        rows: height,
-        columns,
-        max_scroll,
-        travel,
-        thumb_length,
-    });
-    let start = scroll_bar_position(travel, max_scroll, state.scroll_offset);
-    let thumb = shaded_background(state.accent_color, SCROLL_THUMB_INTENSITY);
-    for (row, line) in region.iter_mut().enumerate() {
-        debug_assert_eq!(markdown::visible_width(line), columns);
-        if row >= start && row < start + thumb_length {
-            *line = markdown::overlay_last_cell_background(line, &thumb);
-        }
     }
 }
 
@@ -489,6 +368,7 @@ pub(super) fn build_frame_with_images(
     } else if visible.is_empty() && state.transcript.is_empty() {
         region.extend(render_welcome(
             state.accent_color,
+            &state.welcome,
             transcript_width,
             transcript_height,
             state.spinner_tick,
@@ -571,19 +451,12 @@ pub(super) fn build_frame_with_images(
             markdown::fit_composer_width(line, inner_width)
         ));
     }
-    let show_queue_hint = state.question.is_none()
-        && state.turn_started.is_some()
-        && !editor.is_empty()
-        && menu.is_empty();
-    let bottom_border = if show_queue_hint {
-        const HINT: &str = " Tab queues ";
-        format!(
-            "{}{}",
-            "─".repeat(inner_width.saturating_sub(HINT.len())),
-            HINT
-        )
-    } else {
-        "─".repeat(inner_width)
+    let bottom_border = match busy_composer_hint(state, editor, menu.is_empty(), inner_width) {
+        Some(hint) => format!(
+            "{}{hint}",
+            "─".repeat(inner_width - markdown::visible_width(hint))
+        ),
+        None => "─".repeat(inner_width),
     };
     frame.push(format!("{text_box_color}└{bottom_border}┘\x1b[0m"));
     frame.extend(menu);
@@ -629,107 +502,6 @@ pub(super) fn build_frame_with_images(
     }
 }
 
-pub(super) fn composer_top_border(width: usize, label: Option<&str>) -> String {
-    let Some(label) = label else {
-        return "─".repeat(width);
-    };
-    let label = format!(" {label} ");
-    if label.len().saturating_add(1) > width {
-        return "─".repeat(width);
-    }
-    format!(
-        "─{label}{}",
-        "─".repeat(width.saturating_sub(label.len() + 1))
-    )
-}
-
-fn render_plan_handoff_input(
-    picker: &Picker,
-    width: usize,
-    selection_color: UiColor,
-    compact: bool,
-) -> (Vec<String>, usize) {
-    let mut lines = Vec::with_capacity(picker.items.len() + 2);
-    let mut focus_row = 0;
-    if !compact {
-        lines.push(markdown::fit_width("Choose what happens next", width));
-    }
-    for (index, item) in picker.items.iter().enumerate() {
-        if index == picker.selected {
-            focus_row = lines.len();
-        }
-        lines.extend(render_choice_lines(
-            index,
-            &item.label,
-            &item.description,
-            matches!(item.action, PickerAction::ImplementPlan),
-            index == picker.selected,
-            width,
-            selection_color,
-        ));
-    }
-    if !compact {
-        lines.push(markdown::fit_width(
-            " ↑/↓ choose · 1–2 select · Enter confirm · Esc return",
-            width,
-        ));
-    }
-    (lines, focus_row)
-}
-
-fn bounded_input_view(
-    lines: Vec<String>,
-    cursor: Option<(usize, usize)>,
-    focus_row: usize,
-    max_lines: usize,
-) -> (Vec<String>, Option<(usize, usize)>) {
-    let max_lines = max_lines.max(1);
-    if lines.len() <= max_lines {
-        return (lines, cursor);
-    }
-    let focus_row = cursor
-        .map_or(focus_row, |(row, _)| row)
-        .min(lines.len().saturating_sub(1));
-    let start = focus_row
-        .saturating_sub(max_lines / 2)
-        .min(lines.len() - max_lines);
-    let end = start + max_lines;
-    let cursor = cursor
-        .and_then(|(row, column)| (start..end).contains(&row).then_some((row - start, column)));
-    (lines[start..end].to_vec(), cursor)
-}
-
-fn render_choice_lines(
-    index: usize,
-    label: &str,
-    description: &str,
-    recommended: bool,
-    selected: bool,
-    width: usize,
-    selection_color: UiColor,
-) -> Vec<String> {
-    let prefix = format!(" {}. ", index + 1);
-    let continuation = " ".repeat(markdown::visible_width(&prefix));
-    let recommended = if recommended { " (Recommended)" } else { "" };
-    let content = if description.is_empty() {
-        format!("{label}{recommended}")
-    } else {
-        format!("{label}{recommended} · {description}")
-    };
-    let style = selection_style(selection_color);
-    markdown::wrapped_plain_prefixed_lines(&prefix, &continuation, &content, width)
-        .into_iter()
-        .map(|line| {
-            let line = markdown::fit_width(&line, width);
-            if selected {
-                selected_row(&line, &style)
-            } else {
-                line
-            }
-        })
-        .collect()
-}
-
 /// Weighted RGB distance keeps activity separate from the composer accent.
 fn perceptual_color_distance(left: UiColor, right: UiColor) -> u32 {
     let red_mean = (u32::from(left.red) + u32::from(right.red)) / 2;
@@ -773,6 +545,7 @@ fn render_block_viewer(
         state.accent_color,
         &labels,
         state.spinner_tick,
+        transcript::stalled_for(&state.transcript),
     )
     .unwrap_or_default();
     let body = body.lines;
@@ -800,5 +573,3 @@ fn render_block_viewer(
     ));
     (frame, (rows, 1))
 }
-
-pub(super) use super::status_bar::format_token_count;

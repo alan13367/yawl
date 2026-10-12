@@ -1,5 +1,4 @@
-use std::io::{IsTerminal, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -161,18 +160,30 @@ fn oauth_agent() -> ureq::Agent {
         .into()
 }
 
-fn start_device_auth(agent: &ureq::Agent) -> Result<DeviceAuth, Error> {
-    let body = json!({"client_id": CLIENT_ID}).to_string();
+/// Posts `body` and returns the status with the response text, read up to
+/// 512 KiB.
+fn post(
+    agent: &ureq::Agent,
+    url: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<(u16, String), Error> {
     let mut response = agent
-        .post(DEVICE_USER_CODE_URL)
-        .header("content-type", "application/json")
+        .post(url)
+        .header("content-type", content_type)
         .send(body)?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
         .with_config()
-        .limit(256 * 1024)
+        .limit(512 * 1024)
         .read_to_string()?;
+    Ok((status, text))
+}
+
+fn start_device_auth(agent: &ureq::Agent) -> Result<DeviceAuth, Error> {
+    let body = json!({"client_id": CLIENT_ID}).to_string();
+    let (status, text) = post(agent, DEVICE_USER_CODE_URL, "application/json", &body)?;
     if status != 200 {
         return Err(Error::Http { status, body: text });
     }
@@ -206,16 +217,7 @@ fn poll_device_auth(
             "user_code": device.user_code,
         })
         .to_string();
-        let mut response = agent
-            .post(DEVICE_TOKEN_URL)
-            .header("content-type", "application/json")
-            .send(body)?;
-        let status = response.status().as_u16();
-        let text = response
-            .body_mut()
-            .with_config()
-            .limit(256 * 1024)
-            .read_to_string()?;
+        let (status, text) = post(agent, DEVICE_TOKEN_URL, "application/json", &body)?;
         if status == 200 {
             return serde_json::from_str(&text).map_err(Error::from);
         }
@@ -279,16 +281,7 @@ fn token_request(
     form: &str,
     operation: &str,
 ) -> Result<CodexCredential, Error> {
-    let mut response = agent
-        .post(TOKEN_URL)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .send(form)?;
-    let status = response.status().as_u16();
-    let text = response
-        .body_mut()
-        .with_config()
-        .limit(512 * 1024)
-        .read_to_string()?;
+    let (status, text) = post(agent, TOKEN_URL, "application/x-www-form-urlencoded", form)?;
     if status != 200 {
         return Err(Error::Http { status, body: text });
     }
@@ -483,44 +476,9 @@ fn save_credential(config: &Config, credential: &CodexCredential) -> Result<(), 
 }
 
 fn save_credential_to(path: &Path, credential: &CodexCredential) -> Result<(), Error> {
-    let mut root = match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str::<Value>(&text)
-            .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
-        Err(error) => return Err(Error::Config(format!("{}: {error}", path.display()))),
-    };
-    let Value::Object(object) = &mut root else {
-        return Err(Error::Config(format!(
-            "{}: top-level JSON value must be an object",
-            path.display()
-        )));
-    };
-    object.insert("openai-codex".into(), serde_json::to_value(credential)?);
-    write_private_json(path, &root)
-}
-
-fn write_private_json(path: &Path, value: &Value) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        serde_json::to_writer_pretty(&mut file, value)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        Ok::<(), Error>(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temporary);
-    }
-    result
+    let mut root = crate::config::read_json_object(path)?;
+    root.insert("openai-codex".into(), serde_json::to_value(credential)?);
+    crate::config::write_json_object(path, &root)
 }
 
 #[cfg(test)]
@@ -546,14 +504,7 @@ mod tests {
     #[test]
     fn canceled_login_does_not_persist_exchanged_credentials() {
         crate::set_interrupted(false);
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "yawl-canceled-login-{}-{nonce}",
-            std::process::id()
-        ));
+        let root = crate::test_support::unique_temp_dir("canceled-login");
         let config = Config {
             home_dir: root.join(".yawl"),
             ..Config::test_default()
@@ -577,14 +528,7 @@ mod tests {
 
     #[test]
     fn rejected_token_reuses_a_login_another_request_already_refreshed() -> Result<(), Error> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "yawl-rejected-login-{}-{nonce}",
-            std::process::id()
-        ));
+        let root = crate::test_support::unique_temp_dir("rejected-login");
         let path = root.join("auth.json");
         let replaced = CodexCredential {
             credential_type: oauth_type(),

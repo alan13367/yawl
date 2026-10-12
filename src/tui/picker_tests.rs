@@ -546,27 +546,8 @@ fn test_picker_state(picker: Picker) -> ViewState {
 }
 
 fn test_agent() -> Agent {
-    // Parallel tests can read the same clock value on coarse clocks.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!(
-        "yawl-picker-agent-{}-{nonce}-{sequence}",
-        std::process::id()
-    ));
-    let config = Config {
-        model: Some("test".into()),
-        home_dir: root.join("home/.yawl"),
-        project_dir: root.join("project/.yawl"),
-        ..Config::test_default()
-    };
-    let cwd = root.join("project");
-    let session = crate::session::Session::create(&config.session_dirs(&cwd).project, &cwd, "test")
-        .expect("test session should be created");
-    Agent::new(config, "test".into(), session, Vec::new())
+    let root = crate::test_support::unique_temp_dir("picker-agent");
+    super::test_support::agent_in(&root)
 }
 
 #[test]
@@ -665,49 +646,6 @@ fn compatible_connection_toggles_with_space_and_confirms_with_enter() {
 #[test]
 fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
     let mut state = ViewState {
-        transcript: Transcript::from_messages(&[]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
-        show_scroll_bar: true,
-        scroll_bar_enabled: true,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
         picker: Some(Picker {
             title: "Settings".into(),
             hint: "Enter change".into(),
@@ -724,20 +662,7 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
             editing: None,
             parent: None,
         }),
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: crate::tui::render::RenderCache::default(),
+        ..ViewState::test_default()
     };
     let mut editor = Editor::default();
 
@@ -761,49 +686,6 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
 #[test]
 fn escape_cancels_picker_editing_and_dismisses_picker() {
     let mut state = ViewState {
-        transcript: Transcript::from_messages(&[]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
-        show_scroll_bar: true,
-        scroll_bar_enabled: true,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
         picker: Some(Picker {
             title: "Settings".into(),
             hint: "Enter change".into(),
@@ -820,20 +702,7 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
             editing: None,
             parent: None,
         }),
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: crate::tui::render::RenderCache::default(),
+        ..ViewState::test_default()
     };
     let mut editor = Editor::default();
 
@@ -855,25 +724,8 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
 
 #[test]
 fn settings_picker_categories_and_items_keep_their_action_contracts() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-picker-contract-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let config = Config {
-        model: Some("test".into()),
-        home_dir: root.join("home/.yawl"),
-        project_dir: root.join("project/.yawl"),
-        ..Config::test_default()
-    };
-    let cwd = root.join("project");
-    let dirs = config.session_dirs(&cwd);
-    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
-        .expect("test session should be created");
-    let agent = Agent::new(config, "test".into(), session, Vec::new());
+    let root = crate::test_support::unique_temp_dir("tui-picker-contract");
+    let agent = super::test_support::agent_in(&root);
 
     let picker = settings_picker(&agent);
     assert_eq!(picker.items.len(), 8);
@@ -981,21 +833,11 @@ fn subagent_model_picker_inherits_and_keeps_custom_and_manual_selection_on_refre
     config.providers.insert(
         "local".into(),
         crate::config::ProviderConfig {
-            base_url: "http://127.0.0.1:9/v1".into(),
-            api: "openai-completions".into(),
-            api_key: None,
-            auth_header: None,
-            headers: Default::default(),
             models: vec![crate::config::ModelConfig {
-                id: "listed".into(),
                 name: Some("Listed".into()),
-                context_window: None,
-                max_tokens: None,
-                input: Vec::new(),
-                reasoning_efforts: Vec::new(),
-                compat: Default::default(),
+                ..crate::config::ModelConfig::named("listed")
             }],
-            compat: Default::default(),
+            ..crate::config::ProviderConfig::test_openai_compatible("http://127.0.0.1:9/v1")
         },
     );
     let listed = subagent_model_picker(&config, "local:listed");

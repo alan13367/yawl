@@ -62,74 +62,8 @@ fn display_settings_apply_during_an_active_turn() {
         accent_color: picker.clone(),
         selection_color: picker,
     };
-    let mut state = ViewState {
-        transcript: Transcript::from_messages(&[]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
-        show_scroll_bar: true,
-        scroll_bar_enabled: true,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: crate::tui::render::RenderCache::default(),
-    };
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-live-settings-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let mut state = ViewState::test_default();
+    let root = crate::test_support::unique_temp_dir("tui-live-settings");
     let mut config = Config {
         model: Some("test".into()),
         home_dir: root.join("home/.yawl"),
@@ -277,6 +211,25 @@ fn display_settings_apply_during_an_active_turn() {
         PickerAction::SetScrollBarAutoHide(true)
     ));
 
+    super::theme::use_light(false);
+    activate_picker_action_while_busy(
+        &mut state,
+        PickerAction::SetTheme(crate::config::Theme::Light),
+        &mut active_pickers,
+        &mut config,
+    );
+
+    assert_eq!(config.theme, crate::config::Theme::Light);
+    assert!(super::theme::is_light());
+    let settings = state
+        .picker
+        .as_ref()
+        .expect("settings picker should reopen");
+    let theme = settings_item_index(SettingsCategory::Interface, SettingsItem::Theme);
+    assert_eq!(settings.selected, theme);
+    assert_eq!(settings.items[theme].description, "Light · Enter to change");
+    super::theme::use_light(false);
+
     activate_picker_action_while_busy(
         &mut state,
         PickerAction::OpenWebSearchProviders,
@@ -396,21 +349,8 @@ fn display_settings_apply_during_an_active_turn() {
     config.providers.insert(
         "local".into(),
         crate::config::ProviderConfig {
-            base_url: "http://127.0.0.1:9/v1".into(),
-            api: "openai-completions".into(),
-            api_key: None,
-            auth_header: None,
-            headers: Default::default(),
-            models: vec![crate::config::ModelConfig {
-                id: "busy".into(),
-                name: None,
-                context_window: None,
-                max_tokens: None,
-                input: Vec::new(),
-                reasoning_efforts: Vec::new(),
-                compat: Default::default(),
-            }],
-            compat: Default::default(),
+            models: vec![crate::config::ModelConfig::named("busy")],
+            ..crate::config::ProviderConfig::test_openai_compatible("http://127.0.0.1:9/v1")
         },
     );
     activate_picker_action_while_busy(

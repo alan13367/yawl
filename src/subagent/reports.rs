@@ -1,17 +1,11 @@
 //! Keep large child reports outside model history, with durable read_file paths.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::types::bounded;
 
 const INLINE_BYTES: usize = 2048;
 const EXCERPT_BYTES: usize = 1024;
-static NEXT_REPORT: AtomicU64 = AtomicU64::new(1);
 
 /// Small results remain unchanged. Long results become an opening excerpt
 /// plus an absolute path. Files outlive worker pruning and session resumption.
@@ -21,7 +15,7 @@ pub(super) fn prepare(directory: &Path, text: &str) -> String {
         return text.to_string();
     }
     let excerpt = bounded(text, EXCERPT_BYTES);
-    match save(directory, text) {
+    match crate::tools::save_artifact(directory, "report", "md", text) {
         Ok(path) => format!(
             "Full report ({} bytes): {}\nUse read_file with this path, offset=0 and limit=16384; continue with next_offset as needed.\n\nOpening excerpt:\n{excerpt}\n[excerpt ends]",
             text.len(),
@@ -34,47 +28,13 @@ pub(super) fn prepare(directory: &Path, text: &str) -> String {
     }
 }
 
-fn save(directory: &Path, text: &str) -> std::io::Result<std::path::PathBuf> {
-    fs::create_dir_all(directory)?;
-    let directory = fs::canonicalize(directory)?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    for _ in 0..16 {
-        let sequence = NEXT_REPORT.fetch_add(1, Ordering::Relaxed);
-        let path = directory.join(format!(
-            "report-{}-{timestamp}-{sequence}.md",
-            std::process::id()
-        ));
-        let mut file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        };
-        if let Err(error) = file.write_all(text.as_bytes()) {
-            drop(file);
-            let _ = fs::remove_file(&path);
-            return Err(error);
-        }
-        return Ok(path);
-    }
-    Err(std::io::Error::other(
-        "could not allocate a unique report file",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn directory(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("yawl-reports-{}-{label}", std::process::id()))
+        crate::test_support::unique_temp_dir(&format!("reports-{label}"))
     }
 
     #[test]

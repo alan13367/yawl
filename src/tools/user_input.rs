@@ -139,6 +139,20 @@ struct State {
     canceled: Option<u64>,
 }
 
+impl State {
+    /// The pending question set `request_id` refers to, if it is still open.
+    fn active(&mut self, request_id: u64) -> Result<&mut Pending, String> {
+        let pending = self
+            .pending
+            .as_mut()
+            .ok_or_else(|| "there is no pending user question".to_string())?;
+        if pending.id != request_id {
+            return Err("the user question is no longer active".into());
+        }
+        Ok(pending)
+    }
+}
+
 #[derive(Default)]
 struct Shared {
     state: Mutex<State>,
@@ -269,12 +283,7 @@ impl QuestionBroker {
 
     pub(crate) fn mark_present(&self, request_id: u64) -> Result<(), String> {
         let mut state = self.lock();
-        let Some(pending) = state.pending.as_mut() else {
-            return Err("there is no pending user question".into());
-        };
-        if pending.id != request_id {
-            return Err("the user question is no longer active".into());
-        }
+        let pending = state.active(request_id)?;
         pending.afk_timer = AfkTimer::Disabled;
         self.shared.changed.notify_all();
         Ok(())
@@ -282,12 +291,7 @@ impl QuestionBroker {
 
     pub(crate) fn answer(&self, request_id: u64, option_index: usize) -> Result<(), String> {
         let mut state = self.lock();
-        let Some(pending) = state.pending.as_mut() else {
-            return Err("there is no pending user question".into());
-        };
-        if pending.id != request_id {
-            return Err("the user question is no longer active".into());
-        }
+        let pending = state.active(request_id)?;
         let question = pending
             .questions
             .get(pending.current)
@@ -312,12 +316,7 @@ impl QuestionBroker {
             return Err("the custom answer cannot be empty".into());
         }
         let mut state = self.lock();
-        let Some(pending) = state.pending.as_mut() else {
-            return Err("there is no pending user question".into());
-        };
-        if pending.id != request_id {
-            return Err("the user question is no longer active".into());
-        }
+        let pending = state.active(request_id)?;
         let question = pending
             .questions
             .get(pending.current)

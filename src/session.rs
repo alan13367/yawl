@@ -1038,8 +1038,7 @@ mod tests {
 
     #[test]
     fn session_roundtrip_with_compaction() -> Result<(), Error> {
-        let dir = std::env::temp_dir().join(format!("yawl-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = crate::test_support::unique_temp_dir("test");
         let mut s = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = s.id.clone();
         s.append_message(&Message::user("one"))?;
@@ -1085,11 +1084,7 @@ mod tests {
 
     #[test]
     fn session_roundtrip_with_middle_compaction() -> Result<(), Error> {
-        let dir = std::env::temp_dir().join(format!(
-            "yawl-middle-compaction-session-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = crate::test_support::unique_temp_dir("middle-compaction-session");
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
         for content in ["before", "goal", "progress one", "progress two", "tail"] {
@@ -1138,8 +1133,7 @@ mod tests {
 
     #[test]
     fn session_roundtrip_with_undo() -> Result<(), Error> {
-        let dir = std::env::temp_dir().join(format!("yawl-undo-session-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = crate::test_support::unique_temp_dir("undo-session");
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
         session.append_message(&Message::user("one"))?;
@@ -1162,8 +1156,7 @@ mod tests {
 
     #[test]
     fn session_roundtrip_replays_a_paused_goal() -> Result<(), Error> {
-        let dir = std::env::temp_dir().join(format!("yawl-goal-session-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = crate::test_support::unique_temp_dir("goal-session");
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
         let start = Message::user("ship the feature")
@@ -1183,8 +1176,7 @@ mod tests {
 
     #[test]
     fn session_goal_complete_and_cancel_clear_the_replayed_goal() -> Result<(), Error> {
-        let dir = std::env::temp_dir().join(format!("yawl-goal-clear-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = crate::test_support::unique_temp_dir("goal-clear");
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
         let start =
@@ -1277,8 +1269,7 @@ mod tests {
 
     #[test]
     fn session_undo_can_clear_an_active_goal() -> Result<(), Error> {
-        let dir = std::env::temp_dir().join(format!("yawl-goal-undo-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = crate::test_support::unique_temp_dir("goal-undo");
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
         let start = Message::user("goal").with_control(crate::provider::MessageControl::GoalStart);
@@ -1296,15 +1287,13 @@ mod tests {
 
     #[test]
     fn session_ids_do_not_escape_session_directory() {
-        let dir = std::env::temp_dir().join(format!("yawl-session-id-test-{}", std::process::id()));
+        let dir = crate::test_support::unique_temp_dir("session-id-test");
         assert!(Session::open(&dir, "../../outside").is_err());
     }
 
     #[test]
     fn delivered_subagent_results_replay_with_metadata() -> Result<(), Error> {
-        let dir =
-            std::env::temp_dir().join(format!("yawl-subagent-session-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = crate::test_support::unique_temp_dir("subagent-session-test");
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
         session.append_message(&Message::subagent_results(vec![SubagentResult {
@@ -1342,14 +1331,7 @@ mod tests {
     }
 
     fn temp_root(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "yawl-session-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ))
+        crate::test_support::unique_temp_dir(&format!("session-{name}"))
     }
 
     #[test]

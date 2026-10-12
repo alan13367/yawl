@@ -108,17 +108,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            // Parallel tests can read the same clock value on coarse clocks.
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Self(std::env::temp_dir().join(format!(
-                "yawl-plan-{}-{nonce}-{sequence}",
-                std::process::id()
-            )))
+            Self(crate::test_support::unique_temp_dir("plan"))
         }
     }
 

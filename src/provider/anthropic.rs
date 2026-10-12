@@ -1,12 +1,9 @@
 //! Anthropic Messages API with SSE streaming.
 
-use std::io::BufReader;
-
 use serde_json::{Value, json};
 
 use super::{
-    Event, Provider, Request, Role, SseEvent, SseReader, TokenUsage, ToolCall, error_body,
-    http_agent,
+    Event, Provider, Request, Role, SseEvent, TokenUsage, ToolCall, event_stream, http_agent,
 };
 use crate::error::Error;
 
@@ -279,7 +276,7 @@ impl Provider for Anthropic {
     fn stream_once(&self, req: &Request<'_>, on_event: &mut dyn FnMut(Event)) -> Result<(), Error> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let body = build_body(req, self.prompt_caching).to_string();
-        let mut response = self
+        let response = self
             .agent
             .post(&url)
             .header("x-api-key", &self.api_key)
@@ -287,17 +284,8 @@ impl Provider for Anthropic {
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
             .send(body)?;
-        let status = response.status().as_u16();
-        if status != 200 {
-            return Err(Error::Http {
-                status,
-                body: error_body(&mut response),
-            });
-        }
-
-        let reader = BufReader::new(response.into_body().into_reader());
+        let mut stream = event_stream(response)?;
         let mut decoder = Decoder::default();
-        let mut stream = SseReader::new(reader);
         while let Some(sse) = stream.next() {
             if decoder.decode(sse?, on_event)? {
                 stream.finish();
@@ -315,7 +303,7 @@ impl Provider for Anthropic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::Message;
+    use crate::provider::{Message, SseReader};
     use std::io::Cursor;
 
     fn request<'a>(messages: &'a [Message]) -> Request<'a> {

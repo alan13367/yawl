@@ -240,172 +240,181 @@ pub(in crate::tui) fn render_init(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::super::repository::{git_available, run_git};
     use super::super::test_support::{temp_dir_unique, write_test_gitconfig};
     use super::*;
+    use crate::error::Error;
+
+    /// A fresh `work` directory with a test Git identity, removed on drop.
+    struct Fixture {
+        root: PathBuf,
+        work: PathBuf,
+        identity_path: String,
+    }
+
+    impl Fixture {
+        /// `None` when Git is unavailable, so the test is skipped.
+        fn new(tag: &str) -> Result<Option<Self>, Error> {
+            if !git_available() {
+                return Ok(None);
+            }
+            let root = temp_dir_unique(tag);
+            let work = root.join("work");
+            std::fs::create_dir_all(&work)?;
+            let identity_path = write_test_gitconfig(&root)?;
+            Ok(Some(Self {
+                root,
+                work,
+                identity_path,
+            }))
+        }
+
+        fn init_and_push(&self, remote: &str) -> Result<String, String> {
+            let identity = [("GIT_CONFIG_GLOBAL", self.identity_path.as_str())];
+            init_and_push_env(&self.work, remote, &identity)
+        }
+
+        fn work_git(&self, args: &[&str]) -> Result<String, Error> {
+            git_output(&self.work, args)
+        }
+
+        /// A path under the root that is not a repository.
+        fn missing_remote(&self) -> Result<String, Error> {
+            utf8(self.root.join("no-such-remote.git"))
+        }
+
+        /// An initialized bare repository to push to.
+        fn bare_remote(&self) -> Result<(PathBuf, String), Error> {
+            let bare = self.root.join("remote.git");
+            std::fs::create_dir_all(&bare)?;
+            run_git(&bare, &["init", "--bare"]).map_err(Error::Protocol)?;
+            let remote = utf8(bare.clone())?;
+            Ok((bare, remote))
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn git_output(dir: &std::path::Path, args: &[&str]) -> Result<String, Error> {
+        run_git(dir, args)
+            .map(|output| output.trim().to_string())
+            .map_err(Error::Protocol)
+    }
+
+    fn utf8(path: PathBuf) -> Result<String, Error> {
+        path.into_os_string()
+            .into_string()
+            .map_err(|_| Error::Protocol("non-UTF8 temp path".to_string()))
+    }
 
     #[test]
-    fn init_flow_pushes_first_commit_to_remote() -> Result<(), crate::error::Error> {
-        if !git_available() {
+    fn init_flow_pushes_first_commit_to_remote() -> Result<(), Error> {
+        let Some(fixture) = Fixture::new("push")? else {
             return Ok(());
-        }
-        let root = temp_dir_unique("push");
-        let work = root.join("work");
-        let bare = root.join("remote.git");
-        std::fs::create_dir_all(&work)?;
-        std::fs::create_dir_all(&bare)?;
-        let identity_path = write_test_gitconfig(&root)?;
-        let identity = [("GIT_CONFIG_GLOBAL", identity_path.as_str())];
-        let work_git = |args: &[&str]| {
-            run_git(&work, args)
-                .map(|output| output.trim().to_string())
-                .map_err(crate::error::Error::Protocol)
         };
-        run_git(&bare, &["init", "--bare"]).map_err(crate::error::Error::Protocol)?;
-        let remote = bare
-            .to_str()
-            .ok_or_else(|| crate::error::Error::Protocol("non-UTF8 temp path".to_string()))?;
-        let message =
-            init_and_push_env(&work, remote, &identity).map_err(crate::error::Error::Protocol)?;
+        let (bare, remote) = fixture.bare_remote()?;
+        let message = fixture.init_and_push(&remote).map_err(Error::Protocol)?;
         assert!(
-            message.contains(remote),
+            message.contains(&remote),
             "success names the remote: {message}"
         );
-        assert!(work.join(".git").is_dir());
-        assert_eq!(std::fs::read_to_string(work.join("README.md"))?, "# work\n");
-        assert_eq!(work_git(&["branch", "--show-current"])?, "main");
-        assert_eq!(work_git(&["log", "-1", "--format=%s"])?, "first commit");
-        assert_eq!(work_git(&["remote", "get-url", "origin"])?, remote);
-        let head = work_git(&["rev-parse", "HEAD"])?;
+        assert!(fixture.work.join(".git").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(fixture.work.join("README.md"))?,
+            "# work\n"
+        );
+        assert_eq!(fixture.work_git(&["branch", "--show-current"])?, "main");
+        assert_eq!(
+            fixture.work_git(&["log", "-1", "--format=%s"])?,
+            "first commit"
+        );
+        assert_eq!(fixture.work_git(&["remote", "get-url", "origin"])?, remote);
         // The bare remote keeps its default HEAD (often master) even after
         // pushing main, so resolve the pushed branch explicitly.
-        let remote_head = run_git(&bare, &["rev-parse", "refs/heads/main"])
-            .map(|output| output.trim().to_string())
-            .map_err(crate::error::Error::Protocol)?;
-        assert_eq!(head, remote_head);
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            fixture.work_git(&["rev-parse", "HEAD"])?,
+            git_output(&bare, &["rev-parse", "refs/heads/main"])?
+        );
         Ok(())
     }
 
     #[test]
-    fn init_flow_retry_resumes_after_a_push_failure() -> Result<(), crate::error::Error> {
-        if !git_available() {
+    fn init_flow_retry_resumes_after_a_push_failure() -> Result<(), Error> {
+        let Some(fixture) = Fixture::new("retry")? else {
             return Ok(());
-        }
-        let root = temp_dir_unique("retry");
-        let work = root.join("work");
-        let bare = root.join("remote.git");
-        std::fs::create_dir_all(&work)?;
-        std::fs::create_dir_all(&bare)?;
-        let identity_path = write_test_gitconfig(&root)?;
-        let identity = [("GIT_CONFIG_GLOBAL", identity_path.as_str())];
-        let work_git = |args: &[&str]| {
-            run_git(&work, args)
-                .map(|output| output.trim().to_string())
-                .map_err(crate::error::Error::Protocol)
         };
-        let missing = root.join("no-such-remote.git");
-        let missing = missing
-            .to_str()
-            .ok_or_else(|| crate::error::Error::Protocol("non-UTF8 temp path".to_string()))?;
         // First attempt builds the repo and commit, then fails the push.
-        let error = init_and_push_env(&work, missing, &identity)
+        let error = fixture
+            .init_and_push(&fixture.missing_remote()?)
             .expect_err("pushing to a missing path must fail");
         assert!(error.contains("push failed"), "push failure: {error}");
         // Retrying the identical flow must not fail at `commit` ("nothing
         // to commit") or at `remote add` ("origin already exists").
-        run_git(&bare, &["init", "--bare"]).map_err(crate::error::Error::Protocol)?;
-        let remote = bare
-            .to_str()
-            .ok_or_else(|| crate::error::Error::Protocol("non-UTF8 temp path".to_string()))?;
-        let message =
-            init_and_push_env(&work, remote, &identity).map_err(crate::error::Error::Protocol)?;
+        let (_, remote) = fixture.bare_remote()?;
+        let message = fixture.init_and_push(&remote).map_err(Error::Protocol)?;
         assert!(
-            message.contains(remote),
+            message.contains(&remote),
             "retry pushes to the fixed remote: {message}"
         );
-        assert_eq!(work_git(&["remote", "get-url", "origin"])?, remote);
-        assert_eq!(work_git(&["log", "-1", "--format=%s"])?, "first commit");
+        assert_eq!(fixture.work_git(&["remote", "get-url", "origin"])?, remote);
+        assert_eq!(
+            fixture.work_git(&["log", "-1", "--format=%s"])?,
+            "first commit"
+        );
         // Still exactly one commit: the retry reused it instead of amending
         // or erroring.
-        assert_eq!(work_git(&["rev-list", "--count", "HEAD"])?, "1");
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(fixture.work_git(&["rev-list", "--count", "HEAD"])?, "1");
         Ok(())
     }
 
     #[test]
-    fn init_flow_without_remote_stays_local() -> Result<(), crate::error::Error> {
-        if !git_available() {
+    fn init_flow_without_remote_stays_local() -> Result<(), Error> {
+        let Some(fixture) = Fixture::new("local")? else {
             return Ok(());
-        }
-        let root = temp_dir_unique("local");
-        let work = root.join("work");
-        std::fs::create_dir_all(&work)?;
-        let identity_path = write_test_gitconfig(&root)?;
-        let identity = [("GIT_CONFIG_GLOBAL", identity_path.as_str())];
-        let work_git = |args: &[&str]| {
-            run_git(&work, args)
-                .map(|output| output.trim().to_string())
-                .map_err(crate::error::Error::Protocol)
         };
-        let message =
-            init_and_push_env(&work, "   ", &identity).map_err(crate::error::Error::Protocol)?;
+        let message = fixture.init_and_push("   ").map_err(Error::Protocol)?;
         assert!(
             message.contains("local"),
             "blank URL skips the push: {message}"
         );
-        assert_eq!(work_git(&["branch", "--show-current"])?, "main");
-        assert_eq!(work_git(&["remote"])?, "");
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(fixture.work_git(&["branch", "--show-current"])?, "main");
+        assert_eq!(fixture.work_git(&["remote"])?, "");
         Ok(())
     }
 
     #[test]
-    fn init_flow_keeps_an_existing_readme() -> Result<(), crate::error::Error> {
-        if !git_available() {
+    fn init_flow_keeps_an_existing_readme() -> Result<(), Error> {
+        let Some(fixture) = Fixture::new("readme")? else {
             return Ok(());
-        }
-        let root = temp_dir_unique("readme");
-        let work = root.join("work");
-        std::fs::create_dir_all(&work)?;
-        std::fs::write(work.join("README.md"), "# Keep me\n")?;
-        let identity_path = write_test_gitconfig(&root)?;
-        let identity = [("GIT_CONFIG_GLOBAL", identity_path.as_str())];
-        init_and_push_env(&work, "", &identity).map_err(crate::error::Error::Protocol)?;
+        };
+        std::fs::write(fixture.work.join("README.md"), "# Keep me\n")?;
+        fixture.init_and_push("").map_err(Error::Protocol)?;
         assert_eq!(
-            std::fs::read_to_string(work.join("README.md"))?,
+            std::fs::read_to_string(fixture.work.join("README.md"))?,
             "# Keep me\n"
         );
-        let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }
 
     #[test]
-    fn init_flow_reports_push_failure_but_keeps_the_local_repo() -> Result<(), crate::error::Error>
-    {
-        if !git_available() {
+    fn init_flow_reports_push_failure_but_keeps_the_local_repo() -> Result<(), Error> {
+        let Some(fixture) = Fixture::new("push-fail")? else {
             return Ok(());
-        }
-        let root = temp_dir_unique("push-fail");
-        let work = root.join("work");
-        std::fs::create_dir_all(&work)?;
-        let identity_path = write_test_gitconfig(&root)?;
-        let identity = [("GIT_CONFIG_GLOBAL", identity_path.as_str())];
-        let missing = root.join("no-such-remote.git");
-        let remote = missing
-            .to_str()
-            .ok_or_else(|| crate::error::Error::Protocol("non-UTF8 temp path".to_string()))?;
-        let error = init_and_push_env(&work, remote, &identity)
+        };
+        let error = fixture
+            .init_and_push(&fixture.missing_remote()?)
             .expect_err("pushing to a missing path must fail");
         assert!(
             error.contains("push failed") && error.contains("ready on branch main"),
             "error keeps the local repo usable: {error}"
         );
-        let branch = run_git(&work, &["branch", "--show-current"])
-            .map(|output| output.trim().to_string())
-            .map_err(crate::error::Error::Protocol)?;
-        assert_eq!(branch, "main");
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(fixture.work_git(&["branch", "--show-current"])?, "main");
         Ok(())
     }
 }

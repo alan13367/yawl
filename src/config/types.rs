@@ -271,6 +271,45 @@ impl FromStr for WebSearchProvider {
     }
 }
 
+/// Terminal background the interface colors are tuned for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Theme {
+    /// Ask the terminal for its background color at startup.
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+}
+
+impl fmt::Display for Theme {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Theme {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "dark" => Ok(Self::Dark),
+            "light" => Ok(Self::Light),
+            _ => Err("theme must be auto, dark, or light".to_string()),
+        }
+    }
+}
+
 /// RGB color used by the terminal UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UiColor {
@@ -483,6 +522,22 @@ pub struct ModelConfig {
     pub compat: OpenAiCompatibility,
 }
 
+#[cfg(test)]
+impl ModelConfig {
+    /// A model entry with only its ID set.
+    pub(crate) fn named(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: None,
+            context_window: None,
+            max_tokens: None,
+            input: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            compat: OpenAiCompatibility::default(),
+        }
+    }
+}
+
 /// Effective configuration for one OpenAI-compatible provider.
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
@@ -530,6 +585,14 @@ impl ProviderConfig {
         if let Some(compat) = file.compat {
             self.compat.apply(compat);
         }
+    }
+}
+
+#[cfg(test)]
+impl ProviderConfig {
+    /// An OpenAI-compatible provider with only its base URL set.
+    pub(crate) fn test_openai_compatible(base_url: &str) -> Self {
+        Self::openai_compatible(base_url)
     }
 }
 

@@ -106,10 +106,12 @@ impl Remote {
     }
 
     /// Names the browser tab after this session so several remote sessions
-    /// can be told apart. Unchanged titles are not resent.
-    pub(super) fn update_title(&self, state: &ViewState) {
+    /// can be told apart, and matches the page to the host's theme.
+    /// Unchanged values are not resent.
+    pub(super) fn update_page(&self, state: &ViewState) {
         self.hub
             .set_title(&session_title(&self.directory, state.transcript.entries()));
+        self.hub.set_light(super::theme::is_light());
     }
 
     /// Moves session notices (such as a host Ctrl+C or a pairing lockout)

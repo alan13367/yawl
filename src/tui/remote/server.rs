@@ -277,12 +277,16 @@ impl Server {
             start_event_stream(&mut *stream)?;
             write_event(&mut *stream, "hello", &client)?;
             write_event(&mut *stream, "title", &self.hub.title())?;
+            write_event(&mut *stream, "theme", theme_name(self.hub.light()))?;
             loop {
                 match receiver.recv_timeout(KEEPALIVE) {
                     Ok(Outgoing::Frame(frame)) => write_event(&mut *stream, "frame", &frame)?,
                     Ok(Outgoing::Clipboard(text)) => write_event(&mut *stream, "clipboard", &text)?,
                     Ok(Outgoing::Bell) => write_event(&mut *stream, "bell", "")?,
                     Ok(Outgoing::Title(title)) => write_event(&mut *stream, "title", &title)?,
+                    Ok(Outgoing::Theme(light)) => {
+                        write_event(&mut *stream, "theme", theme_name(light))?;
+                    }
                     Ok(Outgoing::Replaced) => return write_event(&mut *stream, "replaced", ""),
                     Err(RecvTimeoutError::Timeout) => {
                         stream.write_all(b": ping\n\n")?;
@@ -351,6 +355,11 @@ fn parse_size(body: &[u8]) -> Option<(u16, u16)> {
     let mut parts = text.split_whitespace();
     let size = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
     parts.next().is_none().then_some(size)
+}
+
+/// The page's terminal palette for the host's interface colors.
+fn theme_name(light: bool) -> &'static str {
+    if light { "light" } else { "dark" }
 }
 
 #[cfg(test)]
@@ -529,6 +538,8 @@ mod tests {
 
         hub.set_title("yawl · renamed-title");
         assert!(read_until(&mut events, "renamed-title")?.contains("event: title"));
+        hub.set_light(true);
+        assert!(read_until(&mut events, "\"light\"")?.contains("event: theme"));
 
         assert!(hub.send(Outgoing::Frame("\x1b[1;1Hframe-text".into())));
         assert!(read_until(&mut events, "frame-text")?.contains("event: frame"));

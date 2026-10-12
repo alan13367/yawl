@@ -1069,16 +1069,9 @@ mod tests {
 
     impl TempRoot {
         fn new(name: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "yawl-custom-{name}-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
-            Self(root)
+            Self(crate::test_support::unique_temp_dir(&format!(
+                "custom-{name}"
+            )))
         }
 
         fn config(&self) -> Config {

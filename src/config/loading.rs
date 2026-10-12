@@ -7,7 +7,7 @@ use super::{
     DEFAULT_MAX_TOKENS, DEFAULT_OPENAI_BASE_URL, DEFAULT_SUBAGENT_MODEL,
     DEFAULT_SUBAGENT_REQUEST_BUDGET, DEFAULT_SUBAGENT_TIMEOUT_SECS, DEFAULT_WEB_FETCH_MAX_CHARS,
     MAX_SUBAGENT_REQUEST_BUDGET, MAX_SUBAGENT_TIMEOUT_SECS, MAX_WEB_FETCH_MAX_CHARS,
-    ProviderConfig, UiColor, WebSearchProvider,
+    ProviderConfig, Theme, UiColor, WebSearchProvider,
 };
 use crate::error::Error;
 
@@ -44,7 +44,7 @@ impl Config {
         Ok(cfg)
     }
 
-    fn defaults(home_dir: PathBuf, project_dir: PathBuf) -> Config {
+    pub(super) fn defaults(home_dir: PathBuf, project_dir: PathBuf) -> Config {
         let home = home_dir.parent().unwrap_or(&home_dir);
         Config {
             model: None,
@@ -59,6 +59,7 @@ impl Config {
             scroll_bar: true,
             scroll_bar_auto_hide: true,
             bell: true,
+            theme: Theme::Auto,
             context_windows: HashMap::new(),
             auto_compact: true,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
@@ -170,6 +171,9 @@ impl Config {
         }
         if let Some(value) = file.bell {
             self.bell = value;
+        }
+        if let Some(value) = file.theme {
+            self.theme = value.parse().map_err(Error::Config)?;
         }
         if let Some(map) = file.context_windows {
             for (model, window) in &map {
@@ -597,8 +601,7 @@ mod tests {
 
     #[test]
     fn load_from_reports_the_file_that_failed_validation() -> Result<(), Error> {
-        let root =
-            std::env::temp_dir().join(format!("yawl-config-validation-{}", std::process::id()));
+        let root = crate::test_support::unique_temp_dir("config-validation");
         let home = root.join("home/.yawl");
         std::fs::create_dir_all(&home)?;
         std::fs::write(
@@ -621,10 +624,7 @@ mod tests {
 
     #[test]
     fn load_retains_global_and_project_skill_directory_provenance() -> Result<(), Error> {
-        let root = std::env::temp_dir().join(format!(
-            "yawl-config-skill-provenance-{}",
-            std::process::id()
-        ));
+        let root = crate::test_support::unique_temp_dir("config-skill-provenance");
         let home = root.join("home/.yawl");
         let project = root.join("project/.yawl");
         std::fs::create_dir_all(&home)?;
@@ -651,8 +651,7 @@ mod tests {
 
     #[test]
     fn subagent_defaults_and_project_overrides_are_merged() -> Result<(), Error> {
-        let root =
-            std::env::temp_dir().join(format!("yawl-subagent-config-{}", std::process::id()));
+        let root = crate::test_support::unique_temp_dir("subagent-config");
         let home = root.join("home/.yawl");
         let project = root.join("project/.yawl");
         let _ = std::fs::remove_dir_all(&root);
@@ -693,14 +692,7 @@ mod tests {
 
     #[test]
     fn web_global_and_project_values_are_merged() -> Result<(), Error> {
-        let root = std::env::temp_dir().join(format!(
-            "yawl-web-config-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        let root = crate::test_support::unique_temp_dir("web-config");
         let home = root.join("home/.yawl");
         let project = root.join("project/.yawl");
         std::fs::create_dir_all(&home)?;
@@ -732,14 +724,7 @@ mod tests {
 
     #[test]
     fn project_endpoints_and_credentials_require_trust() -> Result<(), Error> {
-        let root = std::env::temp_dir().join(format!(
-            "yawl-project-trust-config-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        let root = crate::test_support::unique_temp_dir("project-trust-config");
         let home = root.join("home/.yawl");
         let project = root.join("project/.yawl");
         let _ = std::fs::remove_dir_all(&root);

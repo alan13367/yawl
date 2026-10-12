@@ -4,45 +4,6 @@ use super::*;
 
 fn completion_state(commands: &[&str]) -> ViewState {
     ViewState {
-        transcript: Transcript::from_messages(&[]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
-        show_scroll_bar: true,
-        scroll_bar_enabled: true,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
         completions: commands
             .iter()
             .map(|command| Completion {
@@ -50,48 +11,14 @@ fn completion_state(commands: &[&str]) -> ViewState {
                 description: String::new(),
             })
             .collect(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: crate::tui::render::RenderCache::default(),
+        ..ViewState::test_default()
     }
 }
 
 #[test]
 fn command_menu_includes_init() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-init-completion-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let cwd = root.join("project");
-    let config = Config {
-        model: Some("test".into()),
-        home_dir: root.join("home/.yawl"),
-        project_dir: cwd.join(".yawl"),
-        ..Config::test_default()
-    };
-    let dirs = config.session_dirs(&cwd);
-    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
-        .expect("session should be created");
-    let agent = Agent::new(config, "test".into(), session, Vec::new());
+    let root = crate::test_support::unique_temp_dir("init-completion");
+    let agent = super::test_support::agent_in(&root);
 
     let completions = super::completion::command_completions(&agent);
     assert!(completions.iter().any(|entry| {

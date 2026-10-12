@@ -149,9 +149,7 @@ mod tests {
 
     #[test]
     fn builtin_entries_are_shared_until_the_scan_shape_changes() {
-        let root =
-            std::env::temp_dir().join(format!("yawl-catalog-builtins-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::unique_temp_dir("catalog-builtins");
         let mut config = config(&root);
         let mut cache = CatalogCache::default();
 
@@ -181,7 +179,7 @@ mod tests {
 
     #[test]
     fn subagent_entries_follow_preset_generations() {
-        let root = std::env::temp_dir().join(format!("yawl-catalog-agents-{}", std::process::id()));
+        let root = crate::test_support::unique_temp_dir("catalog-agents");
         let home = root.join("home/.yawl");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(home.join("agents")).expect("agents dir");
@@ -216,7 +214,7 @@ mod tests {
 
     #[test]
     fn invocable_skills_are_shared_until_the_catalog_changes() {
-        let root = std::env::temp_dir().join(format!("yawl-catalog-skills-{}", std::process::id()));
+        let root = crate::test_support::unique_temp_dir("catalog-skills");
         let skills = root.join("home/.yawl/skills");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(skills.join("automatic")).expect("skill dir");

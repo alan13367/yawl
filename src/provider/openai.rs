@@ -1,14 +1,12 @@
 //! OpenAI-compatible chat completions with SSE streaming. Also serves
 //! Ollama, llama.cpp, and OpenRouter via a configurable `base_url`.
 
-use std::io::BufReader;
-
 use serde_json::{Value, json};
 
 use super::types::clamp_openai_prompt_cache_key;
 use super::{
-    Event, Provider, ReasoningKind, Request, Role, SseEvent, SseReader, TokenUsage, ToolCall,
-    error_body, http_agent,
+    Event, Provider, ReasoningKind, Request, Role, SseEvent, TokenUsage, ToolCall, error_body,
+    event_stream, http_agent,
 };
 use crate::config::OpenAiCompatibility;
 use crate::error::Error;
@@ -442,9 +440,8 @@ impl Provider for OpenAi {
             return Err(Error::Http { status, body });
         }
 
-        let reader = BufReader::new(response.into_body().into_reader());
+        let mut stream = event_stream(response)?;
         let mut decoder = Decoder::new(&self.compat);
-        let mut stream = SseReader::new(reader);
         while let Some(sse) = stream.next() {
             if decoder.decode(sse?, on_event)? {
                 stream.finish();
@@ -465,7 +462,7 @@ fn reasoning_delta(delta: &Value) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::Message;
+    use crate::provider::{Message, SseReader};
     use std::io::Cursor;
 
     #[test]

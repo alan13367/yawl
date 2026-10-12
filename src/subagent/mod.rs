@@ -4,7 +4,7 @@ pub(crate) mod presets;
 mod reports;
 mod types;
 
-pub(crate) use manager::SubagentManager;
+pub(crate) use manager::{SubagentManager, format_duration};
 pub(crate) use presets::AgentPreset;
 #[cfg(test)]
 pub(crate) use types::{LiveTool, QueuedSubagentMessage, SubagentId};

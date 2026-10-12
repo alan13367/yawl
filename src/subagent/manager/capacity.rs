@@ -1,6 +1,5 @@
 //! Subagent capacity: limits, admission, queueing, and pruning.
 
-use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::agent::{Conversation, RunLimits};
@@ -124,21 +123,9 @@ impl SubagentManager {
                 model.clone(),
                 crate::model::context_window(&config, &model),
             );
-            state.entries.push(Entry {
-                snapshot,
-                cancellation,
-                work: VecDeque::new(),
-                next_run_number: 2,
-                thread_id: None,
-                handle: None,
-                wait_interest: 0,
-                pending_delivery: Vec::new(),
-                suppress_delivery: false,
-                steers,
-                model_steer_accepted: false,
-                holds_slot: false,
-                queued_sequence: 0,
-            });
+            state
+                .entries
+                .push(Entry::new(snapshot, cancellation, steers));
             let index = state.entries.len() - 1;
             let queued = !admit(&mut state, index);
             (id, conversation, work, queued)

@@ -21,6 +21,8 @@ pub mod session;
 pub mod skills;
 pub(crate) mod subagent;
 pub(crate) mod terminal_mode;
+#[cfg(test)]
+mod test_support;
 pub mod tools;
 pub mod trust;
 pub mod tui;

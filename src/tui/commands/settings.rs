@@ -150,6 +150,9 @@ pub(in crate::tui) fn settings(agent: &mut Agent, argument: &str, state: &mut Vi
         "bell" => one_value(&mut parts, "usage: /settings bell on|off")
             .and_then(parse_on_off)
             .map(ConfigChange::Bell),
+        "theme" => one_value(&mut parts, "usage: /settings theme auto|dark|light")
+            .and_then(|value| value.parse().map_err(Error::Config))
+            .map(ConfigChange::Theme),
         "auto_compact" => one_value(&mut parts, "usage: /settings auto_compact on|off")
             .and_then(parse_on_off)
             .map(ConfigChange::AutoCompact),
@@ -307,16 +310,10 @@ pub(in crate::tui) fn apply_config_change(
             state.reasoning_effort =
                 crate::model::effective_reasoning_effort(agent.config(), agent.model())
                     .map(str::to_string);
-            state.hide_reasoning = agent.config().hide_reasoning;
-            state.accent_color = agent.config().accent_color;
-            state.selection_color = agent.config().effective_selection_color();
+            sync_display_settings(agent.config(), state);
             if color_change {
                 state.commit_color_preview();
             }
-            state.status_bar = agent.config().status_bar.clone();
-            state.subagents_enabled = agent.config().subagents;
-            state.sync_scroll_bar_config(agent.config());
-            state.bell = agent.config().bell;
             state.context_window = agent.context_window();
             notice_config_effect(agent.config(), effect, state);
             true
@@ -328,6 +325,23 @@ pub(in crate::tui) fn apply_config_change(
             state.notice(format!("Could not change setting: {error}"));
             false
         }
+    }
+}
+
+/// Mirrors the display settings in `config` into the view and applies its
+/// theme, whether the change was made while idle or during a turn.
+pub(in crate::tui) fn sync_display_settings(config: &Config, state: &mut ViewState) {
+    state.hide_reasoning = config.hide_reasoning;
+    state.accent_color = config.accent_color;
+    state.selection_color = config.effective_selection_color();
+    state.status_bar = config.status_bar.clone();
+    state.subagents_enabled = config.subagents;
+    state.sync_scroll_bar_config(config);
+    state.bell = config.bell;
+    let was_light = super::super::theme::is_light();
+    super::super::theme::apply(config.theme);
+    if super::super::theme::is_light() != was_light {
+        state.render_cache.invalidate();
     }
 }
 
@@ -366,7 +380,7 @@ pub(in crate::tui) fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- status_bar: `{} items, {} style`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- bell: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- web_browsing: `{}`\n- web_search_provider: `{}`\n- web_fetch_max_chars: `{}`\n- brave_api_key: `{}`\n- firecrawl_api_key: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- status_bar: `{} items, {} style`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- bell: `{}`\n- theme: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- web_browsing: `{}`\n- web_search_provider: `{}`\n- web_fetch_max_chars: `{}`\n- brave_api_key: `{}`\n- firecrawl_api_key: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -390,6 +404,7 @@ pub(in crate::tui) fn show_settings(agent: &Agent, state: &mut ViewState) {
             "off"
         },
         if agent.config().bell { "on" } else { "off" },
+        agent.config().theme,
         if agent.config().auto_compact {
             "on"
         } else {
@@ -456,7 +471,7 @@ pub(in crate::tui) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max|ultra`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings bell on|off`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max|ultra`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings bell on|off`\n- `/settings theme auto|dark|light`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);

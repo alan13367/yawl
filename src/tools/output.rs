@@ -3,12 +3,12 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const INLINE_BYTES: usize = 16 * 1024;
 const EXCERPT_BYTES: usize = 2 * 1024;
-static NEXT_OUTPUT: AtomicU64 = AtomicU64::new(0);
+static NEXT_ARTIFACT: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn prepare(directory: &Path, content: &mut String) {
     if content.len() <= INLINE_BYTES {
@@ -32,7 +32,20 @@ pub(super) fn prepare(directory: &Path, content: &mut String) {
     );
 }
 
-pub(super) fn save(directory: &Path, content: &str) -> std::io::Result<std::path::PathBuf> {
+pub(super) fn save(directory: &Path, content: &str) -> std::io::Result<PathBuf> {
+    save_artifact(directory, "output", "txt", content)
+}
+
+/// Writes `content` to a new owner-only file named
+/// `{prefix}-{pid}-{nanos}-{sequence}.{extension}` in `directory` and returns
+/// its absolute path. Existing files are never replaced, and a failed write
+/// leaves no partial file behind.
+pub(crate) fn save_artifact(
+    directory: &Path,
+    prefix: &str,
+    extension: &str,
+    content: &str,
+) -> std::io::Result<PathBuf> {
     fs::create_dir_all(directory)?;
     let directory = fs::canonicalize(directory)?;
     let timestamp = std::time::SystemTime::now()
@@ -40,9 +53,9 @@ pub(super) fn save(directory: &Path, content: &str) -> std::io::Result<std::path
         .unwrap_or_default()
         .as_nanos();
     for _ in 0..16 {
-        let sequence = NEXT_OUTPUT.fetch_add(1, Ordering::Relaxed);
+        let sequence = NEXT_ARTIFACT.fetch_add(1, Ordering::Relaxed);
         let path = directory.join(format!(
-            "output-{}-{timestamp}-{sequence}.txt",
+            "{prefix}-{}-{timestamp}-{sequence}.{extension}",
             std::process::id()
         ));
         let mut file = match OpenOptions::new()
@@ -62,7 +75,9 @@ pub(super) fn save(directory: &Path, content: &str) -> std::io::Result<std::path
         }
         return Ok(path);
     }
-    Err(std::io::Error::other("could not allocate output artifact"))
+    Err(std::io::Error::other(format!(
+        "could not allocate a unique {prefix} file"
+    )))
 }
 
 #[cfg(test)]
@@ -71,7 +86,7 @@ mod tests {
 
     #[test]
     fn output_preserves_head_tail_and_full_unicode_file() {
-        let directory = std::env::temp_dir().join(format!("yawl-output-{}", std::process::id()));
+        let directory = crate::test_support::unique_temp_dir("output");
         let original = format!("START\n{}\nFAILURE AT END", "é".repeat(20_000));
         let mut content = original.clone();
         prepare(&directory, &mut content);

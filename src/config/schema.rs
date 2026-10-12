@@ -33,6 +33,8 @@ pub(super) struct ConfigFile {
     /// Whether the terminal bell rings when a turn settles or a question
     /// needs an answer.
     pub(super) bell: Option<bool>,
+    /// `auto`, `dark`, or `light` interface colors.
+    pub(super) theme: Option<String>,
     /// Compatibility with the brief two-color settings format.
     pub(super) status_bar_color: Option<UiColor>,
     /// Compatibility with the brief two-color settings format.

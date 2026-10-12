@@ -76,6 +76,18 @@ struct PersistentState {
     background: BackgroundProcessManager,
 }
 
+impl PersistentState {
+    /// Fresh per-session workers and undo snapshots for `session`.
+    fn open(config: &Config, session: Session, work_tree: std::path::PathBuf) -> Self {
+        Self {
+            subagents: SubagentManager::new(session.id.clone(), config.max_subagents),
+            checkpoints: Checkpoints::open(&config.home_dir, &session.id, work_tree),
+            background: BackgroundProcessManager::default(),
+            session: Box::new(session),
+        }
+    }
+}
+
 struct ChildState {
     session_id: String,
     prompt_cache_key: String,
@@ -133,51 +145,28 @@ impl Conversation {
         messages: Vec<Message>,
         work_tree: std::path::PathBuf,
     ) -> Self {
-        let subagents = SubagentManager::new(session.id.clone(), config.max_subagents);
-        let checkpoints = Checkpoints::open(&config.home_dir, &session.id, work_tree);
         let context_usage = session
             .context()
             .filter(|usage| usage.model == model && usage.messages <= messages.len())
             .cloned();
-        let configured_reasoning_effort = config.reasoning_effort.clone();
-        let mut config = config;
-        if let Some(effort) = session.recorded_reasoning() {
-            config.reasoning_effort = effort;
+        let reasoning_effort = session.recorded_reasoning();
+        let state = PersistentState::open(&config, session, work_tree);
+        let mut conversation =
+            Self::new(config, model, messages, ConversationKind::Persistent(state));
+        if let Some(effort) = reasoning_effort {
+            conversation.config.reasoning_effort = effort;
         }
-        Self {
-            config,
-            configured_reasoning_effort,
-            model,
-            messages,
-            kind: ConversationKind::Persistent(PersistentState {
-                session: Box::new(session),
-                subagents,
-                checkpoints,
-                background: BackgroundProcessManager::default(),
-            }),
-            context_tokens: context_usage.as_ref().map_or(0, |usage| usage.tokens),
-            context_usage,
-            pending_tool_results: Default::default(),
-            latest_turn_result: String::new(),
-            plan_ready_this_turn: false,
-            unfinished_mode: None,
-            catalog_cache: CatalogCache::default(),
-            reported_warnings: Default::default(),
-            cancellation: CancellationToken::default(),
-            print_mode: false,
-            steers: SteerInbox::default(),
-            questions: QuestionBroker::default(),
-        }
+        conversation.context_tokens = context_usage.as_ref().map_or(0, |usage| usage.tokens);
+        conversation.context_usage = context_usage;
+        conversation
     }
 
     pub(crate) fn memory(config: Config, model: String, session_id: String) -> Self {
-        let configured_reasoning_effort = config.reasoning_effort.clone();
-        Self {
+        Self::new(
             config,
-            configured_reasoning_effort,
             model,
-            messages: Vec::new(),
-            kind: ConversationKind::Child(ChildState {
+            Vec::new(),
+            ConversationKind::Child(ChildState {
                 prompt_cache_key: session_id.clone(),
                 session_id,
                 usage: UsageSummary::default(),
@@ -186,6 +175,18 @@ impl Conversation {
                 tool_allowlist: None,
                 role_fragment: None,
             }),
+        )
+    }
+
+    /// Turn state starts empty; the configured reasoning effort is kept
+    /// apart so a session-chosen effort can be told from the default.
+    fn new(config: Config, model: String, messages: Vec<Message>, kind: ConversationKind) -> Self {
+        Self {
+            configured_reasoning_effort: config.reasoning_effort.clone(),
+            config,
+            model,
+            messages,
+            kind,
             context_tokens: 0,
             context_usage: None,
             pending_tool_results: Default::default(),
@@ -299,12 +300,7 @@ impl Conversation {
     /// fails.
     pub(crate) fn start_goal(&mut self, input: TurnInput) -> Result<Option<String>, Error> {
         self.recover_history()?;
-        let warning = self
-            .persistent_mut()
-            .checkpoints
-            .snapshot()
-            .err()
-            .map(|error| format!("Could not checkpoint for /undo: {error}"));
+        let warning = self.checkpoint_warning();
         let message = Message::user_input(input).with_control(MessageControl::GoalStart);
         let goal = message.content.clone();
         self.persistent_mut()
@@ -329,12 +325,7 @@ impl Conversation {
         if objective.trim().is_empty() {
             return Err(Error::Config("plan objective is empty".into()));
         }
-        let warning = self
-            .persistent_mut()
-            .checkpoints
-            .snapshot()
-            .err()
-            .map(|error| format!("Could not checkpoint for /undo: {error}"));
+        let warning = self.checkpoint_warning();
         let message = Message::user_input(input);
         self.persistent_mut()
             .session
@@ -415,6 +406,8 @@ impl Conversation {
     pub(crate) fn sync_display_config(&mut self, config: &Config) {
         self.config.hide_reasoning = config.hide_reasoning;
         self.config.accent_color = config.accent_color;
+        self.config.selection_color = config.selection_color;
+        self.config.theme = config.theme;
         self.config.status_bar.clone_from(&config.status_bar);
         self.config.scroll_bar = config.scroll_bar;
         self.config.scroll_bar_auto_hide = config.scroll_bar_auto_hide;
@@ -432,15 +425,7 @@ impl Conversation {
         if self.config.reasoning_effort != self.configured_reasoning_effort {
             session.append_reasoning_effort(self.config.reasoning_effort.clone())?;
         }
-        self.persistent_state().subagents.shutdown_and_discard();
-        self.persistent_state().background.shutdown_and_discard();
-        let session_id = session.id.clone();
-        self.kind = ConversationKind::Persistent(PersistentState {
-            session: Box::new(session),
-            subagents: SubagentManager::new(session_id.clone(), self.config.max_subagents),
-            checkpoints: Checkpoints::open(&self.config.home_dir, &session_id, cwd),
-            background: BackgroundProcessManager::default(),
-        });
+        self.switch_session(session, cwd);
         self.messages.clear();
         self.context_tokens = 0;
         self.context_usage = None;
@@ -452,6 +437,15 @@ impl Conversation {
             let _ = Session::delete(&dirs.project, &old_id);
         }
         Ok(())
+    }
+
+    /// Stops the current session's subagents and background processes, then
+    /// makes `session` current.
+    fn switch_session(&mut self, session: Session, work_tree: std::path::PathBuf) {
+        self.persistent_state().subagents.shutdown_and_discard();
+        self.persistent_state().background.shutdown_and_discard();
+        self.kind =
+            ConversationKind::Persistent(PersistentState::open(&self.config, session, work_tree));
     }
 
     /// Deletes a saved session. If it is the active session, starts a fresh one.
@@ -493,15 +487,7 @@ impl Conversation {
         // Continue with the model the session last used, unless its provider is
         // gone from the config.
         let model = session.resumed_model(&self.config, &self.model);
-        self.persistent_state().subagents.shutdown_and_discard();
-        self.persistent_state().background.shutdown_and_discard();
-        let session_id = session.id.clone();
-        self.kind = ConversationKind::Persistent(PersistentState {
-            session: Box::new(session),
-            subagents: SubagentManager::new(session_id.clone(), self.config.max_subagents),
-            checkpoints: Checkpoints::open(&self.config.home_dir, &session_id, cwd),
-            background: BackgroundProcessManager::default(),
-        });
+        self.switch_session(session, cwd);
         self.messages = messages;
         self.model = model;
         self.config.reasoning_effort = match self.persistent_state().session.recorded_reasoning() {
@@ -710,6 +696,14 @@ impl Conversation {
             ConversationKind::Persistent(state) => Some(state.checkpoints.snapshot()),
             ConversationKind::Child(_) => None,
         }
+    }
+
+    /// Snapshots the work tree for `/undo`. A failure only becomes a warning
+    /// because the turn can still run without it.
+    fn checkpoint_warning(&mut self) -> Option<String> {
+        self.checkpoint_snapshot()?
+            .err()
+            .map(|error| format!("Could not checkpoint for /undo: {error}"))
     }
 
     fn checkpoint_path(&mut self, path: &std::path::Path) -> Option<Result<(), Error>> {

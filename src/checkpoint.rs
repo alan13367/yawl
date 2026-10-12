@@ -690,19 +690,35 @@ mod tests {
     }
 
     #[test]
-    fn open_discards_orphaned_legacy_snapshot_data() -> Result<(), Error> {
-        let root = temp_root("legacy-orphan");
-        let home = root.join("home");
+    fn open_discards_legacy_snapshot_stores() -> Result<(), Error> {
+        let root = temp_root("legacy");
         let work = root.join("work");
-        let checkpoint_dir = home.join("checkpoints/sess");
-        write(&checkpoint_dir.join("shadow.git/objects/orphan"), "git");
-        write(&checkpoint_dir.join("copies/0/orphan"), "copy");
         fs::create_dir_all(&work)?;
+        let cases: [(&str, &[(&str, &str)]); 2] = [
+            (
+                "orphaned-data",
+                &[
+                    ("shadow.git/objects/orphan", "git"),
+                    ("copies/0/orphan", "copy"),
+                ],
+            ),
+            (
+                "array-store",
+                &[("stack.json", "[]"), ("shadow.git/objects/legacy", "git")],
+            ),
+        ];
+        for (name, files) in cases {
+            let home = root.join(name);
+            let checkpoint_dir = home.join("checkpoints/sess");
+            for (path, contents) in files {
+                write(&checkpoint_dir.join(path), contents);
+            }
 
-        let checkpoints = Checkpoints::open(&home, "sess", work);
+            let checkpoints = Checkpoints::open(&home, "sess", work.clone());
 
-        assert!(checkpoints.stack.is_empty());
-        assert!(!checkpoint_dir.exists());
+            assert!(checkpoints.stack.is_empty(), "{name}");
+            assert!(!checkpoint_dir.exists(), "{name}");
+        }
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
@@ -751,24 +767,6 @@ mod tests {
     }
 
     #[test]
-    fn open_discards_legacy_array_store() -> Result<(), Error> {
-        let root = temp_root("legacy-array");
-        let home = root.join("home");
-        let work = root.join("work");
-        let checkpoint_dir = home.join("checkpoints/sess");
-        write(&checkpoint_dir.join("stack.json"), "[]");
-        write(&checkpoint_dir.join("shadow.git/objects/legacy"), "git");
-        fs::create_dir_all(&work)?;
-
-        let checkpoints = Checkpoints::open(&home, "sess", work);
-
-        assert!(checkpoints.stack.is_empty());
-        assert!(!checkpoint_dir.exists());
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
     fn outside_cwd_overlay_restores_and_deletes() -> Result<(), Error> {
         let root = temp_root("overlay");
         let home = root.join("home");
@@ -800,6 +798,18 @@ mod tests {
         Ok(())
     }
 
+    /// Commits the staged changes in `work` as a fixed test identity.
+    fn commit(work: &Path, message: &str) -> Result<(), Error> {
+        run_git(
+            Command::new("git")
+                .arg("-C")
+                .arg(work)
+                .args(["-c", "user.name=yawl", "-c", "user.email=yawl@localhost"])
+                .args(["-c", "commit.gpgsign=false", "commit", "-m", message]),
+        )
+        .map(|_| ())
+    }
+
     #[test]
     fn touched_files_restore_after_agent_moves_git_head() -> Result<(), Error> {
         if !git_available() {
@@ -812,18 +822,7 @@ mod tests {
         write(&work.join("tracked.txt"), "v1");
         user_git(&work, &["init", "--template="])?;
         user_git(&work, &["add", "tracked.txt"])?;
-        run_git(
-            Command::new("git")
-                .arg("-C")
-                .arg(&work)
-                .arg("-c")
-                .arg("user.name=yawl")
-                .arg("-c")
-                .arg("user.email=yawl@localhost")
-                .arg("-c")
-                .arg("commit.gpgsign=false")
-                .args(["commit", "-m", "init"]),
-        )?;
+        commit(&work, "init")?;
         write(&work.join("dirty.txt"), "user-dirty");
         let original_head = user_git(&work, &["rev-parse", "HEAD"])?.trim().to_string();
 
@@ -834,18 +833,7 @@ mod tests {
         write(&work.join("tracked.txt"), "agent");
         write(&work.join("added.txt"), "new");
         user_git(&work, &["add", "-A"])?;
-        run_git(
-            Command::new("git")
-                .arg("-C")
-                .arg(&work)
-                .arg("-c")
-                .arg("user.name=yawl")
-                .arg("-c")
-                .arg("user.email=yawl@localhost")
-                .arg("-c")
-                .arg("commit.gpgsign=false")
-                .args(["commit", "-m", "agent"]),
-        )?;
+        commit(&work, "agent")?;
 
         let report = checkpoints.restore_last()?;
         assert!(report.restored);
@@ -874,18 +862,7 @@ mod tests {
         write(&work.join("unstaged.txt"), "base unstaged");
         user_git(&work, &["init", "--template="])?;
         user_git(&work, &["add", "staged.txt", "unstaged.txt"])?;
-        run_git(
-            Command::new("git")
-                .arg("-C")
-                .arg(&work)
-                .arg("-c")
-                .arg("user.name=yawl")
-                .arg("-c")
-                .arg("user.email=yawl@localhost")
-                .arg("-c")
-                .arg("commit.gpgsign=false")
-                .args(["commit", "-m", "base"]),
-        )?;
+        commit(&work, "base")?;
         let original_head = user_git(&work, &["rev-parse", "HEAD"])?.trim().to_string();
         write(&work.join("staged.txt"), "user staged");
         user_git(&work, &["add", "staged.txt"])?;
@@ -898,18 +875,7 @@ mod tests {
         write(&work.join("staged.txt"), "agent staged");
         write(&work.join("unstaged.txt"), "agent unstaged");
         user_git(&work, &["add", "-A"])?;
-        run_git(
-            Command::new("git")
-                .arg("-C")
-                .arg(&work)
-                .arg("-c")
-                .arg("user.name=yawl")
-                .arg("-c")
-                .arg("user.email=yawl@localhost")
-                .arg("-c")
-                .arg("commit.gpgsign=false")
-                .args(["commit", "-m", "agent"]),
-        )?;
+        commit(&work, "agent")?;
 
         let report = checkpoints.restore_retained(Some(0))?;
         // Simulate a crash after HEAD reset but before staging was restored.
@@ -952,18 +918,7 @@ mod tests {
         write(&work.join("tracked.txt"), "v1");
         user_git(&work, &["init", "--template="])?;
         user_git(&work, &["add", "tracked.txt"])?;
-        run_git(
-            Command::new("git")
-                .arg("-C")
-                .arg(&work)
-                .arg("-c")
-                .arg("user.name=yawl")
-                .arg("-c")
-                .arg("user.email=yawl@localhost")
-                .arg("-c")
-                .arg("commit.gpgsign=false")
-                .args(["commit", "-m", "init"]),
-        )?;
+        commit(&work, "init")?;
         let original_head = user_git(&work, &["rev-parse", "HEAD"])?.trim().to_string();
         fs::write(work.join(".git/index"), b"not a git index")?;
 

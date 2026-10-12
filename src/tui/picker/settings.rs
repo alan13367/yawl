@@ -4,7 +4,7 @@
 //! builds the settings catalogs from configuration.
 
 use crate::agent::Agent;
-use crate::config::{Config, UiColor, WebSearchProvider};
+use crate::config::{Config, Theme, UiColor, WebSearchProvider};
 use crate::onboarding::provider::ProviderId;
 
 use super::super::ViewState;
@@ -24,6 +24,16 @@ const COLOR_PALETTE: [(&str, UiColor); 10] = [
     ("Purple", UiColor::new(190, 149, 255)),
     ("Pink", UiColor::new(238, 148, 200)),
 ];
+
+/// `auto` also names the background it resolved to.
+fn theme_description(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Auto if super::super::theme::is_light() => "Auto (light)",
+        Theme::Auto => "Auto (dark)",
+        Theme::Dark => "Dark",
+        Theme::Light => "Light",
+    }
+}
 
 fn swatch_description(color: UiColor) -> String {
     format!(
@@ -146,6 +156,15 @@ pub(in crate::tui) fn settings_category_picker_from(
                 label: "Selection color".into(),
                 description: UiColor::selection_config_value(config.selection_color),
                 action: PickerAction::OpenSelectionColor,
+            },
+            PickerItem {
+                label: "Theme".into(),
+                description: format!("{} · Enter to change", theme_description(config.theme)),
+                action: PickerAction::SetTheme(match config.theme {
+                    Theme::Auto => Theme::Dark,
+                    Theme::Dark => Theme::Light,
+                    Theme::Light => Theme::Auto,
+                }),
             },
             PickerItem {
                 label: "Status bar".into(),
@@ -519,6 +538,7 @@ fn settings_items(category: SettingsCategory) -> &'static [SettingsItem] {
             SettingsItem::ReasoningDisplay,
             SettingsItem::AccentColor,
             SettingsItem::SelectionColor,
+            SettingsItem::Theme,
             SettingsItem::StatusBar,
             SettingsItem::ScrollBar,
             SettingsItem::ScrollBarAutoHide,

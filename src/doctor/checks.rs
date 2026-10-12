@@ -23,6 +23,7 @@ const KNOWN_KEYS: &[&str] = &[
     "reasoning_effort",
     "hide_reasoning",
     "accent_color",
+    "theme",
     "selection_color",
     "status_bar",
     "status_bar_color",
@@ -246,6 +247,15 @@ fn semantic_checks(
                 ["web_search_provider"],
                 json!(config::WebSearchProvider::DuckDuckGo.as_str()),
             )),
+        ));
+    }
+    if let Some(theme) = map.get("theme").and_then(Value::as_str)
+        && theme.parse::<config::Theme>().is_err()
+    {
+        findings.push(error(
+            area,
+            "theme must be auto, dark, or light".into(),
+            Some(set(path, ["theme"], json!(config::Theme::Auto.as_str()))),
         ));
     }
     if let Some(limit) = map.get("web_fetch_max_chars").and_then(Value::as_u64)
@@ -492,53 +502,21 @@ fn check_env_references(
     }
 }
 
-/// Extracts references with the same scan rules as
-/// `config::resolve_config_value`. Escaped `$$` and `$!` pairs are literals.
+/// Environment variables a provider value references, each named once.
 fn referenced_variables(value: &str) -> Result<Vec<String>, &'static str> {
-    if value.starts_with('!') {
-        return Err(
-            "a value beginning with '!', which is unsupported; use an environment variable",
-        );
-    }
-    let chars = value.chars().collect::<Vec<_>>();
+    let parts = config::config_value_parts(value).map_err(|error| match error {
+        config::ValueError::ShellCommand => {
+            "a value beginning with '!', which is unsupported; use an environment variable"
+        }
+        config::ValueError::Unterminated => "an unterminated environment variable reference",
+    })?;
     let mut names = Vec::new();
-    let mut index = 0usize;
-    while index < chars.len() {
-        if chars[index] != '$' {
-            index += 1;
-            continue;
-        }
-        let Some(next) = chars.get(index + 1).copied() else {
-            break;
-        };
-        if matches!(next, '$' | '!') {
-            index += 2;
-            continue;
-        }
-        let (name, next_index) = if next == '{' {
-            let Some(relative_end) = chars[index + 2..]
-                .iter()
-                .position(|character| *character == '}')
-            else {
-                return Err("an unterminated environment variable reference");
-            };
-            let end = index + 2 + relative_end;
-            (chars[index + 2..end].iter().collect::<String>(), end + 1)
-        } else {
-            let end = chars[index + 1..]
-                .iter()
-                .position(|character| !(character.is_ascii_alphanumeric() || *character == '_'))
-                .map_or(chars.len(), |relative| index + 1 + relative);
-            if end == index + 1 {
-                index += 1;
-                continue;
-            }
-            (chars[index + 1..end].iter().collect::<String>(), end)
-        };
-        if !names.contains(&name) {
+    for part in parts {
+        if let config::ValuePart::Variable(name) = part
+            && !names.contains(&name)
+        {
             names.push(name);
         }
-        index = next_index;
     }
     Ok(names)
 }
@@ -918,12 +896,7 @@ mod tests {
 
     impl TestDirs {
         fn new(name: &str) -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let root = std::env::temp_dir()
-                .join(format!("yawl-doctor-{}-{nonce}-{name}", std::process::id()));
+            let root = crate::test_support::unique_temp_dir(&format!("doctor-{name}"));
             let dirs = Self {
                 global: root.join("home/.yawl/config.json"),
                 project: root.join("project/.yawl/config.json"),
@@ -1065,7 +1038,7 @@ mod tests {
     fn semantic_rules_reset_defaults() {
         let dirs = TestDirs::new("semantic");
         dirs.write_global(
-            r#"{"max_tokens":0,"compact_threshold":1.5,"reasoning_effort":"extreme","web_search_provider":"other","web_fetch_max_chars":50001,"setup":"later"}"#,
+            r#"{"max_tokens":0,"compact_threshold":1.5,"reasoning_effort":"extreme","web_search_provider":"other","theme":"sepia","web_fetch_max_chars":50001,"setup":"later"}"#,
         );
 
         let findings = run(&dirs.paths());
@@ -1078,6 +1051,7 @@ mod tests {
             "compact_threshold must be between 0.1 and 0.99",
             "unsupported reasoning effort 'extreme'",
             "web_search_provider must be duckduckgo, brave, or firecrawl",
+            "theme must be auto, dark, or light",
             "web_fetch_max_chars must be between 1 and 50000",
             "setup must be",
         ] {
@@ -1090,6 +1064,20 @@ mod tests {
             errors(&findings)
                 .iter()
                 .all(|finding| finding.fix.is_some())
+        );
+    }
+
+    #[test]
+    fn valid_theme_is_a_known_key() {
+        let dirs = TestDirs::new("theme");
+        dirs.write_global(r#"{"theme":"light"}"#);
+
+        let findings = run(&dirs.paths());
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.message.contains("theme")),
+            "unexpected theme finding in {findings:?}"
         );
     }
 

@@ -160,30 +160,21 @@ impl Conversation {
         input: TurnInput,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
-        let cancellation = self.cancellation.clone();
-        crate::cancellation::scope(&cancellation, || {
-            self.run_turn_input_with_mode(Some(input), sink, &mut provider::resolve, TurnMode::Init)
-        })
+        self.run_mode_preserving_cancellation(Some(input), TurnMode::Init, sink)
     }
 
     pub(crate) fn run_goal_preserving_cancellation(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
-        let cancellation = self.cancellation.clone();
-        crate::cancellation::scope(&cancellation, || {
-            self.run_turn_input_with_mode(None, sink, &mut provider::resolve, TurnMode::Goal)
-        })
+        self.run_mode_preserving_cancellation(None, TurnMode::Goal, sink)
     }
 
     pub(crate) fn run_plan_preserving_cancellation(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
-        let cancellation = self.cancellation.clone();
-        crate::cancellation::scope(&cancellation, || {
-            self.run_turn_input_with_mode(None, sink, &mut provider::resolve, TurnMode::Plan)
-        })
+        self.run_mode_preserving_cancellation(None, TurnMode::Plan, sink)
     }
 
     pub(crate) fn run_plan_follow_up_preserving_cancellation(
@@ -191,15 +182,7 @@ impl Conversation {
         input: TurnInput,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
-        let cancellation = self.cancellation.clone();
-        crate::cancellation::scope(&cancellation, || {
-            self.run_turn_input_with_mode(
-                Some(input),
-                sink,
-                &mut provider::resolve,
-                TurnMode::PlanFollowUp,
-            )
-        })
+        self.run_mode_preserving_cancellation(Some(input), TurnMode::PlanFollowUp, sink)
     }
 
     pub(crate) fn run_plan_implementation_preserving_cancellation(
@@ -207,14 +190,20 @@ impl Conversation {
         input: Option<TurnInput>,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
+        self.run_mode_preserving_cancellation(input, TurnMode::PlanImplement, sink)
+    }
+
+    /// Runs one turn in `mode` with the configured provider, inside this
+    /// conversation's cancellation scope without clearing an earlier cancel.
+    fn run_mode_preserving_cancellation(
+        &mut self,
+        input: Option<TurnInput>,
+        mode: TurnMode,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
         let cancellation = self.cancellation.clone();
         crate::cancellation::scope(&cancellation, || {
-            self.run_turn_input_with_mode(
-                input,
-                sink,
-                &mut provider::resolve,
-                TurnMode::PlanImplement,
-            )
+            self.run_turn_input_with_mode(input, sink, &mut provider::resolve, mode)
         })
     }
 
@@ -378,70 +367,7 @@ impl Conversation {
         self.run_turn_input_with_mode(user_input, sink, resolve_provider, TurnMode::Normal)
     }
 
-    #[cfg(test)]
-    pub(super) fn run_init_with<F>(
-        &mut self,
-        input: TurnInput,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-        resolve_provider: &mut F,
-    ) -> Result<bool, Error>
-    where
-        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
-    {
-        self.run_turn_input_with_mode(Some(input), sink, resolve_provider, TurnMode::Init)
-    }
-
-    #[cfg(test)]
-    pub(super) fn run_goal_with<F>(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-        resolve_provider: &mut F,
-    ) -> Result<bool, Error>
-    where
-        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
-    {
-        self.run_turn_input_with_mode(None, sink, resolve_provider, TurnMode::Goal)
-    }
-
-    #[cfg(test)]
-    pub(super) fn run_plan_with<F>(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-        resolve_provider: &mut F,
-    ) -> Result<bool, Error>
-    where
-        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
-    {
-        self.run_turn_input_with_mode(None, sink, resolve_provider, TurnMode::Plan)
-    }
-
-    #[cfg(test)]
-    pub(super) fn run_plan_follow_up_with<F>(
-        &mut self,
-        input: TurnInput,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-        resolve_provider: &mut F,
-    ) -> Result<bool, Error>
-    where
-        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
-    {
-        self.run_turn_input_with_mode(Some(input), sink, resolve_provider, TurnMode::PlanFollowUp)
-    }
-
-    #[cfg(test)]
-    pub(super) fn run_plan_implementation_with<F>(
-        &mut self,
-        input: Option<TurnInput>,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-        resolve_provider: &mut F,
-    ) -> Result<bool, Error>
-    where
-        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
-    {
-        self.run_turn_input_with_mode(input, sink, resolve_provider, TurnMode::PlanImplement)
-    }
-
-    fn run_turn_input_with_mode<F>(
+    pub(super) fn run_turn_input_with_mode<F>(
         &mut self,
         user_input: Option<TurnInput>,
         sink: &mut dyn FnMut(TurnEvent<'_>),
@@ -509,10 +435,8 @@ impl Conversation {
         self.plan_ready_this_turn = false;
         self.latest_turn_result.clear();
         if mode == TurnMode::PlanImplement && user_input.is_none() && !resuming {
-            if let Some(Err(error)) = self.checkpoint_snapshot() {
-                sink(TurnEvent::Warning(format!(
-                    "Could not checkpoint for /undo: {error}"
-                )));
+            if let Some(warning) = self.checkpoint_warning() {
+                sink(TurnEvent::Warning(warning));
             }
             self.append_input_message(
                 Message::user("Implement the active plan now.")
@@ -527,10 +451,8 @@ impl Conversation {
                     self.model
                 )));
             }
-            if let Some(Err(error)) = self.checkpoint_snapshot() {
-                sink(TurnEvent::Warning(format!(
-                    "Could not checkpoint for /undo: {error}"
-                )));
+            if let Some(warning) = self.checkpoint_warning() {
+                sink(TurnEvent::Warning(warning));
             }
             self.append_input_message(Message::user_input(input))?;
         }
@@ -593,30 +515,8 @@ impl Conversation {
                 TurnMode::PlanImplement | TurnMode::Normal | TurnMode::Init => {}
             }
             let specs = registry.specs();
-            let custom_tools = registry.personalization();
-            let system = match &self.kind {
-                ConversationKind::Persistent(state) => crate::prompt::build_system_prompt(
-                    &self.config.home_dir,
-                    registry.has_subagent_tools(),
-                    self.print_mode,
-                    registry.has_web_tools(),
-                    registry.skills(),
-                    crate::prompt::MainPromptState {
-                        goal: (mode == TurnMode::Goal)
-                            .then_some(state.session.active_goal())
-                            .flatten(),
-                        init: mode == TurnMode::Init,
-                        custom_tools: custom_tools.as_deref(),
-                    },
-                ),
-                ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(
-                    &self.config.home_dir,
-                    self.role_fragment(),
-                    registry.restriction_summary().as_deref(),
-                    registry.has_web_tools(),
-                    registry.skills(),
-                ),
-            };
+            let system =
+                self.system_prompt(&registry, mode == TurnMode::Goal, mode == TurnMode::Init);
 
             let overhead = context::prompt_tokens(&system, registry.tool_tokens());
             self.maybe_compact(overhead, sink, resolve_provider)?;
@@ -1283,6 +1183,33 @@ impl Conversation {
         })
     }
 
+    /// The system prompt for `registry`. `goal` includes the session's
+    /// active goal and `init` adds the `/init` task; children use their own
+    /// prompt.
+    fn system_prompt(&self, registry: &Registry, goal: bool, init: bool) -> String {
+        match &self.kind {
+            ConversationKind::Persistent(state) => crate::prompt::build_system_prompt(
+                &self.config.home_dir,
+                registry.has_subagent_tools(),
+                self.print_mode,
+                registry.has_web_tools(),
+                registry.skills(),
+                crate::prompt::MainPromptState {
+                    goal: goal.then(|| state.session.active_goal()).flatten(),
+                    init,
+                    custom_tools: registry.personalization().as_deref(),
+                },
+            ),
+            ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(
+                &self.config.home_dir,
+                self.role_fragment(),
+                registry.restriction_summary().as_deref(),
+                registry.has_web_tools(),
+                registry.skills(),
+            ),
+        }
+    }
+
     pub(crate) fn compact_now_preserving_cancellation(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent<'_>),
@@ -1305,28 +1232,7 @@ impl Conversation {
         sink(TurnEvent::Compacting);
         let registry = self.scan_tools();
         let specs = registry.specs();
-        let custom_tools = registry.personalization();
-        let system = match &self.kind {
-            ConversationKind::Persistent(state) => crate::prompt::build_system_prompt(
-                &self.config.home_dir,
-                registry.has_subagent_tools(),
-                self.print_mode,
-                registry.has_web_tools(),
-                registry.skills(),
-                crate::prompt::MainPromptState {
-                    goal: state.session.active_goal(),
-                    init: false,
-                    custom_tools: custom_tools.as_deref(),
-                },
-            ),
-            ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(
-                &self.config.home_dir,
-                self.role_fragment(),
-                registry.restriction_summary().as_deref(),
-                registry.has_web_tools(),
-                registry.skills(),
-            ),
-        };
+        let system = self.system_prompt(&registry, true, false);
         if let Some(effort) = self.steers.take_reasoning_effort() {
             self.set_reasoning_effort(effort)?;
         }

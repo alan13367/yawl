@@ -156,24 +156,10 @@ fn handle_command_key(state: &mut ViewState, editor: &mut Editor, key: Key) -> b
         state.completion_index = 0;
         return false;
     }
-    state.completion_index = state.completion_index.min(matches.len() - 1);
+    if move_completion(&mut state.completion_index, matches.len(), key) {
+        return true;
+    }
     match key {
-        Key::Up => {
-            state.completion_index = if state.completion_index == 0 {
-                matches.len() - 1
-            } else {
-                state.completion_index - 1
-            };
-            true
-        }
-        Key::Down => {
-            state.completion_index = if state.completion_index + 1 == matches.len() {
-                0
-            } else {
-                state.completion_index + 1
-            };
-            true
-        }
         Key::Tab => {
             editor.complete_command(&matches[state.completion_index]);
             sync_completion_filter(state, editor);
@@ -193,6 +179,23 @@ fn handle_command_key(state: &mut ViewState, editor: &mut Editor, key: Key) -> b
     }
 }
 
+/// Clamps the menu cursor to `count` rows and moves it with Up or Down,
+/// wrapping at either end. Returns whether `key` moved it.
+fn move_completion(index: &mut usize, count: usize, key: Key) -> bool {
+    *index = (*index).min(count - 1);
+    match key {
+        Key::Up => {
+            *index = index.checked_sub(1).unwrap_or(count - 1);
+            true
+        }
+        Key::Down => {
+            *index = (*index + 1) % count;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Keys for the `@` mention menu. Unlike slash commands, Enter inserts the
 /// tag and keeps editing instead of submitting.
 fn handle_mention_key(state: &mut ViewState, editor: &mut Editor, query: &str, key: Key) -> bool {
@@ -201,24 +204,10 @@ fn handle_mention_key(state: &mut ViewState, editor: &mut Editor, query: &str, k
         state.completion_index = 0;
         return false;
     }
-    state.completion_index = state.completion_index.min(matches.len() - 1);
+    if move_completion(&mut state.completion_index, matches.len(), key) {
+        return true;
+    }
     match key {
-        Key::Up => {
-            state.completion_index = if state.completion_index == 0 {
-                matches.len() - 1
-            } else {
-                state.completion_index - 1
-            };
-            true
-        }
-        Key::Down => {
-            state.completion_index = if state.completion_index + 1 == matches.len() {
-                0
-            } else {
-                state.completion_index + 1
-            };
-            true
-        }
         Key::Tab | Key::Enter => {
             editor.complete_mention(&matches[state.completion_index]);
             state.completion_index = 0;

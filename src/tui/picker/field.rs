@@ -12,9 +12,8 @@ use super::{Picker, PickerAction, PickerEdit, PickerItem, SettingsLocation};
 use crate::tui::connection::ConnectEditField;
 use crate::tui::events::Key;
 use crate::tui::input::{line_edit, line_insert};
-use crate::tui::markdown;
+use crate::tui::{markdown, theme};
 
-const ERROR_COLOR: &str = "\x1b[38;5;210m";
 /// Wrapped help or error rows under the field.
 const MESSAGE_ROWS: usize = 2;
 
@@ -185,7 +184,7 @@ impl PickerField {
         ];
         let cursor = (3, 3 + cursor_col);
         let (message, color) = match &self.error {
-            Some(error) => (format!("✗ {error}"), ERROR_COLOR),
+            Some(error) => (format!("✗ {error}"), theme::palette().field_error),
             None => (self.help.clone(), "\x1b[2m"),
         };
         let mut lines = markdown::wrapped_plain_lines(&message, inner.saturating_sub(2).max(1));

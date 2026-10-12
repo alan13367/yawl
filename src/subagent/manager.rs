@@ -22,6 +22,8 @@ mod format;
 mod validation;
 mod waiting;
 
+pub(crate) use format::format_duration;
+
 #[cfg(test)]
 mod tests;
 
@@ -69,6 +71,45 @@ struct Entry {
     model_steer_accepted: bool,
     holds_slot: bool,
     queued_sequence: u64,
+}
+
+impl State {
+    fn index_of(&self, id: &SubagentId) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|entry| entry.snapshot.id == *id)
+    }
+
+    fn entry_mut(&mut self, id: &SubagentId) -> Option<&mut Entry> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.snapshot.id == *id)
+    }
+}
+
+impl Entry {
+    /// A new entry whose first run is about to be queued.
+    fn new(
+        snapshot: SubagentSnapshot,
+        cancellation: CancellationToken,
+        steers: crate::agent::SteerInbox,
+    ) -> Self {
+        Self {
+            snapshot,
+            cancellation,
+            work: VecDeque::new(),
+            next_run_number: 2,
+            thread_id: None,
+            handle: None,
+            wait_interest: 0,
+            pending_delivery: Vec::new(),
+            suppress_delivery: false,
+            steers,
+            model_steer_accepted: false,
+            holds_slot: false,
+            queued_sequence: 0,
+        }
+    }
 }
 
 #[derive(Clone)]

@@ -2,18 +2,11 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) struct TestDir(pub(super) PathBuf);
 impl TestDir {
     pub(super) fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let path = std::env::temp_dir().join(format!(
-            "yawl-file-inspection-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&path);
+        let path = crate::test_support::unique_temp_dir("file-inspection");
         fs::create_dir_all(&path).expect("fixture directory");
         Self(path)
     }

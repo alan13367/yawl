@@ -78,11 +78,7 @@ mod tests {
 
     #[test]
     fn metadata_invalidates_on_append_and_file_replacement() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("yawl-index-{nonce}"));
+        let directory = crate::test_support::unique_temp_dir("index");
         let mut session = Session::create(&directory, &directory, "first").unwrap();
         session.append_message(&Message::user("Preview")).unwrap();
         let path = directory.join(format!("{}.jsonl", session.id));

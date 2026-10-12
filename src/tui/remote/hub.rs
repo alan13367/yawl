@@ -28,6 +28,8 @@ pub(super) enum Outgoing {
     Bell,
     /// The browser tab title changed.
     Title(String),
+    /// The host switched between dark and light interface colors.
+    Theme(bool),
     /// Another device took control; this client should stop reconnecting.
     Replaced,
 }
@@ -78,6 +80,9 @@ struct State {
     /// Browser tab title, kept across sessions so a new stream starts with
     /// it before the next draw.
     title: String,
+    /// Whether frames use the light palette, so the page can match its
+    /// terminal background.
+    light: bool,
 }
 
 #[derive(Default)]
@@ -318,6 +323,20 @@ impl Hub {
 
     pub(super) fn title(&self) -> String {
         self.lock().title.clone()
+    }
+
+    pub(super) fn set_light(&self, light: bool) {
+        let mut state = self.lock();
+        if state.light == light {
+            return;
+        }
+        state.light = light;
+        drop(state);
+        self.send(Outgoing::Theme(light));
+    }
+
+    pub(super) fn light(&self) -> bool {
+        self.lock().light
     }
 
     pub(super) fn authorized(&self, generation: u64, token: &str) -> bool {

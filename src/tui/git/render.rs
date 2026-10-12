@@ -59,13 +59,6 @@ fn commit_menu_items(amend: bool) -> [(&'static str, &'static str); 4] {
 /// aimed at one cannot land on the other.
 const ACTION_CELL_WIDTH: usize = 6;
 
-/// Semantic colors for staging actions. These stay independent of the
-/// configurable interface accent, which is also the default row-selection
-/// background.
-const STAGE_ACTION_FG: &str = "\x1b[38;2;139;213;162m";
-
-const UNSTAGE_ACTION_FG: &str = "\x1b[38;2;232;202;118m";
-
 /// Stage (`+`) for unstaged/untracked files, unstage (`-`) for staged ones.
 fn row_action(file: &GitFile) -> char {
     match file.section {
@@ -81,9 +74,9 @@ fn action_cell_text(glyph: char, selected: bool) -> String {
     let color = if selected {
         ""
     } else if glyph == '+' {
-        STAGE_ACTION_FG
+        crate::tui::theme::palette().stage_action
     } else {
-        UNSTAGE_ACTION_FG
+        crate::tui::theme::palette().unstage_action
     };
     format!("  \x1b[2m↩\x1b[0m  {color}\x1b[1m{glyph}\x1b[0m")
 }
@@ -1100,7 +1093,7 @@ mod tests {
         let cell = action_cell_text('+', true);
         let selected = selected_row(&cell, &selection);
 
-        assert!(!cell.contains(STAGE_ACTION_FG));
+        assert!(!cell.contains(crate::tui::theme::palette().stage_action));
         assert!(selected.contains(&selection));
         assert!(markdown::strip_ansi(&selected).contains('+'));
     }

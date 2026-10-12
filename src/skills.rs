@@ -431,8 +431,7 @@ mod tests {
 
     #[test]
     fn discovers_nested_skill_files_and_top_level_markdown() {
-        let root = std::env::temp_dir().join(format!("yawl-skills-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::unique_temp_dir("skills");
         std::fs::create_dir_all(root.join("global/nested/review")).unwrap();
         std::fs::write(
             root.join("global/nested/review/SKILL.md"),
@@ -460,8 +459,7 @@ mod tests {
 
     #[test]
     fn cached_discovery_matches_uncached_and_tracks_changes() {
-        let root = std::env::temp_dir().join(format!("yawl-skills-cache-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::unique_temp_dir("skills-cache");
         std::fs::create_dir_all(root.join("global/review")).unwrap();
         let skill_path = root.join("global/review/SKILL.md");
         std::fs::write(
@@ -532,8 +530,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_descriptions_and_survives_symlink_cycles() {
-        let root = std::env::temp_dir().join(format!("yawl-skills-bad-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::unique_temp_dir("skills-bad");
         std::fs::create_dir_all(root.join("global/bad")).unwrap();
         std::fs::write(
             root.join("global/bad/SKILL.md"),
@@ -552,8 +549,7 @@ mod tests {
 
     #[test]
     fn links_to_large_trees_stop_at_the_directory_limit() {
-        let root = std::env::temp_dir().join(format!("yawl-skills-limit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::unique_temp_dir("skills-limit");
         let big = root.join("big");
         for index in 0..=MAX_SKILL_DIRECTORIES {
             std::fs::create_dir_all(big.join(format!("d{index}"))).unwrap();
@@ -573,8 +569,7 @@ mod tests {
 
     #[test]
     fn follows_symlinked_skill_directories_and_files() {
-        let root = std::env::temp_dir().join(format!("yawl-skills-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::unique_temp_dir("skills-link");
         std::fs::create_dir_all(root.join("global")).unwrap();
         std::fs::create_dir_all(root.join("elsewhere/minipc")).unwrap();
         std::fs::write(
@@ -613,8 +608,7 @@ mod tests {
 
     #[test]
     fn later_project_sources_override_global_skills_only_when_trusted() {
-        let root = std::env::temp_dir().join(format!("yawl-skills-trust-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::unique_temp_dir("skills-trust");
         std::fs::create_dir_all(root.join("global/review")).unwrap();
         std::fs::create_dir_all(root.join("project-override/review")).unwrap();
         std::fs::write(
@@ -640,9 +634,7 @@ mod tests {
 
     #[test]
     fn programmatic_skill_directory_replacement_is_discovered() {
-        let root =
-            std::env::temp_dir().join(format!("yawl-skills-programmatic-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::unique_temp_dir("skills-programmatic");
         std::fs::create_dir_all(root.join("replacement/review")).unwrap();
         std::fs::write(
             root.join("replacement/review/SKILL.md"),
@@ -661,8 +653,7 @@ mod tests {
 
     #[test]
     fn nearer_agent_directory_overrides_git_root_and_global_skills() {
-        let root =
-            std::env::temp_dir().join(format!("yawl-skills-ancestors-{}", std::process::id()));
+        let root = crate::test_support::unique_temp_dir("skills-ancestors");
         let repo = root.join("repo");
         let nested = repo.join("packages/app");
         let _ = std::fs::remove_dir_all(&root);
@@ -711,8 +702,7 @@ mod tests {
 
     #[test]
     fn manual_only_skills_remain_in_the_explicit_catalog() {
-        let root = std::env::temp_dir().join(format!("yawl-skills-manual-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::unique_temp_dir("skills-manual");
         std::fs::create_dir_all(root.join("global/manual")).unwrap();
         std::fs::write(
             root.join("global/manual/SKILL.md"),

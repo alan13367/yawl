@@ -1,26 +1,31 @@
 //! Compact, tool-aware transcript rendering.
 //!
-//! This facade owns generic tool-card rendering. The private diff child owns
-//! the edit-diff algorithm. TUI callers keep the entry points here.
+//! This facade owns the card types and entry points TUI callers use. The
+//! private children own per-tool call content (`calls`), card painting and
+//! wrapping (`card`), and the edit-diff algorithm (`diff`).
 
+mod calls;
+mod card;
 mod diff;
-
-pub(super) use diff::edit_diff;
 
 use std::time::Duration;
 
 use serde_json::Value;
 
-use super::markdown;
+use super::theme;
+pub(super) use calls::home_relative;
+use calls::{
+    bool_arg, capitalize_label, define_tool_lines, parse_background_output, parse_background_start,
+    parse_background_stop, question_call, render_call, render_question_answers, saved_file_output,
+    should_show_output,
+};
+use card::{card_content_width, paint_card, preview_lines, text_lines};
+pub(super) use diff::edit_diff;
 
 const OUTPUT_PREVIEW_LINES: usize = 10;
 const CALL_PREVIEW_LINES: usize = 6;
 const SHELL_COMMAND_PREVIEW_ROWS: usize = 12;
 const DIFF_PREVIEW_LINES: usize = 12;
-const SUCCESS_BACKGROUND: &str = "\x1b[48;2;42;50;41m";
-const ERROR_BACKGROUND: &str = "\x1b[48;2;50;42;42m";
-const SKILL_BACKGROUND: &str = "\x1b[48;2;54;44;82m";
-const TOOLSMITH_BACKGROUND: &str = "\x1b[48;2;28;52;60m";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tone {
@@ -37,6 +42,9 @@ pub(super) struct ToolLine {
     pub(super) text: String,
     pub(super) tone: Tone,
     pub(super) wrap: bool,
+    /// Columns of blank gutter before each continuation row of a wrapped
+    /// line, so diff text stays clear of the `+`/`-` marker column.
+    pub(super) hang: usize,
 }
 
 /// Display name and liveness for a subagent ID referenced by a tool card.
@@ -47,29 +55,26 @@ pub(super) struct SubagentLabel {
     pub(super) active: bool,
 }
 
-struct BackgroundStartDetails {
-    id: String,
-    pid: String,
-    name: Option<String>,
-}
-
-struct BackgroundOutputDetails {
-    status: String,
-    pid: String,
-    lines: Vec<ToolLine>,
-}
-
 impl ToolLine {
     pub(super) fn new(text: impl Into<String>, tone: Tone) -> Self {
         Self {
             text: text.into(),
             tone,
             wrap: false,
+            hang: 0,
         }
     }
 
     fn wrapping(mut self) -> Self {
         self.wrap = true;
+        self
+    }
+
+    /// Wraps even in a collapsed card, up to a few rows there, indenting
+    /// continuation rows by `hang`.
+    fn hanging(mut self, hang: usize) -> Self {
+        self.wrap = true;
+        self.hang = hang;
         self
     }
 }
@@ -111,8 +116,7 @@ pub(super) fn render_labeled(
     expanded: bool,
 ) -> Vec<String> {
     let width = width.max(8);
-    let horizontal_padding = usize::from(width >= 3);
-    let content_width = width.saturating_sub(horizontal_padding * 2).max(1);
+    let content_width = card_content_width(width);
     let parsed = serde_json::from_str::<Value>(args).ok();
     let background_start = name == "shell" && bool_arg(parsed.as_ref(), "background") == Some(true);
     let background_details = if background_start && !is_error && !running {
@@ -142,6 +146,7 @@ pub(super) fn render_labeled(
             name,
             parsed.as_ref(),
             args,
+            output,
             background_start,
             background_details.as_ref(),
             running,
@@ -230,591 +235,22 @@ pub(super) fn render_labeled(
         }
     }
 
+    let palette = theme::palette();
     let background = if is_error {
-        ERROR_BACKGROUND
+        palette.card_error
     } else if name == "read_skill" {
-        SKILL_BACKGROUND
+        palette.card_skill
     } else if name == crate::tools::DEFINE_TOOL_NAME && !running {
-        TOOLSMITH_BACKGROUND
+        palette.card_toolsmith
     } else if name == crate::tools::USER_INPUT_TOOL_NAME {
-        "\x1b[48;2;40;44;52m"
+        palette.card_question
     } else if running {
-        "\x1b[48;5;58m"
+        palette.card_running
     } else {
-        SUCCESS_BACKGROUND
+        palette.card_success
     };
 
-    let padding = format!("{background}{}\x1b[0m", " ".repeat(width));
-    let mut rendered = Vec::new();
-    rendered.push(padding.clone());
-    rendered.extend(lines.into_iter().flat_map(|line| {
-        render_line(
-            line,
-            width,
-            content_width,
-            horizontal_padding,
-            expanded,
-            background,
-        )
-    }));
-    rendered.push(padding);
-    rendered
-}
-
-#[expect(clippy::too_many_arguments)]
-fn render_call(
-    name: &str,
-    args: Option<&Value>,
-    raw_args: &str,
-    background_start: bool,
-    background_details: Option<&BackgroundStartDetails>,
-    running: bool,
-    elapsed: Option<Duration>,
-    is_error: bool,
-    labels: &[SubagentLabel],
-    content_width: usize,
-    expanded: bool,
-) -> Vec<ToolLine> {
-    let status = if background_start && running {
-        match elapsed {
-            Some(elapsed) => format!("  [starting in background {}]", format_elapsed(elapsed)),
-            None => "  [starting in background]".to_string(),
-        }
-    } else if background_start && !is_error {
-        background_details.map_or_else(
-            || "  [background]".to_string(),
-            |details| format!("  [started in background \u{b7} {}]", details.id),
-        )
-    } else if running {
-        match elapsed {
-            Some(elapsed) => format!("  [running {}]", format_elapsed(elapsed)),
-            None => "  [running]".to_string(),
-        }
-    } else if is_error {
-        "  [error]".to_string()
-    } else {
-        String::new()
-    };
-    let status = status.as_str();
-    match name {
-        "shell" => {
-            let command = string_arg(args, "command").unwrap_or(raw_args);
-            let mut call = prefixed_lines(command, "$ ", "  ", Tone::Header);
-            if !background_start && let Some(last) = call.last_mut() {
-                last.text.push_str(status);
-            }
-            // Preview rendered rows, not source lines: a single long script line
-            // must not take over the transcript before it is expanded.
-            let rows = call
-                .into_iter()
-                .flat_map(|line| {
-                    wrap_chars(&sanitize_line(&line.text), content_width)
-                        .into_iter()
-                        .map(|text| ToolLine::new(text, Tone::Header))
-                })
-                .collect::<Vec<_>>();
-            let truncated = rows.len() > SHELL_COMMAND_PREVIEW_ROWS;
-            let mut call = preview_lines(rows, SHELL_COMMAND_PREVIEW_ROWS, expanded, false);
-            if background_start {
-                let title = background_details.map_or_else(
-                    || format!("Background terminal{status}"),
-                    |details| format!("Background terminal  ·  {}", details.id),
-                );
-                let mut titled = vec![
-                    ToolLine::new(title, Tone::Header),
-                    ToolLine::new("", Tone::Output),
-                ];
-                titled.extend(call);
-                titled
-            } else {
-                if truncated && !expanded && !status.is_empty() {
-                    call.push(ToolLine::new(status.trim(), Tone::Muted));
-                }
-                call
-            }
-        }
-        "shell_output" => vec![ToolLine::new(
-            format!(
-                "Background output  \u{b7}  {}{status}",
-                string_arg(args, "id").unwrap_or("?")
-            ),
-            Tone::Header,
-        )],
-        "shell_list" => vec![ToolLine::new(
-            format!("Background terminals{status}"),
-            Tone::Header,
-        )],
-        "shell_stop" => vec![ToolLine::new(
-            format!(
-                "Stop background terminal  \u{b7}  {}{status}",
-                string_arg(args, "id").unwrap_or("?")
-            ),
-            Tone::Header,
-        )],
-        "read_file" => {
-            let path = display_path(string_arg(args, "path").unwrap_or("?"));
-            let from = args
-                .and_then(|args| args.get("start_line"))
-                .and_then(Value::as_u64)
-                .map_or_else(String::new, |line| format!(" from line {line}"));
-            vec![ToolLine::new(
-                format!("read {path}{from}{status}"),
-                Tone::Header,
-            )]
-        }
-        "read_skill" => vec![ToolLine::new(
-            format!("Skill {}{status}", string_arg(args, "name").unwrap_or("?")),
-            Tone::Header,
-        )],
-        "web_search" => vec![ToolLine::new(
-            format!(
-                "Search web  \u{b7}  {}{status}",
-                string_arg(args, "query").unwrap_or("?")
-            ),
-            Tone::Header,
-        )],
-        "web_fetch" => vec![ToolLine::new(
-            format!(
-                "Fetch web  \u{b7}  {}{status}",
-                string_arg(args, "url").unwrap_or("?")
-            ),
-            Tone::Header,
-        )],
-        "write_file" => {
-            let path = display_path(string_arg(args, "path").unwrap_or("?"));
-            let mut call = vec![ToolLine::new(format!("write {path}{status}"), Tone::Header)];
-            if let Some(content) = string_arg(args, "content") {
-                call.push(ToolLine::new("", Tone::Output));
-                call.extend(preview_lines(
-                    text_lines(content, Tone::Output),
-                    CALL_PREVIEW_LINES,
-                    expanded,
-                    false,
-                ));
-            }
-            call
-        }
-        "edit_file" => {
-            let path = display_path(string_arg(args, "path").unwrap_or("?"));
-            let all = if bool_arg(args, "replace_all") == Some(true) {
-                " (all occurrences)"
-            } else {
-                ""
-            };
-            let mut call = vec![ToolLine::new(
-                format!("edit {path}{all}{status}"),
-                Tone::Header,
-            )];
-            let old = string_arg(args, "old_string");
-            let new = string_arg(args, "new_string");
-            if old.is_some() || new.is_some() {
-                call.push(ToolLine::new("", Tone::Output));
-                let diff = edit_diff(old.unwrap_or_default(), new.unwrap_or_default());
-                call.extend(preview_lines(diff, CALL_PREVIEW_LINES, expanded, false));
-            }
-            call
-        }
-        "subagent_spawn" => {
-            let agent = string_arg(args, "agent").unwrap_or("default");
-            let title = match string_arg(args, "name") {
-                Some(name) => format!("Spawn {name} ({agent}){status}"),
-                None => format!("Spawn subagent ({agent}){status}"),
-            };
-            let mut call = vec![ToolLine::new(title, Tone::Header)];
-            if let Some(prompt) = string_arg(args, "prompt") {
-                call.push(ToolLine::new("", Tone::Output));
-                call.extend(preview_lines(
-                    text_lines(prompt, Tone::Output),
-                    CALL_PREVIEW_LINES,
-                    expanded,
-                    false,
-                ));
-            }
-            call
-        }
-        "subagent_send" => {
-            let target = labeled_id(string_arg(args, "id").unwrap_or("?"), labels);
-            let mut call = vec![ToolLine::new(
-                format!("Message {target}{status}"),
-                Tone::Header,
-            )];
-            if let Some(message) = string_arg(args, "message") {
-                call.push(ToolLine::new("", Tone::Output));
-                call.extend(preview_lines(
-                    text_lines(message, Tone::Output),
-                    CALL_PREVIEW_LINES,
-                    expanded,
-                    false,
-                ));
-            }
-            call
-        }
-        "subagent_wait" if running => running_wait_lines(args, labels, elapsed),
-        "subagent_wait" => {
-            let targets = labeled_ids(args, labels);
-            let title = if is_error {
-                format!("Waiting for {targets}  [error]")
-            } else {
-                format!("Waiting for {targets}")
-            };
-            vec![ToolLine::new(title, Tone::Header)]
-        }
-        "subagent_cancel" => vec![ToolLine::new(
-            format!("Cancel {}{status}", labeled_ids(args, labels)),
-            Tone::Header,
-        )],
-        "subagent_list" => {
-            let title = match string_arg(args, "id") {
-                Some(id) => format!("Subagent {}{status}", labeled_id(id, labels)),
-                None => format!("Subagents{status}"),
-            };
-            vec![ToolLine::new(title, Tone::Header)]
-        }
-        _ => {
-            let summary = generic_summary(args, raw_args);
-            let title = if summary.is_empty() {
-                format!("{name}{status}")
-            } else {
-                format!("{name}  {summary}{status}")
-            };
-            vec![ToolLine::new(title, Tone::Header)]
-        }
-    }
-}
-
-/// The card for a tool the model saved: what it does, its command, and
-/// where it lives. The model-facing usage report stays out of the card.
-fn define_tool_lines(
-    args: Option<&Value>,
-    output: &str,
-    running: bool,
-    is_error: bool,
-    expanded: bool,
-) -> Vec<ToolLine> {
-    let name = string_arg(args, "name").unwrap_or("?");
-    let scope = string_arg(args, "scope").unwrap_or("custom");
-    let saved = (!running && !is_error)
-        .then(|| define_tool_report(output))
-        .flatten();
-    let title = match (saved, running, is_error) {
-        (Some((verb, _)), _, _) => format!("\u{2726} {verb} {scope} tool {name}"),
-        (None, true, _) => format!("Define {scope} tool {name}  [running]"),
-        (None, _, true) => format!("Define {scope} tool {name}  [error]"),
-        (None, false, false) => format!("Define {scope} tool {name}"),
-    };
-    let mut lines = vec![ToolLine::new(title, Tone::Header)];
-    if let Some(description) = string_arg(args, "description") {
-        lines.push(ToolLine::new("", Tone::Output));
-        lines.extend(text_lines(description.trim(), Tone::Output));
-    }
-    if let Some(command) = string_arg(args, "command") {
-        lines.push(ToolLine::new("", Tone::Output));
-        lines.extend(preview_lines(
-            prefixed_lines(command, "$ ", "  ", Tone::Output),
-            CALL_PREVIEW_LINES,
-            expanded,
-            false,
-        ));
-    }
-    if let Some((_, path)) = saved {
-        lines.push(ToolLine::new("", Tone::Output));
-        lines.push(ToolLine::new(
-            format!("Saved to {}", display_path(path)),
-            Tone::Muted,
-        ));
-    }
-    lines
-}
-
-/// Reads `Created|Updated <scope> tool `<name>` at <path>.` from the first
-/// line of a successful `define_tool` result.
-fn define_tool_report(output: &str) -> Option<(&str, &str)> {
-    let (verb, rest) = output.lines().next()?.split_once(' ')?;
-    if !matches!(verb, "Created" | "Updated") {
-        return None;
-    }
-    let path = rest.split_once(" at ")?.1.strip_suffix('.')?;
-    Some((verb, path))
-}
-
-/// Older sessions contain the original JSON file-tool envelopes. Decode only
-/// those known shapes so resumed transcripts benefit from readable output too.
-fn saved_file_output(name: &str, args: Option<&Value>, output: &str) -> Option<String> {
-    if !matches!(name, "list_files" | "search_files" | "read_file") {
-        return None;
-    }
-    let value: Value = serde_json::from_str(output).ok()?;
-    if name == "read_file" {
-        let args = args?;
-        if args.get("offset").is_none() && args.get("limit").is_none() {
-            return None;
-        }
-        let content = value.get("content")?.as_str()?;
-        let offset = value.get("offset")?.as_u64()?;
-        let total = value.get("total_bytes")?.as_u64()?;
-        let next = value.get("next_offset")?;
-        let continuation = if next.is_null() {
-            "EOF".into()
-        } else {
-            format!("next_offset={}", next.as_u64()?)
-        };
-        return Some(format!(
-            "bytes from {offset} of {total}; {continuation}\n\n{content}"
-        ));
-    }
-    let results = value.get("results")?.as_array()?;
-    let mut lines = Vec::new();
-    for result in results {
-        let path = result.get("path")?.as_str()?;
-        if name == "list_files" {
-            lines.push(path.to_string());
-        } else {
-            let line = result.get("line")?.as_u64()?;
-            let column = result.get("column")?.as_u64()?;
-            let text = result.get("text")?.as_str()?;
-            lines.push(format!("{path}:{line}:{column}: {text}"));
-        }
-    }
-    if lines.is_empty() {
-        lines.push("No results.".into());
-    }
-    if value.get("truncated").and_then(Value::as_bool) == Some(true) {
-        lines.push("[truncated; narrow path or path_contains]".into());
-    }
-    if let Some(skipped) = value
-        .get("skipped")
-        .and_then(Value::as_u64)
-        .filter(|count| *count > 0)
-    {
-        lines.push(format!("[skipped {skipped} entries]"));
-    }
-    Some(lines.join("\n"))
-}
-
-fn should_show_output(name: &str, output: &str, is_error: bool) -> bool {
-    if output.is_empty() || output == "(no output; command succeeded)" {
-        return false;
-    }
-    is_error
-        || !matches!(
-            name,
-            "write_file"
-                | "edit_file"
-                | crate::tools::USER_INPUT_TOOL_NAME
-                | crate::tools::DEFINE_TOOL_NAME
-        )
-}
-
-fn question_call(
-    args: Option<&Value>,
-    running: bool,
-    is_error: bool,
-    expanded: bool,
-) -> Vec<ToolLine> {
-    let questions = args
-        .and_then(|args| args.get("questions"))
-        .and_then(Value::as_array);
-    let title = if is_error {
-        "Questions · needs attention"
-    } else if running {
-        "Awaiting your answers"
-    } else {
-        "Questions"
-    };
-    let count = questions.map_or(String::new(), |questions| {
-        format!(" · {} questions", questions.len())
-    });
-    let mut lines = vec![ToolLine::new(format!("{title}{count}"), Tone::Header).wrapping()];
-    if expanded && let Some(questions) = questions {
-        for (index, question) in questions.iter().enumerate() {
-            if let Some(text) = question.get("question").and_then(Value::as_str) {
-                lines
-                    .push(ToolLine::new(format!("{}. {text}", index + 1), Tone::Output).wrapping());
-            }
-        }
-    }
-    lines
-}
-
-fn render_question_answers(args: Option<&Value>, output: &str) -> Option<Vec<ToolLine>> {
-    let questions = args?.get("questions")?.as_array()?;
-    let result: Value = serde_json::from_str(output).ok()?;
-    let answers = result.get("answers")?.as_array()?;
-    let timed_out = result
-        .get("timed_out")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut lines = vec![ToolLine::new(
-        if timed_out {
-            "Questions answered · timed out"
-        } else {
-            "Questions answered"
-        },
-        Tone::Header,
-    )];
-    for question in questions {
-        let id = question.get("id").and_then(Value::as_str).unwrap_or("?");
-        let prompt = question
-            .get("question")
-            .and_then(Value::as_str)
-            .unwrap_or(id);
-        let answer = answers
-            .iter()
-            .find(|answer| answer.get("id").and_then(Value::as_str) == Some(id));
-        let label = answer
-            .and_then(|answer| answer.get("answer").or_else(|| answer.get("label")))
-            .and_then(Value::as_str)
-            .unwrap_or("?");
-        let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
-        let timeout = answer
-            .and_then(|answer| answer.get("source"))
-            .and_then(Value::as_str)
-            .filter(|source| *source == "timeout")
-            .map_or("", |_| " [timeout]");
-        lines.push(ToolLine::new(format!("{prompt} → {label}{timeout}"), Tone::Output).wrapping());
-    }
-    Some(lines)
-}
-
-fn string_arg<'a>(args: Option<&'a Value>, key: &str) -> Option<&'a str> {
-    args?.get(key)?.as_str()
-}
-
-fn bool_arg(args: Option<&Value>, key: &str) -> Option<bool> {
-    args?.get(key)?.as_bool()
-}
-
-fn parse_background_start(output: &str) -> Option<BackgroundStartDetails> {
-    let line = output.lines().next()?;
-    let rest = line.strip_prefix("started ")?;
-    let (id, rest) = rest.split_once(" (pid ")?;
-    let (pid, suffix) = rest.split_once(')')?;
-    let suffix = suffix.strip_suffix(" in the background")?;
-    let name = suffix
-        .strip_prefix(" as ")
-        .filter(|name| !name.is_empty())
-        .map(str::to_string);
-    if !suffix.is_empty() && name.is_none() {
-        return None;
-    }
-    Some(BackgroundStartDetails {
-        id: id.to_string(),
-        pid: pid.to_string(),
-        name,
-    })
-}
-
-fn parse_background_output(output: &str) -> Option<BackgroundOutputDetails> {
-    let mut lines = output.lines();
-    let status_line = lines.next()?;
-    let cursor_line = lines.next_back()?;
-    cursor_line
-        .strip_prefix("next_cursor: ")?
-        .parse::<u64>()
-        .ok()?;
-
-    let (_, status_and_pid) = status_line.split_once(": ")?;
-    let (status, pid) = status_and_pid.rsplit_once(" (pid ")?;
-    let pid = pid.strip_suffix(')')?;
-    let lines = lines
-        .filter_map(|line| match line {
-            "[stdout]" | "[stderr]" => None,
-            "[earlier output was discarded]" => {
-                Some(ToolLine::new("Earlier output was discarded.", Tone::Muted))
-            }
-            line => Some(ToolLine::new(line, Tone::Output)),
-        })
-        .collect();
-
-    Some(BackgroundOutputDetails {
-        status: status.to_string(),
-        pid: pid.to_string(),
-        lines,
-    })
-}
-
-fn capitalize_label(label: &str) -> String {
-    let mut characters = label.chars();
-    characters.next().map_or_else(String::new, |first| {
-        first.to_uppercase().chain(characters).collect()
-    })
-}
-
-fn parse_background_stop(output: &str) -> Option<String> {
-    if output.starts_with("stop requested for ") {
-        return Some("Stop requested".to_string());
-    }
-    output
-        .split_once(": ")
-        .map(|(_, status)| capitalize_label(status))
-}
-
-fn labeled_id(id: &str, labels: &[SubagentLabel]) -> String {
-    labels
-        .iter()
-        .find(|label| label.id == id)
-        .map(|label| label.name.as_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(id)
-        .to_string()
-}
-
-fn arg_ids(args: Option<&Value>) -> Vec<&str> {
-    args.and_then(|args| args.get("ids"))
-        .and_then(Value::as_array)
-        .map(|values| values.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default()
-}
-
-fn join_labels(ids: &[&str], labels: &[SubagentLabel]) -> String {
-    ids.iter()
-        .map(|id| labeled_id(id, labels))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn labeled_ids(args: Option<&Value>, labels: &[SubagentLabel]) -> String {
-    let ids = arg_ids(args);
-    if ids.is_empty() {
-        "?".to_string()
-    } else {
-        join_labels(&ids, labels)
-    }
-}
-
-/// A waited ID counts as finished only when a known child has settled;
-/// unknown IDs stay listed so the card never hides work it cannot see.
-fn running_wait_lines(
-    args: Option<&Value>,
-    labels: &[SubagentLabel],
-    elapsed: Option<Duration>,
-) -> Vec<ToolLine> {
-    let ids = arg_ids(args);
-    if ids.is_empty() {
-        return vec![ToolLine::new("Waiting for ?", Tone::Header)];
-    }
-    let (done, pending): (Vec<&str>, Vec<&str>) = ids
-        .iter()
-        .partition(|id| labels.iter().any(|label| label.id == **id && !label.active));
-    let mut title = if pending.is_empty() {
-        "Collecting results".to_string()
-    } else {
-        format!("Waiting for {}", join_labels(&pending, labels))
-    };
-    if !done.is_empty() {
-        title.push_str(&format!(" · {} of {} done", done.len(), ids.len()));
-    }
-    if let Some(elapsed) = elapsed {
-        title.push_str(&format!(" · {}", format_elapsed(elapsed)));
-    }
-    let mut lines = vec![ToolLine::new(title, Tone::Header)];
-    if !done.is_empty() {
-        lines.push(ToolLine::new(
-            format!("Finished: {}", join_labels(&done, labels)),
-            Tone::Muted,
-        ));
-    }
-    lines
+    paint_card(lines, background, width, expanded)
 }
 
 /// Compact human elapsed time: `42s`, `3m 07s`, `1h 04m`.
@@ -829,51 +265,6 @@ pub(super) fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
-fn generic_summary(args: Option<&Value>, raw_args: &str) -> String {
-    if let Some(args) = args {
-        for key in ["path", "query", "pattern", "command"] {
-            if let Some(value) = args.get(key).and_then(Value::as_str) {
-                return display_path(value);
-            }
-        }
-        if let Ok(compact) = serde_json::to_string(args) {
-            return compact;
-        }
-    }
-    raw_args.to_string()
-}
-
-fn display_path(path: &str) -> String {
-    let Some(home) = std::env::var_os("HOME") else {
-        return path.to_string();
-    };
-    let home = home.to_string_lossy();
-    if path == home {
-        "~".to_string()
-    } else if let Some(relative) = path
-        .strip_prefix(home.as_ref())
-        .and_then(|rest| rest.strip_prefix('/'))
-    {
-        format!("~/{relative}")
-    } else {
-        path.to_string()
-    }
-}
-
-fn text_lines(text: &str, tone: Tone) -> Vec<ToolLine> {
-    text.lines().map(|line| ToolLine::new(line, tone)).collect()
-}
-
-fn prefixed_lines(text: &str, first: &str, rest: &str, tone: Tone) -> Vec<ToolLine> {
-    let mut lines = text.lines();
-    let Some(line) = lines.next() else {
-        return vec![ToolLine::new(first, tone)];
-    };
-    std::iter::once(ToolLine::new(format!("{first}{line}"), tone))
-        .chain(lines.map(|line| ToolLine::new(format!("{rest}{line}"), tone)))
-        .collect()
-}
-
 /// Renders one full-width diff card for a `/diff` file entry, mirroring the
 /// edit-call presentation: success background, bold path header, then the
 /// precomputed diff lines with preview truncation.
@@ -884,138 +275,24 @@ pub(super) fn render_diff_card(
     expanded: bool,
 ) -> Vec<String> {
     let width = width.max(8);
-    let horizontal_padding = usize::from(width >= 3);
-    let content_width = width.saturating_sub(horizontal_padding * 2).max(1);
-    let mut content = vec![ToolLine::new(path, Tone::Header)];
+    let count = |tone| lines.iter().filter(|line| line.tone == tone).count();
+    let (added, removed) = (count(Tone::Added), count(Tone::Removed));
+    let mut content = vec![ToolLine::new(
+        format!("{path}  +{added} −{removed}"),
+        Tone::Header,
+    )];
     content.extend(preview_lines(
         lines.to_vec(),
         DIFF_PREVIEW_LINES,
         expanded,
         false,
     ));
-    let background = SUCCESS_BACKGROUND;
-    let padding = format!("{background}{}\x1b[0m", " ".repeat(width));
-    let mut rendered = Vec::new();
-    rendered.push(padding.clone());
-    rendered.extend(content.into_iter().flat_map(|line| {
-        render_line(
-            line,
-            width,
-            content_width,
-            horizontal_padding,
-            expanded,
-            background,
-        )
-    }));
-    rendered.push(padding);
-    rendered
-}
-
-fn preview_lines(
-    mut lines: Vec<ToolLine>,
-    limit: usize,
-    expanded: bool,
-    keep_tail: bool,
-) -> Vec<ToolLine> {
-    if lines.len() <= limit {
-        return lines;
-    }
-    let omitted = lines.len() - limit;
-    if expanded {
-        lines.push(ToolLine::new("[Ctrl+O or click to collapse]", Tone::Muted));
-        return lines;
-    }
-    let marker = if keep_tail {
-        format!("... ({omitted} earlier lines, Ctrl+O or click to expand)")
-    } else {
-        format!("... ({omitted} more lines, Ctrl+O or click to expand)")
-    };
-    if keep_tail {
-        let mut preview = Vec::with_capacity(limit + 1);
-        preview.extend(lines.drain(omitted..));
-        preview.push(ToolLine::new(marker, Tone::Muted));
-        preview
-    } else {
-        lines.truncate(limit);
-        lines.push(ToolLine::new(marker, Tone::Muted));
-        lines
-    }
-}
-
-fn render_line(
-    line: ToolLine,
-    width: usize,
-    content_width: usize,
-    horizontal_padding: usize,
-    expanded: bool,
-    background: &str,
-) -> Vec<String> {
-    let sanitized = sanitize_line(&line.text);
-    let chunks = if expanded || line.wrap {
-        wrap_chars(&sanitized, content_width)
-    } else {
-        vec![truncate_chars(&sanitized, content_width)]
-    };
-    let style = match line.tone {
-        Tone::Header => "\x1b[1;97m",
-        Tone::Output => "\x1b[38;5;245m",
-        Tone::Muted => "\x1b[2;37m",
-        Tone::Added => "\x1b[38;5;114m",
-        Tone::Removed => "\x1b[38;5;203m",
-        Tone::Error => "\x1b[38;5;210m",
-    };
-    let left_pad = " ".repeat(horizontal_padding);
-    chunks
-        .into_iter()
-        .map(|chunk| {
-            let right_pad =
-                " ".repeat(width.saturating_sub(horizontal_padding + chunk.chars().count()));
-            format!("{background}{style}{left_pad}{chunk}{right_pad}\x1b[0m")
-        })
-        .collect()
-}
-
-fn sanitize_line(line: &str) -> String {
-    markdown::strip_ansi(line)
-        .chars()
-        .map(|character| {
-            if character == '\t' {
-                ' '
-            } else if character.is_control() {
-                '�'
-            } else {
-                character
-            }
-        })
-        .collect()
-}
-
-fn truncate_chars(text: &str, width: usize) -> String {
-    let Some((cut, _)) = text.char_indices().nth(width) else {
-        return text.to_string();
-    };
-    if width <= 1 {
-        return "…".chars().take(width).collect();
-    }
-    let end = text
-        .char_indices()
-        .nth(width - 1)
-        .map_or(cut, |(index, _)| index);
-    let mut truncated = text[..end].to_string();
-    truncated.push('…');
-    truncated
-}
-
-fn wrap_chars(text: &str, width: usize) -> Vec<String> {
-    let chunks = markdown::split_chars(text, width);
-    if chunks.is_empty() {
-        return vec![String::new()];
-    }
-    chunks
+    paint_card(content, theme::palette().card_success, width, expanded)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::markdown;
     use super::*;
 
     #[test]
@@ -1259,8 +536,16 @@ mod tests {
             false,
         );
 
-        assert!(success.iter().all(|line| line.contains(SUCCESS_BACKGROUND)));
-        assert!(error.iter().all(|line| line.contains(ERROR_BACKGROUND)));
+        assert!(
+            success
+                .iter()
+                .all(|line| line.contains(theme::palette().card_success))
+        );
+        assert!(
+            error
+                .iter()
+                .all(|line| line.contains(theme::palette().card_error))
+        );
     }
 
     #[test]
@@ -1277,7 +562,11 @@ mod tests {
         );
         let plain = markdown::strip_ansi(&running.join("\n"));
         assert!(plain.contains("Skill rust  [running]"));
-        assert!(running.iter().all(|line| line.contains(SKILL_BACKGROUND)));
+        assert!(
+            running
+                .iter()
+                .all(|line| line.contains(theme::palette().card_skill))
+        );
 
         let error = render(
             "read_skill",
@@ -1289,7 +578,11 @@ mod tests {
             40,
             false,
         );
-        assert!(error.iter().all(|line| line.contains(ERROR_BACKGROUND)));
+        assert!(
+            error
+                .iter()
+                .all(|line| line.contains(theme::palette().card_error))
+        );
     }
 
     #[test]
@@ -1315,7 +608,11 @@ mod tests {
             assert!(plain.contains(expected), "missing {expected}:\n{plain}");
         }
         assert!(!plain.contains("From your next step on"));
-        assert!(saved.iter().all(|line| line.contains(TOOLSMITH_BACKGROUND)));
+        assert!(
+            saved
+                .iter()
+                .all(|line| line.contains(theme::palette().card_toolsmith))
+        );
 
         let rejected = render(
             crate::tools::DEFINE_TOOL_NAME,
@@ -1330,7 +627,11 @@ mod tests {
         let plain = markdown::strip_ansi(&rejected.join("\n"));
         assert!(plain.contains("Define project tool greet  [error]"));
         assert!(plain.contains("Tool not saved: 'shell' is a builtin tool name"));
-        assert!(rejected.iter().all(|line| line.contains(ERROR_BACKGROUND)));
+        assert!(
+            rejected
+                .iter()
+                .all(|line| line.contains(theme::palette().card_error))
+        );
     }
 
     #[test]
@@ -1790,6 +1091,19 @@ mod tests {
     }
 
     #[test]
+    fn a_changed_minified_line_stays_short_until_the_card_expands() {
+        let minified = "x".repeat(100_000);
+        let lines = edit_diff("short", &minified);
+
+        let compact = render_diff_card("dist/app.js", &lines, 80, false);
+        assert!(compact.len() < 16, "{} rows", compact.len());
+        assert!(compact.iter().any(|line| line.contains("x…")));
+
+        let expanded = render_diff_card("dist/app.js", &lines, 80, true);
+        assert!(expanded.len() > 1_000);
+    }
+
+    #[test]
     fn diff_cards_truncate_when_compact_and_expand_fully() {
         let old = "a\n".repeat(20);
         let new = "b\n".repeat(20);
@@ -1817,6 +1131,99 @@ mod tests {
         );
         assert!(expanded.iter().any(|line| line.contains("- a")));
         assert!(expanded.iter().any(|line| line.contains("+ b")));
-        assert!(expanded.iter().any(|line| line.contains("src/note.txt")));
+        assert!(
+            expanded
+                .iter()
+                .any(|line| line.contains("src/note.txt  +20 −20"))
+        );
+    }
+
+    #[test]
+    fn edit_cards_name_the_lines_the_edit_landed_on() {
+        let header = |args: &str, output: &str, is_error: bool| {
+            let lines = render("edit_file", args, output, is_error, false, None, 80, false);
+            markdown::strip_ansi(&lines[1]).trim().to_string()
+        };
+        let args = r#"{"path":"src/a.rs","old_string":"x","new_string":"y"}"#;
+        assert_eq!(
+            header(args, "edited src/a.rs (line 42)", false),
+            "edit src/a.rs:42"
+        );
+        assert_eq!(
+            header(
+                args,
+                "edited src/a.rs (lines 42-45); matched CRLF line endings",
+                false
+            ),
+            "edit src/a.rs:42-45"
+        );
+        assert_eq!(
+            header(args, "edited src/a.rs (deleted text at line 7)", false),
+            "edit src/a.rs:7"
+        );
+        let all = r#"{"path":"src/a.rs","old_string":"x","new_string":"y","replace_all":true}"#;
+        assert_eq!(
+            header(
+                all,
+                "edited src/a.rs (3 replacements at lines 4, 9, 12)",
+                false
+            ),
+            "edit src/a.rs (3 replacements at lines 4, 9, 12)"
+        );
+        assert_eq!(
+            header(all, "old_string not found in src/a.rs", true),
+            "edit src/a.rs (all occurrences)  [error]"
+        );
+
+        let card = render(
+            "edit_file",
+            args,
+            "edited src/a.rs (line 42)",
+            false,
+            false,
+            None,
+            80,
+            false,
+        )
+        .iter()
+        .map(|line| markdown::strip_ansi(line))
+        .collect::<Vec<_>>();
+        assert!(!card.iter().any(|line| line.contains("@@")));
+    }
+
+    #[test]
+    fn collapsed_diff_rows_wrap_under_a_blank_gutter() {
+        let long = format!("let value = {};", "x".repeat(40));
+        let args = serde_json::json!({
+            "path": "a.rs",
+            "old_string": "let value = 1;",
+            "new_string": long,
+        })
+        .to_string();
+        let lines = render(
+            "edit_file",
+            &args,
+            "edited a.rs (line 3)",
+            false,
+            false,
+            None,
+            30,
+            false,
+        )
+        .iter()
+        .map(|line| markdown::strip_ansi(line).trim_end().to_string())
+        .collect::<Vec<_>>();
+        let added = lines
+            .iter()
+            .position(|line| line.starts_with(" + let value"))
+            .expect("added row");
+        assert!(!lines[added].ends_with('…'));
+        assert!(lines[added + 1].starts_with("   x"), "{lines:?}");
+        let rejoined = lines[added..]
+            .iter()
+            .take_while(|line| !line.is_empty())
+            .map(|line| line.trim_start_matches([' ', '+']))
+            .collect::<String>();
+        assert_eq!(rejoined, long);
     }
 }

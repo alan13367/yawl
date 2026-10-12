@@ -310,47 +310,28 @@ fn push_status_entry(
     path: String,
     renamed_from: Option<String>,
 ) {
-    if x == '?' && y == '?' {
-        status.untracked.push(GitFile {
-            path,
-            x,
-            y,
-            section: GitSection::Untracked,
-            renamed_from,
-        });
-        return;
-    }
     if x == '!' {
         return;
     }
+    let file = |section| GitFile {
+        path: path.clone(),
+        x,
+        y,
+        section,
+        renamed_from: renamed_from.clone(),
+    };
     let unmerged = x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D');
-    if unmerged {
-        status.unstaged.push(GitFile {
-            path,
-            x,
-            y,
-            section: GitSection::Unstaged,
-            renamed_from,
-        });
-        return;
-    }
-    if x != ' ' {
-        status.staged.push(GitFile {
-            path: path.clone(),
-            x,
-            y,
-            section: GitSection::Staged,
-            renamed_from: renamed_from.clone(),
-        });
-    }
-    if y != ' ' {
-        status.unstaged.push(GitFile {
-            path,
-            x,
-            y,
-            section: GitSection::Unstaged,
-            renamed_from,
-        });
+    if x == '?' && y == '?' {
+        status.untracked.push(file(GitSection::Untracked));
+    } else if unmerged {
+        status.unstaged.push(file(GitSection::Unstaged));
+    } else {
+        if x != ' ' {
+            status.staged.push(file(GitSection::Staged));
+        }
+        if y != ' ' {
+            status.unstaged.push(file(GitSection::Unstaged));
+        }
     }
 }
 
@@ -476,81 +457,7 @@ pub(super) fn parse_unified_diff(path: &str, staged: bool, output: &str) -> Load
 /// diff` call fails.
 pub(super) fn load_diff(root: &Path, file: &GitFile) -> Result<LoadedDiff, String> {
     if file.section == GitSection::Untracked {
-        use std::io::Read;
-
-        let abs = root.join(&file.path);
-        let mut bytes = Vec::new();
-        std::fs::File::open(&abs)
-            .and_then(|input| {
-                input
-                    .take(MAX_DIFF_BYTES as u64 + 1)
-                    .read_to_end(&mut bytes)
-            })
-            .map_err(|e| format!("could not read {}: {e}", file.path))?;
-        if bytes.len() > MAX_DIFF_BYTES {
-            return Ok(LoadedDiff {
-                path: file.path.clone(),
-                staged: false,
-                untracked: true,
-                commit: None,
-                lines: Vec::new(),
-                added: 0,
-                removed: 0,
-                scroll: 0,
-                binary: false,
-                truncated: true,
-            });
-        }
-        let Ok(text) = String::from_utf8(bytes) else {
-            return Ok(LoadedDiff {
-                path: file.path.clone(),
-                staged: false,
-                untracked: true,
-                commit: None,
-                lines: Vec::new(),
-                added: 0,
-                removed: 0,
-                scroll: 0,
-                binary: true,
-                truncated: false,
-            });
-        };
-        let mut lines = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            if index >= MAX_DIFF_LINES {
-                return Ok(LoadedDiff {
-                    path: file.path.clone(),
-                    staged: false,
-                    untracked: true,
-                    commit: None,
-                    lines,
-                    added: index,
-                    removed: 0,
-                    scroll: 0,
-                    binary: false,
-                    truncated: true,
-                });
-            }
-            lines.push(DiffLine {
-                old_no: None,
-                new_no: Some(index + 1),
-                kind: DiffKind::Added,
-                text: line.to_string(),
-            });
-        }
-        let added = lines.len();
-        return Ok(LoadedDiff {
-            path: file.path.clone(),
-            staged: false,
-            untracked: true,
-            commit: None,
-            lines,
-            added,
-            removed: 0,
-            scroll: 0,
-            binary: false,
-            truncated: false,
-        });
+        return load_untracked_diff(root, &file.path);
     }
     let staged = file.section == GitSection::Staged;
     // Keep full-file context when it fits. Otherwise ask Git for compact
@@ -567,6 +474,52 @@ pub(super) fn load_diff(root: &Path, file: &GitFile) -> Result<LoadedDiff, Strin
         diff = parse_unified_diff(&file.path, staged, &output);
     }
     Ok(diff)
+}
+
+/// An untracked file shown as all-added lines, within the diff size and
+/// line limits.
+fn load_untracked_diff(root: &Path, path: &str) -> Result<LoadedDiff, String> {
+    use std::io::Read;
+
+    let untracked = |lines: Vec<DiffLine>, binary, truncated| LoadedDiff {
+        path: path.to_string(),
+        staged: false,
+        untracked: true,
+        commit: None,
+        added: lines.len(),
+        lines,
+        removed: 0,
+        scroll: 0,
+        binary,
+        truncated,
+    };
+    let mut bytes = Vec::new();
+    std::fs::File::open(root.join(path))
+        .and_then(|input| {
+            input
+                .take(MAX_DIFF_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|e| format!("could not read {path}: {e}"))?;
+    if bytes.len() > MAX_DIFF_BYTES {
+        return Ok(untracked(Vec::new(), false, true));
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Ok(untracked(Vec::new(), true, false));
+    };
+    let lines = text
+        .lines()
+        .take(MAX_DIFF_LINES)
+        .enumerate()
+        .map(|(index, line)| DiffLine {
+            old_no: None,
+            new_no: Some(index + 1),
+            kind: DiffKind::Added,
+            text: line.to_string(),
+        })
+        .collect();
+    let truncated = text.lines().nth(MAX_DIFF_LINES).is_some();
+    Ok(untracked(lines, false, truncated))
 }
 
 /// Sorted local branch names for the branch switcher.
@@ -794,14 +747,7 @@ mod tests {
         if !git_available() {
             return Ok(());
         }
-        let root = std::env::temp_dir().join(format!(
-            "yawl-git-poll-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        let root = crate::test_support::unique_temp_dir("git-poll");
         let _ = std::fs::remove_dir_all(&root);
         let work = root.join("work");
         std::fs::create_dir_all(&work)?;

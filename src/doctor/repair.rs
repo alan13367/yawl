@@ -171,7 +171,6 @@ fn sibling(path: &Path, kind: &str) -> PathBuf {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -182,14 +181,7 @@ mod tests {
 
     impl TestDirs {
         fn new(name: &str) -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let root = std::env::temp_dir().join(format!(
-                "yawl-doctor-repair-{}-{nonce}-{name}",
-                std::process::id()
-            ));
+            let root = crate::test_support::unique_temp_dir(&format!("doctor-repair-{name}"));
             let dirs = Self {
                 global: root.join("home/.yawl/config.json"),
                 root,

@@ -35,25 +35,8 @@ fn goal_submission_expands_long_pastes_for_the_agent() {
 
 #[test]
 fn direct_web_settings_apply_and_validate() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-web-settings-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let config = Config {
-        model: Some("test".into()),
-        home_dir: root.join("home/.yawl"),
-        project_dir: root.join("project/.yawl"),
-        ..Config::test_default()
-    };
-    let cwd = root.join("project");
-    let dirs = config.session_dirs(&cwd);
-    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
-        .expect("session should be created");
-    let mut agent = Agent::new(config, "test".into(), session, Vec::new());
+    let root = crate::test_support::unique_temp_dir("tui-web-settings");
+    let mut agent = super::test_support::agent_in(&root);
     let mut state = ViewState::from_agent(&agent);
 
     assert!(settings(&mut agent, "web_browsing on", &mut state));
@@ -110,25 +93,8 @@ fn direct_web_settings_apply_and_validate() {
 
 #[test]
 fn status_bar_editor_discards_drafts_and_saves_once() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-status-settings-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let config = Config {
-        model: Some("test".into()),
-        home_dir: root.join("home/.yawl"),
-        project_dir: root.join("project/.yawl"),
-        ..Config::test_default()
-    };
-    let cwd = root.join("project");
-    let dirs = config.session_dirs(&cwd);
-    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
-        .expect("session should be created");
-    let mut agent = Agent::new(config, "test".into(), session, Vec::new());
+    let root = crate::test_support::unique_temp_dir("tui-status-settings");
+    let mut agent = super::test_support::agent_in(&root);
     let mut state = ViewState::from_agent(&agent);
 
     activate_picker_action(
@@ -179,64 +145,8 @@ fn status_bar_editor_discards_drafts_and_saves_once() {
 #[test]
 fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
     let mut state = ViewState {
-        transcript: Transcript::from_messages(&[]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
-        show_scroll_bar: true,
-        scroll_bar_enabled: true,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
         queued_inputs: ["first".into(), "second".into()].into(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: crate::tui::render::RenderCache::default(),
+        ..ViewState::test_default()
     };
     open_queue_picker(&mut state);
     let mut editor = Editor::default();
@@ -333,14 +243,7 @@ fn queue_editor_removes_a_selected_message_and_keeps_the_rest() {
 
 #[test]
 fn resume_picker_is_scoped_but_explicit_ids_search_other_projects() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-resume-picker-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let root = crate::test_support::unique_temp_dir("tui-resume-picker");
     let config = Config {
         model: Some("claude".into()),
         home_dir: root.join("home/.yawl"),
@@ -389,15 +292,38 @@ fn resume_picker_is_scoped_but_explicit_ids_search_other_projects() {
 }
 
 #[test]
+fn welcome_details_are_only_gathered_for_an_empty_transcript() {
+    let root = crate::test_support::unique_temp_dir("tui-welcome-lazy");
+    let config = Config {
+        model: Some("claude".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
+    };
+    let cwd = crate::config::working_dir();
+    let dirs = config.session_dirs(&cwd);
+    let mut used = crate::session::Session::create(&dirs.project, &cwd, "claude")
+        .expect("used session should be created");
+    let used_id = used.id.clone();
+    used.append_message(&crate::provider::Message::user("hello"))
+        .expect("message should append");
+    drop(used);
+    let empty = crate::session::Session::create(&dirs.project, &cwd, "claude")
+        .expect("empty session should be created");
+    let mut agent = Agent::new(config, "claude".into(), empty, Vec::new());
+
+    let mut state = ViewState::from_agent(&agent);
+    assert_ne!(state.welcome, Default::default());
+
+    resume(&mut agent, &used_id, &mut state);
+    assert_eq!(state.welcome, Default::default());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn resume_picker_deletes_the_selected_session() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-resume-delete-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let root = crate::test_support::unique_temp_dir("tui-resume-delete");
     let config = Config {
         model: Some("claude".into()),
         home_dir: root.join("home/.yawl"),
@@ -543,25 +469,8 @@ fn hotkeys_lists_the_key_reference_sections() {
 
 #[test]
 fn bell_setting_round_trips_through_settings_and_picker() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-bell-settings-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let config = Config {
-        model: Some("test".into()),
-        home_dir: root.join("home/.yawl"),
-        project_dir: root.join("project/.yawl"),
-        ..Config::test_default()
-    };
-    let cwd = root.join("project");
-    let dirs = config.session_dirs(&cwd);
-    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
-        .expect("session should be created");
-    let mut agent = Agent::new(config, "test".into(), session, Vec::new());
+    let root = crate::test_support::unique_temp_dir("tui-bell-settings");
+    let mut agent = super::test_support::agent_in(&root);
     let mut state = ViewState::from_agent(&agent);
     assert!(state.bell);
 
@@ -582,25 +491,8 @@ fn bell_setting_round_trips_through_settings_and_picker() {
 
 #[test]
 fn show_diff_explains_when_nothing_was_tracked() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-diff-empty-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let config = Config {
-        model: Some("test".into()),
-        home_dir: root.join("home/.yawl"),
-        project_dir: root.join("project/.yawl"),
-        ..Config::test_default()
-    };
-    let cwd = root.join("project");
-    let dirs = config.session_dirs(&cwd);
-    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
-        .expect("session should be created");
-    let agent = Agent::new(config, "test".into(), session, Vec::new());
+    let root = crate::test_support::unique_temp_dir("tui-diff-empty");
+    let agent = super::test_support::agent_in(&root);
     let mut state = ViewState::from_agent(&agent);
 
     show_diff(&agent, &mut state);
@@ -618,14 +510,7 @@ fn show_diff_explains_when_nothing_was_tracked() {
 
 #[test]
 fn show_diff_renders_modified_created_and_deleted_files_from_disk() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-diff-files-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let root = crate::test_support::unique_temp_dir("tui-diff-files");
     let work = root.join("work");
     std::fs::create_dir_all(&work).expect("work dir should be created");
     let modified = work.join("modified.txt");
@@ -667,17 +552,7 @@ fn show_diff_renders_modified_created_and_deleted_files_from_disk() {
         },
     ];
 
-    let config = Config {
-        model: Some("test".into()),
-        home_dir: root.join("home/.yawl"),
-        project_dir: root.join("project/.yawl"),
-        ..Config::test_default()
-    };
-    let cwd = root.join("project");
-    let dirs = config.session_dirs(&cwd);
-    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
-        .expect("session should be created");
-    let agent = Agent::new(config, "test".into(), session, Vec::new());
+    let agent = super::test_support::agent_in(&root);
     let mut state = ViewState::from_agent(&agent);
 
     super::commands::show_diff_files(&mut state, &work, &files);
@@ -737,14 +612,7 @@ fn show_diff_renders_modified_created_and_deleted_files_from_disk() {
 
 #[test]
 fn reasoning_command_shows_model_levels_and_sets_them_directly() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-reasoning-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let root = crate::test_support::unique_temp_dir("tui-reasoning");
     let config = Config {
         model: Some("openai-codex:gpt-5.4".into()),
         home_dir: root.join("home/.yawl"),
@@ -805,14 +673,7 @@ fn reasoning_command_shows_model_levels_and_sets_them_directly() {
 
 #[test]
 fn reasoning_status_only_shows_an_effort_supported_by_the_active_model() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-reasoning-status-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let root = crate::test_support::unique_temp_dir("tui-reasoning-status");
     let config = Config {
         model: Some("claude".into()),
         reasoning_effort: Some("high".into()),
@@ -850,14 +711,7 @@ fn reasoning_status_only_shows_an_effort_supported_by_the_active_model() {
 
 #[test]
 fn reasoning_command_reports_models_without_levels() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-reasoning-none-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let root = crate::test_support::unique_temp_dir("tui-reasoning-none");
     let config = Config {
         model: Some("claude".into()),
         home_dir: root.join("home/.yawl"),
@@ -957,14 +811,7 @@ fn format_copy_all_drops_a_user_turn_with_only_an_empty_assistant() {
 
 #[test]
 fn new_then_resume_does_not_reuse_submitted_image_numbers() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-image-numbering-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = crate::test_support::unique_temp_dir("image-numbering");
     let config = Config {
         model: Some("claude".into()),
         home_dir: root.join("home/.yawl"),
@@ -1003,14 +850,9 @@ fn new_then_resume_does_not_reuse_submitted_image_numbers() {
 fn model_selection_follows_up_with_only_the_models_supported_reasoning_levels() {
     for save in [false, true] {
         for levels in [vec!["low", "ultra"], vec![]] {
-            let root = std::env::temp_dir().join(format!(
-                "yawl-model-reasoning-{}-{}-{save}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos(),
-                levels.len(),
+            let root = crate::test_support::unique_temp_dir(&format!(
+                "model-reasoning-{save}-{}",
+                levels.len()
             ));
             let mut config = Config {
                 model: Some("test".into()),
@@ -1022,21 +864,11 @@ fn model_selection_follows_up_with_only_the_models_supported_reasoning_levels() 
             config.providers.insert(
                 "local".into(),
                 crate::config::ProviderConfig {
-                    base_url: "http://127.0.0.1:9/v1".into(),
-                    api: "openai-completions".into(),
-                    api_key: None,
-                    auth_header: None,
-                    headers: Default::default(),
                     models: vec![crate::config::ModelConfig {
-                        id: "listed".into(),
-                        name: None,
-                        context_window: None,
-                        max_tokens: None,
-                        input: Vec::new(),
                         reasoning_efforts: levels.iter().map(|level| (*level).into()).collect(),
-                        compat: Default::default(),
+                        ..crate::config::ModelConfig::named("listed")
                     }],
-                    compat: Default::default(),
+                    ..crate::config::ProviderConfig::test_openai_compatible("http://127.0.0.1:9/v1")
                 },
             );
             // Saved model changes reload the provider metadata from disk.
@@ -1110,14 +942,7 @@ fn new_connection_session_activation_prompts_for_just_saved_reasoning_levels() {
         ConnectionActivation::ConnectionOnly,
     ] {
         for levels in [vec!["low".to_string(), "ultra".to_string()], vec![]] {
-            let root = std::env::temp_dir().join(format!(
-                "yawl-connect-reasoning-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos(),
-            ));
+            let root = crate::test_support::unique_temp_dir("connect-reasoning");
             let config = Config {
                 model: Some("test".into()),
                 home_dir: root.join("home/.yawl"),
@@ -1194,14 +1019,7 @@ fn new_connection_session_activation_prompts_for_just_saved_reasoning_levels() {
 
 #[test]
 fn tools_listing_separates_custom_tools_and_explains_skipped_manifests() {
-    let root = std::env::temp_dir().join(format!(
-        "yawl-tui-tools-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let root = crate::test_support::unique_temp_dir("tui-tools");
     let tools = root.join("home/.yawl/tools");
     std::fs::create_dir_all(&tools).expect("tools dir");
     std::fs::write(
@@ -1210,17 +1028,7 @@ fn tools_listing_separates_custom_tools_and_explains_skipped_manifests() {
     )
     .expect("manifest");
     std::fs::write(tools.join("broken.json"), "{").expect("broken manifest");
-    let config = Config {
-        model: Some("test".into()),
-        home_dir: root.join("home/.yawl"),
-        project_dir: root.join("project/.yawl"),
-        ..Config::test_default()
-    };
-    let cwd = root.join("project");
-    let dirs = config.session_dirs(&cwd);
-    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
-        .expect("session should be created");
-    let mut agent = Agent::new(config, "test".into(), session, Vec::new());
+    let mut agent = super::test_support::agent_in(&root);
     let mut state = ViewState::from_agent(&agent);
 
     super::commands::show_tools(&mut agent, &mut state);

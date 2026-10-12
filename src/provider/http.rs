@@ -330,6 +330,23 @@ impl<R: BufRead> Iterator for SseReader<R> {
     }
 }
 
+/// Reads a successful response as server-sent events. Any other status
+/// becomes [`Error::Http`] with the bounded response body.
+pub(crate) fn event_stream(
+    mut response: ureq::http::Response<ureq::Body>,
+) -> Result<SseReader<impl BufRead>, Error> {
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(Error::Http {
+            status,
+            body: error_body(&mut response),
+        });
+    }
+    Ok(SseReader::new(std::io::BufReader::new(
+        response.into_body().into_reader(),
+    )))
+}
+
 /// Reads a non-2xx response body (bounded) for error reporting.
 pub(crate) fn error_body(response: &mut ureq::http::Response<ureq::Body>) -> String {
     response
@@ -482,50 +499,11 @@ mod pooling_tests {
     #[test]
     fn completion_does_not_wait_for_a_server_that_leaves_the_body_open() {
         crate::install_interrupt_handler().expect("interrupt handler");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
-        let address = listener.local_addr().expect("address");
-        let (release, wait) = std::sync::mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("accept");
-            socket
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .expect("timeout");
-            let mut request = BufReader::new(socket.try_clone().expect("clone"));
-            let mut length = 0;
-            loop {
-                let mut line = String::new();
-                request.read_line(&mut line).expect("header");
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.eq_ignore_ascii_case("content-length")
-                {
-                    length = value.trim().parse::<usize>().expect("length");
-                }
-            }
-            request.read_exact(&mut vec![0; length]).expect("body");
-            let body = "data: [DONE]\n\n";
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n", body.len()).expect("response");
-            socket.flush().expect("flush");
-            let _ = wait.recv_timeout(Duration::from_secs(3));
-        });
-        let request = Request {
-            model: "test",
-            system: "",
-            messages: &[],
-            tools: &[],
-            max_tokens: 1,
-            supports_images: false,
-            prompt_cache_control: false,
-            prompt_cache_key: None,
-        };
+        let (url, stop) = serve_stream(vec!["data: [DONE]\n\n"], Duration::ZERO);
         let started = Instant::now();
-        let result = OpenAi::new(format!("http://{address}"), String::new())
-            .stream_once(&request, &mut |_| {});
+        let result = OpenAi::new(url, String::new()).stream_once(&empty_request(), &mut |_| {});
         let elapsed = started.elapsed();
-        let _ = release.send(());
-        server.join().expect("server");
+        stop();
         result.expect("completed response must remain successful");
         assert!(
             elapsed < Duration::from_secs(2),

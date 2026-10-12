@@ -4,8 +4,8 @@
 
 use std::time::Duration;
 
-use super::super::tool_view::SubagentLabel;
-use super::super::transcript::Entry;
+use super::super::tool_view::{SubagentLabel, format_elapsed};
+use super::super::transcript::{Entry, Transcript};
 use super::super::{ViewState, markdown};
 use super::cache::{LineOwner, RenderSettings};
 use super::entries::{render_queued_panel, render_steer_panel};
@@ -180,19 +180,26 @@ pub(in crate::tui) fn loading_label(activity: &str) -> Option<&str> {
     }
 }
 
+/// How long the live turn has shown no progress, once that reaches
+/// [`MODEL_STREAM_STALL`]. Shorter gaps are ordinary streaming rhythm.
+pub(super) fn stalled_for(transcript: &Transcript) -> Option<Duration> {
+    transcript
+        .last_progress()
+        .map(|at| at.elapsed())
+        .filter(|quiet| *quiet >= MODEL_STREAM_STALL)
+}
+
 pub(in crate::tui) fn render_loading_state(state: &ViewState, width: usize) -> Option<String> {
     let label = loading_label(&state.activity)?;
+    let retrying = state.activity.starts_with("attempt");
     let announces_step = state.activity.starts_with("preparing ")
-        || state.activity.starts_with("attempt")
+        || retrying
         || state.activity == "loading skill"
         || state.activity == "compacting conversation";
-    let stream_quiet = state
-        .transcript
-        .last_model_activity()
-        .is_some_and(|at| at.elapsed() >= MODEL_STREAM_STALL);
+    let stalled = stalled_for(&state.transcript);
     let covered = match in_flight_content(state) {
         InFlight::Nothing => false,
-        InFlight::Static => !stream_quiet,
+        InFlight::Static => stalled.is_none(),
         InFlight::Animated => true,
     };
     if covered && !announces_step {
@@ -200,6 +207,10 @@ pub(in crate::tui) fn render_loading_state(state: &ViewState, width: usize) -> O
     }
     let frame = SPINNER_FRAMES[state.spinner_tick % SPINNER_FRAMES.len()];
     let accent = foreground_color(state.accent_color);
-    let rendered = format!(" {accent}{frame}\x1b[0m \x1b[2m{label}\x1b[0m");
+    // A retry message carries its own countdown.
+    let quiet = stalled
+        .filter(|_| !retrying)
+        .map_or_else(String::new, |quiet| format!(" {}", format_elapsed(quiet)));
+    let rendered = format!("{accent}{frame}\x1b[0m \x1b[2m{label}{quiet}\x1b[0m");
     Some(markdown::fit_width(&rendered, width))
 }

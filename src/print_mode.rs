@@ -179,35 +179,13 @@ fn print_reasoning(reasoning: &mut Vec<Reasoning>) {
     for block in reasoning.drain(..) {
         match block.kind {
             ReasoningKind::Summary => {
-                for summary in reasoning_summary_parts(&block.content) {
+                for summary in ReasoningKind::summary_parts(&block.content) {
                     eprintln!("{summary}");
                 }
             }
             ReasoningKind::Full => eprintln!("{}", block.content.trim()),
         }
     }
-}
-
-fn reasoning_summary_parts(content: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            if !current.is_empty() {
-                parts.push(std::mem::take(&mut current));
-            }
-        } else {
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(line);
-        }
-    }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    parts
 }
 
 #[cfg(test)]

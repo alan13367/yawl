@@ -1,7 +1,9 @@
 //! Edit-diff calculation for file-edit tool calls.
 //!
 //! Generic tool-card rendering stays in the tool-view facade; this child
-//! owns the line-diff algorithm with context elision.
+//! owns the line-diff algorithm with context elision. Diff rows wrap with a
+//! blank gutter instead of truncating, so a change near the end of a long
+//! line stays visible in a collapsed card, which caps each row's wrapping.
 
 use super::{Tone, ToolLine};
 
@@ -22,10 +24,7 @@ pub(in crate::tui) fn edit_diff(old: &str, new: &str) -> Vec<ToolLine> {
     let old_lines = old.lines().collect::<Vec<_>>();
     let new_lines = new.lines().collect::<Vec<_>>();
     let diff = line_diff(&old_lines, &new_lines);
-    let mut rendered = vec![ToolLine::new(
-        format!("@@ -{} +{} @@", old_lines.len(), new_lines.len()),
-        Tone::Muted,
-    )];
+    let mut rendered = Vec::new();
     let mut omitted = false;
     for (index, line) in diff.iter().enumerate() {
         let nearby_change = line.kind != DiffKind::Equal
@@ -45,7 +44,7 @@ pub(in crate::tui) fn edit_diff(old: &str, new: &str) -> Vec<ToolLine> {
             DiffKind::Added => ("+ ", Tone::Added),
             DiffKind::Removed => ("- ", Tone::Removed),
         };
-        rendered.push(ToolLine::new(format!("{prefix}{}", line.text), tone));
+        rendered.push(ToolLine::new(format!("{prefix}{}", line.text), tone).hanging(prefix.len()));
     }
     rendered
 }

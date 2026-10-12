@@ -35,6 +35,9 @@ mod subagents;
 mod terminal;
 #[cfg(test)]
 mod terminal_tests;
+#[cfg(test)]
+mod test_support;
+mod theme;
 mod tool_view;
 mod transcript;
 mod worker;
@@ -58,15 +61,13 @@ use self::picker::{
     open_model_picker, open_settings_picker, paste_into_picker, picker_is_editing,
     picker_is_plan_handoff, poll_model_picker, sync_color_preview, take_picker_action,
 };
-use self::state::{
-    Update, ViewState, advance_ticks, clear_jump_pointer, scroll, toggle_tool_expansion,
-};
+use self::state::{Update, ViewState, advance_ticks, scroll, toggle_tool_expansion};
 use self::subagents::open_dashboard as open_subagent_dashboard;
 use self::terminal::Terminal;
 use self::transcript::Transcript;
 use self::worker::{
-    TurnKind, compact_interactive, deferred_subagents_interactive, handle_mouse_selection,
-    turn_interactive,
+    TurnKind, apply_focus_events, compact_interactive, deferred_subagents_interactive,
+    handle_mouse_selection, paste_clipboard_image, turn_interactive,
 };
 
 #[cfg(test)]
@@ -101,9 +102,6 @@ use crate::config::{Config, UiColor};
 #[cfg(test)]
 use crate::provider::ReasoningKind;
 
-const USER_BACKGROUND: &str = "\x1b[48;2;52;53;64m";
-const USER_TEXT: &str = "\x1b[38;2;208;208;214m";
-
 /// Runs the alternate-screen terminal interface until `/quit`.
 ///
 /// # Errors
@@ -113,7 +111,18 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
     crate::install_interrupt_handler()?;
     agent.enable_interactive_questions();
     let mut terminal = Terminal::enter()?;
-    let mut events = EventReader::new(terminal.remote().terminal_input(remote::FdInput::stdin()));
+    // An explicit theme needs no answer from the terminal, which some
+    // multiplexers and slow links never give in time.
+    let (light_background, typed) = if agent.config().theme == crate::config::Theme::Auto {
+        terminal.query_light_background()
+    } else {
+        (None, Vec::new())
+    };
+    theme::init(agent.config().theme, light_background);
+    let mut events = EventReader::with_pending(
+        terminal.remote().terminal_input(remote::FdInput::stdin()),
+        &typed,
+    );
     let mut editor = Editor::default();
     let mut state = ViewState::from_agent(agent);
     terminal.draw(&mut state, &editor)?;
@@ -133,8 +142,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
             continue;
         }
         if agent.has_deferred_subagent_results() {
-            state.activity = "delivering subagent results".into();
-            state.turn_started = Some(std::time::Instant::now());
+            state.begin_turn("delivering subagent results");
             terminal.draw(&mut state, &editor)?;
             match deferred_subagents_interactive(
                 agent,
@@ -181,27 +189,13 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
         let mut event = events.read_event()?;
         let mut needs_draw = false;
         loop {
-            match event {
-                Event::FocusGained => {
-                    terminal.set_focused(true);
-                    if !events.has_pending() {
-                        break;
-                    }
-                    event = events.read_event()?;
-                    continue;
-                }
-                Event::FocusLost => {
-                    terminal.set_focused(false);
-                    needs_draw |= git::clear_hover(&mut state);
-                    needs_draw |= clear_jump_pointer(&mut state);
-                    if !events.has_pending() {
-                        break;
-                    }
-                    event = events.read_event()?;
-                    continue;
-                }
-                _ => {}
-            }
+            let (next, focus_redraw) =
+                apply_focus_events(event, &mut events, &mut terminal, &mut state)?;
+            needs_draw |= focus_redraw;
+            let Some(next) = next else {
+                break;
+            };
+            event = next;
             needs_draw |= event_requests_redraw(&event);
             if matches!(&event, Event::Tick) {
                 needs_draw |= terminal.remote().poll(&mut state);
@@ -286,7 +280,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                     } else {
                         state.transcript.blur();
                         if text.is_empty() {
-                            paste_clipboard_image(agent, &mut state, &mut editor);
+                            paste_clipboard_image(agent.config(), &mut state, &mut editor);
                         } else {
                             editor.paste(&text);
                         }
@@ -307,7 +301,7 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                             Key::Ctrl('l') => terminal.invalidate(),
                             Key::Ctrl('o') => toggle_tool_expansion(&mut state),
                             Key::Ctrl('v') | Key::Super('v') => {
-                                paste_clipboard_image(agent, &mut state, &mut editor)
+                                paste_clipboard_image(agent.config(), &mut state, &mut editor)
                             }
                             _ if handle_completion_key(&mut state, &mut editor, key) => {
                                 // The completion menu consumed navigation or Tab.
@@ -392,16 +386,6 @@ fn continue_turn<R: Read>(
 fn notify_settled(terminal: &mut Terminal, state: &ViewState) {
     if state.bell && state.queued_inputs.is_empty() {
         terminal.ring_bell();
-    }
-}
-
-fn paste_clipboard_image(agent: &Agent, state: &mut ViewState, editor: &mut Editor) {
-    let supported = crate::model::supports_images(agent.config(), agent.model());
-    match editor.paste_clipboard_image(supported) {
-        Ok(()) => {
-            state.scroll_offset = 0;
-        }
-        Err(error) => state.notice(format!("Could not paste image: {error}.")),
     }
 }
 
@@ -586,6 +570,7 @@ fn handle_submission<R: Read>(
             "undo" => match agent.undo_last_turn() {
                 Ok(report) => {
                     state.transcript = Transcript::from_messages(agent.messages());
+                    state.refresh_welcome(agent);
                     state.render_cache.invalidate();
                     state.context_tokens = agent.context_tokens();
                     state.active_goal = agent.active_goal().map(str::to_string);
@@ -692,8 +677,7 @@ fn run_agent_turn<R: Read>(
     if let Some(displayed_input) = displayed_input {
         state.transcript.push_user(displayed_input);
     }
-    state.activity = "sending".into();
-    state.turn_started = Some(std::time::Instant::now());
+    state.begin_turn("sending");
     state.active_goal = agent.active_goal().map(str::to_string);
     state.active_plan = agent.active_plan().map(str::to_string);
     state.plan_draft = matches!(

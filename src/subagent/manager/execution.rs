@@ -39,22 +39,14 @@ impl SubagentManager {
         match spawn {
             Ok(handle) => {
                 let mut state = self.lock();
-                if let Some(index) = state
-                    .entries
-                    .iter()
-                    .position(|entry| entry.snapshot.id == id)
-                {
+                if let Some(index) = state.index_of(&id) {
                     state.entries[index].handle = Some(handle);
                 }
                 Ok(())
             }
             Err(error) => {
                 let mut state = self.lock();
-                if let Some(index) = state
-                    .entries
-                    .iter()
-                    .position(|entry| entry.snapshot.id == id)
-                {
+                if let Some(index) = state.index_of(&id) {
                     let entry = &mut state.entries[index];
                     entry.snapshot.status = SubagentStatus::Failed;
                     entry.snapshot.error = bounded(
@@ -73,11 +65,7 @@ impl SubagentManager {
 
     fn worker_started(&self, id: &SubagentId) {
         let mut state = self.lock();
-        if let Some(entry) = state
-            .entries
-            .iter_mut()
-            .find(|entry| entry.snapshot.id == *id)
-        {
+        if let Some(entry) = state.entry_mut(id) {
             entry.thread_id = Some(crate::cancellation::native_thread_id());
         }
         self.shared.changed.notify_all();
@@ -125,11 +113,7 @@ impl SubagentManager {
             // race between a turn ending and the settled state becoming
             // visible.
             leftovers.extend(conversation.take_unaccepted_steers());
-            let Some(index) = state
-                .entries
-                .iter()
-                .position(|entry| entry.snapshot.id == *id)
-            else {
+            let Some(index) = state.index_of(id) else {
                 return;
             };
             let entry = &mut state.entries[index];
@@ -186,10 +170,7 @@ impl SubagentManager {
             if state.shutting_down {
                 return None;
             }
-            let index = state
-                .entries
-                .iter()
-                .position(|entry| entry.snapshot.id == *id)?;
+            let index = state.index_of(id)?;
             if state.entries[index].snapshot.status == SubagentStatus::Canceling {
                 state.entries[index].snapshot.latest_outcome = Some(RunOutcome::Interrupted);
                 settle_entry(
@@ -219,11 +200,7 @@ impl SubagentManager {
     pub(super) fn begin_work(&self, id: &SubagentId, work: &WorkItem) -> bool {
         let mut state = self.lock();
         let index = loop {
-            let Some(index) = state
-                .entries
-                .iter()
-                .position(|entry| entry.snapshot.id == *id)
-            else {
+            let Some(index) = state.index_of(id) else {
                 return false;
             };
             if state.entries[index].snapshot.status == SubagentStatus::Canceling {
@@ -256,11 +233,7 @@ impl SubagentManager {
 
     fn worker_stopped(&self, id: &SubagentId) {
         let mut state = self.lock();
-        if let Some(entry) = state
-            .entries
-            .iter_mut()
-            .find(|entry| entry.snapshot.id == *id)
-        {
+        if let Some(entry) = state.entry_mut(id) {
             entry.thread_id = None;
         }
         self.shared.changed.notify_all();
@@ -268,11 +241,7 @@ impl SubagentManager {
 
     fn worker_panicked(&self, id: &SubagentId) {
         let mut state = self.lock();
-        let Some(index) = state
-            .entries
-            .iter()
-            .position(|entry| entry.snapshot.id == *id)
-        else {
+        let Some(index) = state.index_of(id) else {
             return;
         };
         let was_active = state.entries[index].snapshot.status.is_active();
@@ -339,11 +308,7 @@ pub(super) fn apply_turn_event(
     id: &SubagentId,
     event: crate::agent::TurnEvent<'_>,
 ) {
-    let Some(index) = state
-        .entries
-        .iter()
-        .position(|entry| entry.snapshot.id == *id)
-    else {
+    let Some(index) = state.index_of(id) else {
         return;
     };
     match &event {

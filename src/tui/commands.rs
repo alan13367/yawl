@@ -1,30 +1,47 @@
 //! Slash commands, settings mutation, queue actions, skills, and session selection.
 //!
-//! This facade owns slash-command dispatch and session/queue actions. Private
-//! children handle settings parsing/application and transcript copying. TUI
-//! callers keep the entry points here.
+//! This facade owns slash-command help and picker-action dispatch. Private
+//! children handle settings, goal and plan commands, the message queue,
+//! sessions, `/diff`, and transcript copying. TUI callers keep the entry
+//! points here.
 
 mod copy;
+mod diff;
+mod modes;
+mod queue;
+mod sessions;
 mod settings;
 
 pub(super) use copy::{copy_all_from_transcript, copy_all_messages, copy_last_reply};
 #[cfg(test)]
 pub(super) use copy::{format_copy_all, last_assistant_reply};
+pub(super) use diff::show_diff;
+#[cfg(test)]
+pub(super) use diff::show_diff_files;
+pub(super) use modes::{
+    GoalAction, PlanAction, goal, goal_while_busy, init, plan, plan_handoff_picker, plan_while_busy,
+};
+#[cfg(test)]
+pub(super) use queue::open_queue_picker;
+pub(super) use queue::{handle_queue_picker_action, promote_queued, unqueue};
+pub(super) use sessions::{
+    delete_session, is_new_session_command, load_session, new_session, notice_undo,
+    open_resume_picker, resume,
+};
 pub(super) use settings::{
     apply_config_change, notice_config_effect, reasoning, refresh_model_selection, settings,
-    show_settings, show_usage,
+    show_settings, show_usage, sync_display_settings,
 };
 use settings::{apply_reasoning_effort, interface_location, open_settings_location};
 
 use crate::agent::Agent;
 use crate::config::ConfigChange;
-use crate::provider::TurnInput;
 
 use super::picker::{
-    Picker, PickerAction, PickerItem, SettingsCategory, SettingsItem, SettingsLocation,
-    color_picker, open_model_picker, open_reasoning_picker, open_subagent_model_picker,
-    remove_model_confirm, select_picker_item, selection_color_picker, settings_category_picker,
-    settings_picker, status_bar_editor_picker, web_search_provider_picker,
+    PickerAction, SettingsCategory, SettingsItem, SettingsLocation, color_picker,
+    open_model_picker, open_reasoning_picker, open_subagent_model_picker, remove_model_confirm,
+    select_picker_item, selection_color_picker, settings_category_picker, settings_picker,
+    status_bar_editor_picker, web_search_provider_picker,
 };
 use super::state::ViewState;
 
@@ -148,201 +165,6 @@ Keyboard shortcuts
 | | `Escape` | Close diff, then dashboard |
 ";
 
-pub(super) fn is_new_session_command(name: &str) -> bool {
-    matches!(name, "new" | "clear")
-}
-
-pub(super) fn init(argument: &str) -> Result<TurnInput, &'static str> {
-    if argument.is_empty() {
-        Ok("/init".to_string().into())
-    } else {
-        Err("Usage: /init")
-    }
-}
-
-pub(super) enum GoalAction {
-    None,
-    Start,
-    Resume,
-}
-
-pub(super) enum PlanAction {
-    None,
-    Start,
-    Resume,
-}
-
-pub(super) fn plan(agent: &mut Agent, argument: &str, state: &mut ViewState) -> PlanAction {
-    match argument {
-        "" => {
-            notice_plan_status(agent, state);
-            PlanAction::None
-        }
-        "cancel" => {
-            match agent.cancel_plan() {
-                Ok(true) => {
-                    state.active_plan = None;
-                    state.plan_draft = false;
-                    state.notice("Plan canceled.");
-                }
-                Ok(false) => state.notice("No active plan."),
-                Err(error) => state.notice(format!("Could not cancel the plan: {error}")),
-            }
-            PlanAction::None
-        }
-        "resume" => match agent.plan_state() {
-            Some(crate::session::PlanState::Draft { .. }) => PlanAction::Resume,
-            Some(crate::session::PlanState::Ready { .. }) => {
-                state.notice(
-                    "The plan is already complete. Enter a prompt to revise or implement it.",
-                );
-                PlanAction::None
-            }
-            None => {
-                state.notice("No interrupted plan to resume.");
-                PlanAction::None
-            }
-        },
-        objective => match agent.start_plan(objective.to_string().into()) {
-            Ok(warning) => {
-                state.active_plan = None;
-                state.plan_draft = true;
-                if let Some(warning) = warning {
-                    state.notice(warning);
-                }
-                PlanAction::Start
-            }
-            Err(error) => {
-                state.notice(format!("Could not start the plan: {error}"));
-                PlanAction::None
-            }
-        },
-    }
-}
-
-fn notice_plan_status(agent: &Agent, state: &mut ViewState) {
-    match agent.plan_state() {
-        Some(crate::session::PlanState::Draft { objective, .. }) => state.notice(format!(
-            "Draft plan for:\n{objective}\n\n/plan resume continues it. /plan cancel clears it."
-        )),
-        Some(crate::session::PlanState::Ready { plan, .. }) => state.notice(format!(
-            "Active plan:\n\n{plan}\n\nEnter a prompt to revise or implement it. /plan cancel clears it."
-        )),
-        None => state.notice("No active plan. Start one with /plan TEXT."),
-    }
-}
-
-pub(super) fn plan_handoff_picker() -> Picker {
-    Picker {
-        title: "Plan ready".into(),
-        hint: "Enter select · Esc return to editor".into(),
-        selected: 0,
-        items: vec![
-            PickerItem {
-                label: "Implement".into(),
-                description: "Start implementing this plan now".into(),
-                action: PickerAction::ImplementPlan,
-            },
-            PickerItem {
-                label: "Return to editor".into(),
-                description: "Write a change request or implementation prompt".into(),
-                action: PickerAction::ReturnFromPlan,
-            },
-        ],
-        editing: None,
-        parent: Some(PickerAction::ReturnFromPlan),
-    }
-}
-
-pub(super) fn goal(agent: &mut Agent, argument: &str, state: &mut ViewState) -> GoalAction {
-    match argument {
-        "" => {
-            notice_goal_status(agent, state, false);
-            GoalAction::None
-        }
-        "cancel" => {
-            match agent.cancel_goal() {
-                Ok(true) => {
-                    state.active_goal = None;
-                    state.notice("Goal canceled.");
-                }
-                Ok(false) => state.notice("No active goal."),
-                Err(error) => state.notice(format!("Could not cancel the goal: {error}")),
-            }
-            GoalAction::None
-        }
-        "resume" => {
-            if agent.active_goal().is_none() {
-                state.notice("No paused goal to resume.");
-                return GoalAction::None;
-            }
-            GoalAction::Resume
-        }
-        goal => match agent.start_goal(goal.to_string().into()) {
-            Ok(warning) => {
-                state.active_goal = agent.active_goal().map(str::to_string);
-                if let Some(warning) = warning {
-                    state.notice(warning);
-                }
-                GoalAction::Start
-            }
-            Err(error) => {
-                state.notice(format!("Could not start the goal: {error}"));
-                GoalAction::None
-            }
-        },
-    }
-}
-
-pub(super) fn goal_while_busy(argument: &str, state: &mut ViewState) {
-    match argument {
-        "" => {
-            if let Some(goal) = state.active_goal.as_deref() {
-                if state.goal_running {
-                    state.notice(format!("Working on goal:\n{goal}"));
-                } else {
-                    state.notice(format!(
-                        "Paused goal:\n{goal}\n\nWait for the current turn to settle, then run /goal resume."
-                    ));
-                }
-            } else {
-                state.notice("No active goal.");
-            }
-        }
-        "cancel" => state.notice("Wait for the current turn to settle, then run /goal cancel."),
-        "resume" if state.goal_running => state.notice("A goal is already running."),
-        "resume" => state.notice("Wait for the current turn to settle, then run /goal resume."),
-        _ => state.notice("Wait for the current turn to settle before replacing the goal."),
-    }
-}
-
-pub(super) fn plan_while_busy(argument: &str, state: &mut ViewState) {
-    match argument {
-        "" => {
-            if state.plan_draft {
-                state.notice("A planning workflow is currently running.");
-            } else if let Some(plan) = state.active_plan.as_deref() {
-                state.notice(format!("Active plan:\n\n{plan}"));
-            } else {
-                state.notice("No active plan.");
-            }
-        }
-        _ => state.notice("Wait for the current turn to settle before changing the plan."),
-    }
-}
-
-fn notice_goal_status(agent: &Agent, state: &mut ViewState, running: bool) {
-    match agent.active_goal() {
-        Some(goal) if running || state.turn_started.is_some() => {
-            state.notice(format!("Working on goal:\n{goal}"));
-        }
-        Some(goal) => state.notice(format!(
-            "Paused goal:\n{goal}\n\n/goal resume continues it. /goal cancel clears it."
-        )),
-        None => state.notice("No active goal. Start one with /goal TEXT."),
-    }
-}
-
 /// Lists builtin tools, then the custom tools saved for this user, so the
 /// personalization the model added is visible and easy to find on disk.
 pub(super) fn show_tools(agent: &mut Agent, state: &mut ViewState) {
@@ -413,147 +235,6 @@ pub(super) fn show_skills(agent: &Agent, state: &mut ViewState) {
         }
     }
     state.notice(text);
-}
-
-pub(super) fn queue_picker(state: &ViewState, selected: usize) -> Option<Picker> {
-    if state.queued_inputs.is_empty() {
-        return None;
-    }
-    let mut items = state
-        .queued_inputs
-        .iter()
-        .enumerate()
-        .map(|(index, input)| PickerItem {
-            label: format!("Queued {}", index + 1),
-            description: input.text.replace('\n', " "),
-            action: PickerAction::SendQueued(index),
-        })
-        .collect::<Vec<_>>();
-    items.push(PickerItem {
-        label: "Clear all queued messages".into(),
-        description: format!("Remove all {} pending", state.queued_inputs.len()),
-        action: PickerAction::ClearQueued,
-    });
-    Some(Picker {
-        title: "Queued messages".into(),
-        hint: "↑/↓ select  K/J reorder  e edit  d delete  Enter send now".into(),
-        selected: selected.min(items.len().saturating_sub(1)),
-        items,
-        editing: None,
-        parent: None,
-    })
-}
-
-pub(super) fn open_queue_picker(state: &mut ViewState) {
-    state.picker = queue_picker(state, 0);
-    if state.picker.is_none() {
-        state.activity = "no queued messages".into();
-    }
-}
-
-pub(super) fn remove_queued(state: &mut ViewState, index: usize) -> bool {
-    if state.queued_inputs.remove(index).is_some() {
-        if state.queued_inputs.is_empty() {
-            state.queue_paused = false;
-        }
-        state.activity = format!("removed queued message {}", index + 1);
-        state.scroll_offset = 0;
-        true
-    } else {
-        state.activity = format!("queued message {} does not exist", index + 1);
-        false
-    }
-}
-
-pub(super) fn clear_queued(state: &mut ViewState) {
-    let count = state.queued_inputs.len();
-    state.queued_inputs.clear();
-    state.queue_paused = false;
-    state.activity = match count {
-        0 => "no queued messages".into(),
-        1 => "removed 1 queued message".into(),
-        _ => format!("removed {count} queued messages"),
-    };
-    state.scroll_offset = 0;
-}
-
-pub(super) fn move_queued(state: &mut ViewState, index: usize, direction: isize) -> usize {
-    if state.queued_inputs.is_empty() || index >= state.queued_inputs.len() {
-        return index;
-    }
-    let target = if direction < 0 {
-        index.saturating_sub(direction.unsigned_abs())
-    } else {
-        index
-            .saturating_add(direction as usize)
-            .min(state.queued_inputs.len() - 1)
-    };
-    if target != index
-        && let Some(input) = state.queued_inputs.remove(index)
-    {
-        state.queued_inputs.insert(target, input);
-        state.activity = format!("moved queued message {} to {}", index + 1, target + 1);
-    }
-    target
-}
-
-pub(super) fn promote_queued(state: &mut ViewState, index: usize) -> bool {
-    if index >= state.queued_inputs.len() {
-        return false;
-    }
-    state.queue_paused = false;
-    let _ = move_queued(state, index, -(index as isize));
-    state.activity = "stopping the active turn to send queued message".into();
-    true
-}
-
-pub(super) fn unqueue(argument: &str, state: &mut ViewState) {
-    match argument {
-        "" => open_queue_picker(state),
-        "all" => clear_queued(state),
-        number => match number
-            .parse::<usize>()
-            .ok()
-            .and_then(|number| number.checked_sub(1))
-        {
-            Some(index) => {
-                let _ = remove_queued(state, index);
-            }
-            None => state.activity = "usage: /unqueue [NUMBER|all]".into(),
-        },
-    }
-}
-
-pub(super) fn handle_queue_picker_action(
-    state: &mut ViewState,
-    action: PickerAction,
-) -> Option<PickerAction> {
-    match action {
-        PickerAction::ApplyQueued { index, input } => {
-            if let Some(queued) = state.queued_inputs.get_mut(index) {
-                *queued = input;
-                state.activity = format!("updated queued message {}", index + 1);
-            }
-            state.picker = queue_picker(state, index);
-            None
-        }
-        PickerAction::MoveQueued { index, direction } => {
-            let selected = move_queued(state, index, direction);
-            state.picker = queue_picker(state, selected);
-            None
-        }
-        PickerAction::RemoveQueued(index) => {
-            if remove_queued(state, index) {
-                state.picker = queue_picker(state, index);
-            }
-            None
-        }
-        PickerAction::ClearQueued => {
-            clear_queued(state);
-            None
-        }
-        action => Some(action),
-    }
 }
 
 /// Switches the session model and follows up with the reasoning picker for
@@ -719,6 +400,11 @@ pub(super) fn activate_picker_action(
         PickerAction::SetBell(enabled) => {
             if apply_config_change(agent, ConfigChange::Bell(enabled), state) {
                 open_settings_location(agent, state, interface_location(SettingsItem::Bell));
+            }
+        }
+        PickerAction::SetTheme(theme) => {
+            if apply_config_change(agent, ConfigChange::Theme(theme), state) {
+                open_settings_location(agent, state, interface_location(SettingsItem::Theme));
             }
         }
         PickerAction::SetAccentColor(color) => {
@@ -890,222 +576,6 @@ pub(super) fn activate_picker_action(
     state.refresh_completions(agent);
 }
 
-pub(super) fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
-    let cwd = crate::config::working_dir();
-    let dirs = agent.config().session_dirs(&cwd);
-    let sessions = match crate::session::list(&dirs.project) {
-        Ok(sessions) => sessions,
-        Err(error) => {
-            state.notice(format!("Could not list sessions: {error}"));
-            return;
-        }
-    };
-    if sessions.is_empty() {
-        state.picker = None;
-        state.notice("No saved sessions for this directory.");
-        return;
-    }
-    state.picker = Some(Picker {
-        title: "Resume session".into(),
-        hint: "↑/↓ move  Enter resume  d delete…  Esc cancel".into(),
-        selected: 0,
-        items: sessions
-            .into_iter()
-            .take(100)
-            .map(|session| PickerItem {
-                label: if session.preview.is_empty() {
-                    "Untitled session".into()
-                } else {
-                    session.preview
-                },
-                description: format!("{} · {}", session.model, session.id),
-                action: PickerAction::ResumeSession(session.id),
-            })
-            .collect(),
-        editing: None,
-        parent: None,
-    });
-}
-
-/// Per-side content cap for `/diff` cards, matching the `read_file` limit.
-const DIFF_MAX_BYTES: usize = 1024 * 1024;
-
-/// Renders `/diff`: one diff card per file the file tools touched this
-/// session, comparing the oldest `/undo` pre-image with the current contents.
-pub(super) fn show_diff(agent: &Agent, state: &mut ViewState) {
-    let work_tree = crate::config::working_dir();
-    show_diff_files(state, &work_tree, &agent.touched_files());
-}
-
-/// Renders diff cards for explicit touched-file records. Split from
-/// `show_diff` so tests can drive real files without checkpoint plumbing.
-pub(super) fn show_diff_files(
-    state: &mut ViewState,
-    work_tree: &std::path::Path,
-    files: &[crate::checkpoint::TouchedFile],
-) {
-    let mut skipped: Vec<String> = Vec::new();
-    let mut shown = 0usize;
-    for file in files {
-        let display = diff_display_path(work_tree, &file.path);
-        let previous = match (file.existed, &file.previous) {
-            (true, Some(bytes)) => Some(bytes.clone()),
-            (true, None) => {
-                skipped.push(format!("{display} (pre-image unreadable)"));
-                continue;
-            }
-            (false, _) => None,
-        };
-        let new_bytes = match std::fs::read(&file.path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if previous.is_none() {
-                    // Created and deleted again within the session.
-                    continue;
-                }
-                Vec::new()
-            }
-            Err(_) => {
-                skipped.push(format!("{display} (unreadable)"));
-                continue;
-            }
-        };
-        let old_bytes = previous.unwrap_or_default();
-        if old_bytes == new_bytes {
-            continue;
-        }
-        let (Ok(old), Ok(new)) = (String::from_utf8(old_bytes), String::from_utf8(new_bytes))
-        else {
-            skipped.push(format!("{display} (not UTF-8)"));
-            continue;
-        };
-        if old.len() > DIFF_MAX_BYTES || new.len() > DIFF_MAX_BYTES {
-            skipped.push(format!("{display} (over 1 MiB)"));
-            continue;
-        }
-        state
-            .transcript
-            .push_diff(display, super::tool_view::edit_diff(&old, &new));
-        shown += 1;
-    }
-    if shown == 0 && skipped.is_empty() {
-        state.notice(
-            "No file changes recorded this session. Changes made through `shell` or exec tools are not tracked.",
-        );
-        return;
-    }
-    if !skipped.is_empty() {
-        let mut text = String::from("Files not shown\n\n");
-        for path in &skipped {
-            text.push_str(&format!("- {path}\n"));
-        }
-        state.notice(text);
-    }
-}
-
-fn diff_display_path(work_tree: &std::path::Path, path: &str) -> String {
-    std::path::Path::new(path)
-        .strip_prefix(work_tree)
-        .map(|relative| relative.display().to_string())
-        .unwrap_or_else(|_| path.to_string())
-}
-
-pub(super) fn notice_undo(state: &mut ViewState, report: crate::agent::UndoReport) {
-    if report.dropped == 0 {
-        state.notice("Nothing to undo.");
-        return;
-    }
-    let mut text = "Undid the last turn.".to_string();
-    if report.reset_head {
-        text.push_str(" Reset git HEAD.");
-    }
-    if !report.restored_files {
-        text.push_str(" File changes could not be restored.");
-    }
-    if let Some(warning) = report.warning {
-        text.push(' ');
-        text.push_str(&warning);
-    }
-    state.notice(text);
-}
-
-pub(super) fn resume(agent: &mut Agent, selector: &str, state: &mut ViewState) {
-    if !selector.is_empty() && selector.parse::<usize>().is_err() {
-        load_session(agent, selector, state);
-        return;
-    }
-
-    let cwd = crate::config::working_dir();
-    let dirs = agent.config().session_dirs(&cwd);
-    let sessions = match crate::session::list(&dirs.project) {
-        Ok(sessions) => sessions,
-        Err(error) => {
-            state.notice(format!("Could not list sessions: {error}"));
-            return;
-        }
-    };
-    if selector.is_empty() {
-        if sessions.is_empty() {
-            state.notice("No saved sessions for this directory.");
-            return;
-        }
-        let mut text = String::from("Saved sessions\n\n");
-        for (index, session) in sessions.iter().take(20).enumerate() {
-            text.push_str(&format!(
-                "{}. `{}`  {}\n",
-                index + 1,
-                session.id,
-                session.preview
-            ));
-        }
-        text.push_str("\nUse `/resume ID` or `/resume NUMBER`.");
-        state.notice(text);
-        return;
-    }
-    let id = selector
-        .parse::<usize>()
-        .ok()
-        .and_then(|number| number.checked_sub(1))
-        .and_then(|index| sessions.get(index))
-        .map_or(selector, |session| session.id.as_str());
-    load_session(agent, id, state);
-}
-
-pub(super) fn new_session(agent: &mut Agent, state: &mut ViewState) {
-    match agent.reset() {
-        Ok(()) => {
-            let queued_inputs = std::mem::take(&mut state.queued_inputs);
-            let pending_steers = std::mem::take(&mut state.pending_steers);
-            let pending_actions = std::mem::take(&mut state.pending_actions);
-            *state = ViewState::from_agent(agent);
-            state.queued_inputs = queued_inputs;
-            state.pending_steers = pending_steers;
-            state.pending_actions = pending_actions;
-        }
-        Err(error) => state.notice(format!("Could not start a session: {error}")),
-    }
-}
-
-pub(super) fn load_session(agent: &mut Agent, id: &str, state: &mut ViewState) {
-    let previous_model = agent.model().to_string();
-    match agent.load_session(id) {
-        Ok(()) => {
-            let queued_inputs = std::mem::take(&mut state.queued_inputs);
-            let pending_actions = std::mem::take(&mut state.pending_actions);
-            *state = ViewState::from_agent(agent);
-            state.queued_inputs = queued_inputs;
-            state.pending_actions = pending_actions;
-            let model = agent.model().to_string();
-            state.notice(if model == previous_model {
-                format!("Resumed session {id}.")
-            } else {
-                format!("Resumed session {id} with {model}.")
-            });
-        }
-        Err(error) => state.notice(format!("Could not resume '{id}': {error}")),
-    }
-}
-
 fn remove_model(agent: &mut Agent, model: &str, state: &mut ViewState) {
     let Some((provider, id)) = model.split_once(':') else {
         state.notice(format!("`{model}` is not a configured provider model."));
@@ -1123,47 +593,5 @@ fn remove_model(agent: &mut Agent, model: &str, state: &mut ViewState) {
             .is_none_or(|provider| provider.models.iter().all(|entry| entry.id != id))
     {
         state.notice(format!("Removed `{model}` from the model list."));
-    }
-}
-
-pub(super) fn delete_session(agent: &mut Agent, id: &str, state: &mut ViewState) {
-    let selected = state
-        .picker
-        .as_ref()
-        .map(|picker| picker.selected)
-        .unwrap_or(0);
-    let deleting_current = agent.session_id() == id;
-    match agent.delete_session(id) {
-        Ok(()) => {
-            if deleting_current {
-                let queued_inputs = std::mem::take(&mut state.queued_inputs);
-                let pending_actions = std::mem::take(&mut state.pending_actions);
-                *state = ViewState::from_agent(agent);
-                state.queued_inputs = queued_inputs;
-                state.pending_actions = pending_actions;
-            }
-            let cwd = crate::config::working_dir();
-            let dirs = agent.config().session_dirs(&cwd);
-            match crate::session::list(&dirs.project) {
-                Ok(sessions) if sessions.is_empty() => {
-                    state.picker = None;
-                    state.notice(format!("Deleted session {id}. No saved sessions left."));
-                }
-                Ok(_) => {
-                    open_resume_picker(agent, state);
-                    if let Some(picker) = state.picker.as_mut() {
-                        picker.selected = selected.min(picker.items.len().saturating_sub(1));
-                    }
-                    state.notice(format!("Deleted session {id}."));
-                }
-                Err(error) => {
-                    state.picker = None;
-                    state.notice(format!(
-                        "Deleted session {id}. Could not refresh the list: {error}"
-                    ));
-                }
-            }
-        }
-        Err(error) => state.notice(format!("Could not delete '{id}': {error}")),
     }
 }

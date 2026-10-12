@@ -5,41 +5,59 @@ use std::time::{Duration, Instant};
 use crate::provider::UsageSummary;
 use crate::subagent::types::{SubagentSnapshot, SubagentStatus};
 
-use super::SubagentManager;
 use super::format::{
     format_deferred_result, format_detailed_snapshot, format_duration, format_snapshots,
 };
 use super::validation::{find_index, resolve_indexes, validate_id_list, wait_timeout};
+use super::{Entry, State, SubagentManager};
+use crate::subagent::types::SubagentId;
+use std::sync::MutexGuard;
 
 const CANCEL_WAIT: Duration = Duration::from_secs(5);
 
+/// Registers wait interest in the entries at `indexes`, so their results are
+/// reported to the waiter instead of deferred, and returns their IDs.
+fn watch(state: &mut State, indexes: &[usize]) -> Vec<SubagentId> {
+    indexes
+        .iter()
+        .map(|index| {
+            let entry = &mut state.entries[*index];
+            entry.wait_interest = entry.wait_interest.saturating_add(1);
+            entry.snapshot.id.clone()
+        })
+        .collect()
+}
+
+impl Entry {
+    /// Stops an active run: drops its queued work and messages, cancels its
+    /// token, and returns the worker thread to wake.
+    fn begin_cancel(&mut self) -> Option<usize> {
+        self.snapshot.status = SubagentStatus::Canceling;
+        self.snapshot.current_activity = "canceling".into();
+        self.work.clear();
+        self.snapshot.queued_messages.clear();
+        self.cancellation.cancel();
+        self.thread_id
+    }
+}
+
 impl SubagentManager {
-    pub(crate) fn wait(&self, ids: &[String], timeout_secs: Option<u64>) -> Result<String, String> {
-        validate_id_list(ids)?;
-        let timeout = wait_timeout(timeout_secs)?;
-        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
-        let mut state = self.lock();
-        let indexes = resolve_indexes(&state, ids)?;
-        let selected = indexes
-            .iter()
-            .map(|index| state.entries[*index].snapshot.id.clone())
-            .collect::<Vec<_>>();
-        for index in &indexes {
-            state.entries[*index].wait_interest =
-                state.entries[*index].wait_interest.saturating_add(1);
-        }
-        loop {
-            if selected.iter().all(|id| {
-                state
-                    .entries
-                    .iter()
-                    .find(|entry| entry.snapshot.id == *id)
-                    .is_none_or(|entry| !entry.snapshot.status.is_active())
-            }) || crate::cancellation::interrupted()
-                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                break;
-            }
+    /// Blocks until every watched run settles, the turn is interrupted, or
+    /// `deadline` passes, then releases the wait interest from [`watch`] and
+    /// returns the runs' latest snapshots.
+    fn settle<'a>(
+        &'a self,
+        mut state: MutexGuard<'a, State>,
+        selected: Vec<SubagentId>,
+        deadline: Option<Instant>,
+    ) -> (MutexGuard<'a, State>, Vec<SubagentSnapshot>) {
+        while !(selected.iter().all(|id| {
+            state
+                .index_of(id)
+                .is_none_or(|index| !state.entries[index].snapshot.status.is_active())
+        }) || crate::cancellation::interrupted()
+            || deadline.is_some_and(|deadline| Instant::now() >= deadline))
+        {
             let remaining = deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                 .unwrap_or(Duration::from_millis(100))
@@ -49,25 +67,24 @@ impl SubagentManager {
                 Err(poisoned) => poisoned.into_inner().0,
             };
         }
-        let snapshots = selected
-            .iter()
-            .filter_map(|id| {
-                state
-                    .entries
-                    .iter()
-                    .find(|entry| entry.snapshot.id == *id)
-                    .map(|entry| entry.snapshot.clone())
-            })
-            .collect::<Vec<_>>();
-        for id in selected {
-            if let Some(entry) = state
-                .entries
-                .iter_mut()
-                .find(|entry| entry.snapshot.id == id)
-            {
+        let mut snapshots = Vec::with_capacity(selected.len());
+        for id in &selected {
+            if let Some(entry) = state.entry_mut(id) {
                 entry.wait_interest = entry.wait_interest.saturating_sub(1);
+                snapshots.push(entry.snapshot.clone());
             }
         }
+        (state, snapshots)
+    }
+
+    pub(crate) fn wait(&self, ids: &[String], timeout_secs: Option<u64>) -> Result<String, String> {
+        validate_id_list(ids)?;
+        let timeout = wait_timeout(timeout_secs)?;
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        let mut state = self.lock();
+        let indexes = resolve_indexes(&state, ids)?;
+        let selected = watch(&mut state, &indexes);
+        let (mut state, snapshots) = self.settle(state, selected, deadline);
         let mut consumed = state
             .deferred
             .iter()
@@ -137,23 +154,12 @@ impl SubagentManager {
         let deadline = Instant::now().checked_add(CANCEL_WAIT);
         let mut state = self.lock();
         let indexes = resolve_indexes(&state, ids)?;
-        let selected = indexes
-            .iter()
-            .map(|index| state.entries[*index].snapshot.id.clone())
-            .collect::<Vec<_>>();
+        let selected = watch(&mut state, &indexes);
         let mut wake_threads = Vec::new();
         for index in &indexes {
             let entry = &mut state.entries[*index];
-            entry.wait_interest = entry.wait_interest.saturating_add(1);
             if entry.snapshot.status.is_active() {
-                entry.snapshot.status = SubagentStatus::Canceling;
-                entry.snapshot.current_activity = "canceling".into();
-                entry.work.clear();
-                entry.snapshot.queued_messages.clear();
-                entry.cancellation.cancel();
-                if let Some(thread) = entry.thread_id {
-                    wake_threads.push(thread);
-                }
+                wake_threads.extend(entry.begin_cancel());
                 if private {
                     entry.suppress_delivery = true;
                 }
@@ -170,46 +176,7 @@ impl SubagentManager {
         for thread in wake_threads {
             crate::cancellation::wake_thread(thread);
         }
-        loop {
-            if selected.iter().all(|id| {
-                state
-                    .entries
-                    .iter()
-                    .find(|entry| entry.snapshot.id == *id)
-                    .is_none_or(|entry| !entry.snapshot.status.is_active())
-            }) || crate::cancellation::interrupted()
-                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                break;
-            }
-            let remaining = deadline
-                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or(Duration::from_millis(100))
-                .min(Duration::from_millis(100));
-            state = match self.shared.changed.wait_timeout(state, remaining) {
-                Ok((state, _)) => state,
-                Err(poisoned) => poisoned.into_inner().0,
-            };
-        }
-        let snapshots = selected
-            .iter()
-            .filter_map(|id| {
-                state
-                    .entries
-                    .iter()
-                    .find(|entry| entry.snapshot.id == *id)
-                    .map(|entry| entry.snapshot.clone())
-            })
-            .collect::<Vec<_>>();
-        for id in selected {
-            if let Some(entry) = state
-                .entries
-                .iter_mut()
-                .find(|entry| entry.snapshot.id == id)
-            {
-                entry.wait_interest = entry.wait_interest.saturating_sub(1);
-            }
-        }
+        let (_state, snapshots) = self.settle(state, selected, deadline);
         Ok(format_snapshots(&snapshots))
     }
 
@@ -313,13 +280,7 @@ impl SubagentManager {
             let mut handles = Vec::new();
             for entry in &mut state.entries {
                 if entry.snapshot.status.is_active() {
-                    entry.snapshot.status = SubagentStatus::Canceling;
-                    entry.cancellation.cancel();
-                    entry.work.clear();
-                    entry.snapshot.queued_messages.clear();
-                    if let Some(thread) = entry.thread_id {
-                        threads.push(thread);
-                    }
+                    threads.extend(entry.begin_cancel());
                 }
                 if let Some(handle) = entry.handle.take() {
                     handles.push(handle);
@@ -348,15 +309,8 @@ impl SubagentManager {
             let mut threads = Vec::new();
             for entry in &mut state.entries {
                 if entry.snapshot.status.is_active() {
-                    entry.snapshot.status = SubagentStatus::Canceling;
-                    entry.snapshot.current_activity = "canceling".into();
-                    entry.work.clear();
-                    entry.snapshot.queued_messages.clear();
                     entry.suppress_delivery = true;
-                    entry.cancellation.cancel();
-                    if let Some(thread) = entry.thread_id {
-                        threads.push(thread);
-                    }
+                    threads.extend(entry.begin_cancel());
                 }
             }
             threads

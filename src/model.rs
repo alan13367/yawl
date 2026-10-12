@@ -336,31 +336,22 @@ pub(crate) fn available_models(config: &Config) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::config::OpenAiCompatibility;
 
     fn config() -> Config {
         let mut providers = HashMap::new();
         providers.insert(
             "local".into(),
             ProviderConfig {
-                base_url: "http://localhost/v1".into(),
-                api: "openai-completions".into(),
-                api_key: None,
-                auth_header: None,
-                headers: HashMap::new(),
                 models: vec![ModelConfig {
-                    id: "family:model".into(),
                     name: Some("Local model".into()),
                     context_window: Some(65_536),
                     max_tokens: Some(4096),
                     input: vec!["text".into(), "image".into()],
-                    reasoning_efforts: Vec::new(),
-                    compat: OpenAiCompatibility::default(),
+                    ..ModelConfig::named("family:model")
                 }],
-                compat: OpenAiCompatibility::default(),
+                ..ProviderConfig::test_openai_compatible("http://localhost/v1")
             },
         );
         Config {
@@ -372,9 +363,7 @@ mod tests {
     #[test]
     fn available_codex_models_follow_the_saved_catalog() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = config();
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        config.home_dir =
-            std::env::temp_dir().join(format!("yawl-model-catalog-{}-{nonce}", std::process::id()));
+        config.home_dir = crate::test_support::unique_temp_dir("model-catalog");
         std::fs::create_dir_all(&config.home_dir)?;
         std::fs::write(
             config.home_dir.join("auth.json"),

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -16,6 +14,7 @@ use super::execution::{apply_turn_event, requeue_unaccepted_steers};
 use super::format::salvage_result;
 use super::validation::{resolve_model, validate_id_list, wait_timeout};
 use super::*;
+use crate::test_support::{read_http_request, write_completion, write_event_stream};
 
 fn config() -> Config {
     Config {
@@ -26,21 +25,28 @@ fn config() -> Config {
     }
 }
 
+/// An OpenAI-compatible provider at `base_url` with no key or models.
+fn local_provider(base_url: String) -> ProviderConfig {
+    ProviderConfig {
+        auth_header: Some(false),
+        ..ProviderConfig::test_openai_compatible(&base_url)
+    }
+}
+
+/// A listener for a scripted local provider and its OpenAI-compatible base
+/// URL.
+fn provider_listener() -> (TcpListener, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
+    let address = listener.local_addr().expect("test provider address");
+    (listener, format!("http://{address}/v1"))
+}
+
 fn provider_config(base_url: String) -> Config {
     let mut config = config();
     config.model = Some("local:model".into());
-    config.providers.insert(
-        "local".into(),
-        ProviderConfig {
-            base_url,
-            api: "openai-completions".into(),
-            api_key: None,
-            auth_header: Some(false),
-            headers: HashMap::new(),
-            models: Vec::new(),
-            compat: crate::config::OpenAiCompatibility::default(),
-        },
-    );
+    config
+        .providers
+        .insert("local".into(), local_provider(base_url));
     config
 }
 
@@ -57,19 +63,8 @@ fn test_entry(status: SubagentStatus) -> Entry {
     );
     snapshot.status = status;
     Entry {
-        snapshot,
-        cancellation,
-        work: VecDeque::new(),
-        next_run_number: 2,
-        thread_id: None,
-        handle: None,
-        wait_interest: 0,
-        pending_delivery: Vec::new(),
-        suppress_delivery: false,
-        steers: crate::agent::SteerInbox::default(),
-        model_steer_accepted: false,
         holds_slot: status.is_active(),
-        queued_sequence: 0,
+        ..Entry::new(snapshot, cancellation, Default::default())
     }
 }
 
@@ -106,64 +101,6 @@ fn usage_is_counted_before_an_active_subagent_settles() {
     manager.shutdown_and_discard();
 }
 
-fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
-    let mut request = Vec::new();
-    let mut buffer = [0u8; 4096];
-    let mut wanted = None;
-    loop {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(String::new());
-        }
-        request.extend_from_slice(&buffer[..read]);
-        if wanted.is_none()
-            && let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
-        {
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-                .unwrap_or(0);
-            wanted = Some(header_end + 4 + content_length);
-        }
-        if wanted.is_some_and(|wanted| request.len() >= wanted) {
-            return Ok(String::from_utf8_lossy(&request).into_owned());
-        }
-    }
-}
-
-fn write_response(stream: &mut TcpStream, text: &str) -> std::io::Result<()> {
-    let body = format!(
-        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
-    );
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )?;
-    stream.flush()
-}
-
-fn write_multiline_response(stream: &mut TcpStream, text: &str) -> std::io::Result<()> {
-    let event = serde_json::json!({
-        "choices": [{"delta": {"content": text}, "finish_reason": null}]
-    });
-    let body = format!("data: {event}\n\ndata: [DONE]\n\n");
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )?;
-    stream.flush()
-}
-
 /// Streams `text` followed by an unknown-tool call and a usage event, so
 /// the child keeps issuing requests while burning budget.
 fn write_tool_call_response(
@@ -191,30 +128,20 @@ fn write_tool_call_response(
     });
     body.push_str(&format!("data: {usage}\n\n"));
     body.push_str("data: [DONE]\n\n");
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )?;
-    stream.flush()
+    write_event_stream(stream, &body)
 }
 
 #[test]
 fn wait_reports_the_complete_final_result() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let answer = (1..=30)
         .map(|line| format!("summary line {line:02}"))
         .collect::<Vec<_>>()
         .join("\n");
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("subagent provider connection");
-        read_request(&mut stream).expect("subagent provider request");
-        write_multiline_response(&mut stream, &answer).expect("subagent provider response");
+        read_http_request(&mut stream).expect("subagent provider request");
+        write_completion(&mut stream, &answer).expect("subagent provider response");
     });
     let manager = SubagentManager::new("session".into(), 1);
     let id = manager
@@ -242,8 +169,7 @@ fn wait_reports_the_complete_final_result() {
 
 #[test]
 fn large_reports_are_bounded_in_deliveries_and_readable_after_shutdown() {
-    let root = std::env::temp_dir().join(format!("yawl-report-delivery-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = crate::test_support::unique_temp_dir("report-delivery");
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let mut config = provider_config(format!(
         "http://{}/v1",
@@ -258,11 +184,11 @@ fn large_reports_are_bounded_in_deliveries_and_readable_after_shutdown() {
     let expected = report.clone();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("connection");
-        read_request(&mut stream).expect("request");
-        write_multiline_response(&mut stream, &report).expect("response");
+        read_http_request(&mut stream).expect("request");
+        write_completion(&mut stream, &report).expect("response");
         let (mut stream, _) = listener.accept().expect("follow-up connection");
-        read_request(&mut stream).expect("follow-up request");
-        write_response(&mut stream, "short follow-up").expect("follow-up response");
+        read_http_request(&mut stream).expect("follow-up request");
+        write_completion(&mut stream, "short follow-up").expect("follow-up response");
     });
     let manager = SubagentManager::new("reports".into(), 1);
     let id = manager
@@ -331,16 +257,12 @@ fn large_reports_are_bounded_in_deliveries_and_readable_after_shutdown() {
 
 #[test]
 fn wait_reports_earlier_run_results_after_a_follow_up() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let server = std::thread::spawn(move || {
         for response in ["first full result", "second full result"] {
             let (mut stream, _) = listener.accept().expect("subagent provider connection");
-            read_request(&mut stream).expect("subagent provider request");
-            write_response(&mut stream, response).expect("subagent provider response");
+            read_http_request(&mut stream).expect("subagent provider request");
+            write_completion(&mut stream, response).expect("subagent provider response");
         }
     });
     let manager = SubagentManager::new("session".into(), 1);
@@ -388,18 +310,9 @@ fn model_precedence_prefers_config_then_parent() {
 #[test]
 fn unresolvable_configured_models_are_rejected_at_spawn_time() {
     let mut config = config();
-    config.providers.insert(
-        "broken".into(),
-        ProviderConfig {
-            base_url: String::new(),
-            api: "openai-completions".into(),
-            api_key: None,
-            auth_header: Some(false),
-            headers: HashMap::new(),
-            models: Vec::new(),
-            compat: crate::config::OpenAiCompatibility::default(),
-        },
-    );
+    config
+        .providers
+        .insert("broken".into(), local_provider(String::new()));
     config.subagent_model = "broken:model".into();
     let error = resolve_model(&config, "local:parent", None, None)
         .expect_err("unusable provider models must fail fast");
@@ -432,27 +345,23 @@ fn omitted_wait_timeout_has_no_deadline() {
 
 #[test]
 fn wait_without_timeout_blocks_until_every_selected_subagent_settles() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (first_release_tx, first_release_rx) = mpsc::channel();
     let (second_release_tx, second_release_rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
         let (mut first, _) = listener.accept().expect("first provider connection");
-        read_request(&mut first).expect("first provider request");
+        read_http_request(&mut first).expect("first provider request");
         ready_tx.send(()).expect("first provider ready");
 
         let (mut second, _) = listener.accept().expect("second provider connection");
-        read_request(&mut second).expect("second provider request");
+        read_http_request(&mut second).expect("second provider request");
         ready_tx.send(()).expect("second provider ready");
 
         first_release_rx.recv().expect("first provider release");
-        write_response(&mut first, "first result").expect("first provider response");
+        write_completion(&mut first, "first result").expect("first provider response");
         second_release_rx.recv().expect("second provider release");
-        write_response(&mut second, "second result").expect("second provider response");
+        write_completion(&mut second, "second result").expect("second provider response");
     });
     let manager = SubagentManager::new("session".into(), 2);
     let config = provider_config(base_url);
@@ -546,19 +455,15 @@ fn omitted_spawn_names_are_generated_and_supplied_names_are_kept() {
 
 #[test]
 fn active_capacity_and_queue_limits_are_reserved_synchronously() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("subagent provider connection");
-        read_request(&mut stream).expect("subagent provider request");
+        read_http_request(&mut stream).expect("subagent provider request");
         ready_tx.send(()).expect("provider ready signal");
         release_rx.recv().expect("provider release signal");
-        write_response(&mut stream, "done").expect("subagent provider response");
+        write_completion(&mut stream, "done").expect("subagent provider response");
     });
     let config = provider_config(base_url);
     let manager = SubagentManager::new("session".into(), 1);
@@ -602,17 +507,13 @@ fn active_capacity_and_queue_limits_are_reserved_synchronously() {
 
 #[test]
 fn spawns_past_the_limit_start_in_order_as_slots_free() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let (task_tx, task_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let server = std::thread::spawn(move || {
         for index in 0..3 {
             let (mut stream, _) = listener.accept().expect("subagent provider connection");
-            let request = read_request(&mut stream).expect("subagent provider request");
+            let request = read_http_request(&mut stream).expect("subagent provider request");
             let task = ["task alpha", "task beta", "task gamma"]
                 .into_iter()
                 .find(|task| request.contains(task))
@@ -621,7 +522,7 @@ fn spawns_past_the_limit_start_in_order_as_slots_free() {
             if index == 0 {
                 release_rx.recv().expect("release signal");
             }
-            write_response(&mut stream, &format!("{task} done")).expect("provider response");
+            write_completion(&mut stream, &format!("{task} done")).expect("provider response");
         }
     });
     let config = provider_config(base_url);
@@ -711,19 +612,15 @@ fn raising_the_limit_starts_queued_children() {
 
 #[test]
 fn timed_out_wait_reports_progress_and_discourages_cancellation() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("subagent provider connection");
-        read_request(&mut stream).expect("subagent provider request");
+        read_http_request(&mut stream).expect("subagent provider request");
         ready_tx.send(()).expect("provider ready signal");
         release_rx.recv().expect("provider release signal");
-        write_response(&mut stream, "slow result").expect("subagent provider response");
+        write_completion(&mut stream, "slow result").expect("subagent provider response");
     });
     let manager = SubagentManager::new("session".into(), 1);
     let id = manager
@@ -767,19 +664,15 @@ fn timed_out_wait_reports_progress_and_discourages_cancellation() {
 #[test]
 fn interrupted_wait_explains_that_the_work_continues() {
     crate::set_interrupted(false);
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("subagent provider connection");
-        read_request(&mut stream).expect("subagent provider request");
+        read_http_request(&mut stream).expect("subagent provider request");
         ready_tx.send(()).expect("provider ready signal");
         release_rx.recv().expect("provider release signal");
-        write_response(&mut stream, "slow result").expect("subagent provider response");
+        write_completion(&mut stream, "slow result").expect("subagent provider response");
     });
     let manager = SubagentManager::new("session".into(), 1);
     let id = manager
@@ -870,15 +763,11 @@ fn interrupted_wait_reports_children_stopped_with_the_turn() {
 #[test]
 fn interrupted_wait_stays_quiet_when_every_id_already_settled() {
     crate::set_interrupted(false);
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("subagent provider connection");
-        read_request(&mut stream).expect("subagent provider request");
-        write_response(&mut stream, "done").expect("subagent provider response");
+        read_http_request(&mut stream).expect("subagent provider request");
+        write_completion(&mut stream, "done").expect("subagent provider response");
     });
     let manager = SubagentManager::new("session".into(), 1);
     let id = manager
@@ -978,16 +867,12 @@ fn work_canceled_after_dequeue_does_not_enter_the_transcript() {
 
 #[test]
 fn settled_agents_reuse_their_conversation_on_restart() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let server = std::thread::spawn(move || {
         for response in ["first", "second"] {
             let (mut stream, _) = listener.accept().expect("subagent provider connection");
-            read_request(&mut stream).expect("subagent provider request");
-            write_response(&mut stream, response).expect("subagent provider response");
+            read_http_request(&mut stream).expect("subagent provider request");
+            write_completion(&mut stream, response).expect("subagent provider response");
         }
     });
     let config = provider_config(base_url);
@@ -1036,22 +921,18 @@ fn settled_agents_reuse_their_conversation_on_restart() {
 
 #[test]
 fn queued_messages_run_in_order_on_one_worker() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
         for (index, response) in ["first", "second", "third"].into_iter().enumerate() {
             let (mut stream, _) = listener.accept().expect("subagent provider connection");
-            read_request(&mut stream).expect("subagent provider request");
+            read_http_request(&mut stream).expect("subagent provider request");
             if index == 0 {
                 ready_tx.send(()).expect("provider ready signal");
                 release_rx.recv().expect("provider release signal");
             }
-            write_response(&mut stream, response).expect("subagent provider response");
+            write_completion(&mut stream, response).expect("subagent provider response");
         }
     });
     let manager = SubagentManager::new("session".into(), 1);
@@ -1120,21 +1001,9 @@ fn pruning_keeps_active_waited_and_undelivered_entries() {
                 .checked_sub(Duration::from_secs(MAX_TRACKED_SUBAGENTS as u64 - sequence))
                 .expect("test settlement instant"),
         );
-        state.entries.push(Entry {
-            snapshot,
-            cancellation,
-            work: VecDeque::new(),
-            next_run_number: 2,
-            thread_id: None,
-            handle: None,
-            wait_interest: 0,
-            pending_delivery: Vec::new(),
-            suppress_delivery: false,
-            steers: crate::agent::SteerInbox::default(),
-            model_steer_accepted: false,
-            holds_slot: false,
-            queued_sequence: 0,
-        });
+        state
+            .entries
+            .push(Entry::new(snapshot, cancellation, Default::default()));
     }
     state.deferred.push_back(DeferredResult {
         id: SubagentId::new(1),
@@ -1179,16 +1048,12 @@ fn pruning_keeps_active_waited_and_undelivered_entries() {
 
 #[test]
 fn late_wait_consumes_deferred_results_and_private_runs_stay_private() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let server = std::thread::spawn(move || {
         for response in ["model result", "private result"] {
             let (mut stream, _) = listener.accept().expect("subagent provider connection");
-            read_request(&mut stream).expect("subagent provider request");
-            write_response(&mut stream, response).expect("subagent provider response");
+            read_http_request(&mut stream).expect("subagent provider request");
+            write_completion(&mut stream, response).expect("subagent provider response");
         }
     });
     let config = provider_config(base_url);
@@ -1258,7 +1123,7 @@ fn accepted_model_steers_deliver_a_private_turn_once_without_queueing() {
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            let request = read_request(&mut stream).expect("request");
+            let request = read_http_request(&mut stream).expect("request");
             if index == 1 {
                 ready_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1267,7 +1132,7 @@ fn accepted_model_steers_deliver_a_private_turn_once_without_queueing() {
                 assert!(request.contains("first model steer"));
                 assert!(request.contains("second model steer"));
             }
-            write_response(&mut stream, response).expect("response");
+            write_completion(&mut stream, response).expect("response");
         }
     });
     let manager = SubagentManager::new("session".into(), 1);
@@ -1332,28 +1197,24 @@ fn accepted_model_steers_deliver_a_private_turn_once_without_queueing() {
 
 #[test]
 fn private_cancellation_preserves_an_earlier_model_result() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let (first_ready_tx, first_ready_rx) = mpsc::channel();
     let (first_release_tx, first_release_rx) = mpsc::channel();
     let (private_ready_tx, private_ready_rx) = mpsc::channel();
     let (private_release_tx, private_release_rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
         let (mut first, _) = listener.accept().expect("first provider connection");
-        read_request(&mut first).expect("first provider request");
+        read_http_request(&mut first).expect("first provider request");
         first_ready_tx.send(()).expect("first provider ready");
         first_release_rx.recv().expect("first provider release");
-        write_response(&mut first, "model result").expect("first provider response");
+        write_completion(&mut first, "model result").expect("first provider response");
 
         let (mut private, _) = listener.accept().expect("private provider connection");
-        read_request(&mut private).expect("private provider request");
+        read_http_request(&mut private).expect("private provider request");
         private_ready_tx.send(()).expect("private provider ready");
         private_release_rx.recv().expect("private provider release");
         // Cancellation may already have closed the client connection.
-        let _ = write_response(&mut private, "private result");
+        let _ = write_completion(&mut private, "private result");
     });
     let manager = SubagentManager::new("session".into(), 1);
     let id = manager
@@ -1449,23 +1310,19 @@ fn preset_model_overrides_config() {
 
 #[test]
 fn request_budget_steers_then_stops_a_runaway_subagent() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let server = std::thread::spawn(move || {
         let mut bodies = Vec::new();
         for index in 0..3 {
             let (mut stream, _) = listener.accept().expect("subagent provider connection");
-            let body = read_request(&mut stream).expect("subagent provider request");
+            let body = read_http_request(&mut stream).expect("subagent provider request");
             bodies.push(body);
             write_tool_call_response(&mut stream, "working", &format!("call-{index}"))
                 .expect("subagent provider response");
         }
         let (mut stream, _) = listener.accept().expect("follow-up connection");
-        read_request(&mut stream).expect("follow-up request");
-        write_response(&mut stream, "finished follow-up").expect("follow-up response");
+        read_http_request(&mut stream).expect("follow-up request");
+        write_completion(&mut stream, "finished follow-up").expect("follow-up response");
         bodies
     });
     let mut config = provider_config(base_url);
@@ -1528,14 +1385,10 @@ fn request_budget_steers_then_stops_a_runaway_subagent() {
 #[test]
 fn run_timeout_interrupts_an_in_flight_subagent_request() {
     crate::install_interrupt_handler().expect("interrupt handler");
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test provider listener");
-    let base_url = format!(
-        "http://{}/v1",
-        listener.local_addr().expect("test provider address")
-    );
+    let (listener, base_url) = provider_listener();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("subagent provider connection");
-        read_request(&mut stream).expect("subagent provider request");
+        read_http_request(&mut stream).expect("subagent provider request");
         std::thread::sleep(Duration::from_secs(3));
         // The timeout should close or interrupt the client before this
         // response. A broken pipe is therefore an expected outcome.
@@ -1626,15 +1479,15 @@ fn canceled_steers_do_not_restart_work_or_consume_capacity() {
     let (release_tx, release_rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("connection");
-        read_request(&mut stream).expect("request");
+        read_http_request(&mut stream).expect("request");
         ready_tx.send(()).expect("ready");
         release_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("release");
-        let _ = write_response(&mut stream, "done");
+        let _ = write_completion(&mut stream, "done");
         let (mut follow_up, _) = listener.accept().expect("follow-up connection");
-        let request = read_request(&mut follow_up).expect("follow-up request");
-        write_response(&mut follow_up, "follow-up answer").expect("follow-up response");
+        let request = read_http_request(&mut follow_up).expect("follow-up request");
+        write_completion(&mut follow_up, "follow-up answer").expect("follow-up response");
         request
     });
     let manager = SubagentManager::new("session".into(), 1);
@@ -1724,15 +1577,7 @@ fn explicit_listed_model_overrides_preset_and_config_without_removing_preset_lim
         .get_mut("local")
         .expect("provider")
         .models
-        .push(crate::config::ModelConfig {
-            id: "requested".into(),
-            name: None,
-            context_window: None,
-            max_tokens: None,
-            input: Vec::new(),
-            reasoning_efforts: Vec::new(),
-            compat: Default::default(),
-        });
+        .push(crate::config::ModelConfig::named("requested"));
     let mut preset = super::super::presets::bundled().remove(0);
     preset.model = Some("local:pinned".into());
     let model = resolve_model(

@@ -68,14 +68,7 @@ mod tests {
     use super::*;
 
     fn temp_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "yawl-trust-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ))
+        crate::test_support::unique_temp_dir(&format!("trust-{name}"))
     }
 
     #[test]

@@ -2,24 +2,12 @@
 //! chrome-free fenced-code highlighting (code renders as background-shaded
 //! highlighted lines so terminal drag-select copies clean commands).
 
-use super::highlight;
+use super::{highlight, theme};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const RESET: &str = "\x1b[0m";
-const INLINE_CODE: &str = "\x1b[38;2;155;188;198m";
-/// Dark warm gray for fenced code blocks. Deliberately distinct from the cool
-/// user-prompt panel (`48;2;52;53;64`), the green tool cards, and the purple
-/// skill cards. Background ANSI never survives `strip_ansi`, so drag-select
-/// copies stay clean.
-const CODE_BACKGROUND: &str = "\x1b[48;2;36;34;30m";
-/// Truecolor so headings and markers read the same in every terminal theme;
-/// basic ANSI blue renders near-black on many dark palettes.
-const HEADING_MAJOR: &str = "\x1b[1;38;2;137;180;250m";
-const HEADING_MINOR: &str = "\x1b[1;38;2;180;205;250m";
 const HEADING: &str = "\x1b[1m";
-const MARKER: &str = "\x1b[38;2;116;199;213m";
-const MUTED: &str = "\x1b[38;2;140;146;160m";
 const BOLD: &str = "\x1b[1m";
 const ITALIC: &str = "\x1b[3m";
 const STRIKE: &str = "\x1b[9m";
@@ -30,6 +18,8 @@ const MAX_INDENT: usize = 12;
 const MAX_AUTOLINK_CHARS: usize = 2048;
 
 pub fn render(markdown: &str, width: usize) -> Vec<String> {
+    let palette = theme::palette();
+    let (marker_style, muted) = (palette.marker, palette.muted);
     let width = width.max(8);
     let source: Vec<&str> = markdown.lines().collect();
     let mut output = Vec::new();
@@ -74,24 +64,24 @@ pub fn render(markdown: &str, width: usize) -> Vec<String> {
             output.push(String::new());
         } else if let Some((level, content)) = heading(trimmed) {
             let style = match level {
-                1 => HEADING_MAJOR,
-                2 => HEADING_MINOR,
+                1 => palette.heading_major,
+                2 => palette.heading_minor,
                 _ => HEADING,
             };
             let styled = format!("{style}{}{RESET}", render_inline_styled(content, style));
             push_wrapped("", "", &styled, width, &mut output);
             list_content = None;
         } else if is_rule(trimmed) {
-            output.push(format!("{MUTED}{}{RESET}", "─".repeat(width)));
+            output.push(format!("{muted}{}{RESET}", "─".repeat(width)));
             list_content = None;
         } else if let Some((depth, content)) = blockquote(trimmed) {
-            let bars = format!("{MARKER}{}{RESET}", "│ ".repeat(depth));
+            let bars = format!("{marker_style}{}{RESET}", "│ ".repeat(depth));
             let blank = " ".repeat(depth * 2);
-            let styled = format!("{MUTED}{}{RESET}", render_inline_styled(content, MUTED));
+            let styled = format!("{muted}{}{RESET}", render_inline_styled(content, muted));
             push_wrapped(&bars, &blank, &styled, width, &mut output);
         } else if let Some((marker, content)) = list_item(trimmed, indent) {
             let pad = " ".repeat(indent);
-            let prefix = format!("{pad}{MARKER}{marker}{RESET} ");
+            let prefix = format!("{pad}{marker_style}{marker}{RESET} ");
             let continuation = " ".repeat(indent + visible_width(&marker) + 1);
             list_content = Some(continuation.len());
             push_wrapped(
@@ -249,11 +239,12 @@ fn is_rule(line: &str) -> bool {
 }
 
 fn render_code_line(language: &str, line: &str, width: usize, output: &mut Vec<String>) {
+    let code_background = theme::palette().code_background;
     let plain = sanitize(line).replace('\t', "    ");
     let chunks = split_chars(&plain, width.max(1));
     if chunks.is_empty() {
         output.push(format!(
-            "{CODE_BACKGROUND}{path}{RESET}",
+            "{code_background}{path}{RESET}",
             path = " ".repeat(width)
         ));
     } else {
@@ -261,8 +252,8 @@ fn render_code_line(language: &str, line: &str, width: usize, output: &mut Vec<S
             let highlighted = highlight::render_line(language, &chunk);
             let padded = fit_width(&highlighted, width);
             output.push(format!(
-                "{CODE_BACKGROUND}{}{RESET}",
-                padded.replace(RESET, &format!("{RESET}{CODE_BACKGROUND}"))
+                "{code_background}{}{RESET}",
+                padded.replace(RESET, &format!("{RESET}{code_background}"))
             ));
         }
     }
@@ -305,7 +296,7 @@ fn render_spans(chars: &[char], base: &str, output: &mut String) {
             code_index += 1;
         }
         if let Some(span) = code.get(code_index).filter(|span| span.start == index) {
-            output.push_str(INLINE_CODE);
+            output.push_str(theme::palette().inline_code);
             output.extend(trim_code(&chars[span.content.clone()]));
             output.push_str(RESET);
             output.push_str(base);
@@ -586,6 +577,7 @@ fn is_row_separator(row: &[String]) -> bool {
 }
 
 fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
+    let muted = theme::palette().muted;
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     // Borders plus one space of padding on each side of every cell.
     let available = width.saturating_sub(columns + 1 + columns * 2);
@@ -638,12 +630,12 @@ fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
             .collect::<Vec<_>>();
         let row_height = cells.iter().map(Vec::len).max().unwrap_or(1);
         for physical_row in 0..row_height {
-            let mut line = format!("{MUTED}│{RESET}");
+            let mut line = format!("{muted}│{RESET}");
             for (cell, cell_width) in cells.iter().zip(widths.iter().copied()) {
                 let content = cell.get(physical_row).map_or("", String::as_str);
                 line.push(' ');
                 line.push_str(&fit_width(content, cell_width));
-                line.push_str(&format!(" {MUTED}│{RESET}"));
+                line.push_str(&format!(" {muted}│{RESET}"));
             }
             output.push(line);
         }
@@ -655,7 +647,7 @@ fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
 }
 
 fn table_border(left: char, join: char, right: char, widths: &[usize]) -> String {
-    let mut line = String::from(MUTED);
+    let mut line = String::from(theme::palette().muted);
     line.push(left);
     for (index, width) in widths.iter().copied().enumerate() {
         line.push_str(&"─".repeat(width + 2));
@@ -673,25 +665,36 @@ fn terminal_character_width(character: char) -> usize {
     UnicodeWidthChar::width(character).unwrap_or(0)
 }
 
-pub(crate) fn visible_width(text: &str) -> usize {
-    let bytes = text.as_bytes();
-    let mut width = 0;
-    let mut index = 0;
-    while index < bytes.len() {
-        if let Some(end) = ansi_sequence_end(bytes, index) {
+/// One step through styled text: a whole CSI escape sequence or a single
+/// character. An escape byte that starts no sequence is a character.
+enum Piece<'a> {
+    Escape(&'a str),
+    Char(char),
+}
+
+/// Splits styled text into escape sequences and characters, each with its
+/// byte offset.
+fn pieces(text: &str) -> impl Iterator<Item = (usize, Piece<'_>)> {
+    let mut index = 0usize;
+    std::iter::from_fn(move || {
+        let start = index;
+        if let Some(end) = ansi_sequence_end(text.as_bytes(), start) {
             index = end;
-        } else {
-            let start = index;
-            while index < bytes.len() && bytes[index] != 0x1b {
-                index += 1;
-            }
-            width += text[start..index]
-                .chars()
-                .map(terminal_character_width)
-                .sum::<usize>();
+            return Some((start, Piece::Escape(&text[start..end])));
         }
-    }
-    width
+        let character = text[start..].chars().next()?;
+        index += character.len_utf8();
+        Some((start, Piece::Char(character)))
+    })
+}
+
+pub(crate) fn visible_width(text: &str) -> usize {
+    pieces(text)
+        .map(|(_, piece)| match piece {
+            Piece::Escape(_) => 0,
+            Piece::Char(character) => terminal_character_width(character),
+        })
+        .sum()
 }
 
 pub(crate) fn fit_width(text: &str, width: usize) -> String {
@@ -722,25 +725,19 @@ pub(super) fn fit_composer_width(text: &str, width: usize) -> String {
         remaining_chars += grapheme.chars().count();
     }
 
-    let bytes = text.as_bytes();
     let mut line = String::new();
-    let mut index = 0usize;
     let mut styled = false;
-    while index < bytes.len() {
-        if let Some(end) = ansi_sequence_end(bytes, index) {
-            let sequence = &text[index..end];
-            line.push_str(sequence);
-            styled |= sequence.ends_with('m');
-            index = end;
-        } else if remaining_chars > 0 {
-            let Some(character) = text[index..].chars().next() else {
-                break;
-            };
-            line.push(character);
-            index += character.len_utf8();
-            remaining_chars -= 1;
-        } else {
-            break;
+    for (_, piece) in pieces(text) {
+        match piece {
+            Piece::Escape(sequence) => {
+                line.push_str(sequence);
+                styled |= sequence.ends_with('m');
+            }
+            Piece::Char(character) if remaining_chars > 0 => {
+                line.push(character);
+                remaining_chars -= 1;
+            }
+            Piece::Char(_) => break,
         }
     }
     if styled && !line.ends_with(RESET) {
@@ -751,22 +748,12 @@ pub(super) fn fit_composer_width(text: &str, width: usize) -> String {
 }
 
 pub(crate) fn strip_ansi(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut output = String::new();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if let Some(end) = ansi_sequence_end(bytes, index) {
-            index = end;
-        } else {
-            let character = text[index..]
-                .chars()
-                .next()
-                .unwrap_or(char::REPLACEMENT_CHARACTER);
-            output.push(character);
-            index += character.len_utf8();
-        }
-    }
-    output
+    pieces(text)
+        .filter_map(|(_, piece)| match piece {
+            Piece::Escape(_) => None,
+            Piece::Char(character) => Some(character),
+        })
+        .collect()
 }
 
 /// Draws `overlay` over the cells of `text` starting at `column`. Text on
@@ -774,29 +761,24 @@ pub(crate) fn strip_ansi(text: &str) -> String {
 /// spaces.
 pub(crate) fn overlay_at(text: &str, column: usize, overlay: &str) -> String {
     let end = column + visible_width(overlay);
-    let bytes = text.as_bytes();
     let (mut before, mut after, mut replay) = (String::new(), String::new(), String::new());
     let mut cell = 0usize;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if let Some(sequence_end) = ansi_sequence_end(bytes, index) {
-            let sequence = &text[index..sequence_end];
-            if cell < column {
-                before.push_str(sequence);
+    for (_, piece) in pieces(text) {
+        let character = match piece {
+            Piece::Escape(sequence) => {
+                if cell < column {
+                    before.push_str(sequence);
+                }
+                // Styling that starts under the overlay must still apply after it.
+                if cell < end {
+                    replay.push_str(sequence);
+                } else {
+                    after.push_str(sequence);
+                }
+                continue;
             }
-            // Styling that starts under the overlay must still apply after it.
-            if cell < end {
-                replay.push_str(sequence);
-            } else {
-                after.push_str(sequence);
-            }
-            index = sequence_end;
-            continue;
-        }
-        let character = text[index..]
-            .chars()
-            .next()
-            .unwrap_or(char::REPLACEMENT_CHARACTER);
+            Piece::Char(character) => character,
+        };
         let width = terminal_character_width(character);
         if cell + width <= column {
             before.push(character);
@@ -808,7 +790,6 @@ pub(crate) fn overlay_at(text: &str, column: usize, overlay: &str) -> String {
             after.push_str(&" ".repeat(cell + width - end));
         }
         cell += width;
-        index += character.len_utf8();
     }
     if cell < column {
         before.push_str(&" ".repeat(column - cell));
@@ -819,25 +800,17 @@ pub(crate) fn overlay_at(text: &str, column: usize, overlay: &str) -> String {
 /// Applies a background color to the final visible character without
 /// replacing it or changing the line's terminal width.
 pub(crate) fn overlay_last_cell_background(text: &str, background: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut index = 0usize;
     let mut last_visible = None;
-    while index < bytes.len() {
-        if let Some(end) = ansi_sequence_end(bytes, index) {
-            index = end;
+    for (index, piece) in pieces(text) {
+        let Piece::Char(character) = piece else {
             continue;
-        }
-        let character = text[index..]
-            .chars()
-            .next()
-            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        };
         let end = index + character.len_utf8();
         if terminal_character_width(character) > 0 {
             last_visible = Some((index, end));
         } else if let Some((_, last_end)) = &mut last_visible {
             *last_end = end;
         }
-        index = end;
     }
 
     let Some((start, end)) = last_visible else {
@@ -892,11 +865,7 @@ fn wrap_ansi(text: &str, width: usize) -> Vec<String> {
         if let Some(end) = ansi_sequence_end(bytes, index) {
             let sequence = &text[index..end];
             line.push_str(sequence);
-            if sequence == RESET {
-                active_style.clear();
-            } else if sequence.ends_with('m') {
-                active_style = sequence.to_string();
-            }
+            track_style(&mut active_style, sequence);
             index = end;
             if separator_open && let Some(break_point) = &mut last_break {
                 break_point.next_index = index;
@@ -905,11 +874,7 @@ fn wrap_ansi(text: &str, width: usize) -> Vec<String> {
             continue;
         }
         if bytes[index] == b'\n' {
-            if !active_style.is_empty() {
-                line.push_str(RESET);
-            }
-            lines.push(line);
-            line = active_style.clone();
+            break_styled_line(&mut lines, &mut line, &active_style);
             column = 0;
             last_break = None;
             separator_open = false;
@@ -958,11 +923,7 @@ fn wrap_ansi(text: &str, width: usize) -> Vec<String> {
                 index = break_point.next_index;
                 continue;
             }
-            if !active_style.is_empty() {
-                line.push_str(RESET);
-            }
-            lines.push(line);
-            line = active_style.clone();
+            break_styled_line(&mut lines, &mut line, &active_style);
             column = 0;
             last_break = None;
             separator_open = false;
@@ -988,51 +949,31 @@ pub(super) fn wrap_ansi_hard(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
     }
-    let bytes = text.as_bytes();
     let mut lines = Vec::new();
     let mut line = String::new();
     let mut column = 0usize;
     let mut active_style = String::new();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if let Some(end) = ansi_sequence_end(bytes, index) {
-            let start = index;
-            index = end;
-            let sequence = &text[start..index];
-            line.push_str(sequence);
-            if sequence == RESET {
-                active_style.clear();
-            } else if sequence.ends_with('m') {
-                active_style = sequence.to_string();
+    for (_, piece) in pieces(text) {
+        let character = match piece {
+            Piece::Escape(sequence) => {
+                line.push_str(sequence);
+                track_style(&mut active_style, sequence);
+                continue;
             }
-            continue;
-        }
-        if bytes[index] == b'\n' {
-            if !active_style.is_empty() {
-                line.push_str(RESET);
-            }
-            lines.push(line);
-            line = active_style.clone();
+            Piece::Char(character) => character,
+        };
+        if character == '\n' {
+            break_styled_line(&mut lines, &mut line, &active_style);
             column = 0;
-            index += 1;
             continue;
         }
-        let character = text[index..]
-            .chars()
-            .next()
-            .unwrap_or(char::REPLACEMENT_CHARACTER);
         let character_width = terminal_character_width(character);
         if column > 0 && column.saturating_add(character_width) > width {
-            if !active_style.is_empty() {
-                line.push_str(RESET);
-            }
-            lines.push(line);
-            line = active_style.clone();
+            break_styled_line(&mut lines, &mut line, &active_style);
             column = 0;
         }
         line.push(character);
         column = column.saturating_add(character_width);
-        index += character.len_utf8();
     }
     if !line.is_empty() || lines.is_empty() {
         if !active_style.is_empty() && !line.ends_with(RESET) {
@@ -1041,6 +982,24 @@ pub(super) fn wrap_ansi_hard(text: &str, width: usize) -> Vec<String> {
         lines.push(line);
     }
     lines
+}
+
+/// Remembers the style an SGR sequence leaves active, so wrapped lines can
+/// reopen it.
+fn track_style(active_style: &mut String, sequence: &str) {
+    if sequence == RESET {
+        active_style.clear();
+    } else if sequence.ends_with('m') {
+        *active_style = sequence.to_string();
+    }
+}
+
+/// Ends `line`, closing its style, and starts the next line in that style.
+fn break_styled_line(lines: &mut Vec<String>, line: &mut String, active_style: &str) {
+    if !active_style.is_empty() {
+        line.push_str(RESET);
+    }
+    lines.push(std::mem::replace(line, active_style.to_string()));
 }
 
 pub(super) fn split_chars(text: &str, width: usize) -> Vec<String> {
@@ -1076,24 +1035,19 @@ fn sanitize(text: &str) -> String {
 }
 
 fn terminal_lines(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
     let mut lines = Vec::new();
     let mut line = Vec::new();
     let mut cursor = 0usize;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if let Some(end) = ansi_sequence_end(bytes, index) {
-            if bytes.get(end.saturating_sub(1)) == Some(&b'K') {
-                erase_terminal_line(&mut line, cursor, &text[index..end]);
+    for (_, piece) in pieces(text) {
+        let character = match piece {
+            Piece::Escape(sequence) => {
+                if sequence.ends_with('K') {
+                    erase_terminal_line(&mut line, cursor, sequence);
+                }
+                continue;
             }
-            index = end;
-            continue;
-        }
-        let character = text[index..]
-            .chars()
-            .next()
-            .unwrap_or(char::REPLACEMENT_CHARACTER);
-        index += character.len_utf8();
+            Piece::Char(character) => character,
+        };
         match character {
             '\n' => {
                 lines.push(line.iter().collect());
@@ -1176,6 +1130,8 @@ pub(crate) fn wrapped_plain_prefixed_lines(
 
 #[cfg(test)]
 mod tests {
+    use super::super::theme::palette;
+
     #[test]
     fn overlay_keeps_styling_on_both_sides() {
         let line = "\x1b[31mred text\x1b[0m and \x1b[32mgreen tail\x1b[0m";
@@ -1217,7 +1173,7 @@ mod tests {
         assert!(lines.iter().all(|line| visible_width(line) <= 12));
         let rendered = lines.join("");
         assert!(rendered.contains("\x1b[1mbold\x1b[0m"));
-        assert!(rendered.contains(&format!("{INLINE_CODE}code{RESET}")));
+        assert!(rendered.contains(&format!("{}code{RESET}", palette().inline_code)));
         assert!(!rendered.contains("\x1b[30;47m"));
         assert!(!rendered.contains("\x1b[7m"));
     }
@@ -1418,7 +1374,7 @@ mod tests {
         assert!(
             lines
                 .join("\n")
-                .contains(&format!("{}fn{RESET}", highlight::KEYWORD))
+                .contains(&format!("{}fn{RESET}", theme::palette().keyword))
         );
     }
 
@@ -1456,20 +1412,21 @@ mod tests {
         assert!(!lines.is_empty());
         for line in &lines {
             assert!(
-                line.contains(CODE_BACKGROUND),
+                line.contains(palette().code_background),
                 "code lines need the shaded background: {line:?}"
             );
             assert_eq!(visible_width(line), 40);
         }
         // Warm dark gray must stay distinct from the cool user-prompt panel
         // and the green/red/purple tool cards.
-        assert_ne!(CODE_BACKGROUND, super::super::USER_BACKGROUND);
+        let palette = palette();
         for other in [
-            "\x1b[48;2;42;50;41m",
-            "\x1b[48;2;50;42;42m",
-            "\x1b[48;2;54;44;82m",
+            palette.user_background,
+            palette.card_success,
+            palette.card_error,
+            palette.card_skill,
         ] {
-            assert_ne!(CODE_BACKGROUND, other);
+            assert_ne!(palette.code_background, other);
         }
     }
 
@@ -1500,8 +1457,16 @@ mod tests {
     fn headings_drop_markers_and_keep_their_style_around_inline_spans() {
         let lines = render("# Target\n## Notes ##\n### Deep `code` **bold** tail", 60);
         assert_eq!(plain(&lines), ["Target", "Notes", "Deep code bold tail"]);
-        assert!(lines[0].starts_with(HEADING_MAJOR), "{:?}", lines[0]);
-        assert!(lines[1].starts_with(HEADING_MINOR), "{:?}", lines[1]);
+        assert!(
+            lines[0].starts_with(palette().heading_major),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with(palette().heading_minor),
+            "{:?}",
+            lines[1]
+        );
         assert!(!lines.join("").contains("\x1b[1;34m"));
         // After the code and bold spans the heading style comes back.
         assert!(
@@ -1529,7 +1494,10 @@ mod tests {
         assert_eq!(render_inline(r"\*literal\*"), "*literal*");
         assert_eq!(
             render_inline("**bold `code` end**"),
-            format!("{BOLD}bold {INLINE_CODE}code{RESET}{BOLD} end{RESET}")
+            format!(
+                "{BOLD}bold {}code{RESET}{BOLD} end{RESET}",
+                palette().inline_code
+            )
         );
     }
 
@@ -1537,11 +1505,14 @@ mod tests {
     fn code_spans_pair_matching_runs_and_shield_their_contents() {
         assert_eq!(
             render_inline("``a ` b``"),
-            format!("{INLINE_CODE}a ` b{RESET}")
+            format!("{}a ` b{RESET}", palette().inline_code)
         );
         assert_eq!(
             render_inline("*see `a*b` here*"),
-            format!("{ITALIC}see {INLINE_CODE}a*b{RESET}{ITALIC} here{RESET}")
+            format!(
+                "{ITALIC}see {}a*b{RESET}{ITALIC} here{RESET}",
+                palette().inline_code
+            )
         );
         assert_eq!(render_inline("unpaired ` tick"), "unpaired ` tick");
     }
@@ -1578,7 +1549,7 @@ mod tests {
         assert_eq!(plain[1], "│ quoted bold");
         assert_eq!(plain[2], "│ │ deeper");
         assert_eq!(plain[3], "x = 1");
-        assert!(lines[3].contains(CODE_BACKGROUND));
+        assert!(lines[3].contains(palette().code_background));
         assert_eq!(plain[4], "• item");
         assert_eq!(plain[5], "echo hi", "fence indentation is stripped");
         assert_eq!(plain.len(), 6);
@@ -1610,11 +1581,18 @@ mod tests {
             for (index, _) in line.match_indices(RESET) {
                 let after = &line[index + RESET.len()..];
                 assert!(
-                    after.is_empty() || after.starts_with(super::super::USER_BACKGROUND),
+                    after.is_empty() || after.starts_with(palette().user_background),
                     "{line:?}"
                 );
             }
         }
         assert_eq!(strip_ansi(&lines[1]).trim(), "Target");
+    }
+
+    #[test]
+    fn lone_escape_bytes_are_plain_characters() {
+        assert_eq!(visible_width("a\x1bb"), 2);
+        assert_eq!(strip_ansi("a\x1bb\x1b[31mc\x1b[0m"), "a\x1bbc");
+        assert_eq!(fit_width("\x1b", 3), "\x1b   ");
     }
 }

@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::turn::TurnMode;
 use super::{Conversation, is_undoable_user_prompt, last_undoable_user_index};
 use crate::agent::TurnEvent;
 use crate::compaction;
@@ -129,12 +129,7 @@ struct TestAgent {
 
 impl TestAgent {
     fn new(name: &str) -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("yawl-agent-{}-{nonce}-{name}", std::process::id()));
+        let root = crate::test_support::unique_temp_dir(&format!("agent-{name}"));
         let home_dir = root.join("home");
         let project_dir = root.join("project");
         let config = Config {
@@ -171,11 +166,18 @@ fn active_display_config_sync_keeps_the_status_bar_layout() {
     active_config.status_bar.items.clear();
     active_config.status_bar.style = crate::config::StatusBarStyle::Plain;
     active_config.bell = false;
+    active_config.theme = crate::config::Theme::Light;
+    active_config.selection_color = Some(crate::config::UiColor::WHITE);
 
     conversation.sync_display_config(&active_config);
 
     assert_eq!(conversation.config().status_bar, active_config.status_bar);
     assert!(!conversation.config().bell);
+    assert_eq!(conversation.config().theme, crate::config::Theme::Light);
+    assert_eq!(
+        conversation.config().selection_color,
+        active_config.selection_color
+    );
 }
 
 #[test]
@@ -209,23 +211,12 @@ fn print_mode_pump_delivers_deferred_results_in_a_follow_up_turn() {
         crate::subagent::RunOutcome::Completed,
         "found it",
     );
-    let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
-        text: "delivered summary",
-        tool_calls: Vec::new(),
-        input_tokens: 10,
-        output_tokens: 2,
-    }])));
+    let steps = Rc::new(RefCell::new(VecDeque::from([step(
+        "delivered summary",
+        Vec::new(),
+    )])));
     let requests = Rc::new(RefCell::new(Vec::new()));
-    let mut resolve = |_: &str, _: &Config| {
-        Ok::<(Box<dyn Provider>, String), Error>((
-            Box::new(ScriptedProvider {
-                steps: Rc::clone(&steps),
-                requests: Rc::clone(&requests),
-                systems: None,
-            }),
-            "test".into(),
-        ))
-    };
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
 
     // Drive the pump's delivery turn with the injected resolver the same
     // way run drives it with the real one.
@@ -272,22 +263,11 @@ fn print_mode_pump_with_no_active_subagents_returns_promptly() {
 fn mid_turn_reasoning_change_reaches_the_next_model_request() {
     let mut test = TestAgent::new("mid-turn-reasoning");
     let steps = Rc::new(RefCell::new(VecDeque::from([
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
-                id: "call-1".into(),
-                name: "shell".into(),
-                arguments: r#"{"command":"printf ok"}"#.into(),
-            }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
-        ProviderStep::Output {
-            text: "done",
-            tool_calls: Vec::new(),
-            input_tokens: 10,
-            output_tokens: 2,
-        },
+        step(
+            "",
+            vec![call("call-1", "shell", r#"{"command":"printf ok"}"#)],
+        ),
+        step("done", Vec::new()),
     ])));
     let requests = Rc::new(RefCell::new(Vec::new()));
     let steers = test.agent.steers.clone();
@@ -320,34 +300,18 @@ fn mid_turn_reasoning_change_reaches_the_next_model_request() {
 fn conversation_transaction_persists_tool_loop_in_order() {
     let mut test = TestAgent::new("tool-loop");
     let steps = Rc::new(RefCell::new(VecDeque::from([
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
-                id: "call-1".into(),
-                name: "shell".into(),
-                arguments: r#"{"command":"printf tool-output"}"#.into(),
-            }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
-        ProviderStep::Output {
-            text: "done",
-            tool_calls: Vec::new(),
-            input_tokens: 10,
-            output_tokens: 2,
-        },
+        step(
+            "",
+            vec![call(
+                "call-1",
+                "shell",
+                r#"{"command":"printf tool-output"}"#,
+            )],
+        ),
+        step("done", Vec::new()),
     ])));
     let requests = Rc::new(RefCell::new(Vec::new()));
-    let mut resolve = |_: &str, _: &Config| {
-        Ok::<(Box<dyn Provider>, String), Error>((
-            Box::new(ScriptedProvider {
-                steps: Rc::clone(&steps),
-                requests: Rc::clone(&requests),
-                systems: None,
-            }),
-            "test".into(),
-        ))
-    };
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
 
     let completed = test
         .agent
@@ -386,9 +350,9 @@ fn conversation_transaction_persists_tool_loop_in_order() {
 fn run_scripted_init_write(test: &mut TestAgent, content: &str) -> Rc<RefCell<Vec<String>>> {
     let path = test.root.join("cwd/AGENTS.md");
     let steps = Rc::new(RefCell::new(VecDeque::from([
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
+        step(
+            "",
+            vec![ToolCall {
                 id: "init-write".into(),
                 name: "write_file".into(),
                 arguments: serde_json::json!({
@@ -397,9 +361,7 @@ fn run_scripted_init_write(test: &mut TestAgent, content: &str) -> Rc<RefCell<Ve
                 })
                 .to_string(),
             }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
+        ),
         ProviderStep::Output {
             text: "Updated AGENTS.md.",
             tool_calls: Vec::new(),
@@ -409,20 +371,17 @@ fn run_scripted_init_write(test: &mut TestAgent, content: &str) -> Rc<RefCell<Ve
     ])));
     let requests = Rc::new(RefCell::new(Vec::new()));
     let systems = Rc::new(RefCell::new(Vec::new()));
-    let mut resolve = |_: &str, _: &Config| {
-        Ok::<(Box<dyn Provider>, String), Error>((
-            Box::new(ScriptedProvider {
-                steps: Rc::clone(&steps),
-                requests: Rc::clone(&requests),
-                systems: Some(Rc::clone(&systems)),
-            }),
-            "test".into(),
-        ))
-    };
+    let mut resolve =
+        scripted_resolve_with_systems(Rc::clone(&steps), Rc::clone(&requests), Rc::clone(&systems));
 
     let completed = test
         .agent
-        .run_init_with("/init".to_string().into(), &mut |_| {}, &mut resolve)
+        .run_turn_input_with_mode(
+            Some("/init".to_string().into()),
+            &mut |_| {},
+            &mut resolve,
+            TurnMode::Init,
+        )
         .expect("init turn should complete");
     assert!(completed);
     systems
@@ -464,16 +423,11 @@ fn init_turn_keeps_literal_message_and_created_file_is_undoable() {
     }])));
     let requests = Rc::new(RefCell::new(Vec::new()));
     let normal_systems = Rc::new(RefCell::new(Vec::new()));
-    let mut resolve = |_: &str, _: &Config| {
-        Ok::<(Box<dyn Provider>, String), Error>((
-            Box::new(ScriptedProvider {
-                steps: Rc::clone(&steps),
-                requests: Rc::clone(&requests),
-                systems: Some(Rc::clone(&normal_systems)),
-            }),
-            "test".into(),
-        ))
-    };
+    let mut resolve = scripted_resolve_with_systems(
+        Rc::clone(&steps),
+        Rc::clone(&requests),
+        Rc::clone(&normal_systems),
+    );
     test.agent
         .run_turn_with(Some("next".into()), &mut |_| {}, &mut resolve)
         .expect("normal turn should complete");
@@ -505,16 +459,7 @@ fn failed_provider_does_not_persist_partial_assistant() {
     let mut test = TestAgent::new("provider-failure");
     let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Fail])));
     let requests = Rc::new(RefCell::new(Vec::new()));
-    let mut resolve = |_: &str, _: &Config| {
-        Ok::<(Box<dyn Provider>, String), Error>((
-            Box::new(ScriptedProvider {
-                steps: Rc::clone(&steps),
-                requests: Rc::clone(&requests),
-                systems: None,
-            }),
-            "test".into(),
-        ))
-    };
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
 
     let result = test
         .agent
@@ -574,14 +519,7 @@ fn a_failed_turn_continues_from_saved_history_without_a_new_prompt() {
 fn a_session_left_mid_tool_call_can_continue_after_resume() {
     crate::set_interrupted(false);
     let mut test = TestAgent::new("continue-after-resume");
-    let assistant = Message::assistant(
-        String::new(),
-        vec![ToolCall {
-            id: "call-1".into(),
-            name: "shell".into(),
-            arguments: "{}".into(),
-        }],
-    );
+    let assistant = Message::assistant(String::new(), vec![call("call-1", "shell", "{}")]);
     test.agent.messages = vec![Message::user("run it"), assistant];
 
     assert!(test.agent.can_continue());
@@ -610,16 +548,7 @@ fn provider_usage_saturates_instead_of_wrapping() {
         output_tokens: 1,
     }])));
     let requests = Rc::new(RefCell::new(Vec::new()));
-    let mut resolve = |_: &str, _: &Config| {
-        Ok::<(Box<dyn Provider>, String), Error>((
-            Box::new(ScriptedProvider {
-                steps: Rc::clone(&steps),
-                requests: Rc::clone(&requests),
-                systems: None,
-            }),
-            "test".into(),
-        ))
-    };
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
 
     let completed = test
         .agent
@@ -683,11 +612,7 @@ fn failed_auto_compaction_warns_and_the_turn_continues() {
     let steps = Rc::new(RefCell::new(VecDeque::from([
         ProviderStep::Output {
             text: "",
-            tool_calls: vec![ToolCall {
-                id: "call-1".into(),
-                name: "shell".into(),
-                arguments: r#"{"command":"true"}"#.into(),
-            }],
+            tool_calls: vec![call("call-1", "shell", r#"{"command":"true"}"#)],
             input_tokens: 100_000,
             output_tokens: 0,
         },
@@ -700,16 +625,7 @@ fn failed_auto_compaction_warns_and_the_turn_continues() {
         },
     ])));
     let requests = Rc::new(RefCell::new(Vec::new()));
-    let mut resolve = |_: &str, _: &Config| {
-        Ok::<(Box<dyn Provider>, String), Error>((
-            Box::new(ScriptedProvider {
-                steps: Rc::clone(&steps),
-                requests: Rc::clone(&requests),
-                systems: None,
-            }),
-            "test".into(),
-        ))
-    };
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
     let mut warnings = Vec::new();
 
     let completed = test
@@ -739,16 +655,8 @@ fn interrupted_tool_batch_keeps_one_result_per_call() {
     let mut test = TestAgent::new("interrupted-tools");
     let registry = test.agent.scan_tools();
     let calls = [
-        ToolCall {
-            id: "one".into(),
-            name: "shell".into(),
-            arguments: r#"{"command":"true"}"#.into(),
-        },
-        ToolCall {
-            id: "two".into(),
-            name: "shell".into(),
-            arguments: r#"{"command":"true"}"#.into(),
-        },
+        call("one", "shell", r#"{"command":"true"}"#),
+        call("two", "shell", r#"{"command":"true"}"#),
     ];
 
     let aborted = test
@@ -897,12 +805,29 @@ fn scripted_resolve(
     steps: Rc<RefCell<VecDeque<ProviderStep>>>,
     requests: Rc<RefCell<Vec<Vec<Role>>>>,
 ) -> impl FnMut(&str, &Config) -> Result<(Box<dyn Provider>, String), Error> {
+    resolve_scripted(steps, requests, None)
+}
+
+/// Like [`scripted_resolve`], also recording each request's system prompt.
+fn scripted_resolve_with_systems(
+    steps: Rc<RefCell<VecDeque<ProviderStep>>>,
+    requests: Rc<RefCell<Vec<Vec<Role>>>>,
+    systems: Rc<RefCell<Vec<String>>>,
+) -> impl FnMut(&str, &Config) -> Result<(Box<dyn Provider>, String), Error> {
+    resolve_scripted(steps, requests, Some(systems))
+}
+
+fn resolve_scripted(
+    steps: Rc<RefCell<VecDeque<ProviderStep>>>,
+    requests: Rc<RefCell<Vec<Vec<Role>>>>,
+    systems: Option<Rc<RefCell<Vec<String>>>>,
+) -> impl FnMut(&str, &Config) -> Result<(Box<dyn Provider>, String), Error> {
     move |_: &str, _: &Config| {
         Ok::<(Box<dyn Provider>, String), Error>((
             Box::new(ScriptedProvider {
                 steps: Rc::clone(&steps),
                 requests: Rc::clone(&requests),
-                systems: None,
+                systems: systems.clone(),
             }),
             "test".into(),
         ))
@@ -916,29 +841,22 @@ fn goal_mode_continues_on_text_only_then_finishes_with_goal_complete() {
         .start_goal("ship the feature".to_string().into())
         .expect("start goal");
     let steps = Rc::new(RefCell::new(VecDeque::from([
-        ProviderStep::Output {
-            text: "still working",
-            tool_calls: Vec::new(),
-            input_tokens: 10,
-            output_tokens: 2,
-        },
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
+        step("still working", Vec::new()),
+        step(
+            "",
+            vec![ToolCall {
                 id: "goal-1".into(),
                 name: crate::tools::GOAL_COMPLETE_TOOL_NAME.into(),
                 arguments: r#"{"result":"shipped"}"#.into(),
             }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
+        ),
     ])));
     let requests = Rc::new(RefCell::new(Vec::new()));
     let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
 
     let completed = test
         .agent
-        .run_goal_with(&mut |_| {}, &mut resolve)
+        .run_turn_input_with_mode(None, &mut |_| {}, &mut resolve, TurnMode::Goal)
         .expect("goal turn should complete");
 
     assert!(completed);
@@ -966,12 +884,10 @@ fn ordinary_turn_does_not_resume_a_paused_goal() {
     test.agent
         .start_goal("ship the feature".to_string().into())
         .expect("start goal");
-    let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
-        text: "answer to the separate question",
-        tool_calls: Vec::new(),
-        input_tokens: 10,
-        output_tokens: 2,
-    }])));
+    let steps = Rc::new(RefCell::new(VecDeque::from([step(
+        "answer to the separate question",
+        Vec::new(),
+    )])));
     let requests = Rc::new(RefCell::new(Vec::new()));
     let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
 
@@ -1018,40 +934,32 @@ fn goal_mode_rejects_mixed_goal_complete_batches() {
         .start_goal("finish".to_string().into())
         .expect("start goal");
     let steps = Rc::new(RefCell::new(VecDeque::from([
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![
+        step(
+            "",
+            vec![
                 ToolCall {
                     id: "goal-1".into(),
                     name: crate::tools::GOAL_COMPLETE_TOOL_NAME.into(),
                     arguments: r#"{"result":"done"}"#.into(),
                 },
-                ToolCall {
-                    id: "shell-1".into(),
-                    name: "shell".into(),
-                    arguments: r#"{"command":"printf ok"}"#.into(),
-                },
+                call("shell-1", "shell", r#"{"command":"printf ok"}"#),
             ],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
+        ),
+        step(
+            "",
+            vec![ToolCall {
                 id: "goal-2".into(),
                 name: crate::tools::GOAL_COMPLETE_TOOL_NAME.into(),
                 arguments: r#"{"result":"done"}"#.into(),
             }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
+        ),
     ])));
     let requests = Rc::new(RefCell::new(Vec::new()));
     let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
 
     let completed = test
         .agent
-        .run_goal_with(&mut |_| {}, &mut resolve)
+        .run_turn_input_with_mode(None, &mut |_| {}, &mut resolve, TurnMode::Goal)
         .expect("goal turn should complete");
 
     assert!(completed);
@@ -1098,9 +1006,7 @@ fn planning_requires_three_questions_then_persists_the_completed_plan() {
     })
     .to_string();
     let steps = Rc::new(RefCell::new(VecDeque::from([
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
+        step("", vec![ToolCall {
                 id: "questions-invalid".into(),
                 name: crate::tools::USER_INPUT_TOOL_NAME.into(),
                 arguments: serde_json::json!({
@@ -1110,30 +1016,17 @@ fn planning_requires_three_questions_then_persists_the_completed_plan() {
                     ]
                 })
                 .to_string(),
-            }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
+            }]),
+        step("", vec![ToolCall {
                 id: "questions-1".into(),
                 name: crate::tools::USER_INPUT_TOOL_NAME.into(),
                 arguments: question_arguments,
-            }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
+            }]),
+        step("", vec![ToolCall {
                 id: "plan-1".into(),
                 name: crate::tools::PLAN_COMPLETE_TOOL_NAME.into(),
                 arguments: r##"{"plan":"# Plan\n\n1. Build it."}"##.into(),
-            }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
+            }]),
     ])));
     let requests = Rc::new(RefCell::new(Vec::new()));
     let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
@@ -1154,7 +1047,7 @@ fn planning_requires_three_questions_then_persists_the_completed_plan() {
 
     let completed = test
         .agent
-        .run_plan_with(&mut |_| {}, &mut resolve)
+        .run_turn_input_with_mode(None, &mut |_| {}, &mut resolve, TurnMode::Plan)
         .expect("planning should complete");
     responder.join().expect("question responder");
 
@@ -1174,10 +1067,11 @@ fn planning_requires_three_questions_then_persists_the_completed_plan() {
     let mut failed_resolve = scripted_resolve(failed_steps, Rc::new(RefCell::new(Vec::new())));
     assert!(
         test.agent
-            .run_plan_implementation_with(
+            .run_turn_input_with_mode(
                 Some("implement it".to_string().into()),
                 &mut |_| {},
                 &mut failed_resolve,
+                TurnMode::PlanImplement
             )
             .is_err()
     );
@@ -1208,26 +1102,22 @@ fn unrelated_follow_up_replies_normally_and_leaves_the_plan_active() {
     })
     .to_string();
     let steps = Rc::new(RefCell::new(VecDeque::from([
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
+        step(
+            "",
+            vec![ToolCall {
                 id: "questions-1".into(),
                 name: crate::tools::USER_INPUT_TOOL_NAME.into(),
                 arguments: question_arguments,
             }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
+        ),
+        step(
+            "",
+            vec![ToolCall {
                 id: "plan-1".into(),
                 name: crate::tools::PLAN_COMPLETE_TOOL_NAME.into(),
                 arguments: r##"{"plan":"# Plan\n\n1. Build it."}"##.into(),
             }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
+        ),
     ])));
     let requests = Rc::new(RefCell::new(Vec::new()));
     let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
@@ -1248,7 +1138,7 @@ fn unrelated_follow_up_replies_normally_and_leaves_the_plan_active() {
 
     let completed = test
         .agent
-        .run_plan_with(&mut |_| {}, &mut resolve)
+        .run_turn_input_with_mode(None, &mut |_| {}, &mut resolve, TurnMode::Plan)
         .expect("planning should complete");
     responder.join().expect("question responder");
 
@@ -1256,20 +1146,19 @@ fn unrelated_follow_up_replies_normally_and_leaves_the_plan_active() {
     assert!(test.agent.plan_ready_this_turn());
     assert_eq!(test.agent.active_plan(), Some("# Plan\n\n1. Build it."));
 
-    let reply_steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
-        text: "This plan adds a planning mode before implementation starts.",
-        tool_calls: Vec::new(),
-        input_tokens: 10,
-        output_tokens: 2,
-    }])));
+    let reply_steps = Rc::new(RefCell::new(VecDeque::from([step(
+        "This plan adds a planning mode before implementation starts.",
+        Vec::new(),
+    )])));
     let mut reply_resolve = scripted_resolve(reply_steps, Rc::new(RefCell::new(Vec::new())));
 
     let completed = test
         .agent
-        .run_plan_follow_up_with(
-            "what is this plan about?".to_string().into(),
+        .run_turn_input_with_mode(
+            Some("what is this plan about?".to_string().into()),
             &mut |_| {},
             &mut reply_resolve,
+            TurnMode::PlanFollowUp,
         )
         .expect("unrelated follow-up should complete");
 
@@ -1309,16 +1198,14 @@ fn resumed_plan_remembers_that_requirements_were_answered() {
     })
     .to_string();
     let first_steps = Rc::new(RefCell::new(VecDeque::from([
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
+        step(
+            "",
+            vec![ToolCall {
                 id: "questions-1".into(),
                 name: crate::tools::USER_INPUT_TOOL_NAME.into(),
                 arguments: question_arguments,
             }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
+        ),
         ProviderStep::Fail,
     ])));
     let mut first_resolve = scripted_resolve(first_steps, Rc::new(RefCell::new(Vec::new())));
@@ -1339,7 +1226,7 @@ fn resumed_plan_remembers_that_requirements_were_answered() {
 
     assert!(
         test.agent
-            .run_plan_with(&mut |_| {}, &mut first_resolve)
+            .run_turn_input_with_mode(None, &mut |_| {}, &mut first_resolve, TurnMode::Plan)
             .is_err()
     );
     responder.join().expect("question responder");
@@ -1349,20 +1236,18 @@ fn resumed_plan_remembers_that_requirements_were_answered() {
             .is_some_and(crate::session::PlanState::questions_asked)
     );
 
-    let resumed_steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
-        text: "",
-        tool_calls: vec![ToolCall {
+    let resumed_steps = Rc::new(RefCell::new(VecDeque::from([step(
+        "",
+        vec![ToolCall {
             id: "plan-1".into(),
             name: crate::tools::PLAN_COMPLETE_TOOL_NAME.into(),
             arguments: r##"{"plan":"# Plan\n\n1. Build it."}"##.into(),
         }],
-        input_tokens: 10,
-        output_tokens: 2,
-    }])));
+    )])));
     let mut resumed_resolve = scripted_resolve(resumed_steps, Rc::new(RefCell::new(Vec::new())));
     assert!(
         test.agent
-            .run_plan_with(&mut |_| {}, &mut resumed_resolve)
+            .run_turn_input_with_mode(None, &mut |_| {}, &mut resumed_resolve, TurnMode::Plan)
             .expect("resumed plan should complete without another question batch")
     );
     assert_eq!(test.agent.active_plan(), Some("# Plan\n\n1. Build it."));
@@ -1383,19 +1268,17 @@ fn unrelated_plan_follow_up_transitions_to_the_full_tool_registry() {
     test.agent.messages.push(ready);
     let output_path = test.root.join("unrelated.txt");
     let steps = Rc::new(RefCell::new(VecDeque::from([
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
+        step(
+            "",
+            vec![ToolCall {
                 id: "classify-1".into(),
                 name: crate::tools::PLAN_ACTION_TOOL_NAME.into(),
                 arguments: r#"{"action":"unrelated"}"#.into(),
             }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
-        ProviderStep::Output {
-            text: "",
-            tool_calls: vec![ToolCall {
+        ),
+        step(
+            "",
+            vec![ToolCall {
                 id: "write-1".into(),
                 name: "write_file".into(),
                 arguments: serde_json::json!({
@@ -1404,24 +1287,18 @@ fn unrelated_plan_follow_up_transitions_to_the_full_tool_registry() {
                 })
                 .to_string(),
             }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
-        ProviderStep::Output {
-            text: "Completed the unrelated request.",
-            tool_calls: Vec::new(),
-            input_tokens: 10,
-            output_tokens: 2,
-        },
+        ),
+        step("Completed the unrelated request.", Vec::new()),
     ])));
     let mut resolve = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
 
     assert!(
         test.agent
-            .run_plan_follow_up_with(
-                "write an unrelated file".to_string().into(),
+            .run_turn_input_with_mode(
+                Some("write an unrelated file".to_string().into()),
                 &mut |_| {},
                 &mut resolve,
+                TurnMode::PlanFollowUp
             )
             .expect("unrelated request should run normally")
     );
@@ -1452,30 +1329,26 @@ fn plan_implementation_receives_deferred_subagent_results() {
         crate::subagent::RunOutcome::Completed,
         "child result",
     );
-    let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
-        text: "",
-        tool_calls: vec![ToolCall {
+    let steps = Rc::new(RefCell::new(VecDeque::from([step(
+        "",
+        vec![ToolCall {
             id: "implemented-1".into(),
             name: crate::tools::PLAN_IMPLEMENTED_TOOL_NAME.into(),
             arguments: r#"{"result":"Implemented the plan."}"#.into(),
         }],
-        input_tokens: 10,
-        output_tokens: 2,
-    }])));
-    steps.borrow_mut().push_front(ProviderStep::Output {
-        text: "Implement the agreed feature.",
-        tool_calls: vec![],
-        input_tokens: 10,
-        output_tokens: 2,
-    });
+    )])));
+    steps
+        .borrow_mut()
+        .push_front(step("Implement the agreed feature.", Vec::new()));
     let mut resolve = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
 
     assert!(
         test.agent
-            .run_plan_implementation_with(
+            .run_turn_input_with_mode(
                 Some("implement it".to_string().into()),
                 &mut |_| {},
                 &mut resolve,
+                TurnMode::PlanImplement
             )
             .expect("implementation should complete")
     );
@@ -1496,22 +1369,15 @@ fn steering_skips_pending_tools_and_injects_the_steer_message() {
         images: Vec::new(),
     });
     let steps = Rc::new(RefCell::new(VecDeque::from([
-        ProviderStep::Output {
-            text: "working",
-            tool_calls: vec![ToolCall {
-                id: "shell-1".into(),
-                name: "shell".into(),
-                arguments: r#"{"command":"printf tool-output"}"#.into(),
-            }],
-            input_tokens: 10,
-            output_tokens: 2,
-        },
-        ProviderStep::Output {
-            text: "summary",
-            tool_calls: Vec::new(),
-            input_tokens: 10,
-            output_tokens: 2,
-        },
+        step(
+            "working",
+            vec![call(
+                "shell-1",
+                "shell",
+                r#"{"command":"printf tool-output"}"#,
+            )],
+        ),
+        step("summary", Vec::new()),
     ])));
     let requests = Rc::new(RefCell::new(Vec::new()));
     let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
@@ -1915,6 +1781,24 @@ fn config_reload_keeps_a_session_reasoning_choice_until_the_default_is_saved() {
     );
 }
 
+fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: arguments.into(),
+    }
+}
+
+/// A scripted reply with the token usage most tests do not care about.
+fn step(text: &'static str, tool_calls: Vec<ToolCall>) -> ProviderStep {
+    ProviderStep::Output {
+        text,
+        tool_calls,
+        input_tokens: 10,
+        output_tokens: 2,
+    }
+}
+
 fn text_step(text: &'static str) -> ProviderStep {
     ProviderStep::Output {
         text,
@@ -2223,14 +2107,19 @@ fn plan_handoff_reduces_requests_for_picker_and_classified_follow_up() -> Result
             ))
         };
         if classify {
-            test.agent.run_plan_follow_up_with(
-                "Implement, preserving compatibility".to_string().into(),
+            test.agent.run_turn_input_with_mode(
+                Some("Implement, preserving compatibility".to_string().into()),
                 &mut |_| {},
                 &mut resolve,
+                TurnMode::PlanFollowUp,
             )?;
         } else {
-            test.agent
-                .run_plan_implementation_with(None, &mut |_| {}, &mut resolve)?;
+            test.agent.run_turn_input_with_mode(
+                None,
+                &mut |_| {},
+                &mut resolve,
+                TurnMode::PlanImplement,
+            )?;
         }
         let requests = captures.borrow();
         // No summarizer request: acceptance goes straight to implementation.
@@ -2295,8 +2184,12 @@ fn plan_handoff_reduces_requests_for_picker_and_classified_follow_up() -> Result
         *test.agent.persistent_mut().session = session;
         test.agent.messages = messages;
         captures.borrow_mut().clear();
-        test.agent
-            .run_plan_implementation_with(None, &mut |_| {}, &mut resolve)?;
+        test.agent.run_turn_input_with_mode(
+            None,
+            &mut |_| {},
+            &mut resolve,
+            TurnMode::PlanImplement,
+        )?;
         assert_eq!(captures.borrow().len(), 1);
         let requests = captures.borrow();
         let (_, _, resumed) = requests.last().unwrap();
@@ -2459,7 +2352,12 @@ fn plan_phases_keep_the_prompt_prefix_and_gate_tools_in_history_notes() -> Resul
         ))
     };
 
-    assert!(test.agent.run_plan_with(&mut |_| {}, &mut resolve)?);
+    assert!(test.agent.run_turn_input_with_mode(
+        None,
+        &mut |_| {},
+        &mut resolve,
+        TurnMode::Plan
+    )?);
     assert!(!blocked.exists(), "planning must not run write_file");
     let rejected = test
         .agent
@@ -2470,10 +2368,12 @@ fn plan_phases_keep_the_prompt_prefix_and_gate_tools_in_history_notes() -> Resul
     assert!(rejected.is_error);
     assert!(rejected.content.contains("unavailable while planning"));
 
-    assert!(
-        test.agent
-            .run_plan_implementation_with(None, &mut |_| {}, &mut resolve)?
-    );
+    assert!(test.agent.run_turn_input_with_mode(
+        None,
+        &mut |_| {},
+        &mut resolve,
+        TurnMode::PlanImplement
+    )?);
     assert_eq!(test.agent.active_plan(), None);
     assert!(
         test.agent
@@ -2523,51 +2423,30 @@ fn defined_tools_work_on_the_next_step_reach_the_prompt_and_undo_cleanly() {
     std::fs::create_dir_all(&home_tools).expect("home tools");
     std::fs::write(home_tools.join("broken.json"), "{").expect("broken manifest");
     let manifest = test.root.join("project/tools/greet.json");
-    let call = |id: &str, name: &str, arguments: serde_json::Value| ToolCall {
-        id: id.into(),
-        name: name.into(),
-        arguments: arguments.to_string(),
-    };
-    let output = |text: &'static str, tool_calls: Vec<ToolCall>| ProviderStep::Output {
-        text,
-        tool_calls,
-        input_tokens: 10,
-        output_tokens: 2,
-    };
     let steps = Rc::new(RefCell::new(VecDeque::from([
-        output(
+        step(
             "",
             vec![call(
                 "define",
                 crate::tools::DEFINE_TOOL_NAME,
-                serde_json::json!({
+                &serde_json::json!({
                     "name": "greet",
                     "description": "Greet someone by name",
                     "params": {"who": {"type": "string"}},
                     "command": "printf 'hello %s' {{who}}",
                     "scope": "project"
-                }),
+                })
+                .to_string(),
             )],
         ),
-        output(
-            "",
-            vec![call("use", "greet", serde_json::json!({"who": "Ada"}))],
-        ),
-        output("Saved and tried greet.", Vec::new()),
-        output("Still here.", Vec::new()),
+        step("", vec![call("use", "greet", r#"{"who":"Ada"}"#)]),
+        step("Saved and tried greet.", Vec::new()),
+        step("Still here.", Vec::new()),
     ])));
     let requests = Rc::new(RefCell::new(Vec::new()));
     let systems = Rc::new(RefCell::new(Vec::new()));
-    let mut resolve = |_: &str, _: &Config| {
-        Ok::<(Box<dyn Provider>, String), Error>((
-            Box::new(ScriptedProvider {
-                steps: Rc::clone(&steps),
-                requests: Rc::clone(&requests),
-                systems: Some(Rc::clone(&systems)),
-            }),
-            "test".into(),
-        ))
-    };
+    let mut resolve =
+        scripted_resolve_with_systems(Rc::clone(&steps), Rc::clone(&requests), Rc::clone(&systems));
     let mut warnings = Vec::new();
     let mut sink = |event: TurnEvent<'_>| {
         if let TurnEvent::Warning(text) = event {

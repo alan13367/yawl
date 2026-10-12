@@ -4,7 +4,7 @@ use serde_json::{Map, Value, json};
 
 use super::{
     Config, MAX_SUBAGENT_REQUEST_BUDGET, MAX_SUBAGENT_TIMEOUT_SECS, MAX_WEB_FETCH_MAX_CHARS,
-    OPENAI_COMPLETIONS_API, ProviderConfig, StatusBarConfig, UiColor, WebSearchProvider,
+    OPENAI_COMPLETIONS_API, ProviderConfig, StatusBarConfig, Theme, UiColor, WebSearchProvider,
     expand_home_path, object_field, validate_bounded, validate_provider_name,
 };
 use crate::error::Error;
@@ -26,6 +26,7 @@ pub(crate) enum ConfigChange {
     ScrollBar(bool),
     ScrollBarAutoHide(bool),
     Bell(bool),
+    Theme(Theme),
     AutoCompact(bool),
     CompactThreshold(f64),
     WebBrowsing(bool),
@@ -278,6 +279,7 @@ impl ConfigChange {
                 insert_root(root, "scroll_bar_auto_hide", json!(enabled))
             }
             Self::Bell(enabled) => insert_root(root, "bell", json!(enabled)),
+            Self::Theme(theme) => insert_root(root, "theme", json!(theme.as_str())),
             Self::AutoCompact(enabled) => insert_root(root, "auto_compact", json!(enabled)),
             Self::CompactThreshold(threshold) => {
                 insert_root(root, "compact_threshold", json!(threshold))
@@ -328,15 +330,7 @@ impl ConfigChange {
                 base_url,
                 api_key,
             } => {
-                let providers = object_field(root, "providers")?;
-                let provider = providers
-                    .entry(name.clone())
-                    .or_insert_with(|| Value::Object(Map::new()));
-                let Value::Object(provider) = provider else {
-                    return Err(Error::Config(format!(
-                        "providers.{name} must be a JSON object"
-                    )));
-                };
+                let provider = provider_object(root, name)?;
                 provider.insert("base_url".into(), json!(base_url));
                 provider.insert("api".into(), json!(OPENAI_COMPLETIONS_API));
                 provider.remove("baseUrl");
@@ -358,15 +352,7 @@ impl ConfigChange {
                 model,
                 reasoning_efforts,
             } => {
-                let providers = object_field(root, "providers")?;
-                let provider = providers
-                    .entry(name.clone())
-                    .or_insert_with(|| Value::Object(Map::new()));
-                let Value::Object(provider) = provider else {
-                    return Err(Error::Config(format!(
-                        "providers.{name} must be a JSON object"
-                    )));
-                };
+                let provider = provider_object(root, name)?;
                 let models = provider
                     .entry("models".to_string())
                     .or_insert_with(|| Value::Array(Vec::new()));
@@ -440,6 +426,7 @@ impl ConfigChange {
             Self::ScrollBar(enabled) => config.scroll_bar == *enabled,
             Self::ScrollBarAutoHide(enabled) => config.scroll_bar_auto_hide == *enabled,
             Self::Bell(enabled) => config.bell == *enabled,
+            Self::Theme(theme) => config.theme == *theme,
             Self::AutoCompact(enabled) => config.auto_compact == *enabled,
             Self::CompactThreshold(threshold) => config.compact_threshold == *threshold,
             Self::WebBrowsing(enabled) => config.web_browsing == *enabled,
@@ -590,10 +577,25 @@ fn validate_http_url(url: &str) -> Result<(), Error> {
     }
 }
 
+/// `providers.<name>` in a config file, created empty when missing.
+fn provider_object<'a>(
+    root: &'a mut Map<String, Value>,
+    name: &str,
+) -> Result<&'a mut Map<String, Value>, Error> {
+    match object_field(root, "providers")?
+        .entry(name.to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+    {
+        Value::Object(provider) => Ok(provider),
+        _ => Err(Error::Config(format!(
+            "providers.{name} must be a JSON object"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -605,14 +607,7 @@ mod tests {
 
     impl TestDirs {
         fn new(name: &str) -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let root = std::env::temp_dir().join(format!(
-                "yawl-config-change-{}-{nonce}-{name}",
-                std::process::id()
-            ));
+            let root = crate::test_support::unique_temp_dir(&format!("config-change-{name}"));
             Self {
                 home: root.join("home/.yawl"),
                 project: root.join("project/.yawl"),
@@ -1080,6 +1075,27 @@ mod tests {
         )
         .expect("saved config should remain JSON");
         assert_eq!(saved["bell"], false);
+    }
+
+    #[test]
+    fn theme_change_is_persisted_and_reloaded() {
+        let dirs = TestDirs::new("theme");
+        let config = dirs.config();
+        assert_eq!(config.theme, Theme::Auto);
+
+        let outcome = config
+            .change_global(ConfigChange::Theme(Theme::Light))
+            .expect("a valid theme should apply");
+
+        assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
+        assert_eq!(outcome.config.theme, Theme::Light);
+        let saved: Value = serde_json::from_str(
+            &fs::read_to_string(dirs.home.join("config.json"))
+                .expect("saved config should be readable"),
+        )
+        .expect("saved config should remain JSON");
+        assert_eq!(saved["theme"], "light");
+        assert!("sepia".parse::<Theme>().is_err());
     }
 
     #[test]

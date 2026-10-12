@@ -85,30 +85,44 @@ pub(crate) fn write_json_object(path: &Path, root: &Map<String, Value>) -> Resul
     result
 }
 
-/// Resolves pi-style `$ENV_VAR` and `${ENV_VAR}` references in provider
-/// keys and header values. `$$` emits `$` and `$!` emits `!`.
-pub(crate) fn resolve_config_value(value: &str) -> Result<String, Error> {
+/// One piece of a provider key or header value.
+pub(crate) enum ValuePart {
+    Text(String),
+    /// Name of an environment variable referenced as `$NAME` or `${NAME}`.
+    Variable(String),
+}
+
+/// Why a provider key or header value cannot be parsed.
+pub(crate) enum ValueError {
+    /// A leading `!`, which pi uses for shell commands.
+    ShellCommand,
+    /// A `${` without its closing brace.
+    Unterminated,
+}
+
+/// Splits a provider key or header value into text and pi-style
+/// environment references. `$$` and `$!` are a literal `$` and `!`, and a
+/// `$` that starts no name stays literal.
+pub(crate) fn config_value_parts(value: &str) -> Result<Vec<ValuePart>, ValueError> {
     if value.starts_with('!') {
-        return Err(Error::Config(
-            "provider values beginning with '!' are not supported; use an environment variable"
-                .into(),
-        ));
+        return Err(ValueError::ShellCommand);
     }
     let chars = value.chars().collect::<Vec<_>>();
-    let mut output = String::with_capacity(value.len());
+    let mut parts = Vec::new();
+    let mut text = String::new();
     let mut index = 0usize;
     while index < chars.len() {
         if chars[index] != '$' {
-            output.push(chars[index]);
+            text.push(chars[index]);
             index += 1;
             continue;
         }
         let Some(next) = chars.get(index + 1).copied() else {
-            output.push('$');
+            text.push('$');
             break;
         };
         if matches!(next, '$' | '!') {
-            output.push(if next == '$' { '$' } else { '!' });
+            text.push(next);
             index += 2;
             continue;
         }
@@ -117,9 +131,7 @@ pub(crate) fn resolve_config_value(value: &str) -> Result<String, Error> {
                 .iter()
                 .position(|character| *character == '}')
             else {
-                return Err(Error::Config(
-                    "unterminated environment variable reference".into(),
-                ));
+                return Err(ValueError::Unterminated);
             };
             let end = index + 2 + relative_end;
             (chars[index + 2..end].iter().collect::<String>(), end + 1)
@@ -129,16 +141,48 @@ pub(crate) fn resolve_config_value(value: &str) -> Result<String, Error> {
                 .position(|character| !(character.is_ascii_alphanumeric() || *character == '_'))
                 .map_or(chars.len(), |relative| index + 1 + relative);
             if end == index + 1 {
-                output.push('$');
+                text.push('$');
                 index += 1;
                 continue;
             }
             (chars[index + 1..end].iter().collect::<String>(), end)
         };
-        let resolved = std::env::var(&name)
-            .map_err(|_| Error::Config(format!("environment variable {name} is not set")))?;
-        output.push_str(&resolved);
+        if !text.is_empty() {
+            parts.push(ValuePart::Text(std::mem::take(&mut text)));
+        }
+        parts.push(ValuePart::Variable(name));
         index = next_index;
+    }
+    if !text.is_empty() {
+        parts.push(ValuePart::Text(text));
+    }
+    Ok(parts)
+}
+
+/// Resolves pi-style `$ENV_VAR` and `${ENV_VAR}` references in provider
+/// keys and header values. `$$` emits `$` and `$!` emits `!`.
+pub(crate) fn resolve_config_value(value: &str) -> Result<String, Error> {
+    let parts = config_value_parts(value).map_err(|error| {
+        Error::Config(
+            match error {
+                ValueError::ShellCommand => {
+                    "provider values beginning with '!' are not supported; use an environment variable"
+                }
+                ValueError::Unterminated => "unterminated environment variable reference",
+            }
+            .into(),
+        )
+    })?;
+    let mut output = String::with_capacity(value.len());
+    for part in parts {
+        match part {
+            ValuePart::Text(text) => output.push_str(&text),
+            ValuePart::Variable(name) => {
+                output.push_str(&std::env::var(&name).map_err(|_| {
+                    Error::Config(format!("environment variable {name} is not set"))
+                })?)
+            }
+        }
     }
     Ok(output)
 }

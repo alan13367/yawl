@@ -183,11 +183,81 @@ pub(super) struct ViewState {
     pub(super) background_active_count: usize,
     pub(super) process_view: Option<ProcessView>,
     pub(super) render_cache: super::render::RenderCache,
+    /// Project facts under the welcome wordmark of an empty session.
+    pub(super) welcome: super::render::WelcomeDetails,
 }
 
 impl ViewState {
-    pub(super) fn from_agent(agent: &Agent) -> Self {
+    /// An empty, idle view with fixed values, for tests to override with
+    /// struct-update syntax.
+    #[cfg(test)]
+    pub(super) fn test_default() -> Self {
         Self {
+            transcript: Transcript::from_messages(&[]),
+            tools_expanded: false,
+            model: "test".into(),
+            reasoning_effort: None,
+            hide_reasoning: false,
+            accent_color: UiColor::WHITE,
+            selection_color: UiColor::WHITE,
+            status_bar: Default::default(),
+            status_bar_draft: None,
+            color_preview: None,
+            show_scroll_bar: true,
+            scroll_bar_enabled: true,
+            scroll_bar_auto_hide: false,
+            bell: false,
+            scroll_bar_idle_ticks: 0,
+            scroll_geometry: None,
+            follow: Default::default(),
+            scroll_bar_drag: None,
+            transcript_row_entries: Vec::new(),
+            tool_click_press: None,
+            copy_toast_ticks: 0,
+            spinner_tick: 0,
+            turn_started: None,
+            context_tokens: 0,
+            context_window: 100,
+            usage: UsageSummary::default(),
+            activity: String::new(),
+            scroll_offset: 0,
+            queued_inputs: std::collections::VecDeque::new(),
+            pending_steers: std::collections::VecDeque::new(),
+            queue_paused: false,
+            continue_offered: false,
+            active_goal: None,
+            goal_running: false,
+            active_plan: None,
+            plan_draft: false,
+            pending_plan_implementation: false,
+            question: None,
+            pending_actions: std::collections::VecDeque::new(),
+            completions: Vec::new(),
+            completion_index: 0,
+            completion_filter: None,
+            file_index: super::files::FileIndex::default(),
+            picker: None,
+            connection: None,
+            model_refresh: None,
+            subagent_manager: SubagentManager::new("test".into(), 3),
+            subagent_snapshots: Vec::new(),
+            subagent_tokens: 0,
+            subagents_enabled: false,
+            subagent_view: None,
+            background_processes: BackgroundProcessManager::default(),
+            background_active_count: 0,
+            process_view: None,
+            git_view: None,
+            git_job: None,
+            git_init: None,
+            render_cache: super::render::RenderCache::default(),
+            welcome: Default::default(),
+        }
+    }
+
+    pub(super) fn from_agent(agent: &Agent) -> Self {
+        let completions = command_completions(agent);
+        let mut state = Self {
             transcript: Transcript::from_messages(agent.messages()),
             tools_expanded: false,
             model: agent.model().to_string(),
@@ -234,7 +304,7 @@ impl ViewState {
             pending_plan_implementation: false,
             question: None,
             pending_actions: std::collections::VecDeque::new(),
-            completions: command_completions(agent),
+            completions,
             completion_index: 0,
             completion_filter: None,
             file_index: super::files::FileIndex::default(),
@@ -253,7 +323,25 @@ impl ViewState {
             background_active_count: agent.background_processes().active_count(),
             process_view: None,
             render_cache: super::render::RenderCache::default(),
+            welcome: Default::default(),
+        };
+        state.refresh_welcome(agent);
+        state
+    }
+
+    /// Gathers the welcome details only while the transcript is empty, since
+    /// they cost session-list and instruction-file reads. Callers that can
+    /// empty the transcript without rebuilding the view (`/undo`) call this.
+    pub(super) fn refresh_welcome(&mut self, agent: &Agent) {
+        if !self.transcript.is_empty() {
+            return;
         }
+        let skill_count = self
+            .completions
+            .iter()
+            .filter(|completion| completion.command.starts_with("/skill:"))
+            .count();
+        self.welcome = super::render::WelcomeDetails::gather(agent, skill_count);
     }
 
     pub(super) fn refresh_completions(&mut self, agent: &Agent) {
@@ -320,6 +408,15 @@ impl ViewState {
         }
     }
 
+    /// Starts the elapsed and quiet clocks for an agent job. Jobs that begin
+    /// without a typed message (resumed goals, `/continue`, subagent
+    /// results) would otherwise inherit the quiet time since the last turn.
+    pub(super) fn begin_turn(&mut self, activity: &str) {
+        self.activity = activity.into();
+        self.turn_started = Some(std::time::Instant::now());
+        self.transcript.mark_progress();
+    }
+
     /// Stops previewing while keeping the colors currently on screen, which
     /// are the ones just written to the configuration.
     pub(super) fn commit_color_preview(&mut self) {
@@ -380,6 +477,7 @@ impl ViewState {
                 // the tool, so close the live segment here too; otherwise
                 // the spinner keeps ticking until ToolStart.
                 self.transcript.close_streaming_reasoning();
+                self.transcript.mark_progress();
                 if !crate::tools::is_private_tool_name(&name) {
                     self.activity = match name.as_str() {
                         "write_file" => "preparing write".into(),
@@ -400,7 +498,10 @@ impl ViewState {
                     crate::error::truncate(&error, 80)
                 );
             }
-            Update::Compacting => self.activity = "compacting conversation".into(),
+            Update::Compacting => {
+                self.transcript.mark_progress();
+                self.activity = "compacting conversation".into();
+            }
             Update::Compacted { replaced } => {
                 self.activity.clear();
                 self.transcript

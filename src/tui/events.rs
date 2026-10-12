@@ -87,6 +87,14 @@ impl<R: Read> EventReader<R> {
         }
     }
 
+    /// A reader that decodes `pending` before anything new from `input`.
+    pub(super) fn with_pending(input: R, pending: &[u8]) -> Self {
+        Self {
+            input,
+            pending: pending.iter().copied().collect(),
+        }
+    }
+
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
@@ -123,6 +131,7 @@ impl<R: Read> EventReader<R> {
         };
         match next {
             b'[' => self.read_csi(),
+            b']' => self.read_osc(),
             b'O' => {
                 let key = match self.read_byte()? {
                     Some(b'A') => Key::Up,
@@ -226,6 +235,34 @@ impl<R: Read> EventReader<R> {
             _ => return Ok(Event::Tick),
         };
         Ok(Event::Key(key))
+    }
+
+    /// Discards an operating-system-command reply such as `ESC ] 11 ; rgb:…`
+    /// ended by BEL or `ESC \`, which a terminal can send after the startup
+    /// background query gave up waiting. A reply always starts with a number,
+    /// so Alt+] followed by anything else still types `]`.
+    fn read_osc(&mut self) -> io::Result<Event> {
+        match self.read_byte()? {
+            Some(digit) if digit.is_ascii_digit() => {}
+            Some(other) => {
+                self.pending.push_front(other);
+                return Ok(Event::Key(Key::Char(']')));
+            }
+            None => return Ok(Event::Key(Key::Char(']'))),
+        }
+        for _ in 0..4096 {
+            match self.read_byte()? {
+                Some(0x07) | None => break,
+                Some(0x1b) => {
+                    if self.pending.front() == Some(&b'\\') {
+                        self.pending.pop_front();
+                    }
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(Event::Tick)
     }
 
     fn read_paste(&mut self) -> io::Result<Event> {
@@ -634,6 +671,30 @@ mod tests {
         assert!(reader.has_pending());
         assert_eq!(reader.read_event()?, Event::MouseScroll(3));
         assert!(!reader.has_pending());
+        Ok(())
+    }
+
+    #[test]
+    fn background_replies_are_discarded_and_keys_typed_around_them_kept() -> std::io::Result<()> {
+        let typed = b"a\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b[?62;22cb";
+        let late = b"\x1b]11;rgb:0/0/0\x07c\x1b]x";
+        let mut reader = EventReader::with_pending(Cursor::new(late), typed);
+        let mut keys = Vec::new();
+        for _ in 0..10 {
+            if let Event::Key(key) = reader.read_event()? {
+                keys.push(key);
+            }
+        }
+        assert_eq!(
+            keys,
+            [
+                Key::Char('a'),
+                Key::Char('b'),
+                Key::Char('c'),
+                Key::Char(']'),
+                Key::Char('x'),
+            ]
+        );
         Ok(())
     }
 

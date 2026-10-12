@@ -35,6 +35,31 @@ pub enum ReasoningKind {
     Full,
 }
 
+impl ReasoningKind {
+    /// Splits summary reasoning into its paragraphs, each joined onto one
+    /// line. Summaries arrive as blank-line-separated sections.
+    pub fn summary_parts(content: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        for line in content.lines().map(str::trim) {
+            if line.is_empty() {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            } else {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(line);
+            }
+        }
+        if !current.is_empty() {
+            parts.push(current);
+        }
+        parts
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reasoning {
     pub kind: ReasoningKind,
@@ -207,10 +232,11 @@ impl Message {
         tokens.saturating_add((self.images.len() as u64).saturating_mul(4096))
     }
 
-    pub fn user(content: impl Into<String>) -> Message {
+    /// A plain text message; the other constructors add their parts.
+    fn text(role: Role, content: String) -> Message {
         Message {
-            role: Role::User,
-            content: content.into(),
+            role,
+            content,
             images: Vec::new(),
             tool_calls: Vec::new(),
             reasoning: Vec::new(),
@@ -224,37 +250,21 @@ impl Message {
         }
     }
 
+    pub fn user(content: impl Into<String>) -> Message {
+        Self::text(Role::User, content.into())
+    }
+
     pub fn user_input(input: TurnInput) -> Message {
         Message {
-            role: Role::User,
-            content: input.text,
             images: input.images,
-            tool_calls: Vec::new(),
-            reasoning: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-            is_error: false,
-            provider_data: Vec::new(),
-            provider_data_model: None,
-            subagent_results: Vec::new(),
-            control: None,
+            ..Self::text(Role::User, input.text)
         }
     }
 
     pub fn assistant(content: String, tool_calls: Vec<ToolCall>) -> Message {
         Message {
-            role: Role::Assistant,
-            content,
-            images: Vec::new(),
             tool_calls,
-            reasoning: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-            is_error: false,
-            provider_data: Vec::new(),
-            provider_data_model: None,
-            subagent_results: Vec::new(),
-            control: None,
+            ..Self::text(Role::Assistant, content)
         }
     }
 
@@ -275,18 +285,11 @@ impl Message {
         is_error: bool,
     ) -> Message {
         Message {
-            role: Role::Tool,
-            content,
             images,
-            tool_calls: Vec::new(),
-            reasoning: Vec::new(),
             tool_call_id: Some(call_id.into()),
             tool_name: Some(name.into()),
             is_error,
-            provider_data: Vec::new(),
-            provider_data_model: None,
-            subagent_results: Vec::new(),
-            control: None,
+            ..Self::text(Role::Tool, content)
         }
     }
 
@@ -332,18 +335,8 @@ impl Message {
             ));
         }
         Message {
-            role: Role::User,
-            content,
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            reasoning: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-            is_error: false,
-            provider_data: Vec::new(),
-            provider_data_model: None,
             subagent_results: results,
-            control: None,
+            ..Self::text(Role::User, content)
         }
     }
 }

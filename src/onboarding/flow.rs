@@ -657,14 +657,7 @@ mod tests {
 
     #[test]
     fn trusted_project_providers_appear_in_setup_catalog() -> Result<(), Error> {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "yawl-setup-project-provider-{}-{nonce}",
-            std::process::id()
-        ));
+        let root = crate::test_support::unique_temp_dir("setup-project-provider");
         let project = root.join("project/.yawl");
         std::fs::create_dir_all(&project)?;
         std::fs::write(
@@ -703,15 +696,7 @@ mod tests {
 
         config.providers.insert(
             "ollama".into(),
-            crate::config::ProviderConfig {
-                base_url: "http://remote-host:11434/v1".into(),
-                api: "openai-completions".into(),
-                api_key: None,
-                auth_header: None,
-                headers: Default::default(),
-                models: Vec::new(),
-                compat: Default::default(),
-            },
+            crate::config::ProviderConfig::test_openai_compatible("http://remote-host:11434/v1"),
         );
 
         assert_eq!(

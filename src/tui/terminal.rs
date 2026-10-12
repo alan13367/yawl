@@ -1,6 +1,6 @@
 //! Raw terminal lifecycle, frame output, selection, and clipboard support.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 
 use base64::Engine as _;
 
@@ -11,7 +11,7 @@ use super::events::{MouseEvent, MouseKind};
 use super::input::Editor;
 use super::remote::{self, Remote, Snapshot};
 use super::render::{FrameImage, HIDDEN_CURSOR, ImageSupport, build_frame_with_images};
-use super::{ViewState, markdown};
+use super::{ViewState, markdown, theme};
 
 pub(super) struct Terminal {
     raw_mode: RawMode,
@@ -210,6 +210,33 @@ impl Terminal {
         Ok(terminal)
     }
 
+    /// Asks the terminal whether its background is light. The answer is
+    /// `None` when the terminal does not report a color within half a
+    /// second. Everything read is returned too, so keys typed meanwhile
+    /// reach the input reader, which discards the replies themselves,
+    /// including ones that arrive after the deadline.
+    pub(super) fn query_light_background(&mut self) -> (Option<bool>, Vec<u8>) {
+        if self.stdout.write_all(theme::BACKGROUND_QUERY).is_err() || self.stdout.flush().is_err() {
+            return (None, Vec::new());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut input = remote::FdInput::stdin();
+        let mut reply = Vec::new();
+        let mut buffer = [0_u8; 256];
+        while !theme::has_device_attributes(&reply)
+            && reply.len() < 4096
+            && std::time::Instant::now() < deadline
+        {
+            // Raw mode returns from an idle read after 100 ms.
+            match input.read(&mut buffer) {
+                Ok(read) => reply.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        (theme::reported_background_is_light(&reply), reply)
+    }
+
     pub(super) fn invalidate(&mut self) {
         self.last_frame.clear();
         self.last_base_frame.clear();
@@ -337,7 +364,7 @@ impl Terminal {
     pub(super) fn draw(&mut self, state: &mut ViewState, editor: &Editor) -> Result<(), Error> {
         let remote = self.remote.snapshot();
         if remote.address.is_some() {
-            self.remote.update_title(state);
+            self.remote.update_page(state);
         }
         let ((columns, rows), to_remote) = self.sync_remote(&remote)?;
         if self.last_size != (columns, rows) {

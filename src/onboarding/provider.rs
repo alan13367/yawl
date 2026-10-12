@@ -453,14 +453,6 @@ mod tests {
     }
 
     fn test_provider(base_url: &str) -> crate::config::ProviderConfig {
-        crate::config::ProviderConfig {
-            base_url: base_url.into(),
-            api: "openai-completions".into(),
-            api_key: None,
-            auth_header: None,
-            headers: Default::default(),
-            models: Vec::new(),
-            compat: Default::default(),
-        }
+        crate::config::ProviderConfig::test_openai_compatible(base_url)
     }
 }

@@ -11,11 +11,10 @@ fn user_messages_render_in_a_padded_panel() {
     let plain = markdown::strip_ansi(&rendered.join("\n"));
 
     assert_eq!(rendered.len(), 4);
-    assert!(
-        rendered[..3]
-            .iter()
-            .all(|line| line.starts_with(USER_BACKGROUND) && markdown::visible_width(line) == 24)
-    );
+    assert!(rendered[..3].iter().all(|line| {
+        line.starts_with(super::theme::palette().user_background)
+            && markdown::visible_width(line) == 24
+    }));
     assert!(plain.contains(" hello"));
     assert!(!plain.contains("You"));
 }
@@ -51,63 +50,8 @@ fn frame_keeps_input_and_status_pinned() {
             "hello".into(),
             Vec::new(),
         )]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
-        show_scroll_bar: true,
-        scroll_bar_enabled: true,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
         context_tokens: 12,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: RenderCache::default(),
+        ..ViewState::test_default()
     };
     let editor = Editor::default();
     let (frame, cursor) = build_frame(&mut state, &editor, 40, 12);
@@ -233,16 +177,37 @@ fn input_box_moves_complete_words_to_the_next_row() {
 }
 
 #[test]
-fn busy_input_box_hints_that_tab_queues_the_message() {
+fn busy_input_box_hints_what_enter_tab_and_esc_do() {
     let mut state = empty_session_state();
     state.turn_started = Some(std::time::Instant::now());
+    let bottom_border = |state: &mut ViewState, editor: &Editor, columns: usize| {
+        let (frame, _) = build_frame(state, editor, columns, 12);
+        frame
+            .iter()
+            .map(|line| markdown::strip_ansi(line))
+            .find(|line| line.starts_with('└'))
+            .expect("composer bottom border")
+    };
     let mut editor = Editor::default();
+    let empty = bottom_border(&mut state, &editor, 60);
+    assert!(empty.ends_with("─ Esc stops ┘"), "{empty}");
+
     editor.paste("follow up");
+    let typed = bottom_border(&mut state, &editor, 60);
+    assert!(
+        typed.ends_with("─ Enter steers · Tab queues · Esc stops ┘"),
+        "{typed}"
+    );
+    let narrow = bottom_border(&mut state, &editor, 30);
+    assert!(
+        narrow.ends_with("─ Enter steers · Tab queues ┘"),
+        "{narrow}"
+    );
+    assert_eq!(markdown::visible_width(&narrow), 30);
 
-    let (frame, _) = build_frame(&mut state, &editor, 40, 12);
-    let plain = markdown::strip_ansi(&frame.join("\n"));
-
-    assert!(plain.contains("Tab queues"), "{plain}");
+    state.turn_started = None;
+    let idle = bottom_border(&mut state, &editor, 60);
+    assert!(!idle.contains("Esc"), "{idle}");
 }
 
 #[test]
@@ -703,63 +668,8 @@ fn reasoning_has_one_blank_line_on_each_side() {
 fn loading_state_appears_under_user_prompt_and_animates() {
     let mut state = ViewState {
         transcript: Transcript::from_messages(&[crate::provider::Message::user("hello")]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
-        show_scroll_bar: true,
-        scroll_bar_enabled: true,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
         activity: "sending".into(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: RenderCache::default(),
+        ..ViewState::test_default()
     };
 
     let loading = render_loading_state(&state, 80).expect("loading state should be present");
@@ -790,7 +700,7 @@ fn waiting_returns_when_a_visible_response_goes_quiet() {
 
     state
         .transcript
-        .set_last_model_activity(std::time::Instant::now() - super::render::MODEL_STREAM_STALL);
+        .set_last_progress(std::time::Instant::now() - super::render::MODEL_STREAM_STALL);
     let loading = render_loading_state(&state, 80).expect("a quiet stream should show waiting");
     assert!(markdown::strip_ansi(&loading).contains("Waiting…"));
 
@@ -813,7 +723,7 @@ fn quiet_reasoning_keeps_only_the_thinking_spinner() {
     assert_eq!(state.activity, "reasoning");
     state
         .transcript
-        .set_last_model_activity(std::time::Instant::now() - super::render::MODEL_STREAM_STALL);
+        .set_last_progress(std::time::Instant::now() - super::render::MODEL_STREAM_STALL);
     assert!(
         render_loading_state(&state, 80).is_none(),
         "the live thinking tag already animates between summary bursts"
@@ -829,66 +739,75 @@ fn quiet_reasoning_keeps_only_the_thinking_spinner() {
 }
 
 #[test]
+fn stalled_waiting_counts_the_quiet_time_from_the_left_edge() {
+    let mut state = overflow_state();
+    state.transcript.push_user("hello".into());
+    state.activity = "sending".into();
+    let fresh = markdown::strip_ansi(&render_loading_state(&state, 80).expect("waiting"));
+    assert_eq!(fresh.trim_end(), "⠋ Waiting…", "no timer before a stall");
+
+    state
+        .transcript
+        .set_last_progress(std::time::Instant::now() - std::time::Duration::from_secs(12));
+    let stalled = markdown::strip_ansi(&render_loading_state(&state, 80).expect("waiting"));
+    assert_eq!(stalled.trim_end(), "⠋ Waiting… 12s");
+
+    state.apply(Update::Retrying {
+        attempt: 1,
+        delay_ms: 1000,
+        error: "stream stalled".into(),
+    });
+    let retry = markdown::strip_ansi(&render_loading_state(&state, 80).expect("retry"));
+    assert!(!retry.contains("12s"), "a retry shows its own countdown");
+}
+
+#[test]
+fn a_turn_without_a_typed_message_starts_with_a_fresh_quiet_timer() {
+    let mut state = overflow_state();
+    state
+        .transcript
+        .set_last_progress(std::time::Instant::now() - std::time::Duration::from_secs(300));
+
+    state.begin_turn("sending");
+
+    let loading = render_loading_state(&state, 80).map(|line| markdown::strip_ansi(&line));
+    assert!(
+        loading.as_deref().is_none_or(|line| !line.contains("5m")),
+        "the last turn's quiet time leaked into {loading:?}"
+    );
+}
+
+#[test]
+fn stalled_thinking_tag_shows_how_long_the_stream_was_quiet() {
+    let mut state = overflow_state();
+    state.apply(Update::Transcript(TranscriptEvent::ReasoningDelta {
+        kind: ReasoningKind::Summary,
+        text: "Inspecting the request".into(),
+    }));
+    let editor = Editor::default();
+    let tag_row = |state: &mut ViewState| {
+        let (frame, _) = build_frame(state, &editor, 60, 12);
+        frame
+            .iter()
+            .map(|line| markdown::strip_ansi(line))
+            .find(|line| line.contains("Thinking"))
+            .expect("thinking tag on screen")
+    };
+    assert!(!tag_row(&mut state).contains("quiet"));
+
+    state
+        .transcript
+        .set_last_progress(std::time::Instant::now() - std::time::Duration::from_secs(75));
+    assert!(tag_row(&mut state).starts_with("⠋ Thinking · quiet 1m 15s"));
+}
+
+#[test]
 fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
     let mut state = ViewState {
         transcript: Transcript::from_messages(&[crate::provider::Message::user("hello")]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
         hide_reasoning: true,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
-        show_scroll_bar: true,
-        scroll_bar_enabled: true,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
         activity: "sending".into(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: RenderCache::default(),
+        ..ViewState::test_default()
     };
 
     // Hidden reasoning delta arrives: loading state stays visible
@@ -964,66 +883,7 @@ fn skill_loading_uses_a_specific_activity_label() {
 
 #[test]
 fn loading_state_ignores_status_activity() {
-    let mut state = ViewState {
-        transcript: Transcript::from_messages(&[]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
-        show_scroll_bar: true,
-        scroll_bar_enabled: true,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: RenderCache::default(),
-    };
+    let mut state = ViewState::test_default();
     state.notice("Yawl is ready. Type /help for commands.");
 
     for activity in [
@@ -1048,63 +908,7 @@ fn overflow_state() -> ViewState {
         .collect::<Vec<_>>();
     ViewState {
         transcript: Transcript::from_messages(&messages),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
-        show_scroll_bar: true,
-        scroll_bar_enabled: true,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: RenderCache::default(),
+        ..ViewState::test_default()
     }
 }
 
@@ -1372,63 +1176,7 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
             "short".into(),
             Vec::new(),
         )]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
-        show_scroll_bar: true,
-        scroll_bar_enabled: true,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: RenderCache::default(),
+        ..ViewState::test_default()
     };
     let editor = Editor::default();
     let (frame, _) = build_frame(&mut state, &editor, 40, 12);
@@ -1598,69 +1346,15 @@ fn render_cache_preserves_and_updates_incremental_entries() {
 #[test]
 fn command_menu_lists_every_match_and_scrolls_with_the_selection() {
     let mut state = ViewState {
-        transcript: Transcript::from_messages(&[]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
         show_scroll_bar: false,
         scroll_bar_enabled: false,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
         completions: (1..=12)
             .map(|n| Completion {
                 command: format!("/cmd{n:02}"),
                 description: format!("Command {n}"),
             })
             .collect(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: RenderCache::default(),
+        ..ViewState::test_default()
     };
     let mut editor = Editor::default();
     editor.paste("/");
@@ -1767,68 +1461,14 @@ fn selected_row_re_arms_the_highlight_after_embedded_resets() {
 #[test]
 fn mention_menu_lists_matching_files_below_the_input_box() {
     let mut state = ViewState {
-        transcript: Transcript::from_messages(&[]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
         show_scroll_bar: false,
         scroll_bar_enabled: false,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
         file_index: crate::tui::files::FileIndex::with_entries(vec![
             "src/tui/render.rs".into(),
             "src/config.rs".into(),
             "README.md".into(),
         ]),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: RenderCache::default(),
+        ..ViewState::test_default()
     };
     let mut editor = Editor::default();
     editor.paste("look at @rend");
@@ -2362,64 +2002,9 @@ fn planning_turn_labels_the_composer_border() {
 
 fn empty_session_state() -> ViewState {
     ViewState {
-        transcript: Transcript::from_messages(&[]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
         show_scroll_bar: false,
         scroll_bar_enabled: false,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: RenderCache::default(),
+        ..ViewState::test_default()
     }
 }
 
@@ -2550,6 +2135,80 @@ fn welcome_types_the_wordmark_then_the_hint() {
         !done_plain.contains('|'),
         "the typing caret should disappear once the wordmark is finished"
     );
+}
+
+#[test]
+fn welcome_lists_project_details_after_the_hint_types() {
+    let mut state = empty_session_state();
+    state.welcome = super::render::WelcomeDetails::new(
+        "~/Projects/yawl · main",
+        &["AGENTS.md", "3 skills", "2 earlier sessions · /resume"],
+    );
+    let editor = Editor::default();
+    let plain = |state: &mut ViewState, columns: usize| {
+        let (frame, _) = build_frame(state, &editor, columns, 24);
+        frame
+            .iter()
+            .map(|line| markdown::strip_ansi(line).trim().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    state.spinner_tick = 4;
+    assert!(
+        !plain(&mut state, 80)
+            .iter()
+            .any(|line| line.contains("yawl · main"))
+    );
+
+    state.spinner_tick = WELCOME_ANIMATION_TICKS;
+    let wide = plain(&mut state, 80);
+    let hint = wide
+        .iter()
+        .position(|line| line == "Type /help for commands.")
+        .expect("hint");
+    assert_eq!(wide[hint + 2], "~/Projects/yawl · main");
+    assert_eq!(
+        wide[hint + 3],
+        "AGENTS.md · 3 skills · 2 earlier sessions · /resume"
+    );
+
+    let narrow = plain(&mut state, 40);
+    assert!(
+        narrow.contains(&"AGENTS.md · 3 skills".to_string()),
+        "{narrow:?}"
+    );
+    assert!(narrow.contains(&"2 earlier sessions · /resume".to_string()));
+}
+
+#[test]
+fn light_theme_keeps_a_white_accent_and_tool_cards_readable() {
+    super::theme::use_light(true);
+    let mut state = overflow_state();
+    state.accent_color = UiColor::WHITE;
+    state.apply(Update::Transcript(TranscriptEvent::ToolStart {
+        name: "shell".into(),
+        args: r#"{"command":"ls"}"#.into(),
+    }));
+    state.apply(Update::Transcript(TranscriptEvent::ToolEnd {
+        name: "shell".into(),
+        output: "a.txt".into(),
+        images: Vec::new(),
+        is_error: false,
+    }));
+    let (frame, _) = build_frame(&mut state, &Editor::default(), 60, 16);
+    let joined = frame.join("\n");
+    super::theme::use_light(false);
+
+    let border = frame
+        .iter()
+        .find(|line| markdown::strip_ansi(line).starts_with('┌'))
+        .expect("composer border");
+    assert!(!border.contains("38;2;238;238;238"), "{border:?}");
+    assert!(
+        joined.contains("\x1b[48;2;228;241;226m"),
+        "light success card"
+    );
+    assert!(!joined.contains("\x1b[1;97m"), "no bright-white headers");
 }
 
 #[test]

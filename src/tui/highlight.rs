@@ -3,15 +3,9 @@
 //! unknown languages.
 
 const RESET: &str = "\x1b[0m";
-// Truecolor tuned for the dark code background: basic ANSI blue and dim
-// styles fall below readable contrast in many terminal themes.
-pub(super) const KEYWORD: &str = "\x1b[1;38;2;198;160;246m";
-pub(super) const STRING: &str = "\x1b[38;2;166;209;137m";
-pub(super) const NUMBER: &str = "\x1b[38;2;239;159;118m";
-pub(super) const COMMENT: &str = "\x1b[3;38;2;140;146;160m";
-pub(super) const LITERAL: &str = "\x1b[38;2;133;193;220m";
 
 pub fn render_line(language: &str, line: &str) -> String {
+    let palette = super::theme::palette();
     let language = normalize_language(language);
     let line = sanitize(line);
     if language.is_empty() || !is_supported(language) {
@@ -27,7 +21,7 @@ pub fn render_line(language: &str, line: &str) -> String {
         {
             styled(
                 &mut output,
-                COMMENT,
+                palette.comment,
                 &chars[index..].iter().collect::<String>(),
             );
             break;
@@ -35,7 +29,7 @@ pub fn render_line(language: &str, line: &str) -> String {
         if language == "html" && starts_with(&chars, index, "<!--") {
             styled(
                 &mut output,
-                COMMENT,
+                palette.comment,
                 &chars[index..].iter().collect::<String>(),
             );
             break;
@@ -47,7 +41,7 @@ pub fn render_line(language: &str, line: &str) -> String {
         {
             styled(
                 &mut output,
-                COMMENT,
+                palette.comment,
                 &chars[index..].iter().collect::<String>(),
             );
             break;
@@ -71,7 +65,7 @@ pub fn render_line(language: &str, line: &str) -> String {
             }
             styled(
                 &mut output,
-                STRING,
+                palette.string,
                 &chars[start..index].iter().collect::<String>(),
             );
         } else if character.is_ascii_digit() {
@@ -85,7 +79,7 @@ pub fn render_line(language: &str, line: &str) -> String {
             }
             styled(
                 &mut output,
-                NUMBER,
+                palette.number,
                 &chars[start..index].iter().collect::<String>(),
             );
         } else if is_identifier_start(character) {
@@ -96,9 +90,9 @@ pub fn render_line(language: &str, line: &str) -> String {
             }
             let token: String = chars[start..index].iter().collect();
             if is_keyword(language, &token) {
-                styled(&mut output, KEYWORD, &token);
+                styled(&mut output, palette.keyword, &token);
             } else if is_literal(&token) {
-                styled(&mut output, LITERAL, &token);
+                styled(&mut output, palette.literal, &token);
             } else {
                 output.push_str(&token);
             }
@@ -418,9 +412,18 @@ mod tests {
     #[test]
     fn rust_keywords_strings_and_comments_are_styled() {
         let rendered = render_line("rust", "let name = \"yawl\"; // note");
-        assert!(rendered.contains(&format!("{KEYWORD}let{RESET}")));
-        assert!(rendered.contains(&format!("{STRING}\"yawl\"{RESET}")));
-        assert!(rendered.contains(&format!("{COMMENT}// note{RESET}")));
+        assert!(rendered.contains(&format!(
+            "{}let{RESET}",
+            super::super::theme::palette().keyword
+        )));
+        assert!(rendered.contains(&format!(
+            "{}\"yawl\"{RESET}",
+            super::super::theme::palette().string
+        )));
+        assert!(rendered.contains(&format!(
+            "{}// note{RESET}",
+            super::super::theme::palette().comment
+        )));
     }
 
     #[test]

@@ -14,14 +14,15 @@ pub(super) enum Alignment {
     Right,
 }
 
-pub(super) struct Column {
+#[derive(Clone, Copy)]
+struct Column {
     header: &'static str,
     width: usize,
     alignment: Alignment,
 }
 
 impl Column {
-    pub(super) const fn new(header: &'static str, width: usize, alignment: Alignment) -> Self {
+    const fn new(header: &'static str, width: usize, alignment: Alignment) -> Self {
         Self {
             header,
             width,
@@ -30,7 +31,180 @@ impl Column {
     }
 }
 
-pub(super) fn render_header(columns: &[Column], width: usize) -> String {
+/// A table column and the item field `F` that fills it.
+pub(super) struct FieldColumn<F> {
+    field: F,
+    column: Column,
+}
+
+impl<F> FieldColumn<F> {
+    pub(super) const fn new(
+        field: F,
+        header: &'static str,
+        width: usize,
+        alignment: Alignment,
+    ) -> Self {
+        Self {
+            field,
+            column: Column::new(header, width, alignment),
+        }
+    }
+}
+
+/// The chrome around a dashboard table.
+pub(super) struct TableChrome<'a> {
+    pub(super) title: &'a str,
+    pub(super) summary: String,
+    /// Row shown when there are no items.
+    pub(super) empty: &'a str,
+    pub(super) hint: &'a str,
+    pub(super) accent: UiColor,
+    pub(super) selection: UiColor,
+}
+
+/// Renders `items` as a selectable table in a centered panel, scrolled so
+/// the `selected` row stays visible. `columns` lays out fields for the
+/// panel's inner width; `cell` fills one field of one item, knowing
+/// whether that item is selected.
+pub(super) fn render_table<T, F: Copy>(
+    items: &[T],
+    selected: Option<usize>,
+    chrome: TableChrome<'_>,
+    columns: impl FnOnce(usize) -> Vec<FieldColumn<F>>,
+    mut cell: impl FnMut(&T, F, bool) -> String,
+    screen_columns: usize,
+    screen_rows: usize,
+) -> Vec<String> {
+    let panel = Panel::new(screen_columns, screen_rows, items.len());
+    let capacity = panel.capacity();
+    let width = panel.inner_width();
+    let start = selected
+        .unwrap_or(0)
+        .saturating_sub(capacity.saturating_sub(1));
+    let fields = columns(width);
+    let table = fields.iter().map(|field| field.column).collect::<Vec<_>>();
+    let header = render_header(&table, width);
+    let mut rows = Vec::with_capacity(capacity);
+    for (index, item) in items.iter().enumerate().skip(start).take(capacity) {
+        let is_selected = selected == Some(index);
+        let cells = fields
+            .iter()
+            .map(|field| cell(item, field.field, is_selected))
+            .collect::<Vec<_>>();
+        rows.push(PanelRow {
+            content: render_row(&table, &cells, width),
+            selected: is_selected,
+        });
+    }
+    if items.is_empty() {
+        rows.push(PanelRow {
+            content: markdown::fit_width(chrome.empty, width),
+            selected: false,
+        });
+    }
+    panel.render(PanelContent {
+        title: chrome.title,
+        summary: &chrome.summary,
+        header: &header,
+        rows: &rows,
+        hint: chrome.hint,
+        accent: chrome.accent,
+        selection: chrome.selection,
+    })
+}
+
+/// Scroll position of a live view whose content keeps growing. While
+/// pinned, the window holds its place in the content so output arriving
+/// below does not drag it along; scrolling back down to where the reader
+/// left the tail resumes following.
+///
+/// Pins hold absolute line indices, so when bounded content starts
+/// dropping lines at the front, a pinned window shows progressively later
+/// content and releases once it reaches the bottom.
+#[derive(Default)]
+pub(super) struct PinnedScroll {
+    /// Absolute first visible line while pinned; `None` follows the tail.
+    pinned: Option<usize>,
+    /// Window top captured when the pin started; reaching it again
+    /// releases the pin even if the tail has moved on.
+    pin_floor: usize,
+    /// First visible line of the last placed window; anchors new pins.
+    window_top: usize,
+}
+
+impl PinnedScroll {
+    pub(super) fn up(&mut self, amount: usize) {
+        let top = match self.pinned {
+            Some(top) => top,
+            None => {
+                self.pin_floor = self.window_top;
+                self.window_top
+            }
+        };
+        self.pinned = Some(top.saturating_sub(amount));
+    }
+
+    pub(super) fn down(&mut self, amount: usize) {
+        // Already at the live tail: there is nothing further down to show.
+        if let Some(top) = self.pinned {
+            self.pinned = Some(top.saturating_add(amount));
+        }
+    }
+
+    pub(super) fn follow(&mut self) {
+        self.pinned = None;
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_pinned(&self) -> bool {
+        self.pinned.is_some()
+    }
+
+    pub(super) fn window_top(&self) -> usize {
+        self.window_top
+    }
+
+    /// First visible line for `content_len` lines shown in `height` rows.
+    /// Back at (or past) the bottom the reader left, the view follows again.
+    pub(super) fn place(&mut self, content_len: usize, height: usize) -> usize {
+        let max_top = content_len.saturating_sub(height);
+        let top = match self.pinned.map(|pinned| pinned.min(max_top)) {
+            Some(top) if top < max_top && top < self.pin_floor => top,
+            _ => {
+                self.follow();
+                max_top
+            }
+        };
+        self.window_top = top;
+        top
+    }
+}
+
+/// Keeps a dashboard selection on the same item as rows come and go, and
+/// falls back to the nearest row when that item disappears.
+pub(super) fn reconcile_selection<T>(
+    items: &[T],
+    id: impl Fn(&T) -> &str,
+    selected_id: &mut Option<String>,
+    selected_index: &mut usize,
+) {
+    if items.is_empty() {
+        *selected_id = None;
+        *selected_index = 0;
+        return;
+    }
+    if let Some(index) = selected_id
+        .as_deref()
+        .and_then(|selected| items.iter().position(|item| id(item) == selected))
+    {
+        *selected_index = index;
+    } else {
+        *selected_index = (*selected_index).min(items.len() - 1);
+        *selected_id = Some(id(&items[*selected_index]).to_string());
+    }
+}
+
+fn render_header(columns: &[Column], width: usize) -> String {
     render_cells(
         columns,
         &columns
@@ -41,7 +215,7 @@ pub(super) fn render_header(columns: &[Column], width: usize) -> String {
     )
 }
 
-pub(super) fn render_row(columns: &[Column], cells: &[String], width: usize) -> String {
+fn render_row(columns: &[Column], cells: &[String], width: usize) -> String {
     debug_assert_eq!(columns.len(), cells.len());
     render_cells(columns, cells, width)
 }

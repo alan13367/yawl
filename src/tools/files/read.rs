@@ -567,7 +567,7 @@ mod tests {
         );
         assert!(!outcome.is_error, "{}", outcome.content);
         let mut content = outcome.content;
-        crate::tools::truncate_result(&mut content);
+        crate::tools::registry::truncate_result(&mut content);
         let (header, body) = content.split_once("\n\n").expect("page header and body");
         assert!(header.ends_with("EOF"));
         assert_eq!(body, "\0".repeat(MAX_PAGE_BYTES));

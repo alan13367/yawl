@@ -1,14 +1,26 @@
 //! Picker model, catalogs, and keyboard reducer.
 //!
 //! This facade owns the shared picker model and keyboard reducer. Private
-//! children build the settings and status-bar editor catalogs. TUI callers
-//! keep the entry points here.
+//! children build the settings, status-bar editor, model, and reasoning
+//! catalogs, edit single-line fields, and render pickers. TUI callers keep
+//! the entry points here.
 
 mod field;
+mod models;
+mod render;
 mod settings;
 mod status_bar;
 
 pub(super) use field::{FieldTarget, PickerField, field_picker};
+pub(super) use models::{
+    ModelRefreshJob, open_model_picker, open_model_picker_from_config, open_reasoning_picker,
+    open_subagent_model_picker, poll_model_picker, reasoning_picker, reasoning_picker_from_config,
+};
+#[cfg(test)]
+pub(super) use models::{
+    model_picker, refreshed_model_picker, refreshed_subagent_model_picker, subagent_model_picker,
+};
+pub(super) use render::render_picker;
 
 pub(super) use settings::{
     color_picker, open_settings_picker, selection_color_picker, settings_category_picker,
@@ -22,25 +34,17 @@ pub(super) use status_bar::{
 
 use crate::agent::Agent;
 use crate::config::{
-    Config, StatusBarFormat, StatusBarKind, StatusBarStyle, StatusBarVisibility, UiColor,
+    Config, StatusBarFormat, StatusBarKind, StatusBarStyle, StatusBarVisibility, Theme, UiColor,
     WebSearchProvider,
 };
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use super::ViewState;
 use super::connection::{ConnectEditField, ConnectStep};
 use super::events::Key;
 use super::input::{Editor, Submission};
-use super::markdown;
 use crate::onboarding::provider::{
     ConnectionActivation, ConnectionPlan, CredentialChoice, ProviderId,
 };
-
-/// Pickers narrower than this list labels only and show the selected
-/// description in a detail area.
-const COMPACT_PICKER_COLUMNS: usize = 60;
-/// Separator plus two wrapped description lines.
-const COMPACT_DETAIL_ROWS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SettingsCategory {
@@ -108,6 +112,7 @@ pub(super) enum SettingsItem {
     ReasoningDisplay,
     AccentColor,
     SelectionColor,
+    Theme,
     StatusBar,
     ScrollBar,
     ScrollBarAutoHide,
@@ -219,6 +224,7 @@ pub(super) enum PickerAction {
     SetScrollBar(bool),
     SetScrollBarAutoHide(bool),
     SetBell(bool),
+    SetTheme(Theme),
     ResumeSession(String),
     DeleteSession(String),
     /// Reopen the resume picker, restoring `selected` after a canceled delete.
@@ -327,14 +333,6 @@ pub(super) struct ActivePickers {
     pub(super) selection_color: Picker,
 }
 
-pub(super) struct ModelRefreshJob {
-    receiver: Receiver<Result<(), crate::error::Error>>,
-    config: Config,
-    selected_model: String,
-    save: bool,
-    subagent: bool,
-}
-
 impl ActivePickers {
     pub(super) fn from_agent(agent: &Agent) -> Self {
         Self {
@@ -365,352 +363,6 @@ impl ActivePickers {
         }
         self.accent_color = color_picker(config.accent_color);
         self.selection_color = selection_color_picker(config.selection_color);
-    }
-}
-
-pub(super) fn open_model_picker(agent: &Agent, state: &mut ViewState, save: bool) {
-    let selected_model = if save {
-        agent.config().model.as_deref().unwrap_or(agent.model())
-    } else {
-        agent.model()
-    };
-    open_model_picker_from_config(agent.config(), selected_model, state, save);
-}
-
-pub(super) fn open_model_picker_from_config(
-    config: &Config,
-    selected_model: &str,
-    state: &mut ViewState,
-    save: bool,
-) {
-    state.picker = Some(model_picker(config, selected_model, save));
-    start_model_refresh(config, selected_model, state, save, false);
-}
-
-pub(super) fn open_subagent_model_picker(config: &Config, state: &mut ViewState) {
-    state.picker = Some(subagent_model_picker(config, &config.subagent_model));
-    start_model_refresh(config, &config.subagent_model, state, true, true);
-}
-
-fn start_model_refresh(
-    config: &Config,
-    selected_model: &str,
-    state: &mut ViewState,
-    save: bool,
-    subagent: bool,
-) {
-    state.model_refresh = None;
-    if crate::provider::codex::credential_status(config)
-        != crate::provider::codex::CodexLoginStatus::LoggedIn
-    {
-        return;
-    }
-    if let Some(picker) = state.picker.as_mut() {
-        picker.hint.insert_str(0, REFRESHING_HINT);
-    }
-    let config_for_worker = config.clone();
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = crate::provider::codex::refresh_catalog(&config_for_worker).map(|_| ());
-        let _ = sender.send(result);
-    });
-    state.model_refresh = Some(ModelRefreshJob {
-        receiver,
-        config: config.clone(),
-        selected_model: selected_model.to_string(),
-        save,
-        subagent,
-    });
-}
-
-pub(super) fn poll_model_picker(state: &mut ViewState) -> bool {
-    let Some(job) = state.model_refresh.take() else {
-        return false;
-    };
-    let expected_title = if job.subagent {
-        "Default subagent model"
-    } else if job.save {
-        "Default model"
-    } else {
-        "Choose model"
-    };
-    let Some(picker) = state
-        .picker
-        .as_ref()
-        .filter(|picker| picker.title == expected_title)
-    else {
-        return false;
-    };
-    match job.receiver.try_recv() {
-        Err(TryRecvError::Empty) => {
-            state.model_refresh = Some(job);
-            false
-        }
-        Ok(Ok(())) => {
-            if picker.editing.is_none() {
-                state.picker = Some(if job.subagent {
-                    refreshed_subagent_model_picker(&job.config, &job.selected_model, picker)
-                } else {
-                    refreshed_model_picker(&job.config, &job.selected_model, job.save, picker)
-                });
-                true
-            } else {
-                clear_refreshing_hint(state);
-                true
-            }
-        }
-        Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
-            state.notice("Could not refresh Codex models. Showing the saved catalog.");
-            clear_refreshing_hint(state);
-            true
-        }
-    }
-}
-
-const REFRESHING_HINT: &str = "Refreshing Codex models…  ";
-
-fn clear_refreshing_hint(state: &mut ViewState) {
-    if let Some(picker) = state.picker.as_mut()
-        && let Some(hint) = picker.hint.strip_prefix(REFRESHING_HINT)
-    {
-        picker.hint = hint.to_string();
-    }
-}
-
-pub(super) fn refreshed_model_picker(
-    config: &Config,
-    selected_model: &str,
-    save: bool,
-    previous: &Picker,
-) -> Picker {
-    refresh_model_selection(previous, model_picker(config, selected_model, save))
-}
-
-pub(super) fn refreshed_subagent_model_picker(
-    config: &Config,
-    selected_model: &str,
-    previous: &Picker,
-) -> Picker {
-    refresh_model_selection(previous, subagent_model_picker(config, selected_model))
-}
-
-fn refresh_model_selection(previous: &Picker, mut updated: Picker) -> Picker {
-    let selected = previous
-        .items
-        .get(previous.selected)
-        .map(|item| &item.action);
-    if let Some(index) = updated
-        .items
-        .iter()
-        .position(|item| match (selected, &item.action) {
-            (Some(PickerAction::SaveModel(old)), PickerAction::SaveModel(new))
-            | (Some(PickerAction::SwitchModel(old)), PickerAction::SwitchModel(new)) => old == new,
-            (
-                Some(PickerAction::EditModel { save: old, .. }),
-                PickerAction::EditModel { save: new, .. },
-            ) => old == new,
-            (
-                Some(PickerAction::ApplySetting { argument: old, .. }),
-                PickerAction::ApplySetting { argument: new, .. },
-            ) => old == new,
-            (
-                Some(PickerAction::EditSetting { key: old, .. }),
-                PickerAction::EditSetting { key: new, .. },
-            ) => old == new,
-            _ => false,
-        })
-    {
-        updated.selected = index;
-    }
-    updated
-}
-
-pub(super) fn subagent_model_picker(config: &Config, selected_model: &str) -> Picker {
-    let location = Some(SettingsLocation {
-        category: SettingsCategory::Subagents,
-        item: SettingsItem::SubagentModel,
-    });
-    let mut models = crate::model::available_models(config);
-    if selected_model != "inherit" && !models.iter().any(|(id, _)| id == selected_model) {
-        models.push((selected_model.to_string(), "Current default".into()));
-    }
-    let mut items = vec![PickerItem {
-        label: "Inherit".into(),
-        description: "Use the active parent model".into(),
-        action: PickerAction::ApplySetting {
-            argument: "subagent_model inherit".into(),
-            location,
-        },
-    }];
-    items.extend(models.into_iter().map(|(id, label)| PickerItem {
-        label,
-        description: id.clone(),
-        action: PickerAction::ApplySetting {
-            argument: format!("subagent_model {id}"),
-            location,
-        },
-    }));
-    items.push(PickerItem {
-        label: "Use another model ID…".into(),
-        description: "Enter a model not listed above".into(),
-        action: PickerAction::EditSetting {
-            key: "subagent_model".into(),
-            initial: if selected_model == "inherit" {
-                String::new()
-            } else {
-                selected_model.to_string()
-            },
-            location,
-        },
-    });
-    let argument = format!("subagent_model {selected_model}");
-    let selected = items
-        .iter()
-        .position(|item| {
-            matches!(&item.action, PickerAction::ApplySetting { argument: value, .. } if value == &argument)
-        })
-        .unwrap_or(0);
-    Picker {
-        title: "Default subagent model".into(),
-        hint: "↑/↓ move  Enter select  Esc cancel".into(),
-        items,
-        selected,
-        editing: None,
-        parent: Some(PickerAction::OpenSettingsCategory {
-            category: SettingsCategory::Subagents,
-            selected: settings_item_index(SettingsCategory::Subagents, SettingsItem::SubagentModel),
-        }),
-    }
-}
-
-pub(super) fn model_picker(config: &Config, selected_model: &str, save: bool) -> Picker {
-    let mut models = crate::model::available_models(config);
-    if !models.iter().any(|(model, _)| model == selected_model) {
-        models.push((
-            selected_model.to_string(),
-            if save {
-                "Current default"
-            } else {
-                "Current model"
-            }
-            .into(),
-        ));
-    }
-    let mut items = models
-        .into_iter()
-        .map(|(model, name)| PickerItem {
-            label: name,
-            description: model.clone(),
-            action: if save {
-                PickerAction::SaveModel(model)
-            } else {
-                PickerAction::SwitchModel(model)
-            },
-        })
-        .collect::<Vec<_>>();
-    items.push(PickerItem {
-        label: "Use another model ID…".into(),
-        description: "Enter a model not listed above".into(),
-        action: PickerAction::EditModel {
-            save,
-            initial: String::new(),
-        },
-    });
-    let selected = items
-        .iter()
-        .position(|item| item.description == selected_model)
-        .unwrap_or(0);
-    Picker {
-        title: if save {
-            "Default model".into()
-        } else {
-            "Choose model".into()
-        },
-        hint: "↑/↓ move  Enter select  d remove  Esc cancel".into(),
-        items,
-        selected,
-        editing: None,
-        parent: save.then_some(PickerAction::OpenSettingsCategory {
-            category: SettingsCategory::Model,
-            selected: settings_item_index(SettingsCategory::Model, SettingsItem::DefaultModel),
-        }),
-    }
-}
-
-pub(super) fn open_reasoning_picker(agent: &Agent, state: &mut ViewState, save: bool) {
-    state.picker = Some(reasoning_picker(agent, save));
-}
-
-pub(super) fn reasoning_picker(agent: &Agent, save: bool) -> Picker {
-    reasoning_picker_from_config(agent.config(), agent.model(), save)
-}
-
-pub(super) fn reasoning_picker_from_config(
-    config: &Config,
-    model_spec: &str,
-    save: bool,
-) -> Picker {
-    let target = crate::model::ModelTarget::parse(model_spec, config);
-    let model = target.model();
-    let current = config.reasoning_effort.as_deref();
-    let mut items = vec![PickerItem {
-        label: "Provider default".into(),
-        description: "Do not request a specific effort".into(),
-        action: PickerAction::SetReasoning { effort: None, save },
-    }];
-    items.extend(
-        crate::model::reasoning_efforts(config, model_spec)
-            .iter()
-            .map(|effort| PickerItem {
-                label: title_case_effort(effort),
-                description: reasoning_description(effort).into(),
-                action: PickerAction::SetReasoning {
-                    effort: Some((*effort).to_string()),
-                    save,
-                },
-            }),
-    );
-    let selected = current
-        .and_then(|current| {
-            items.iter().position(|item| {
-                matches!(
-                    &item.action,
-                    PickerAction::SetReasoning { effort: Some(effort), .. } if effort == current
-                )
-            })
-        })
-        .unwrap_or(0);
-    Picker {
-        title: format!("Reasoning · {model}"),
-        hint: "↑/↓ move  Enter select  Esc cancel".into(),
-        items,
-        selected,
-        editing: None,
-        parent: save.then_some(PickerAction::OpenSettingsCategory {
-            category: SettingsCategory::Model,
-            selected: settings_item_index(SettingsCategory::Model, SettingsItem::ReasoningEffort),
-        }),
-    }
-}
-
-pub(super) fn title_case_effort(effort: &str) -> String {
-    let mut chars = effort.chars();
-    chars
-        .next()
-        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-        .unwrap_or_default()
-}
-
-pub(super) fn reasoning_description(effort: &str) -> &'static str {
-    match effort {
-        "minimal" => "Fastest, least deliberation",
-        "low" => "Fast with light deliberation",
-        "medium" => "Balanced speed and depth",
-        "high" => "More thorough reasoning",
-        "xhigh" => "Very thorough reasoning",
-        "max" => "Maximum available reasoning",
-        "ultra" => "Ultra reasoning effort",
-        _ => "",
     }
 }
 
@@ -1026,155 +678,5 @@ fn picker_cancel_action(picker: &Picker) -> Option<PickerAction> {
 pub(super) fn select_picker_item(state: &mut ViewState, selected: usize) {
     if let Some(picker) = state.picker.as_mut() {
         picker.selected = selected.min(picker.items.len().saturating_sub(1));
-    }
-}
-
-/// Draws the picker panel centered in `height` rows. Returns the lines and,
-/// while a field is focused, the cursor's row and column within them.
-pub(super) fn render_picker(
-    picker: &Picker,
-    editor: &Editor,
-    selection: &str,
-    outline: &str,
-    columns: usize,
-    height: usize,
-) -> (Vec<String>, Option<(usize, usize)>) {
-    if height == 0 {
-        return (Vec::new(), None);
-    }
-    // Narrow screens, such as a phone driving `/remote`, drop the margins and
-    // move the selected description below the list instead of cutting every
-    // row's description short.
-    let compact = columns < COMPACT_PICKER_COLUMNS;
-    let box_width = if compact {
-        columns
-    } else {
-        columns.saturating_sub(4).max(16).min(columns)
-    };
-    let inner = box_width.saturating_sub(2);
-    let left = " ".repeat(columns.saturating_sub(box_width) / 2);
-    let boxed = |content: &str| {
-        format!(
-            "{left}{outline}│\x1b[0m{}{outline}│\x1b[0m",
-            markdown::fit_width(content, inner)
-        )
-    };
-    let separator = format!("{left}{outline}├{}┤\x1b[0m", "─".repeat(inner));
-    let mut panel = vec![format!("{left}{outline}┌{}┐\x1b[0m", "─".repeat(inner))];
-    panel.push(boxed(&format!(" \x1b[1m{}\x1b[0m", picker.title)));
-    panel.push(separator.clone());
-    let mut cursor = None;
-    let hint = if let Some(PickerEdit::Field(field)) = &picker.editing {
-        let (rows, (row, column)) = field.render(inner, outline);
-        cursor = Some((panel.len() + row, left.len() + 1 + column));
-        panel.extend(rows.iter().map(|row| boxed(row)));
-        field.hint(picker.items.is_empty())
-    } else {
-        render_items(
-            picker, editor, selection, compact, inner, height, &boxed, &separator, &mut panel,
-        );
-        if picker.editing.is_some() {
-            "Edit below  Enter save  Esc cancel edit"
-        } else {
-            &picker.hint
-        }
-    };
-    panel.push(boxed(&format!(" \x1b[2m{hint}\x1b[0m")));
-    panel.push(format!("{left}{outline}└{}┘\x1b[0m", "─".repeat(inner)));
-
-    if panel.len() > height {
-        panel.truncate(height);
-    }
-    let top = height.saturating_sub(panel.len()) / 2;
-    let cursor = cursor
-        .filter(|(row, _)| *row < panel.len())
-        .map(|(row, column)| (top + row, column.min(columns.saturating_sub(1))));
-    let mut lines = Vec::with_capacity(height);
-    lines.extend(std::iter::repeat_n(" ".repeat(columns), top));
-    lines.extend(
-        panel
-            .into_iter()
-            .map(|line| markdown::fit_width(&line, columns)),
-    );
-    lines.extend(std::iter::repeat_n(
-        " ".repeat(columns),
-        height.saturating_sub(lines.len()),
-    ));
-    (lines, cursor)
-}
-
-/// The scrolling item list, plus a detail area for the selected row on
-/// compact screens.
-#[expect(clippy::too_many_arguments)]
-fn render_items(
-    picker: &Picker,
-    editor: &Editor,
-    selection: &str,
-    compact: bool,
-    inner: usize,
-    height: usize,
-    boxed: &dyn Fn(&str) -> String,
-    separator: &str,
-    panel: &mut Vec<String>,
-) {
-    let detail_rows = if compact { COMPACT_DETAIL_ROWS } else { 0 };
-    let capacity = height
-        .saturating_sub(5 + detail_rows)
-        .max(1)
-        .min(picker.items.len().max(1));
-    let mut start = picker.selected.saturating_sub(capacity / 2);
-    start = start.min(picker.items.len().saturating_sub(capacity));
-    let end = (start + capacity).min(picker.items.len());
-    // A queued message being edited shows its draft in the selected row.
-    let description_of = |absolute: usize, item: &PickerItem| {
-        if absolute == picker.selected && picker.editing.is_some() {
-            let value = editor.text();
-            if value.is_empty() {
-                "type a value below…".into()
-            } else {
-                value.replace('\n', " ")
-            }
-        } else {
-            item.description.clone()
-        }
-    };
-    for (index, item) in picker.items[start..end].iter().enumerate() {
-        let absolute = start + index;
-        let marker = if absolute == picker.selected {
-            "›"
-        } else {
-            " "
-        };
-        let text = if compact {
-            format!(" {marker} {}", item.label)
-        } else {
-            format!(
-                " {marker} {}  ·  {}",
-                item.label,
-                description_of(absolute, item)
-            )
-        };
-        if absolute == picker.selected {
-            panel.push(boxed(&super::render::selected_row(
-                &markdown::fit_width(&text, inner),
-                selection,
-            )));
-        } else {
-            panel.push(boxed(&text));
-        }
-    }
-    if compact {
-        let description = picker
-            .items
-            .get(picker.selected)
-            .map(|item| description_of(picker.selected, item))
-            .unwrap_or_default();
-        panel.push(separator.to_string());
-        let mut details =
-            markdown::wrapped_plain_lines(&description, inner.saturating_sub(2).max(1));
-        details.resize(COMPACT_DETAIL_ROWS - 1, String::new());
-        for line in details {
-            panel.push(boxed(&format!(" \x1b[2m{line}\x1b[0m")));
-        }
     }
 }

@@ -10,7 +10,7 @@ use crate::error::Error;
 
 use super::commands::{
     copy_all_from_transcript, copy_last_reply, handle_queue_picker_action, notice_config_effect,
-    promote_queued, unqueue,
+    promote_queued, sync_display_settings, unqueue,
 };
 use super::completion::handle_completion_key;
 use super::events::{Event, EventReader, Key, MouseEvent, MouseKind, event_requests_redraw};
@@ -226,27 +226,12 @@ pub(super) fn pump_events<R: Read, T>(
         }
         let mut event = events.read_event()?;
         loop {
-            match event {
-                Event::FocusGained => {
-                    terminal.set_focused(true);
-                    if !events.has_pending() {
-                        break;
-                    }
-                    event = events.read_event()?;
-                    continue;
-                }
-                Event::FocusLost => {
-                    terminal.set_focused(false);
-                    needs_draw |= super::git::clear_hover(state);
-                    needs_draw |= clear_jump_pointer(state);
-                    if !events.has_pending() {
-                        break;
-                    }
-                    event = events.read_event()?;
-                    continue;
-                }
-                _ => {}
-            }
+            let (next, focus_redraw) = apply_focus_events(event, events, terminal, state)?;
+            needs_draw |= focus_redraw;
+            let Some(next) = next else {
+                break;
+            };
+            event = next;
             needs_draw |= event_requests_redraw(&event);
             if matches!(&event, Event::Tick) {
                 needs_draw |= terminal.remote().poll(state);
@@ -379,14 +364,7 @@ pub(super) fn pump_events<R: Read, T>(
                     } else {
                         state.transcript.blur();
                         if text.is_empty() {
-                            let supported =
-                                crate::model::supports_images(active_config, &state.model);
-                            match editor.paste_clipboard_image(supported) {
-                                Ok(()) => state.scroll_offset = 0,
-                                Err(error) => {
-                                    state.notice(format!("Could not paste image: {error}."))
-                                }
-                            }
+                            paste_clipboard_image(active_config, state, editor);
                         } else {
                             editor.paste(&text);
                         }
@@ -409,14 +387,7 @@ pub(super) fn pump_events<R: Read, T>(
                             Key::PageUp => scroll(state, 10),
                             Key::PageDown => scroll(state, -10),
                             Key::Ctrl('v') | Key::Super('v') => {
-                                let supported =
-                                    crate::model::supports_images(active_config, &state.model);
-                                match editor.paste_clipboard_image(supported) {
-                                    Ok(()) => state.scroll_offset = 0,
-                                    Err(error) => {
-                                        state.notice(format!("Could not paste image: {error}."))
-                                    }
-                                }
+                                paste_clipboard_image(active_config, state, editor);
                             }
                             _ if handle_completion_key(state, editor, key) => {
                                 // Keep accepting and completing input while the agent runs.
@@ -633,6 +604,43 @@ pub(super) fn handle_mouse_selection(
     Ok(pointer_over_jump_button(state) != was_hovered)
 }
 
+/// Applies focus changes, which no view handles, and returns the next other
+/// event, or `None` once nothing else is pending. The flag says whether the
+/// frame needs redrawing because hover state was cleared.
+pub(super) fn apply_focus_events<R: Read>(
+    mut event: Event,
+    events: &mut EventReader<R>,
+    terminal: &mut Terminal,
+    state: &mut ViewState,
+) -> Result<(Option<Event>, bool), Error> {
+    let mut needs_draw = false;
+    loop {
+        match event {
+            Event::FocusGained => terminal.set_focused(true),
+            Event::FocusLost => {
+                terminal.set_focused(false);
+                needs_draw |= super::git::clear_hover(state);
+                needs_draw |= clear_jump_pointer(state);
+            }
+            other => return Ok((Some(other), needs_draw)),
+        }
+        if !events.has_pending() {
+            return Ok((None, needs_draw));
+        }
+        event = events.read_event()?;
+    }
+}
+
+/// Attaches the clipboard image to the draft when the current model accepts
+/// images, or explains why it cannot.
+pub(super) fn paste_clipboard_image(config: &Config, state: &mut ViewState, editor: &mut Editor) {
+    let supported = crate::model::supports_images(config, &state.model);
+    match editor.paste_clipboard_image(supported) {
+        Ok(()) => state.scroll_offset = 0,
+        Err(error) => state.notice(format!("Could not paste image: {error}.")),
+    }
+}
+
 pub(super) fn is_cancel_key(key: Key) -> bool {
     matches!(key, Key::Escape | Key::Ctrl('c'))
 }
@@ -645,6 +653,7 @@ pub(super) fn cancel_worker(
     state.queue_paused = !state.queued_inputs.is_empty() || !state.pending_steers.is_empty();
     cancellation.cancel();
     interrupt_thread(thread);
+    state.transcript.mark_progress();
     state.activity = "canceling turn".into();
 }
 
@@ -1030,6 +1039,10 @@ pub(super) fn display_config_change(
             ConfigChange::Bell(*enabled),
             interface(SettingsItem::Bell),
         ))),
+        PickerAction::SetTheme(theme) => Ok(Some((
+            ConfigChange::Theme(*theme),
+            interface(SettingsItem::Theme),
+        ))),
         PickerAction::ApplySetting { argument, location } => {
             let change = if let Some(value) = argument.strip_prefix("accent_color ") {
                 Some(ConfigChange::AccentColor(
@@ -1062,15 +1075,10 @@ pub(super) fn apply_display_config_while_busy(
     match config.change_global(change) {
         Ok(outcome) => {
             *config = outcome.config;
-            state.hide_reasoning = config.hide_reasoning;
-            state.accent_color = config.accent_color;
-            state.selection_color = config.effective_selection_color();
+            sync_display_settings(config, state);
             if color_change {
                 state.commit_color_preview();
             }
-            state.sync_scroll_bar_config(config);
-            state.bell = config.bell;
-            state.subagents_enabled = config.subagents;
             notice_config_effect(config, outcome.effect, state);
             active_pickers.refresh_display_settings(config);
             state.picker = active_pickers
@@ -1186,14 +1194,7 @@ mod completion_tests {
     #[test]
     fn reasoning_save_failure_preserves_job_outcome() {
         for successful in [true, false] {
-            let root = std::env::temp_dir().join(format!(
-                "yawl-worker-save-{}-{}-{successful}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos(),
-            ));
+            let root = crate::test_support::unique_temp_dir(&format!("worker-save-{successful}"));
             let config = Config {
                 home_dir: root.join("home"),
                 project_dir: root.join("project/.yawl"),

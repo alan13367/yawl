@@ -11,7 +11,7 @@ use crate::config::UiColor;
 use crate::provider::ImageContent;
 
 use super::super::transcript::Entry;
-use super::super::{USER_BACKGROUND, USER_TEXT, markdown, tool_view};
+use super::super::{markdown, theme, tool_view};
 use super::reasoning::{render_reasoning, render_thinking_tag};
 use super::{ImageSupport, foreground_color};
 
@@ -47,6 +47,9 @@ pub(super) fn render_entry(
     accent_color: UiColor,
     labels: &[tool_view::SubagentLabel],
     spinner_tick: usize,
+    // How long the live turn has been stalled; only the streaming entry
+    // receives it.
+    quiet: Option<std::time::Duration>,
 ) -> Option<RenderedEntry> {
     let lines = match entry {
         Entry::User(content) if !expanded => render_collapsed("Prompt", content, width),
@@ -74,6 +77,7 @@ pub(super) fn render_entry(
             let mut lines = render_thinking_tag(
                 *duration,
                 started.is_some(),
+                quiet,
                 expanded,
                 spinner_tick,
                 accent_color,
@@ -217,6 +221,7 @@ pub(in crate::tui) fn render_entries(
             UiColor::WHITE,
             &[],
             0,
+            None,
         ) {
             lines.extend(rendered.lines);
             lines.push(String::new());
@@ -236,6 +241,7 @@ pub(in crate::tui) fn render_expanded(entry: &Entry, width: usize) -> Vec<String
         UiColor::WHITE,
         &[],
         0,
+        None,
     )
     .map(|rendered| rendered.lines)
     .unwrap_or_default()
@@ -278,8 +284,10 @@ pub(in crate::tui) fn render_user_panel(content: &str, width: usize) -> Vec<Stri
     let panel_width = width.max(1);
     let horizontal_padding = usize::from(panel_width >= 3);
     let content_width = panel_width.saturating_sub(horizontal_padding * 2).max(1);
-    let blank = format!("{USER_BACKGROUND}{}\x1b[0m", " ".repeat(panel_width));
-    let continuation = format!("\x1b[0m{USER_BACKGROUND}{USER_TEXT}");
+    let palette = theme::palette();
+    let (user_background, user_text) = (palette.user_background, palette.user_text);
+    let blank = format!("{user_background}{}\x1b[0m", " ".repeat(panel_width));
+    let continuation = format!("\x1b[0m{user_background}{user_text}");
     let mut lines = Vec::new();
     lines.push(blank.clone());
     lines.extend(
@@ -289,7 +297,7 @@ pub(in crate::tui) fn render_user_panel(content: &str, width: usize) -> Vec<Stri
                 let fitted =
                     markdown::fit_width(&line, content_width).replace("\x1b[0m", &continuation);
                 format!(
-                    "{USER_BACKGROUND}{USER_TEXT}{}{fitted}{}\x1b[0m",
+                    "{user_background}{user_text}{}{fitted}{}\x1b[0m",
                     " ".repeat(horizontal_padding),
                     " ".repeat(horizontal_padding)
                 )

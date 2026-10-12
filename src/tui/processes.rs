@@ -5,8 +5,11 @@ use std::time::Instant;
 use crate::background::{
     BackgroundProcessManager, BackgroundSnapshot, BackgroundStatus, OutputStream,
 };
+use crate::subagent::format_duration;
 
-use super::dashboard::{Alignment, Column, Panel, PanelContent, PanelRow};
+use super::dashboard::{
+    Alignment, FieldColumn, PinnedScroll, TableChrome, reconcile_selection, render_table,
+};
 use super::events::{Event, Key};
 use super::render::{HIDDEN_CURSOR, status_style};
 use super::{ViewState, markdown};
@@ -25,38 +28,8 @@ enum ProcessMode {
     },
     Logs {
         id: String,
-        scroll: LogScroll,
+        scroll: PinnedScroll,
     },
-}
-
-#[derive(Default)]
-struct LogScroll {
-    pinned: Option<usize>,
-    pin_floor: usize,
-    window_top: usize,
-}
-
-impl LogScroll {
-    fn up(&mut self, amount: usize) {
-        let top = match self.pinned {
-            Some(top) => top,
-            None => {
-                self.pin_floor = self.window_top;
-                self.window_top
-            }
-        };
-        self.pinned = Some(top.saturating_sub(amount));
-    }
-
-    fn down(&mut self, amount: usize) {
-        if let Some(top) = self.pinned {
-            self.pinned = Some(top.saturating_add(amount));
-        }
-    }
-
-    fn follow(&mut self) {
-        self.pinned = None;
-    }
 }
 
 pub(super) fn open_dashboard(state: &mut ViewState, manager: BackgroundProcessManager) {
@@ -81,6 +54,10 @@ pub(super) fn open_dashboard(state: &mut ViewState, manager: BackgroundProcessMa
     state.picker = None;
 }
 
+fn snapshot_id(snapshot: &BackgroundSnapshot) -> &str {
+    snapshot.id.as_str()
+}
+
 pub(super) fn refresh(state: &mut ViewState) {
     let Some(view) = state.process_view.as_mut() else {
         return;
@@ -92,29 +69,7 @@ pub(super) fn refresh(state: &mut ViewState) {
         ..
     } = &mut view.mode
     {
-        reconcile_selection(&view.snapshots, selected_id, selected_index);
-    }
-}
-
-fn reconcile_selection(
-    snapshots: &[BackgroundSnapshot],
-    selected_id: &mut Option<String>,
-    selected_index: &mut usize,
-) {
-    if snapshots.is_empty() {
-        *selected_id = None;
-        *selected_index = 0;
-        return;
-    }
-    if let Some(index) = selected_id.as_deref().and_then(|id| {
-        snapshots
-            .iter()
-            .position(|snapshot| snapshot.id.as_str() == id)
-    }) {
-        *selected_index = index;
-    } else {
-        *selected_index = (*selected_index).min(snapshots.len() - 1);
-        *selected_id = Some(snapshots[*selected_index].id.to_string());
+        reconcile_selection(&view.snapshots, snapshot_id, selected_id, selected_index);
     }
 }
 
@@ -160,7 +115,7 @@ pub(super) fn handle_event(state: &mut ViewState, event: Event) {
                     Event::Key(Key::Escape) => None,
                     Event::Key(Key::Enter) => selected_id.clone().map(|id| ProcessMode::Logs {
                         id,
-                        scroll: LogScroll::default(),
+                        scroll: PinnedScroll::default(),
                     }),
                     Event::Key(Key::Up | Key::Char('k')) => {
                         selected_index = selected_index.saturating_sub(1);
@@ -207,7 +162,12 @@ pub(super) fn handle_event(state: &mut ViewState, event: Event) {
                             }
                         }
                         view.snapshots = view.manager.snapshots();
-                        reconcile_selection(&view.snapshots, &mut selected_id, &mut selected_index);
+                        reconcile_selection(
+                            &view.snapshots,
+                            snapshot_id,
+                            &mut selected_id,
+                            &mut selected_index,
+                        );
                         Some(ProcessMode::Dashboard {
                             selected_id,
                             selected_index,
@@ -338,78 +298,53 @@ fn render_dashboard(
     columns: usize,
     rows: usize,
 ) -> (Vec<String>, (usize, usize)) {
-    let panel = Panel::new(columns, rows, snapshots.len());
-    let capacity = panel.capacity();
-    let selected_index = selected_id
-        .and_then(|id| {
-            snapshots
-                .iter()
-                .position(|snapshot| snapshot.id.as_str() == id)
-        })
-        .unwrap_or(0);
-    let start = selected_index.saturating_sub(capacity.saturating_sub(1));
     let now = Instant::now();
-    let columns = process_columns(panel.inner_width());
-    let table_columns = columns
-        .iter()
-        .map(|column| column.column())
-        .collect::<Vec<_>>();
-    let header = super::dashboard::render_header(&table_columns, panel.inner_width());
-    let mut rendered_rows = Vec::with_capacity(capacity);
-    for snapshot in snapshots.iter().skip(start).take(capacity) {
-        let is_selected = selected_id == Some(snapshot.id.as_str());
-        let marker = if is_selected { "›" } else { " " };
-        let pid = snapshot
-            .pid
-            .map_or_else(|| "?".into(), |pid| pid.to_string());
-        let cells = columns
+    let selected = selected_id.and_then(|id| {
+        snapshots
             .iter()
-            .map(|column| match column.field {
-                ProcessField::Status => format!(
-                    "{marker} {} {}",
-                    status_square(&snapshot.status),
-                    snapshot.status.label()
-                ),
-                ProcessField::Name => plain_preview(snapshot.display_name()),
-                ProcessField::Id => snapshot.id.to_string(),
-                ProcessField::Pid => pid.clone(),
-                ProcessField::Elapsed => format_duration(snapshot.elapsed(now)),
-                ProcessField::Command => plain_preview(&snapshot.command),
-            })
-            .collect::<Vec<_>>();
-        rendered_rows.push(PanelRow {
-            content: super::dashboard::render_row(&table_columns, &cells, panel.inner_width()),
-            selected: is_selected,
-        });
-    }
-    if snapshots.is_empty() {
-        rendered_rows.push(PanelRow {
-            content: markdown::fit_width("No tracked background terminals.", panel.inner_width()),
-            selected: false,
-        });
-    }
-    let hint = if confirm_remove {
-        "Remove selected process and its logs? Enter confirms, Esc keeps it"
-    } else {
-        "↑↓ move · Enter logs · x/Ctrl+C stop · r restart · d remove · Esc close"
-    };
+            .position(|snapshot| snapshot.id.as_str() == id)
+    });
     let active = snapshots
         .iter()
         .filter(|snapshot| snapshot.status.is_active())
         .count();
-    let summary = super::dashboard::summary(active, snapshots.len(), "running");
-    (
-        panel.render(PanelContent {
-            title: "Background terminals",
-            summary: &summary,
-            header: &header,
-            rows: &rendered_rows,
-            hint,
-            accent: accent_color,
-            selection: selection_color,
-        }),
-        HIDDEN_CURSOR,
-    )
+    let chrome = TableChrome {
+        title: "Background terminals",
+        summary: super::dashboard::summary(active, snapshots.len(), "running"),
+        empty: "No tracked background terminals.",
+        hint: if confirm_remove {
+            "Remove selected process and its logs? Enter confirms, Esc keeps it"
+        } else {
+            "↑↓ move · Enter logs · x/Ctrl+C stop · r restart · d remove · Esc close"
+        },
+        accent: accent_color,
+        selection: selection_color,
+    };
+    let cell = |snapshot: &BackgroundSnapshot, field, selected: bool| match field {
+        ProcessField::Status => format!(
+            "{} {} {}",
+            if selected { "›" } else { " " },
+            status_square(&snapshot.status),
+            snapshot.status.label()
+        ),
+        ProcessField::Name => plain_preview(snapshot.display_name()),
+        ProcessField::Id => snapshot.id.to_string(),
+        ProcessField::Pid => snapshot
+            .pid
+            .map_or_else(|| "?".into(), |pid| pid.to_string()),
+        ProcessField::Elapsed => format_duration(snapshot.elapsed(now)),
+        ProcessField::Command => plain_preview(&snapshot.command),
+    };
+    let frame = render_table(
+        snapshots,
+        selected,
+        chrome,
+        process_columns,
+        cell,
+        columns,
+        rows,
+    );
+    (frame, HIDDEN_CURSOR)
 }
 
 #[derive(Clone, Copy)]
@@ -422,32 +357,7 @@ enum ProcessField {
     Command,
 }
 
-struct ProcessColumn {
-    field: ProcessField,
-    header: &'static str,
-    width: usize,
-    alignment: Alignment,
-}
-
-impl ProcessColumn {
-    const fn new(
-        field: ProcessField,
-        header: &'static str,
-        width: usize,
-        alignment: Alignment,
-    ) -> Self {
-        Self {
-            field,
-            header,
-            width,
-            alignment,
-        }
-    }
-
-    const fn column(&self) -> Column {
-        Column::new(self.header, self.width, self.alignment)
-    }
-}
+type ProcessColumn = FieldColumn<ProcessField>;
 
 fn process_columns(width: usize) -> Vec<ProcessColumn> {
     if width >= 63 {
@@ -512,7 +422,7 @@ fn render_logs(
     manager: &BackgroundProcessManager,
     accent_color: crate::config::UiColor,
     id: &str,
-    scroll: &mut LogScroll,
+    scroll: &mut PinnedScroll,
     columns: usize,
     rows: usize,
 ) -> (Vec<String>, (usize, usize)) {
@@ -576,20 +486,7 @@ fn render_logs(
         content.push("\x1b[2mWaiting for output…\x1b[0m".into());
     }
     let height = rows.saturating_sub(2);
-    let max_top = content.len().saturating_sub(height);
-    let top = match scroll.pinned {
-        None => max_top,
-        Some(pinned) => {
-            let top = pinned.min(max_top);
-            if top >= max_top || top >= scroll.pin_floor {
-                scroll.follow();
-                max_top
-            } else {
-                top
-            }
-        }
-    };
-    scroll.window_top = top;
+    let top = scroll.place(content.len(), height);
     let end = top.saturating_add(height).min(content.len());
     let mut frame = vec![markdown::fit_width(
         &format!("\x1b[1m{header}\x1b[0m"),
@@ -626,29 +523,19 @@ fn status_square(status: &BackgroundStatus) -> &'static str {
     }
 }
 
-fn format_duration(duration: std::time::Duration) -> String {
-    let seconds = duration.as_secs();
-    if seconds >= 60 {
-        format!("{}m{:02}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{seconds}s")
-    }
-}
-
 fn plain_preview(text: &str) -> String {
     markdown::plain_lines(text, 4096).join(" ")
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use super::*;
     use crate::background::{BackgroundId, StartSpec};
     use crate::config::UiColor;
-    use crate::tui::transcript::Transcript;
 
     fn snapshot(status: BackgroundStatus) -> BackgroundSnapshot {
         BackgroundSnapshot {
@@ -666,64 +553,9 @@ mod tests {
 
     fn process_state(manager: BackgroundProcessManager) -> ViewState {
         ViewState {
-            transcript: Transcript::from_messages(&[]),
-            tools_expanded: false,
-            model: "test".into(),
-            reasoning_effort: None,
-            hide_reasoning: false,
-            accent_color: UiColor::WHITE,
-            selection_color: UiColor::WHITE,
-            status_bar: Default::default(),
-            status_bar_draft: None,
-            color_preview: None,
-            show_scroll_bar: true,
-            scroll_bar_enabled: true,
-            scroll_bar_auto_hide: false,
-            bell: false,
-            scroll_bar_idle_ticks: 0,
-            scroll_geometry: None,
-            follow: Default::default(),
-            scroll_bar_drag: None,
-            transcript_row_entries: Vec::new(),
-            tool_click_press: None,
-            copy_toast_ticks: 0,
-            spinner_tick: 0,
-            turn_started: None,
-            context_tokens: 0,
-            context_window: 100,
-            usage: crate::provider::UsageSummary::default(),
-            activity: String::new(),
-            scroll_offset: 0,
-            queued_inputs: VecDeque::new(),
-            pending_steers: VecDeque::new(),
-            queue_paused: false,
-            continue_offered: false,
-            active_goal: None,
-            goal_running: false,
-            active_plan: None,
-            plan_draft: false,
-            pending_plan_implementation: false,
-            question: None,
-            pending_actions: VecDeque::new(),
-            completions: Vec::new(),
-            completion_index: 0,
-            completion_filter: None,
-            file_index: crate::tui::files::FileIndex::default(),
-            picker: None,
-            connection: None,
-            model_refresh: None,
-            subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-            subagent_tokens: 0,
-            subagent_snapshots: Vec::new(),
-            subagents_enabled: false,
-            subagent_view: None,
             background_processes: manager,
             background_active_count: 1,
-            process_view: None,
-            git_view: None,
-            git_job: None,
-            git_init: None,
-            render_cache: crate::tui::render::RenderCache::default(),
+            ..ViewState::test_default()
         }
     }
 
@@ -871,7 +703,7 @@ mod tests {
             &manager,
             UiColor::WHITE,
             started.id.as_str(),
-            &mut LogScroll::default(),
+            &mut PinnedScroll::default(),
             100,
             20,
         );

@@ -10,6 +10,7 @@ use crate::config::UiColor;
 use super::super::tool_view::SubagentLabel;
 use super::ImageSupport;
 use super::entries::{RenderedEntry, entry_default_expanded, render_entry};
+use super::transcript::stalled_for;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RenderSettings {
@@ -90,15 +91,11 @@ impl CacheSlot {
             changed_from = Some(entries.len());
         }
 
-        for (i, entry) in entries
-            .iter()
-            .enumerate()
-            .take(frozen_boundary)
-            .skip(self.frozen_count)
-        {
+        let render_at = |index: usize, quiet| {
+            let entry = &entries[index];
             let expanded =
-                transcript.entry_expanded(i, entry_default_expanded(entry, tools_expanded));
-            self.entries[i] = render_entry(
+                transcript.entry_expanded(index, entry_default_expanded(entry, tools_expanded));
+            render_entry(
                 entry,
                 self.width,
                 expanded,
@@ -107,47 +104,29 @@ impl CacheSlot {
                 self.accent_color,
                 labels,
                 spinner_tick,
-            );
-            changed_from = Some(changed_from.map_or(i, |changed| changed.min(i)));
+                quiet,
+            )
+        };
+        for index in self.frozen_count..frozen_boundary {
+            self.entries[index] = render_at(index, None);
+            changed_from = Some(changed_from.map_or(index, |changed| changed.min(index)));
         }
         self.frozen_count = frozen_boundary;
 
         if let Some(idx) = mutable_index
             && idx < entries.len()
         {
-            let expanded = transcript
-                .entry_expanded(idx, entry_default_expanded(&entries[idx], tools_expanded));
-            self.entries[idx] = render_entry(
-                &entries[idx],
-                self.width,
-                expanded,
-                hide_reasoning,
-                self.image_support,
-                self.accent_color,
-                labels,
-                spinner_tick,
-            );
+            self.entries[idx] = render_at(idx, stalled_for(transcript));
             changed_from = Some(changed_from.map_or(idx, |changed| changed.min(idx)));
 
             // Notices raised mid-turn land after the in-flight entry and must
             // show before that entry settles.
-            for (i, entry) in entries.iter().enumerate().skip(idx + 1) {
-                if self.entries[i].is_some() && transcript.running_tool_index() != Some(i) {
+            for index in idx + 1..entries.len() {
+                if self.entries[index].is_some() && transcript.running_tool_index() != Some(index) {
                     continue;
                 }
-                let expanded =
-                    transcript.entry_expanded(i, entry_default_expanded(entry, tools_expanded));
-                self.entries[i] = render_entry(
-                    entry,
-                    self.width,
-                    expanded,
-                    hide_reasoning,
-                    self.image_support,
-                    self.accent_color,
-                    labels,
-                    spinner_tick,
-                );
-                changed_from = Some(changed_from.map_or(i, |changed| changed.min(i)));
+                self.entries[index] = render_at(index, None);
+                changed_from = Some(changed_from.map_or(index, |changed| changed.min(index)));
             }
         }
 

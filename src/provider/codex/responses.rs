@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::io::BufReader;
 
 use serde_json::{Value, json};
 
@@ -7,8 +6,8 @@ use super::Codex;
 use crate::error::Error;
 use crate::provider::types::clamp_openai_prompt_cache_key;
 use crate::provider::{
-    Event, Message, Provider, ReasoningKind, Request, Role, SseEvent, SseReader, TokenUsage,
-    ToolCall, error_body,
+    Event, Message, Provider, ReasoningKind, Request, Role, SseEvent, TokenUsage, ToolCall,
+    event_stream,
 };
 
 const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -317,7 +316,7 @@ impl Provider for Codex {
             None
         };
         let body = build_body(req, self.reasoning_effort.as_deref()).to_string();
-        let mut response = self.send_authorized(|token| {
+        let response = self.send_authorized(|token| {
             let mut request = self
                 .agent
                 .post(CODEX_RESPONSES_URL)
@@ -335,17 +334,8 @@ impl Provider for Codex {
             }
             Ok(request.send(body.as_str())?)
         })?;
-        let status = response.status().as_u16();
-        if status != 200 {
-            return Err(Error::Http {
-                status,
-                body: error_body(&mut response),
-            });
-        }
-
-        let reader = BufReader::new(response.into_body().into_reader());
+        let mut stream = event_stream(response)?;
         let mut decoder = Decoder::default();
-        let mut stream = SseReader::new(reader);
         while let Some(event) = stream.next() {
             if decoder.decode(event?, on_event)? {
                 stream.finish();
@@ -401,6 +391,7 @@ fn emit_tool_call(item: &Value, emitted: &mut HashSet<String>, on_event: &mut dy
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::SseReader;
     use std::io::Cursor;
 
     #[test]

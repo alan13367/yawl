@@ -1,13 +1,11 @@
 //! Codex Responses remote compaction v2.
 
-use std::io::BufReader;
-
 use serde_json::{Value, json};
 
 use super::Codex;
 use super::responses::build_input;
 use crate::error::Error;
-use crate::provider::{CompactionOutput, Request, SseEvent, SseReader, TokenUsage, error_body};
+use crate::provider::{CompactionOutput, Request, SseEvent, TokenUsage, event_stream};
 
 const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const REMOTE_COMPACTION_FEATURE: &str = "remote_compaction_v2";
@@ -16,7 +14,7 @@ const RETAINED_USER_TOKEN_BUDGET: usize = 20_000;
 pub(super) fn compact(codex: &Codex, request: &Request<'_>) -> Result<CompactionOutput, Error> {
     let input = build_input(request.messages, request.supports_images, request.model);
     let body = build_body(request, &input, codex.reasoning_effort.as_deref()).to_string();
-    let mut response = codex.send_authorized(|token| {
+    let response = codex.send_authorized(|token| {
         let mut http = codex
             .agent
             .post(CODEX_RESPONSES_URL)
@@ -38,17 +36,8 @@ pub(super) fn compact(codex: &Codex, request: &Request<'_>) -> Result<Compaction
         }
         Ok(http.send(body.as_str())?)
     })?;
-    let status = response.status().as_u16();
-    if status != 200 {
-        return Err(Error::Http {
-            status,
-            body: error_body(&mut response),
-        });
-    }
-
-    let reader = BufReader::new(response.into_body().into_reader());
+    let mut stream = event_stream(response)?;
     let mut decoder = Decoder::default();
-    let mut stream = SseReader::new(reader);
     while let Some(event) = stream.next() {
         if decoder.decode(event?)? {
             let result = decoder.finish(&input);

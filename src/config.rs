@@ -17,11 +17,14 @@ pub(crate) use loading::{
     bounded_message, expand_home_path, parse_bounded, validate_bounded, validate_file_value,
 };
 pub(crate) use schema::validate_file_shape;
-pub(crate) use storage::{read_json_object, resolve_config_value, write_json_object};
+pub(crate) use storage::{
+    ValueError, ValuePart, config_value_parts, read_json_object, resolve_config_value,
+    write_json_object,
+};
 pub use types::{ModelConfig, OpenAiCompatibility, ProviderConfig, WebSearchProvider};
 pub(crate) use types::{
     REASONING_EFFORTS, StatusBarConfig, StatusBarFormat, StatusBarItemConfig, StatusBarKind,
-    StatusBarStyle, StatusBarVisibility, UiColor,
+    StatusBarStyle, StatusBarVisibility, Theme, UiColor,
 };
 
 use storage::{object_field, validate_provider_name};
@@ -65,6 +68,8 @@ pub struct Config {
     /// Whether the terminal bell rings when a turn settles or a model
     /// question needs an answer.
     pub bell: bool,
+    /// Background the interface colors target; `auto` asks the terminal.
+    pub(crate) theme: Theme,
     pub context_windows: HashMap<String, u64>,
     pub auto_compact: bool,
     pub compact_threshold: f64,
@@ -269,44 +274,16 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 impl Config {
+    /// Built-in defaults without endpoints, providers, or skill
+    /// directories, so tests never touch the user's setup.
     pub(crate) fn test_default() -> Self {
         Self {
-            model: None,
             anthropic_base_url: String::new(),
             openai_base_url: String::new(),
-            max_tokens: DEFAULT_MAX_TOKENS,
-            reasoning_effort: None,
-            hide_reasoning: false,
-            accent_color: UiColor::WHITE,
-            selection_color: None,
-            status_bar: StatusBarConfig::default(),
-            scroll_bar: true,
-            scroll_bar_auto_hide: true,
-            bell: true,
-            context_windows: HashMap::new(),
-            auto_compact: true,
-            compact_threshold: DEFAULT_COMPACT_THRESHOLD,
-            web_browsing: false,
-            web_search_provider: WebSearchProvider::DuckDuckGo,
-            web_fetch_max_chars: DEFAULT_WEB_FETCH_MAX_CHARS,
-            brave_api_key: None,
-            firecrawl_api_key: None,
-            subagents: false,
-            max_subagents: DEFAULT_MAX_SUBAGENTS,
-            subagent_model: DEFAULT_SUBAGENT_MODEL.to_string(),
-            subagent_request_budget: DEFAULT_SUBAGENT_REQUEST_BUDGET,
-            subagent_timeout_secs: DEFAULT_SUBAGENT_TIMEOUT_SECS,
             skill_dirs: Vec::new(),
             global_skill_dirs: Vec::new(),
-            project_skill_dirs: None,
-            project_skills_trusted: false,
             providers: HashMap::new(),
-            setup_skipped: false,
-            anthropic_api_key: None,
-            openai_api_key: None,
-            home_dir: PathBuf::new(),
-            project_dir: PathBuf::new(),
-            project_config_restricted: false,
+            ..Self::defaults(PathBuf::new(), PathBuf::new())
         }
     }
 }
@@ -331,8 +308,7 @@ mod tests {
 
     #[test]
     fn project_keys_match_through_symlinks() {
-        let root = std::env::temp_dir().join(format!("yawl-config-key-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::unique_temp_dir("config-key");
         std::fs::create_dir_all(root.join("real")).expect("test directory");
         std::os::unix::fs::symlink(root.join("real"), root.join("link")).expect("symlink");
 
@@ -345,8 +321,7 @@ mod tests {
 
     #[test]
     fn session_dirs_search_current_and_other_projects() {
-        let root = std::env::temp_dir().join(format!("yawl-config-dirs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::unique_temp_dir("config-dirs");
         let config = Config {
             home_dir: root.clone(),
             ..Config::test_default()

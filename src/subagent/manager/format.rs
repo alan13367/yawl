@@ -178,7 +178,8 @@ pub(super) fn salvage_result(snapshot: &SubagentSnapshot, final_result: &str) ->
     }
 }
 
-pub(super) fn format_duration(duration: Duration) -> String {
+/// Compact run time for lists and dashboards: `42s`, `3m07s`, `1h05m`.
+pub(crate) fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
     if seconds >= 3600 {
         format!("{}h{:02}m", seconds / 3600, seconds % 3600 / 60)

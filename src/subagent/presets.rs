@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn bundled_scout_is_available_without_any_files() {
-        let root = std::env::temp_dir().join(format!("yawl-presets-{}", std::process::id()));
+        let root = crate::test_support::unique_temp_dir("presets");
         let config = test_config(&root, &root);
         let (presets, warnings) = discover(&config);
         assert!(warnings.is_empty());
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn file_presets_are_discovered_and_project_files_override() {
-        let root = std::env::temp_dir().join(format!("yawl-presets-merge-{}", std::process::id()));
+        let root = crate::test_support::unique_temp_dir("presets-merge");
         let home = root.join("home/.yawl");
         let project = root.join("project/.yawl");
         let _ = std::fs::remove_dir_all(&root);
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn cached_discovery_reuses_and_refreshes_preset_files() {
-        let root = std::env::temp_dir().join(format!("yawl-presets-cache-{}", std::process::id()));
+        let root = crate::test_support::unique_temp_dir("presets-cache");
         let home = root.join("home/.yawl");
         let project = root.join("project/.yawl");
         let _ = std::fs::remove_dir_all(&root);
@@ -357,8 +357,7 @@ mod tests {
 
     #[test]
     fn invalid_preset_fields_are_rejected_with_reasons() {
-        let root =
-            std::env::temp_dir().join(format!("yawl-presets-invalid-{}", std::process::id()));
+        let root = crate::test_support::unique_temp_dir("presets-invalid");
         let home = root.join(".yawl");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(home.join("agents")).expect("agents dir");

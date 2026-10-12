@@ -22,19 +22,23 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tui/mod.rs`: `tui::run` facade and top-level event/submission coordination
 - `src/tui/commands.rs`, `picker.rs`: slash-command and picker facades with dispatch and shared models
 - `src/tui/commands/settings.rs`, `commands/copy.rs`: settings parsing/application plus usage summaries, and transcript-to-clipboard formatting
+- `src/tui/commands/modes.rs`, `commands/queue.rs`, `commands/sessions.rs`, `commands/diff.rs`: `/init`, `/goal`, and `/plan`; queued-message editing; new, resumed, and deleted sessions with undo reports; and `/diff` cards
 - `src/tui/picker/settings.rs`, `picker/status_bar.rs`: settings/color/provider picker construction and status-bar editor construction
+- `src/tui/picker/models.rs`, `picker/render.rs`, `picker/field.rs`: model and reasoning pickers with background Codex catalog refresh, picker rendering, and single-line picker fields
 - `src/tui/completion.rs`, `files.rs`, `state.rs`, `worker.rs`: TUI behavior and state
 - `src/tui/render.rs`: frame-composition facade and coordinator
 - `src/tui/render/cache.rs`: rendered-entry reuse, invalidation, row indexing, and cached image lookup
 - `src/tui/render/entries.rs`: individual transcript entry rendering, image preview layout, and user/queued/steer panels
 - `src/tui/render/reasoning.rs`: thinking tags, accent-derived thinking colors, duration labels, and reasoning trace formatting
 - `src/tui/render/transcript.rs`: visible transcript windows, scrolling and selection reveal, pending inputs, and loading indicators
-- `src/tui/render/welcome.rs`, `render/questions.rs`: welcome animation and question composer
+- `src/tui/render/welcome.rs`, `render/questions.rs`: welcome animation with project details, and question composer
 - `src/tui/render/activity.rs`: compact background-terminal and subagent activity strips above the composer
+- `src/tui/render/composer.rs`, `render/scroll.rs`: composer borders, mode labels, key hints, and plan handoff choices; transcript scroll bar and the scroll-to-bottom pill
 - `src/tui/terminal.rs`, `events.rs`, `input.rs`, `transcript.rs`: terminal lifecycle, input decoding/editing, and transcript reduction
 - `src/tui/markdown.rs`, `highlight.rs`, `status_bar.rs`: sanitized Markdown, syntax highlighting, and configurable status rendering
+- `src/tui/theme.rs`: dark and light palettes for fixed interface colors, terminal background detection, and accent darkening on light backgrounds
 - `src/tui/tool_view.rs`: generic tool-card rendering facade
-- `src/tui/tool_view/diff.rs`: edit-diff calculation with context elision
+- `src/tui/tool_view/calls.rs`, `tool_view/card.rs`, `tool_view/diff.rs`: per-tool call headers and result summaries, card painting and wrapping, and edit-diff calculation with context elision
 - `src/tui/git.rs`: Git dashboard entry points, shared state and geometry, and refresh coordination
 - `src/tui/git/repository.rs`, `git/jobs.rs`, `git/operations.rs`: Git subprocess execution and data loading, cancellable workers, UI result merging, and blocking repository actions
 - `src/tui/git/input.rs`, `git/init.rs`, `git/render.rs`, `git/diff.rs`: dashboard input and commit editing, repository initialization, panel rendering, and diff wrapping/highlighting
@@ -44,6 +48,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
 - `src/tools/`: builtin registry and custom-tool discovery
+- `src/tools/registry.rs`: per-step tool registry, tool entries and outcomes, and dispatch to each tool
 - `src/tools/custom.rs`: custom tool manifests (validation, `{{param}}` shell-quoted expansion, trust-gated discovery cache) and the `define_tool` builtin
 - `src/tools/catalog.rs`: per-scan caches for builtin entries, skills, and subagent presets
 - `src/tools/output.rs`: bounded excerpts and saved artifacts for verbose command and web output
@@ -67,7 +72,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/session.rs`, `src/session/recovery.rs`, `src/session/plans.rs`, `src/session/index.rs`, `src/compaction.rs`, `src/checkpoint.rs`: append-only sessions, recovery records, saved plan revisions and implementation handoffs, session-list metadata caching, context compaction, and `/undo` working-tree snapshots
 - `README.md`: user-facing behavior, contracts, and a concise architecture map
 
-Most tests live in `#[cfg(test)]` modules beside their implementation. TUI cross-module tests use focused `*_tests.rs` modules under `src/tui/` so production visibility stays narrow. Git unit tests follow their owning child modules; `src/tui/git/test_support.rs` contains shared test-only repository helpers, and `src/tui/git_tests.rs` covers dashboard behavior across children.
+Most tests live in `#[cfg(test)]` modules beside their implementation. TUI cross-module tests use focused `*_tests.rs` modules under `src/tui/` so production visibility stays narrow. `src/test_support.rs` holds crate-wide test helpers (unique temp directories and local HTTP request and response writers), and `src/tui/test_support.rs` holds the agent fixture shared by TUI tests. Git unit tests follow their owning child modules; `src/tui/git/test_support.rs` contains shared test-only repository helpers, and `src/tui/git_tests.rs` covers dashboard behavior across children.
 
 ## Commands
 

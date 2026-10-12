@@ -3,16 +3,7 @@
 use std::path::{Path, PathBuf};
 
 pub(super) fn temp_dir_unique(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "yawl-git-init-{tag}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+    crate::test_support::unique_temp_dir(&format!("git-init-{tag}"))
 }
 /// Throwaway git identity as child-process env: `init_and_push_env`
 /// commits without touching (or needing) the developer's real git

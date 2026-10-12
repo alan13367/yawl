@@ -200,12 +200,7 @@ fn render_diff_chunks<'a>(
     const HUNK: &str = "\x1b[2;36m";
     const RESET: &str = "\x1b[0m";
     // Full-row tinted backgrounds so added/removed lines read at a glance.
-    const ADD_BG: &str = "\x1b[48;2;30;64;39m";
-    const ADD_FG: &str = "\x1b[38;2;215;236;217m";
-    const ADD_PREFIX: &str = "\x1b[1;38;5;114m";
-    const DEL_BG: &str = "\x1b[48;2;68;34;34m";
-    const DEL_FG: &str = "\x1b[38;2;242;216;216m";
-    const DEL_PREFIX: &str = "\x1b[1;38;5;203m";
+    let palette = crate::tui::theme::palette();
     if line.kind == DiffKind::Hunk {
         return chunks
             .map(|(_, chunk)| markdown::fit_width(&format!("{HUNK}{chunk}{RESET}"), width))
@@ -232,11 +227,20 @@ fn render_diff_chunks<'a>(
             .collect();
     }
     let (bg, fg, prefix_style, prefix) = match line.kind {
-        DiffKind::Added => (ADD_BG, ADD_FG, ADD_PREFIX, "+"),
-        DiffKind::Removed => (DEL_BG, DEL_FG, DEL_PREFIX, "-"),
+        DiffKind::Added => (
+            palette.diff_add_background,
+            palette.diff_add_text,
+            palette.diff_add_prefix,
+            "+",
+        ),
         // Hunk and Context lines return above; naming them keeps the match
         // exhaustive so a new `DiffKind` variant fails to compile here.
-        DiffKind::Hunk | DiffKind::Context => (DEL_BG, DEL_FG, DEL_PREFIX, "-"),
+        DiffKind::Removed | DiffKind::Hunk | DiffKind::Context => (
+            palette.diff_del_background,
+            palette.diff_del_text,
+            palette.diff_del_prefix,
+            "-",
+        ),
     };
     chunks
         .map(|(index, highlighted)| {
@@ -377,8 +381,8 @@ mod tests {
         assert_eq!(markdown::visible_width(removed_row), 44);
         // Syntax highlighting survives under the background tint.
         assert!(
-            added_row.contains(crate::tui::highlight::KEYWORD)
-                || added_row.contains(crate::tui::highlight::STRING)
+            added_row.contains(crate::tui::theme::palette().keyword)
+                || added_row.contains(crate::tui::theme::palette().string)
         );
     }
 

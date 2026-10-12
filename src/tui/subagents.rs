@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::config::UiColor;
 use crate::subagent::{
     RunOrigin, RunOutcome, SubagentSnapshot, SubagentStatus, SubagentTranscriptItem,
+    format_duration,
 };
 
-use super::dashboard::{Alignment, Column, Panel, PanelContent, PanelRow};
+use super::dashboard::{
+    Alignment, FieldColumn, PinnedScroll, TableChrome, reconcile_selection, render_table,
+};
 use super::events::{Event, Key, MouseKind};
 use super::input::{EditAction, Editor};
 use super::render::{
@@ -37,23 +40,11 @@ pub(super) enum SubagentView {
     },
 }
 
-/// Scroll state for the takeover transcript. While pinned, the visible
-/// window holds its position in the content so streaming output below
-/// does not drag it along; scrolling back down to the pin floor, where
-/// the user left the tail, resumes following.
-///
-/// Pins hold absolute line indices, so once the bounded transcript
-/// starts dropping front items, a pinned window shows progressively
-/// later content and releases once it reaches the bottom.
+/// Scroll state for the takeover transcript, which follows the live tail
+/// unless the reader pins it.
 #[derive(Default)]
 pub(super) struct TakeoverScroll {
-    /// Absolute first visible line while pinned; `None` follows the tail.
-    pinned: Option<usize>,
-    /// Window top captured when the pin started; reaching it again
-    /// releases the pin even if the tail has moved on.
-    pin_floor: usize,
-    /// First visible line of the last rendered frame; anchors new pins.
-    window_top: usize,
+    pin: PinnedScroll,
     /// Blank rows above short content and the transcript height in the last
     /// frame, which map clicked rows back to content lines.
     region_padding: usize,
@@ -64,35 +55,13 @@ pub(super) struct TakeoverScroll {
 }
 
 impl TakeoverScroll {
-    fn pin_up(&mut self, amount: usize) {
-        let top = match self.pinned {
-            Some(top) => top,
-            None => {
-                self.pin_floor = self.window_top;
-                self.window_top
-            }
-        };
-        self.pinned = Some(top.saturating_sub(amount));
-    }
-
-    fn pin_down(&mut self, amount: usize) {
-        // Already at the live tail: there is nothing further down to show.
-        if let Some(top) = self.pinned {
-            self.pinned = Some(top.saturating_add(amount));
-        }
-    }
-
-    fn follow(&mut self) {
-        self.pinned = None;
-    }
-
     /// Wheel amounts are positive toward earlier content.
     fn wheel(&mut self, amount: i32) {
         let rows = amount.unsigned_abs() as usize;
         if amount > 0 {
-            self.pin_up(rows);
+            self.pin.up(rows);
         } else {
-            self.pin_down(rows);
+            self.pin.down(rows);
         }
     }
 
@@ -111,7 +80,7 @@ impl TakeoverScroll {
         else {
             return false;
         };
-        self.cache.toggle_at(self.window_top + offset)
+        self.cache.toggle_at(self.pin.window_top() + offset)
     }
 }
 
@@ -142,6 +111,10 @@ fn empty_dashboard_message(subagents_enabled: bool) -> &'static str {
     }
 }
 
+fn snapshot_id(snapshot: &SubagentSnapshot) -> &str {
+    snapshot.id.as_str()
+}
+
 pub(super) fn refresh(state: &mut ViewState) {
     let selected = match state.subagent_view.as_ref() {
         Some(SubagentView::Takeover { id, .. }) => Some(id.as_str()),
@@ -157,29 +130,12 @@ pub(super) fn refresh(state: &mut ViewState) {
     else {
         return;
     };
-    reconcile_selection(&state.subagent_snapshots, selected_id, selected_index);
-}
-
-fn reconcile_selection(
-    snapshots: &[SubagentSnapshot],
-    selected_id: &mut Option<String>,
-    selected_index: &mut usize,
-) {
-    if snapshots.is_empty() {
-        *selected_id = None;
-        *selected_index = 0;
-        return;
-    }
-    if let Some(index) = selected_id.as_deref().and_then(|id| {
-        snapshots
-            .iter()
-            .position(|snapshot| snapshot.id.as_str() == id)
-    }) {
-        *selected_index = index;
-    } else {
-        *selected_index = (*selected_index).min(snapshots.len() - 1);
-        *selected_id = Some(snapshots[*selected_index].id.to_string());
-    }
+    reconcile_selection(
+        &state.subagent_snapshots,
+        snapshot_id,
+        selected_id,
+        selected_index,
+    );
 }
 
 pub(super) fn handle_event(state: &mut ViewState, editor: &mut Editor, event: Event) {
@@ -328,12 +284,12 @@ fn handle_takeover_input(
             *expanded = !*expanded;
             scroll.cache.clear_toggles();
         }
-        Event::Key(Key::PageUp) => scroll.pin_up(10),
+        Event::Key(Key::PageUp) => scroll.pin.up(10),
         // Arrows scroll the transcript; takeover is a reading view and
         // intentionally has no editor history recall.
-        Event::Key(Key::Up) => scroll.pin_up(1),
-        Event::Key(Key::PageDown) => scroll.pin_down(10),
-        Event::Key(Key::Down) => scroll.pin_down(1),
+        Event::Key(Key::Up) => scroll.pin.up(1),
+        Event::Key(Key::PageDown) => scroll.pin.down(10),
+        Event::Key(Key::Down) => scroll.pin.down(1),
         Event::MouseScroll(amount) => scroll.wheel(amount),
         Event::Mouse(mouse) => match mouse.kind {
             MouseKind::Press => scroll.press = Some((mouse.row, mouse.column)),
@@ -355,7 +311,7 @@ fn handle_takeover_input(
                 EditAction::Submit(message) | EditAction::Steer(message) => {
                     let message = editor.expand_submission(&message.text);
                     match state.subagent_manager.steer(id, &message) {
-                        Ok(_) => scroll.follow(),
+                        Ok(_) => scroll.pin.follow(),
                         Err(error) => {
                             state.notice(format!("Could not steer the subagent: {error}"))
                         }
@@ -367,7 +323,7 @@ fn handle_takeover_input(
                         .subagent_manager
                         .send(id, &message, RunOrigin::PrivateUser)
                     {
-                        Ok(_) => scroll.follow(),
+                        Ok(_) => scroll.pin.follow(),
                         Err(error) => state.notice(format!(
                             "Could not send a private message to the subagent: {error}"
                         )),
@@ -460,88 +416,62 @@ fn render_dashboard(
     columns: usize,
     rows: usize,
 ) -> (Vec<String>, (usize, usize)) {
-    let panel = Panel::new(columns, rows, snapshots.len());
-    let capacity = panel.capacity();
-    let selected_index = selected_id
-        .and_then(|id| {
-            snapshots
-                .iter()
-                .position(|snapshot| snapshot.id.as_str() == id)
-        })
-        .unwrap_or(0);
-    let start = selected_index.saturating_sub(capacity.saturating_sub(1));
-    let columns = subagent_columns(panel.inner_width());
-    let table_columns = columns
-        .iter()
-        .map(|column| column.column())
-        .collect::<Vec<_>>();
-    let header = super::dashboard::render_header(&table_columns, panel.inner_width());
-    let mut rendered_rows = Vec::with_capacity(capacity);
-    for snapshot in snapshots.iter().skip(start).take(capacity) {
-        let selected = selected_id == Some(snapshot.id.as_str());
-        let marker = if selected { "›" } else { " " };
-        let square = status_square(snapshot.status);
-        let percentage = snapshot
-            .context_tokens
-            .saturating_mul(100)
-            .checked_div(snapshot.context_window)
-            .unwrap_or(0);
-        let model = crate::subagent::sanitize_preview(&snapshot.model, 1024);
-        let name = if snapshot.agent == "default" {
-            snapshot.name.clone()
-        } else {
-            format!("{} · {}", snapshot.name, snapshot.agent)
-        };
-        let cells = columns
+    let now = Instant::now();
+    let selected = selected_id.and_then(|id| {
+        snapshots
             .iter()
-            .map(|column| match column.field {
-                SubagentField::Status => {
-                    format!("{marker} {square} {}", snapshot.status.label())
-                }
-                SubagentField::Name => name.clone(),
-                SubagentField::Id => snapshot.id.to_string(),
-                SubagentField::Model => model.clone(),
-                SubagentField::Context => format!(
-                    "{percentage}% · {}/{}",
-                    snapshot.context_tokens, snapshot.context_window
-                ),
-                SubagentField::Elapsed => format_duration(snapshot.elapsed(Instant::now())),
-                SubagentField::Queue => snapshot.queued_messages.len().to_string(),
-            })
-            .collect::<Vec<_>>();
-        rendered_rows.push(PanelRow {
-            content: super::dashboard::render_row(&table_columns, &cells, panel.inner_width()),
-            selected,
-        });
-    }
-    if snapshots.is_empty() {
-        rendered_rows.push(PanelRow {
-            content: markdown::fit_width("No tracked subagents.", panel.inner_width()),
-            selected: false,
-        });
-    }
-    let hint = if confirm_cancel {
-        "Cancel selected subagent? Enter confirms, Esc keeps it running"
-    } else {
-        "↑↓ move · Enter take over · x cancel · Esc close"
-    };
+            .position(|snapshot| snapshot.id.as_str() == id)
+    });
     let active = snapshots
         .iter()
         .filter(|snapshot| snapshot.status.is_active())
         .count();
-    let summary = super::dashboard::summary(active, snapshots.len(), "active");
-    (
-        panel.render(PanelContent {
-            title: "Subagents",
-            summary: &summary,
-            header: &header,
-            rows: &rendered_rows,
-            hint,
-            accent: accent_color,
-            selection: selection_color,
-        }),
-        HIDDEN_CURSOR,
-    )
+    let chrome = TableChrome {
+        title: "Subagents",
+        summary: super::dashboard::summary(active, snapshots.len(), "active"),
+        empty: "No tracked subagents.",
+        hint: if confirm_cancel {
+            "Cancel selected subagent? Enter confirms, Esc keeps it running"
+        } else {
+            "↑↓ move · Enter take over · x cancel · Esc close"
+        },
+        accent: accent_color,
+        selection: selection_color,
+    };
+    let cell = |snapshot: &SubagentSnapshot, field, selected: bool| match field {
+        SubagentField::Status => format!(
+            "{} {} {}",
+            if selected { "›" } else { " " },
+            status_square(snapshot.status),
+            snapshot.status.label()
+        ),
+        SubagentField::Name if snapshot.agent == "default" => snapshot.name.clone(),
+        SubagentField::Name => format!("{} · {}", snapshot.name, snapshot.agent),
+        SubagentField::Id => snapshot.id.to_string(),
+        SubagentField::Model => crate::subagent::sanitize_preview(&snapshot.model, 1024),
+        SubagentField::Context => format!(
+            "{}% · {}/{}",
+            snapshot
+                .context_tokens
+                .saturating_mul(100)
+                .checked_div(snapshot.context_window)
+                .unwrap_or(0),
+            snapshot.context_tokens,
+            snapshot.context_window
+        ),
+        SubagentField::Elapsed => format_duration(snapshot.elapsed(now)),
+        SubagentField::Queue => snapshot.queued_messages.len().to_string(),
+    };
+    let frame = render_table(
+        snapshots,
+        selected,
+        chrome,
+        subagent_columns,
+        cell,
+        columns,
+        rows,
+    );
+    (frame, HIDDEN_CURSOR)
 }
 
 #[derive(Clone, Copy)]
@@ -555,32 +485,7 @@ enum SubagentField {
     Queue,
 }
 
-struct SubagentColumn {
-    field: SubagentField,
-    header: &'static str,
-    width: usize,
-    alignment: Alignment,
-}
-
-impl SubagentColumn {
-    const fn new(
-        field: SubagentField,
-        header: &'static str,
-        width: usize,
-        alignment: Alignment,
-    ) -> Self {
-        Self {
-            field,
-            header,
-            width,
-            alignment,
-        }
-    }
-
-    const fn column(&self) -> Column {
-        Column::new(self.header, self.width, self.alignment)
-    }
-}
+type SubagentColumn = FieldColumn<SubagentField>;
 
 fn subagent_columns(width: usize) -> Vec<SubagentColumn> {
     if width >= 75 {
@@ -748,21 +653,7 @@ fn render_takeover(
         context.spinner_tick,
     );
     let content_len = scroll.cache.lines.len() + tail.len();
-    let max_top = content_len.saturating_sub(transcript_height);
-    let top = match scroll.pinned {
-        None => max_top,
-        Some(pinned) => {
-            let top = pinned.min(max_top);
-            if top >= max_top || top >= scroll.pin_floor {
-                // Back at (or past) the bottom the reader left: follow again.
-                scroll.follow();
-                max_top
-            } else {
-                top
-            }
-        }
-    };
-    scroll.window_top = top;
+    let top = scroll.pin.place(content_len, transcript_height);
     let end = top
         .checked_add(transcript_height)
         .unwrap_or(content_len)
@@ -1105,6 +996,7 @@ fn render_snapshot_item(
             lines.extend(render_thinking_tag(
                 *duration,
                 false,
+                None,
                 expanded,
                 0,
                 style.accent,
@@ -1148,6 +1040,7 @@ fn render_snapshot_tail(
         lines.extend(render_thinking_tag(
             snapshot.live_reasoning_duration,
             streaming,
+            None,
             thinking_expanded,
             spinner_tick,
             style.accent,
@@ -1225,7 +1118,7 @@ fn render_loading_line(
     let label = match snapshot.status {
         SubagentStatus::Queued => {
             return Some(markdown::fit_width(
-                " \x1b[2m◌ Queued · starts when a running subagent settles\x1b[0m",
+                "\x1b[2m◌ Queued · starts when a running subagent settles\x1b[0m",
                 style.width,
             ));
         }
@@ -1259,7 +1152,7 @@ fn render_loading_line(
     let frame = SPINNER_FRAMES[spinner_tick % SPINNER_FRAMES.len()];
     let accent = foreground_color(style.accent);
     Some(markdown::fit_width(
-        &format!(" {accent}{frame}\x1b[0m \x1b[2m{label}\x1b[0m"),
+        &format!("{accent}{frame}\x1b[0m \x1b[2m{label}\x1b[0m"),
         style.width,
     ))
 }
@@ -1299,25 +1192,13 @@ fn render_run_end(snapshot: &SubagentSnapshot, width: usize) -> Vec<String> {
     lines
 }
 
-fn format_duration(duration: Duration) -> String {
-    let seconds = duration.as_secs();
-    if seconds >= 3600 {
-        format!("{}h{:02}m", seconds / 3600, seconds % 3600 / 60)
-    } else if seconds >= 60 {
-        format!("{}m{:02}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{seconds}s")
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::time::Duration;
 
     use super::*;
     use crate::config::UiColor;
     use crate::subagent::{QueuedSubagentMessage, SubagentId};
-    use crate::tui::transcript::Transcript;
 
     fn snapshot() -> SubagentSnapshot {
         let mut snapshot = SubagentSnapshot::new(
@@ -1344,64 +1225,9 @@ mod tests {
 
     fn state(view: SubagentView) -> ViewState {
         ViewState {
-            transcript: Transcript::from_messages(&[]),
-            tools_expanded: false,
-            model: "test".into(),
-            reasoning_effort: None,
-            hide_reasoning: false,
-            accent_color: UiColor::WHITE,
-            selection_color: UiColor::WHITE,
-            status_bar: Default::default(),
-            status_bar_draft: None,
-            color_preview: None,
-            show_scroll_bar: true,
-            scroll_bar_enabled: true,
-            scroll_bar_auto_hide: false,
-            bell: false,
-            scroll_bar_idle_ticks: 0,
-            scroll_geometry: None,
-            follow: Default::default(),
-            scroll_bar_drag: None,
-            transcript_row_entries: Vec::new(),
-            tool_click_press: None,
-            copy_toast_ticks: 0,
-            spinner_tick: 0,
-            turn_started: None,
-            context_tokens: 0,
-            context_window: 100,
-            usage: crate::provider::UsageSummary::default(),
-            activity: String::new(),
-            scroll_offset: 0,
-            queued_inputs: VecDeque::new(),
-            pending_steers: VecDeque::new(),
-            queue_paused: false,
-            continue_offered: false,
-            active_goal: None,
-            goal_running: false,
-            active_plan: None,
-            plan_draft: false,
-            pending_plan_implementation: false,
-            question: None,
-            pending_actions: VecDeque::new(),
-            completions: Vec::new(),
-            completion_index: 0,
-            completion_filter: None,
-            file_index: crate::tui::files::FileIndex::default(),
-            picker: None,
-            connection: None,
-            model_refresh: None,
-            subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-            subagent_tokens: 0,
             subagent_snapshots: vec![snapshot()],
-            subagents_enabled: false,
             subagent_view: Some(view),
-            background_processes: crate::background::BackgroundProcessManager::default(),
-            background_active_count: 0,
-            process_view: None,
-            git_view: None,
-            git_job: None,
-            git_init: None,
-            render_cache: crate::tui::render::RenderCache::default(),
+            ..ViewState::test_default()
         }
     }
 
@@ -1545,7 +1371,7 @@ mod tests {
         view.subagent_snapshots = vec![long_snapshot(30)];
         assert!(matches!(
             &view.subagent_view,
-            Some(SubagentView::Takeover { scroll, .. }) if scroll.pinned.is_some()
+            Some(SubagentView::Takeover { scroll, .. }) if scroll.pin.is_pinned()
         ));
         let (stepped, _) = render(&mut view, &editor, 80, 12);
         assert_eq!(
@@ -1564,7 +1390,7 @@ mod tests {
         );
         assert!(matches!(
             &view.subagent_view,
-            Some(SubagentView::Takeover { scroll, .. }) if scroll.pinned.is_none()
+            Some(SubagentView::Takeover { scroll, .. }) if !scroll.pin.is_pinned()
         ));
     }
 
@@ -1581,7 +1407,7 @@ mod tests {
         let (before, _) = render(&mut view, &editor, 80, 12);
 
         if let Some(SubagentView::Takeover { scroll, .. }) = view.subagent_view.as_mut() {
-            scroll.pin_up(2);
+            scroll.pin.up(2);
         }
         let (pinned, _) = render(&mut view, &editor, 80, 12);
         assert_ne!(before[1..8], pinned[1..8], "pinning must move the window");
@@ -1603,14 +1429,14 @@ mod tests {
 
         // Returning to the bottom releases the pin and follows again.
         if let Some(SubagentView::Takeover { scroll, .. }) = view.subagent_view.as_mut() {
-            scroll.pin_down(2);
+            scroll.pin.down(2);
         }
         let (resumed, _) = render(&mut view, &editor, 80, 12);
         assert_ne!(frozen[1..8], resumed[1..8]);
         assert!(resumed.iter().any(|line| line.contains("newly generated")));
         assert!(matches!(
             &view.subagent_view,
-            Some(SubagentView::Takeover { scroll, .. }) if scroll.pinned.is_none()
+            Some(SubagentView::Takeover { scroll, .. }) if !scroll.pin.is_pinned()
         ));
     }
 
@@ -1625,6 +1451,7 @@ mod tests {
 
         reconcile_selection(
             &[second.clone(), first],
+            snapshot_id,
             &mut selected_id,
             &mut selected_index,
         );

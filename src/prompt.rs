@@ -345,8 +345,6 @@ fn append_instructions(prompt: &mut String, tag: &str, display_path: &str, path:
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -354,17 +352,7 @@ mod tests {
 
     impl TestDirs {
         fn new() -> Self {
-            // Parallel tests can read the same clock value on coarse clocks.
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
-            Self(std::env::temp_dir().join(format!(
-                "yawl-prompt-{}-{nonce}-{sequence}",
-                std::process::id()
-            )))
+            Self(crate::test_support::unique_temp_dir("prompt"))
         }
     }
 

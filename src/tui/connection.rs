@@ -470,6 +470,35 @@ fn start_discovery(flow: &mut ConnectFlow, state: &mut ViewState) {
     };
     let endpoint = flow.endpoint.clone();
     let key = provider::request_credential(&flow.config, &provider, &flow.credential);
+    let description = format!("Testing {} in the background", flow.provider_label);
+    spawn_discovery(flow, state, "Discovering models", &description, move || {
+        provider::discover_models(&provider, &endpoint, &key)
+    });
+}
+
+fn start_codex_discovery(flow: &mut ConnectFlow, state: &mut ViewState) {
+    let config = flow.config.clone();
+    spawn_discovery(
+        flow,
+        state,
+        "Discovering Codex models",
+        "Fetching models for this account",
+        move || {
+            let models = crate::provider::codex::refresh_catalog(&config)?;
+            Ok(models.into_iter().map(|model| model.slug).collect())
+        },
+    );
+}
+
+/// Lists models on a worker thread behind a cancelable waiting picker. A
+/// cancel during the request reports an interruption instead of its result.
+fn spawn_discovery(
+    flow: &mut ConnectFlow,
+    state: &mut ViewState,
+    title: &str,
+    description: &str,
+    discover: impl FnOnce() -> Result<Vec<String>, Error> + Send + 'static,
+) {
     let cancellation = CancellationToken::default();
     let worker_cancellation = cancellation.clone();
     let (sender, receiver) = mpsc::channel();
@@ -478,7 +507,7 @@ fn start_discovery(flow: &mut ConnectFlow, state: &mut ViewState) {
             if worker_cancellation.is_canceled() {
                 return Err(Error::Interrupted);
             }
-            let result = provider::discover_models(&provider, &endpoint, &key);
+            let result = discover();
             if worker_cancellation.is_canceled() {
                 Err(Error::Interrupted)
             } else {
@@ -493,39 +522,8 @@ fn start_discovery(flow: &mut ConnectFlow, state: &mut ViewState) {
         cancellation,
     });
     state.picker = Some(waiting_picker(
-        "Discovering models",
-        &format!("Testing {} in the background", flow.provider_label),
-        PickerAction::ConnectCancelJob,
-    ));
-}
-
-fn start_codex_discovery(flow: &mut ConnectFlow, state: &mut ViewState) {
-    let config = flow.config.clone();
-    let cancellation = CancellationToken::default();
-    let worker_cancellation = cancellation.clone();
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = crate::cancellation::scope(&worker_cancellation, || {
-            if worker_cancellation.is_canceled() {
-                return Err(Error::Interrupted);
-            }
-            let models = crate::provider::codex::refresh_catalog(&config)?;
-            if worker_cancellation.is_canceled() {
-                Err(Error::Interrupted)
-            } else {
-                Ok(models.into_iter().map(|model| model.slug).collect())
-            }
-        });
-        let _ = sender.send(result);
-    });
-    flow.step = ConnectStep::Discovery;
-    flow.job = Some(ConnectJob::Discovery {
-        receiver,
-        cancellation,
-    });
-    state.picker = Some(waiting_picker(
-        "Discovering Codex models",
-        "Fetching models for this account",
+        title,
+        description,
         PickerAction::ConnectCancelJob,
     ));
 }
@@ -939,9 +937,7 @@ mod tests {
 
     #[test]
     fn connection_only_persists_the_selected_compatible_model() -> Result<(), Error> {
-        let root =
-            std::env::temp_dir().join(format!("yawl-connection-only-model-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_support::unique_temp_dir("connection-only-model");
         let config = Config::load_from(root.join("home/.yawl"), root.join("project/.yawl"))?;
         let flow = ConnectFlow {
             config: config.clone(),

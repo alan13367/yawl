@@ -1,6 +1,5 @@
 //! Git dashboard behavior regressions.
 
-use super::super::{RenderCache, Transcript};
 use super::diff::{SCROLL_ANCHOR_PENDING, render_diff_pane};
 use super::init::{GitInitFlow, render_init};
 use super::input::{handle_key, handle_mouse, pointer_over_control};
@@ -15,7 +14,6 @@ use super::{
     GitSection, GitStatus, GitView, HistoryEntry, INITIAL_HISTORY_LIMIT, LoadedDiff, MouseTarget,
     file_area_rows, jobs,
 };
-use crate::config::UiColor;
 use crate::tui::events::{Event, Key, MouseEvent, MouseKind};
 use crate::tui::input::Editor;
 use crate::tui::render::HIDDEN_CURSOR;
@@ -58,64 +56,9 @@ fn poll_tick(state: &mut ViewState) -> bool {
 
 fn test_state() -> ViewState {
     ViewState {
-        transcript: Transcript::from_messages(&[]),
-        tools_expanded: false,
-        model: "test".into(),
-        reasoning_effort: None,
-        hide_reasoning: false,
-        accent_color: UiColor::WHITE,
-        selection_color: UiColor::WHITE,
-        status_bar: Default::default(),
-        status_bar_draft: None,
-        color_preview: None,
         show_scroll_bar: false,
         scroll_bar_enabled: false,
-        scroll_bar_auto_hide: false,
-        bell: false,
-        scroll_bar_idle_ticks: 0,
-        scroll_geometry: None,
-        follow: Default::default(),
-        scroll_bar_drag: None,
-        transcript_row_entries: Vec::new(),
-        tool_click_press: None,
-        copy_toast_ticks: 0,
-        spinner_tick: 0,
-        turn_started: None,
-        context_tokens: 0,
-        context_window: 100,
-        usage: crate::provider::UsageSummary::default(),
-        activity: String::new(),
-        scroll_offset: 0,
-        queued_inputs: std::collections::VecDeque::new(),
-        pending_steers: std::collections::VecDeque::new(),
-        queue_paused: false,
-        continue_offered: false,
-        active_goal: None,
-        goal_running: false,
-        active_plan: None,
-        plan_draft: false,
-        pending_plan_implementation: false,
-        question: None,
-        pending_actions: std::collections::VecDeque::new(),
-        completions: Vec::new(),
-        completion_index: 0,
-        completion_filter: None,
-        file_index: crate::tui::files::FileIndex::default(),
-        picker: None,
-        connection: None,
-        model_refresh: None,
-        subagent_manager: crate::subagent::SubagentManager::new("test".into(), 3),
-        subagent_snapshots: Vec::new(),
-        subagent_tokens: 0,
-        subagents_enabled: false,
-        subagent_view: None,
-        background_processes: crate::background::BackgroundProcessManager::default(),
-        background_active_count: 0,
-        process_view: None,
-        git_view: None,
-        git_job: None,
-        git_init: None,
-        render_cache: RenderCache::default(),
+        ..ViewState::test_default()
     }
 }
 
@@ -147,15 +90,7 @@ fn browsing_multiple_diffs_exits_with_two_escapes() {
             .unwrap()
             .0;
         let column = layout.divider + 5;
-        handle_event(
-            &mut state,
-            &mut editor,
-            Event::Mouse(MouseEvent {
-                kind: MouseKind::Press,
-                row,
-                column,
-            }),
-        );
+        press(&mut state, &mut editor, row, column);
         assert!(state.git_view.as_ref().unwrap().diff.is_some());
     }
     handle_event(&mut state, &mut editor, Event::Key(Key::Escape));
@@ -165,6 +100,18 @@ fn browsing_multiple_diffs_exits_with_two_escapes() {
     );
     handle_event(&mut state, &mut editor, Event::Key(Key::Escape));
     assert!(state.git_view.is_none(), "second Escape must close /git");
+}
+
+fn press(state: &mut ViewState, editor: &mut Editor, row: usize, column: usize) {
+    handle_event(
+        state,
+        editor,
+        Event::Mouse(MouseEvent {
+            kind: MouseKind::Press,
+            row,
+            column,
+        }),
+    );
 }
 
 #[test]
@@ -460,15 +407,7 @@ fn commit_message_box_is_labeled_and_focuses_on_click() {
     // hint explains committing, and the text cursor parks on the input row.
     let divider = state.git_view.as_ref().unwrap().layout.divider;
     let mut editor = Editor::default();
-    handle_event(
-        &mut state,
-        &mut editor,
-        Event::Mouse(MouseEvent {
-            kind: MouseKind::Press,
-            row: 1,
-            column: divider + 5,
-        }),
-    );
+    press(&mut state, &mut editor, 1, divider + 5);
     assert_eq!(state.git_view.as_ref().unwrap().focus, GitFocus::Commit);
     let (frame, cursor) = render(&mut state, &editor, 120, 30);
     let right = cells(&frame);
@@ -550,14 +489,7 @@ impl Repo {
         if !git_available() {
             return None;
         }
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "yawl-git-test-{name}-{}-{unique}",
-            std::process::id()
-        ));
+        let root = crate::test_support::unique_temp_dir(&format!("git-test-{name}"));
         std::fs::create_dir_all(&root).unwrap();
         run_git(&root, &["init", "--template="]).unwrap();
         Some(Self(root))
@@ -1134,15 +1066,7 @@ fn clicking_a_commit_opens_its_diff_like_a_file() {
     let (row, _) = layout.history_rows[0];
     let column = layout.divider + 5;
     let mut editor = Editor::default();
-    handle_event(
-        &mut state,
-        &mut editor,
-        Event::Mouse(MouseEvent {
-            kind: MouseKind::Press,
-            row,
-            column,
-        }),
-    );
+    press(&mut state, &mut editor, row, column);
     let view = state.git_view.as_ref().unwrap();
     assert_eq!(view.focus, GitFocus::Diff, "commit click focuses the diff");
     assert!(
@@ -1183,15 +1107,7 @@ fn open_commit_diff_owns_selection_and_clears_file_highlight() {
     assert_eq!(index, 1);
     let column = layout.divider + 5;
     let mut editor = Editor::default();
-    handle_event(
-        &mut state,
-        &mut editor,
-        Event::Mouse(MouseEvent {
-            kind: MouseKind::Press,
-            row,
-            column,
-        }),
-    );
+    press(&mut state, &mut editor, row, column);
     let view = state.git_view.as_ref().unwrap();
     assert_eq!(view.focus, GitFocus::Diff);
     let opened_hash = view.history[index].hash.clone();
@@ -1237,17 +1153,17 @@ fn wrapped_diff_tokens_keep_their_style_when_scrolled() {
             (
                 "a.rs",
                 "// for true 123 let return comment continues here",
-                crate::tui::highlight::COMMENT,
+                crate::tui::theme::palette().comment,
             ),
             (
                 "a.py",
                 "# for True 123 def return comment continues here",
-                crate::tui::highlight::COMMENT,
+                crate::tui::theme::palette().comment,
             ),
             (
                 "a.rs",
                 "\"for true 123 let return string continues here\"",
-                crate::tui::highlight::STRING,
+                crate::tui::theme::palette().string,
             ),
         ] {
             let mut state = state();
@@ -1266,11 +1182,11 @@ fn wrapped_diff_tokens_keep_their_style_when_scrolled() {
             for row in &rows[1..] {
                 assert!(row.contains(style), "missing token style in {row:?}");
                 assert!(
-                    !row.contains(crate::tui::highlight::KEYWORD),
+                    !row.contains(crate::tui::theme::palette().keyword),
                     "token became a keyword: {row:?}"
                 );
                 assert!(
-                    !row.contains(crate::tui::highlight::NUMBER),
+                    !row.contains(crate::tui::theme::palette().number),
                     "token became a number: {row:?}"
                 );
                 assert!(markdown::strip_ansi(row).starts_with(&" ".repeat(12)));

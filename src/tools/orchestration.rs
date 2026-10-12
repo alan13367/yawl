@@ -450,13 +450,11 @@ mod tests {
         config.providers.insert(
             "local".into(),
             crate::config::ProviderConfig {
-                base_url: format!("http://{}/v1", listener.local_addr().expect("address")),
-                api: "openai-completions".into(),
-                api_key: None,
                 auth_header: Some(false),
-                headers: Default::default(),
-                models: Vec::new(),
-                compat: Default::default(),
+                ..crate::config::ProviderConfig::test_openai_compatible(&format!(
+                    "http://{}/v1",
+                    listener.local_addr().expect("address")
+                ))
             },
         );
         let manager = SubagentManager::new("session".into(), 1);
@@ -514,7 +512,6 @@ mod tests {
 
     #[test]
     fn sending_to_a_settled_child_restarts_a_model_originated_run() {
-        use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::time::Duration;
 
@@ -523,13 +520,11 @@ mod tests {
         config.providers.insert(
             "local".into(),
             crate::config::ProviderConfig {
-                base_url: format!("http://{}/v1", listener.local_addr().expect("address")),
-                api: "openai-completions".into(),
-                api_key: None,
                 auth_header: Some(false),
-                headers: Default::default(),
-                models: Vec::new(),
-                compat: Default::default(),
+                ..crate::config::ProviderConfig::test_openai_compatible(&format!(
+                    "http://{}/v1",
+                    listener.local_addr().expect("address")
+                ))
             },
         );
         let server = std::thread::spawn(move || {
@@ -538,40 +533,11 @@ mod tests {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .expect("read timeout");
-                let mut request = Vec::new();
-                let mut buffer = [0; 4096];
-                loop {
-                    let read = stream.read(&mut buffer).expect("provider request");
-                    assert!(read > 0, "request closed before body");
-                    request.extend_from_slice(&buffer[..read]);
-                    if let Some(header_end) =
-                        request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
-                    {
-                        let headers = String::from_utf8_lossy(&request[..header_end]);
-                        let length = headers
-                            .lines()
-                            .find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().ok())
-                                    .flatten()
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= header_end + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                let body = format!(
-                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{answer}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
-                );
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .expect("provider response");
-                stream.flush().expect("flush provider response");
+                let request =
+                    crate::test_support::read_http_request(&mut stream).expect("provider request");
+                assert!(!request.is_empty(), "request closed before body");
+                crate::test_support::write_completion(&mut stream, answer)
+                    .expect("provider response");
             }
         });
         let manager = SubagentManager::new("session".into(), 1);

@@ -183,7 +183,9 @@ Project skills, project tools, and provider endpoints, base URLs, and credential
 
 ### Interface settings
 
-`/settings` includes colors, the bell, reasoning display, and a configurable status bar. Color pickers preview as you move; `Enter` saves and `Esc` restores the previous color. The status-bar editor supports reordering with `K`/`J` and custom labels.
+`/settings` includes colors, the theme, the bell, reasoning display, and a configurable status bar. Color pickers preview as you move; `Enter` saves and `Esc` restores the previous color. The status-bar editor supports reordering with `K`/`J` and custom labels.
+
+The `theme` setting (`auto`, `dark`, or `light`) picks interface colors for the terminal background. `auto`, the default, asks the terminal for its background color at startup, then falls back to `COLORFGBG`, then to dark. On a light background, accent and selection colors that would be too pale are darkened, so the default white accent stays visible. Remote-control pages switch their terminal background to match. Use `/settings theme light` when a terminal does not report its color, for example inside some multiplexers; an explicit `dark` or `light` skips the startup query.
 
 ## Sessions and undo
 
