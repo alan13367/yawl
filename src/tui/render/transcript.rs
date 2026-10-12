@@ -14,7 +14,9 @@ use super::{ImageSupport, SPINNER_FRAMES, foreground_color};
 /// How long a live response may sit without a model delta before `Waiting…`
 /// returns. A server can buffer an entire tool call and emit nothing until
 /// it is parsed; the preamble already on screen would otherwise freeze.
-pub(in crate::tui) const MODEL_STREAM_STALL: Duration = Duration::from_millis(500);
+/// Long enough that ordinary pauses in slow or bursty streams do not flash
+/// the spinner between deltas.
+pub(in crate::tui) const MODEL_STREAM_STALL: Duration = Duration::from_secs(2);
 
 pub(in crate::tui) struct TranscriptWindow {
     pub(in crate::tui) lines: Vec<(String, Option<LineOwner>)>,
@@ -132,19 +134,35 @@ pub(in crate::tui) fn render_transcript_window(
     }
 }
 
-fn has_visible_in_flight_content(state: &ViewState) -> bool {
+/// What the newest transcript entry already shows of the response in flight.
+enum InFlight {
+    /// Nothing, so the loading row is the only progress cue.
+    Nothing,
+    /// Text that freezes when the stream goes quiet.
+    Static,
+    /// A running tool card or live thinking tag with its own spinner.
+    Animated,
+}
+
+fn in_flight_content(state: &ViewState) -> InFlight {
     let Some(last) = state.transcript.entries().last() else {
-        return false;
+        return InFlight::Nothing;
     };
     match last {
         Entry::User(_)
         | Entry::Steer(_)
         | Entry::Notice(_)
         | Entry::Diff { .. }
-        | Entry::SubagentResult { .. } => false,
-        Entry::Tool { running, .. } => *running,
-        Entry::Reasoning { content, .. } => !state.hide_reasoning && !content.trim().is_empty(),
-        Entry::Assistant(content) => !content.trim().is_empty(),
+        | Entry::SubagentResult { .. } => InFlight::Nothing,
+        Entry::Tool { running: true, .. } => InFlight::Animated,
+        Entry::Tool { .. } => InFlight::Nothing,
+        Entry::Reasoning { content, .. } if state.hide_reasoning || content.trim().is_empty() => {
+            InFlight::Nothing
+        }
+        Entry::Reasoning { started, .. } if started.is_some() => InFlight::Animated,
+        Entry::Reasoning { .. } => InFlight::Static,
+        Entry::Assistant(content) if content.trim().is_empty() => InFlight::Nothing,
+        Entry::Assistant(_) => InFlight::Static,
     }
 }
 
@@ -164,16 +182,20 @@ pub(in crate::tui) fn loading_label(activity: &str) -> Option<&str> {
 
 pub(in crate::tui) fn render_loading_state(state: &ViewState, width: usize) -> Option<String> {
     let label = loading_label(&state.activity)?;
+    let announces_step = state.activity.starts_with("preparing ")
+        || state.activity.starts_with("attempt")
+        || state.activity == "loading skill"
+        || state.activity == "compacting conversation";
     let stream_quiet = state
         .transcript
         .last_model_activity()
         .is_some_and(|at| at.elapsed() >= MODEL_STREAM_STALL);
-    if has_visible_in_flight_content(state)
-        && !stream_quiet
-        && !state.activity.starts_with("preparing ")
-        && state.activity != "loading skill"
-        && state.activity != "compacting conversation"
-    {
+    let covered = match in_flight_content(state) {
+        InFlight::Nothing => false,
+        InFlight::Static => !stream_quiet,
+        InFlight::Animated => true,
+    };
+    if covered && !announces_step {
         return None;
     }
     let frame = SPINNER_FRAMES[state.spinner_tick % SPINNER_FRAMES.len()];

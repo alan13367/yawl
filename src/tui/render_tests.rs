@@ -804,6 +804,31 @@ fn waiting_returns_when_a_visible_response_goes_quiet() {
 }
 
 #[test]
+fn quiet_reasoning_keeps_only_the_thinking_spinner() {
+    let mut state = overflow_state();
+    state.apply(Update::Transcript(TranscriptEvent::ReasoningDelta {
+        kind: ReasoningKind::Summary,
+        text: "Inspecting the request".into(),
+    }));
+    assert_eq!(state.activity, "reasoning");
+    state
+        .transcript
+        .set_last_model_activity(std::time::Instant::now() - super::render::MODEL_STREAM_STALL);
+    assert!(
+        render_loading_state(&state, 80).is_none(),
+        "the live thinking tag already animates between summary bursts"
+    );
+
+    state.apply(Update::Retrying {
+        attempt: 1,
+        delay_ms: 1000,
+        error: "stream stalled".into(),
+    });
+    let loading = render_loading_state(&state, 80).expect("retries stay visible");
+    assert!(markdown::strip_ansi(&loading).contains("attempt 1 failed"));
+}
+
+#[test]
 fn loading_state_persists_during_hidden_reasoning_and_after_finished_tools() {
     let mut state = ViewState {
         transcript: Transcript::from_messages(&[crate::provider::Message::user("hello")]),
