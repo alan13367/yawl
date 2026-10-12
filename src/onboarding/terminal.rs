@@ -1,8 +1,9 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use crate::config::validate_environment_name;
 use crate::error::Error;
 
+use super::field::Field;
 use super::select::{self, Choice};
 
 pub(super) enum Authentication {
@@ -58,12 +59,8 @@ pub(super) fn choose_authentication(
         None => Ok(None),
         Some(0) if existing.is_some() => Ok(existing.map(Authentication::Keep)),
         Some(index) if index == offset => {
-            let name = loop {
-                let name = prompt("Environment variable name, without '$'")?;
-                if validate_environment_name(&name).is_ok() {
-                    break name;
-                }
-                println!("Use letters, numbers, and '_', starting with a letter or '_'.");
+            let Some(name) = ask_environment_name()? else {
+                return Ok(None);
             };
             let value = std::env::var(&name).unwrap_or_default();
             if value.is_empty() {
@@ -74,16 +71,7 @@ pub(super) fn choose_authentication(
                 value,
             }))
         }
-        Some(index) if index == offset + 1 => {
-            let key = loop {
-                let key = prompt_secret("API key")?;
-                if !key.is_empty() {
-                    break key;
-                }
-                println!("The API key must not be empty.");
-            };
-            Ok(Some(Authentication::Literal(key)))
-        }
+        Some(index) if index == offset + 1 => Ok(ask_api_key()?.map(Authentication::Literal)),
         Some(index) if allow_no_key && index == offset + 2 => Ok(Some(Authentication::None)),
         Some(_) => Ok(None),
     }
@@ -110,6 +98,66 @@ pub(super) fn prompt(label: &str) -> Result<String, Error> {
     read_line()
 }
 
+/// Asks for one value. Terminals get an inline field with an editable
+/// default; piped input falls back to line prompts that repeat until
+/// `validate` passes. `None` means the user pressed Esc to go back.
+pub(super) fn ask_text(
+    field: Field<'_>,
+    validate: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<Option<String>, Error> {
+    if io::stdin().is_terminal() {
+        return super::field::ask(&field, validate);
+    }
+    loop {
+        let value = if field.initial.is_empty() {
+            prompt(field.label)?
+        } else {
+            prompt_with_default(field.label, field.initial)?
+        };
+        match validate(&value) {
+            Ok(()) => return Ok(Some(value)),
+            Err(error) => println!("{error}"),
+        }
+    }
+}
+
+pub(super) fn ask_api_key() -> Result<Option<String>, Error> {
+    ask_text(
+        Field {
+            label: "API key",
+            initial: "",
+            placeholder: "Paste your key",
+            help: "Saved in ~/.yawl/config.json, readable only by you",
+            secret: true,
+        },
+        &|value| {
+            if value.is_empty() {
+                Err("Paste or type the API key, or press Esc to go back.".into())
+            } else {
+                Ok(())
+            }
+        },
+    )
+}
+
+fn ask_environment_name() -> Result<Option<String>, Error> {
+    let name = ask_text(
+        Field {
+            label: "Environment variable",
+            initial: "",
+            placeholder: "OPENAI_API_KEY",
+            help: "Yawl saves a $NAME reference and reads the key at run time",
+            secret: false,
+        },
+        &|value| {
+            validate_environment_name(value.trim_start_matches('$')).map_err(|_| {
+                "Use letters, numbers, and '_', starting with a letter or '_'.".to_string()
+            })
+        },
+    )?;
+    Ok(name.map(|name| name.trim_start_matches('$').to_string()))
+}
+
 pub(super) fn prompt_with_default(label: &str, default: &str) -> Result<String, Error> {
     print!("{label} [{default}]: ");
     io::stdout().flush()?;
@@ -118,43 +166,6 @@ pub(super) fn prompt_with_default(label: &str, default: &str) -> Result<String, 
         Ok(default.to_string())
     } else {
         Ok(value)
-    }
-}
-
-pub(super) fn prompt_secret(label: &str) -> Result<String, Error> {
-    print!("{label}, input hidden: ");
-    io::stdout().flush()?;
-
-    // SAFETY: `termios` is initialized by `tcgetattr` before use. stdin is a
-    // TTY during onboarding, and the guard restores the original flags.
-    let original = unsafe {
-        let mut original: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(libc::STDIN_FILENO, &mut original) != 0 {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
-        let mut hidden = original;
-        hidden.c_lflag &= !libc::ECHO;
-        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &hidden) != 0 {
-            return Err(Error::Io(io::Error::last_os_error()));
-        }
-        original
-    };
-    let guard = EchoGuard(original);
-    let value = read_line();
-    drop(guard);
-    println!();
-    value
-}
-
-struct EchoGuard(libc::termios);
-
-impl Drop for EchoGuard {
-    fn drop(&mut self) {
-        // SAFETY: The value came from a successful `tcgetattr` call for
-        // stdin and remains initialized until this guard is dropped.
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0);
-        }
     }
 }
 

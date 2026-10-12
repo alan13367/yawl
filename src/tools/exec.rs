@@ -1,17 +1,13 @@
-//! The self-extension contract and process runner.
+//! Bounded child-process execution shared by `shell`, custom tools, and Git
+//! inspection.
 //!
-//! Any executable in `~/.yawl/tools/` or `./.yawl/tools/` is a tool:
-//! - `tool --describe` prints JSON `{name, description, input_schema, timeout_secs?}`
-//! - invocation: JSON arguments on stdin; stdout becomes the tool result
-//! - non-zero exit = error result with stderr appended
-//! - default timeout 120s, overridable via `timeout_secs` in the describe output
-//! - the process gets `YAWL_SESSION_ID` in its environment and inherits cwd
+//! Commands run in their own process group with piped output, a deadline,
+//! and live cancellation. Results follow one contract: stdout first, then
+//! any stderr under a `[stderr]` marker; a nonzero exit marks an error.
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
@@ -20,128 +16,29 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use serde::Deserialize;
-
-use crate::provider::ToolSpec;
-
-pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
-const DESCRIBE_TIMEOUT_SECS: u64 = 10;
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 
-#[derive(Deserialize)]
-struct DescribeOutput {
-    name: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default = "default_schema")]
-    input_schema: serde_json::Value,
-    #[serde(default)]
-    timeout_secs: Option<u64>,
-}
-
-fn default_schema() -> serde_json::Value {
-    serde_json::json!({"type": "object", "properties": {}})
-}
-
-#[derive(Clone)]
-pub struct ExecTool {
-    pub path: PathBuf,
-    pub spec: ToolSpec,
-    pub timeout: Duration,
-}
-
-/// Caches `--describe` results by (path, mtime) so the per-turn registry
-/// rescan does not respawn every tool. Failures are cached too; editing the
-/// tool (new mtime) triggers a fresh describe.
-#[derive(Default)]
-pub struct DescribeCache {
-    entries: HashMap<PathBuf, (SystemTime, Option<ExecTool>)>,
-}
-
-/// Scans one directory for executables and describes them.
-/// Returns discovered tools plus human-readable warnings for broken ones.
-pub fn scan_dir(dir: &Path, cache: &mut DescribeCache) -> (Vec<ExecTool>, Vec<String>) {
-    let mut tools = Vec::new();
-    let mut warnings = Vec::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => {
-            cache.entries.retain(|path, _| path.parent() != Some(dir));
-            return (tools, warnings);
-        }
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| is_executable_file(p))
-        .collect();
-    paths.sort();
-    cache
-        .entries
-        .retain(|path, _| path.parent() != Some(dir) || paths.binary_search(path).is_ok());
-    for path in paths {
-        let mtime = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        if let Some((cached_mtime, cached)) = cache.entries.get(&path)
-            && *cached_mtime == mtime
-        {
-            match cached {
-                Some(tool) => tools.push(tool.clone()),
-                None => warnings.push(format!("{}: --describe failed (cached)", path.display())),
+/// Starts `command` in a new session, which also makes it the leader of its
+/// own process group, so callers can still signal the whole group.
+///
+/// The new session has no controlling terminal. Otherwise a password or
+/// passphrase prompt from ssh, sudo, or git opens the user's terminal, is
+/// stopped by `SIGTTIN` because it runs in a background group, and hangs
+/// until the timeout; the model then sees only "timed out" instead of the
+/// real `Permission denied`. Without a terminal those prompts fail at once.
+pub(crate) fn isolate_from_terminal(command: &mut Command) -> &mut Command {
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    // SAFETY: The hook runs in the forked child before exec and only calls
+    // `setsid`, which is async-signal-safe and touches no parent memory.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
             }
-            continue;
-        }
-        match describe(&path) {
-            Ok(tool) => {
-                cache.entries.insert(path, (mtime, Some(tool.clone())));
-                tools.push(tool);
-            }
-            Err(reason) => {
-                warnings.push(format!("{}: {reason}", path.display()));
-                cache.entries.insert(path, (mtime, None));
-            }
-        }
+            Ok(())
+        });
     }
-    (tools, warnings)
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-fn describe(path: &Path) -> Result<ExecTool, String> {
-    let mut cmd = Command::new(path);
-    cmd.arg("--describe");
-    let result = run_with_timeout(cmd, None, Duration::from_secs(DESCRIBE_TIMEOUT_SECS))
-        .map_err(|e| format!("spawn failed: {e}"))?;
-    if result.timed_out {
-        return Err("--describe timed out".to_string());
-    }
-    if result.status != Some(0) {
-        return Err(format!(
-            "--describe exited with {:?}: {}",
-            result.status,
-            crate::error::truncate(result.stderr.trim(), 200)
-        ));
-    }
-    let parsed: DescribeOutput = serde_json::from_str(result.stdout.trim())
-        .map_err(|e| format!("bad --describe json: {e}"))?;
-    if !valid_tool_name(&parsed.name) {
-        return Err("--describe name must be 1-64 ASCII letters, digits, '_' or '-'".to_string());
-    }
-    Ok(ExecTool {
-        path: path.to_path_buf(),
-        spec: ToolSpec {
-            name: parsed.name,
-            description: parsed.description,
-            input_schema: parsed.input_schema,
-        },
-        timeout: Duration::from_secs(parsed.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1)),
-    })
+    command
 }
 
 pub(crate) fn valid_tool_name(name: &str) -> bool {
@@ -152,24 +49,12 @@ pub(crate) fn valid_tool_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-/// Runs an exec tool: JSON args on stdin, stdout is the result.
-pub fn invoke(tool: &ExecTool, args_json: &str, session_id: &str) -> (String, bool) {
-    let mut cmd = Command::new(&tool.path);
-    cmd.env("YAWL_SESSION_ID", session_id);
-    let result = match run_with_timeout(cmd, Some(args_json.as_bytes()), tool.timeout) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                format!("failed to spawn {}: {e}", tool.path.display()),
-                true,
-            );
-        }
-    };
-    render_result(&result, tool.timeout)
-}
-
-/// Formats a finished process per the contract: stdout is the result;
-/// non-zero exit is an error with stderr appended.
+/// Formats a finished process: stdout, then stderr under a `[stderr]`
+/// marker. A nonzero exit is an error and ends with its exit status.
+///
+/// Stderr is kept on success too. Compilers and linters report warnings
+/// there while exiting zero, and dropping it would tell the model a noisy
+/// `cargo clippy` run was clean.
 pub fn render_result(result: &ExecResult, timeout: Duration) -> (String, bool) {
     if result.interrupted {
         return ("[interrupted by user]".to_string(), true);
@@ -178,25 +63,24 @@ pub fn render_result(result: &ExecResult, timeout: Duration) -> (String, bool) {
         return (format!("tool timed out after {}s", timeout.as_secs()), true);
     }
     let mut out = result.stdout.clone();
-    if result.status == Some(0) {
-        (out, false)
-    } else {
-        if !result.stderr.trim().is_empty() {
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str("[stderr]\n");
-            out.push_str(result.stderr.trim_end());
-        }
+    if !result.stderr.trim().is_empty() {
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
-        match result.status {
-            Some(code) => out.push_str(&format!("[exit code: {code}]")),
-            None => out.push_str("[killed by signal]"),
-        }
-        (out, true)
+        out.push_str("[stderr]\n");
+        out.push_str(result.stderr.trim_end());
     }
+    if result.status == Some(0) {
+        return (out, false);
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    match result.status {
+        Some(code) => out.push_str(&format!("[exit code: {code}]")),
+        None => out.push_str("[killed by signal]"),
+    }
+    (out, true)
 }
 
 pub struct ExecResult {
@@ -217,10 +101,10 @@ pub fn run_with_timeout(
     stdin_data: Option<&[u8]>,
     timeout: Duration,
 ) -> std::io::Result<ExecResult> {
-    // Put the command in its own process group. Killing only the immediate
-    // shell would leave grandchildren running and could keep our output
-    // pipes open forever.
-    cmd.process_group(0);
+    // Put the command in its own session and process group. Killing only
+    // the immediate shell would leave grandchildren running and could keep
+    // our output pipes open forever.
+    isolate_from_terminal(&mut cmd);
     cmd.stdin(if stdin_data.is_some() {
         Stdio::piped()
     } else {
@@ -481,6 +365,46 @@ mod tests {
     }
 
     #[test]
+    fn commands_run_in_their_own_session_without_a_terminal() -> std::io::Result<()> {
+        let mut command = Command::new("sleep");
+        command.arg("5");
+        isolate_from_terminal(&mut command);
+        let mut child = command.spawn()?;
+        let pid = i32::try_from(child.id()).expect("pid fits");
+        // SAFETY: getsid and getpgid only read process attributes for a
+        // live child we own.
+        let (session, group) = unsafe { (libc::getsid(pid), libc::getpgid(pid)) };
+        child.kill()?;
+        child.wait()?;
+        assert_eq!(session, pid, "the child leads a new session");
+        assert_eq!(group, pid, "the child still leads its process group");
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("if (exec 3</dev/tty) 2>/dev/null; then echo tty; else echo none; fi; printf %s \"$GIT_TERMINAL_PROMPT\"");
+        let result = run_with_timeout(cmd, None, Duration::from_secs(5))?;
+        assert_eq!(result.stdout, "none\n0");
+        Ok(())
+    }
+
+    #[test]
+    fn successful_commands_keep_stderr_warnings() -> std::io::Result<()> {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo built; echo 'warning: unused variable' >&2");
+        let result = run_with_timeout(cmd, None, Duration::from_secs(5))?;
+        let (text, is_error) = render_result(&result, Duration::from_secs(5));
+        assert!(!is_error);
+        assert_eq!(text, "built\n[stderr]\nwarning: unused variable");
+
+        let mut quiet = Command::new("sh");
+        quiet.arg("-c").arg("printf ok");
+        let result = run_with_timeout(quiet, None, Duration::from_secs(5))?;
+        assert_eq!(render_result(&result, Duration::from_secs(5)).0, "ok");
+        Ok(())
+    }
+
+    #[test]
     fn run_with_timeout_kills_hung_process() -> std::io::Result<()> {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("sleep 30 & wait");
@@ -516,24 +440,5 @@ mod tests {
         assert!(result.stdout.len() < 70_000);
         assert!(result.stdout.ends_with("[process output truncated]"));
         Ok(())
-    }
-
-    #[test]
-    fn describe_cache_forgets_removed_tools() {
-        let dir = std::env::temp_dir().join(format!(
-            "yawl-describe-cache-missing-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut cache = DescribeCache::default();
-        cache
-            .entries
-            .insert(dir.join("removed-tool"), (SystemTime::UNIX_EPOCH, None));
-
-        let (tools, warnings) = scan_dir(&dir, &mut cache);
-
-        assert!(tools.is_empty());
-        assert!(warnings.is_empty());
-        assert!(cache.entries.is_empty());
     }
 }

@@ -2,9 +2,9 @@
 //!
 //! The registry rescans on every model step so a tool the model just wrote is
 //! usable on its next turn. This cache keeps that promise cheap: filesystem
-//! catalogs (skills, subagent presets) are reused while their mtime signature
-//! holds, exec tools keep their `--describe` cache, and static entries are
-//! shared as `Arc`s instead of being rebuilt.
+//! catalogs (skills, subagent presets, custom tool manifests) are reused while
+//! their mtime signature holds, and static entries are shared as `Arc`s
+//! instead of being rebuilt.
 
 use std::sync::Arc;
 
@@ -13,15 +13,15 @@ use crate::skills::Skill;
 use crate::subagent::AgentPreset;
 use crate::subagent::presets::DiscoveryCache as PresetsCache;
 
-use super::exec::DescribeCache;
+use super::custom::ManifestCache;
 use super::{ToolEntry, files, shell, web};
 
 /// Caches the registry catalogs that would otherwise be rebuilt on every
-/// model step: exec `--describe` results, skills, subagent presets, and the
+/// model step: custom tool manifests, skills, subagent presets, and the
 /// static entry sets, which are shared as `Arc`s across scans.
 #[derive(Default)]
 pub struct CatalogCache {
-    describe: DescribeCache,
+    manifests: ManifestCache,
     skills: crate::skills::DiscoveryCache,
     invocable_skills: Option<InvocableSkills>,
     presets: PresetsCache,
@@ -47,8 +47,8 @@ struct SubagentEntriesCache {
 }
 
 impl CatalogCache {
-    pub(super) fn describe(&mut self) -> &mut DescribeCache {
-        &mut self.describe
+    pub(super) fn manifests(&mut self) -> &mut ManifestCache {
+        &mut self.manifests
     }
 
     /// The model-invocable skill catalog, reused while every `SKILL.md` and

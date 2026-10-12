@@ -55,8 +55,8 @@ use self::completion::handle_completion_key;
 use self::events::{Event, EventReader, Key, event_requests_redraw};
 use self::input::{EditAction, Editor, Submission};
 use self::picker::{
-    open_model_picker, open_settings_picker, picker_is_editing, picker_is_plan_handoff,
-    poll_model_picker, sync_color_preview, take_picker_action,
+    open_model_picker, open_settings_picker, paste_into_picker, picker_is_editing,
+    picker_is_plan_handoff, poll_model_picker, sync_color_preview, take_picker_action,
 };
 use self::state::{
     Update, ViewState, advance_ticks, clear_jump_pointer, scroll, toggle_tool_expansion,
@@ -250,7 +250,9 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
                             sync_color_preview(&mut state);
                         }
                     }
-                    Event::Paste(text) if picker_is_editing(&state) => editor.paste(&text),
+                    Event::Paste(text) if picker_is_editing(&state) => {
+                        paste_into_picker(&mut state, &mut editor, &text);
+                    }
                     Event::MouseScroll(amount) if plan_handoff => scroll(&mut state, amount),
                     Event::Mouse(mouse) => {
                         needs_draw |= handle_mouse_selection(&mut terminal, &mut state, mouse)?;
@@ -511,17 +513,7 @@ fn handle_submission<R: Read>(
             }
             "usage" if argument.is_empty() => commands::show_usage(state),
             "usage" => state.notice("Usage: /usage"),
-            "tools" => {
-                let registry = agent.scan_tools();
-                let mut text = String::from("Available tools\n\n");
-                for (tool, description, origin) in registry.describe_all() {
-                    text.push_str(&format!("- `{tool}` ({origin}): {description}\n"));
-                }
-                for warning in registry.warnings {
-                    text.push_str(&format!("\nWarning: {warning}"));
-                }
-                state.notice(text);
-            }
+            "tools" => commands::show_tools(agent, state),
             "skills" => show_skills(agent, state),
             "subagents" if argument.is_empty() => open_subagent_dashboard(state),
             "subagents" => state.notice("Usage: /subagents"),

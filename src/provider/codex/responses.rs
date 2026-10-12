@@ -317,22 +317,24 @@ impl Provider for Codex {
             None
         };
         let body = build_body(req, self.reasoning_effort.as_deref()).to_string();
-        let mut request = self
-            .agent
-            .post(CODEX_RESPONSES_URL)
-            .header("authorization", format!("Bearer {}", self.access_token))
-            .header("chatgpt-account-id", &self.account_id)
-            .header("originator", "yawl")
-            .header("user-agent", format!("yawl/{}", env!("CARGO_PKG_VERSION")))
-            .header("openai-beta", "responses=experimental")
-            .header("accept", "text/event-stream")
-            .header("content-type", "application/json");
-        if let Some(cache_key) = cache_key.as_deref() {
-            for (name, value) in cache_affinity_headers(cache_key) {
-                request = request.header(name, value);
+        let mut response = self.send_authorized(|token| {
+            let mut request = self
+                .agent
+                .post(CODEX_RESPONSES_URL)
+                .header("authorization", format!("Bearer {token}"))
+                .header("chatgpt-account-id", &self.account_id)
+                .header("originator", "yawl")
+                .header("user-agent", format!("yawl/{}", env!("CARGO_PKG_VERSION")))
+                .header("openai-beta", "responses=experimental")
+                .header("accept", "text/event-stream")
+                .header("content-type", "application/json");
+            if let Some(cache_key) = cache_key.as_deref() {
+                for (name, value) in cache_affinity_headers(cache_key) {
+                    request = request.header(name, value);
+                }
             }
-        }
-        let mut response = request.send(body)?;
+            Ok(request.send(body.as_str())?)
+        })?;
         let status = response.status().as_u16();
         if status != 200 {
             return Err(Error::Http {

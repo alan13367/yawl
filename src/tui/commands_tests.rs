@@ -1191,3 +1191,57 @@ fn new_connection_session_activation_prompts_for_just_saved_reasoning_levels() {
         }
     }
 }
+
+#[test]
+fn tools_listing_separates_custom_tools_and_explains_skipped_manifests() {
+    let root = std::env::temp_dir().join(format!(
+        "yawl-tui-tools-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let tools = root.join("home/.yawl/tools");
+    std::fs::create_dir_all(&tools).expect("tools dir");
+    std::fs::write(
+        tools.join("greet.json"),
+        r#"{"description": "Greet someone", "command": "echo hi"}"#,
+    )
+    .expect("manifest");
+    std::fs::write(tools.join("broken.json"), "{").expect("broken manifest");
+    let config = Config {
+        model: Some("test".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..Config::test_default()
+    };
+    let cwd = root.join("project");
+    let dirs = config.session_dirs(&cwd);
+    let session = crate::session::Session::create(&dirs.project, &cwd, "test")
+        .expect("session should be created");
+    let mut agent = Agent::new(config, "test".into(), session, Vec::new());
+    let mut state = ViewState::from_agent(&agent);
+
+    super::commands::show_tools(&mut agent, &mut state);
+
+    let text = state
+        .transcript
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            Entry::Notice(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("tools notice");
+    let builtin = text.find("Builtin tools").expect("builtin section");
+    let custom = text.find("Custom tools").expect("custom section");
+    let greet = text
+        .find("`greet` (global tool")
+        .expect("custom tool listed");
+    assert!(builtin < custom && custom < greet, "{text}");
+    assert!(text[builtin..custom].contains("`define_tool`"));
+    assert!(text.contains("Skipped"));
+    assert!(text.contains("broken.json: invalid manifest"));
+    let _ = std::fs::remove_dir_all(&root);
+}

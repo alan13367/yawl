@@ -7,6 +7,7 @@ use crate::error::Error;
 use crate::provider::codex::{CodexLoginStatus, credential_status};
 
 use super::SetupOutcome;
+use super::field::Field;
 use super::provider::{self, ProviderId};
 use super::select::{self, Choice};
 use super::terminal::{self, Authentication};
@@ -269,7 +270,10 @@ fn configure_codex(config: &Config) -> Result<Option<SetupPlan>, Error> {
         return Ok(None);
     };
     let model = if index == manual {
-        prompt_model_id()?
+        let Some(model) = prompt_model_id()? else {
+            return Ok(None);
+        };
+        model
     } else {
         models[index]
             .0
@@ -291,7 +295,9 @@ fn configure_builtin(
     current_url: &str,
     stored_key: Option<&str>,
 ) -> Result<Option<SetupPlan>, Error> {
-    let url = prompt_url("API base URL", current_url)?;
+    let Some(url) = prompt_url(current_url)? else {
+        return Ok(None);
+    };
     let mut changes = vec![(spec.url_change)(url.clone())];
     let mut summary = vec![format!("{} base URL: {url}", spec.name)];
 
@@ -335,12 +341,8 @@ fn configure_builtin(
             summary.push("key: current credential preserved".into());
         }
         Some(1) => {
-            let key = loop {
-                let key = terminal::prompt_secret("API key")?;
-                if !key.is_empty() {
-                    break key;
-                }
-                println!("The API key must not be empty.");
+            let Some(key) = terminal::ask_api_key()? else {
+                return Ok(None);
             };
             changes.push((spec.key_change)(Some(key.clone())));
             summary.push(format!("key: stored as {}", spec.key_config_name));
@@ -386,23 +388,31 @@ fn configure_builtin(
 }
 
 fn configure_custom(config: &Config) -> Result<Option<SetupPlan>, Error> {
-    let name = loop {
-        let value = terminal::prompt("Provider name (letters, numbers, '-' or '_')")?;
-        if value.is_empty() {
-            println!("The name must not be empty.");
-            continue;
-        }
-        if matches!(value.as_str(), "anthropic" | "openai") {
-            println!("'{value}' is built in; pick another name.");
-            continue;
-        }
-        if value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
-            break value;
-        }
-        println!("Use only letters, numbers, '-' and '_'.");
+    let Some(name) = terminal::ask_text(
+        Field {
+            label: "Provider name",
+            initial: "",
+            placeholder: "my-provider",
+            help: "Becomes the model prefix, as in my-provider:model-id",
+            secret: false,
+        },
+        &|value| {
+            if value.is_empty() {
+                Err("Enter a name, or press Esc to go back.".into())
+            } else if matches!(value, "anthropic" | "openai") {
+                Err(format!("'{value}' is built in; pick another name."))
+            } else if value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                Ok(())
+            } else {
+                Err("Use only letters, numbers, '-' and '_'.".into())
+            }
+        },
+    )?
+    else {
+        return Ok(None);
     };
     let configured = config
         .providers
@@ -426,15 +436,8 @@ fn configure_entry_with(
     name: &str,
     default_url: Option<String>,
 ) -> Result<Option<SetupPlan>, Error> {
-    let url = match &default_url {
-        Some(default) => prompt_url("API base URL", default)?,
-        None => loop {
-            let value = terminal::prompt("OpenAI-compatible API base URL, usually ending in /v1")?;
-            if value.starts_with("http://") || value.starts_with("https://") {
-                break value;
-            }
-            println!("The URL must start with http:// or https://.");
-        },
+    let Some(url) = prompt_url(default_url.as_deref().unwrap_or_default())? else {
+        return Ok(None);
     };
     let existing = config
         .providers
@@ -566,7 +569,7 @@ fn local_base_url<'a>(config: &'a Config, name: &str) -> &'a str {
 /// means the user wants to go back to the provider menu.
 fn choose_model(models: Vec<String>) -> Result<Option<String>, Error> {
     if models.is_empty() {
-        return prompt_model_id().map(Some);
+        return prompt_model_id();
     }
     let mut choices = models
         .iter()
@@ -586,7 +589,7 @@ fn resolve_model_selection(
     selection: Option<usize>,
 ) -> Result<Option<String>, Error> {
     match selection {
-        Some(index) if index == manual => prompt_model_id().map(Some),
+        Some(index) if index == manual => prompt_model_id(),
         Some(index) => Ok(Some(models[index].clone())),
         None => Ok(None),
     }
@@ -607,25 +610,45 @@ fn initial_reasoning_selection(supported: Option<&[&str]>, count: usize) -> Vec<
     }
 }
 
-fn prompt_model_id() -> Result<String, Error> {
-    loop {
-        let value = terminal::prompt("Model ID")?;
-        if value.is_empty() {
-            println!("The model ID must not be empty.");
-            continue;
-        }
-        return Ok(value);
-    }
+/// `None` means the user went back.
+fn prompt_model_id() -> Result<Option<String>, Error> {
+    terminal::ask_text(
+        Field {
+            label: "Model ID",
+            initial: "",
+            placeholder: "",
+            help: "The exact model ID the server expects",
+            secret: false,
+        },
+        &|value| {
+            if value.is_empty() {
+                Err("Enter a model ID, or press Esc to go back.".into())
+            } else {
+                Ok(())
+            }
+        },
+    )
 }
 
-fn prompt_url(label: &str, default: &str) -> Result<String, Error> {
-    loop {
-        let url = terminal::prompt_with_default(label, default)?;
-        if url.starts_with("http://") || url.starts_with("https://") {
-            return Ok(url);
-        }
-        println!("The URL must start with http:// or https://.");
-    }
+/// Asks for an API base URL, prefilled with `default` when there is one.
+/// `None` means the user went back.
+fn prompt_url(default: &str) -> Result<Option<String>, Error> {
+    terminal::ask_text(
+        Field {
+            label: "API base URL",
+            initial: default,
+            placeholder: "http://localhost:8000/v1",
+            help: "OpenAI-compatible endpoint, usually ending in /v1",
+            secret: false,
+        },
+        &|value| {
+            if value.starts_with("http://") || value.starts_with("https://") {
+                Ok(())
+            } else {
+                Err("Start the URL with http:// or https://.".into())
+            }
+        },
+    )
 }
 
 #[cfg(test)]

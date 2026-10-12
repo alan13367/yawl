@@ -130,6 +130,90 @@ struct BufferLayout {
     positions: Vec<CursorPosition>,
 }
 
+/// Single-line text editing shared by the Git commit box, the Git init URL
+/// field, and picker text fields: insertion, deletion, and word/line motions
+/// over char indices. Newlines are dropped so pastes stay on one line.
+pub(super) fn line_insert(text: &mut String, cursor: &mut usize, insert: &str) {
+    let mut chars: Vec<char> = text.chars().collect();
+    let at = (*cursor).min(chars.len());
+    let insert: Vec<char> = insert.chars().filter(|c| *c != '\n').collect();
+    let count = insert.len();
+    chars.splice(at..at, insert);
+    *text = chars.into_iter().collect();
+    *cursor = at + count;
+}
+
+pub(super) fn line_edit(text: &mut String, cursor: &mut usize, key: Key) -> bool {
+    match key {
+        Key::Char(c) => {
+            line_insert(text, cursor, &c.to_string());
+            true
+        }
+        Key::Backspace => {
+            let mut chars: Vec<char> = text.chars().collect();
+            if *cursor > 0 && *cursor <= chars.len() {
+                chars.remove(*cursor - 1);
+                *text = chars.into_iter().collect();
+                *cursor -= 1;
+            }
+            true
+        }
+        Key::Delete => {
+            let mut chars: Vec<char> = text.chars().collect();
+            if *cursor < chars.len() {
+                chars.remove(*cursor);
+                *text = chars.into_iter().collect();
+            }
+            true
+        }
+        Key::Left => {
+            *cursor = cursor.saturating_sub(1);
+            true
+        }
+        Key::Right => {
+            *cursor = (*cursor + 1).min(text.chars().count());
+            true
+        }
+        Key::Home | Key::Ctrl('a') => {
+            *cursor = 0;
+            true
+        }
+        Key::End | Key::Ctrl('e') => {
+            *cursor = text.chars().count();
+            true
+        }
+        Key::Ctrl('u') => {
+            let chars: Vec<char> = text.chars().collect();
+            let at = (*cursor).min(chars.len());
+            *text = chars[at..].iter().collect();
+            *cursor = 0;
+            true
+        }
+        Key::Ctrl('k') => {
+            let chars: Vec<char> = text.chars().collect();
+            let at = (*cursor).min(chars.len());
+            *text = chars[..at].iter().collect();
+            true
+        }
+        Key::Ctrl('w') => {
+            let mut chars: Vec<char> = text.chars().collect();
+            let mut at = (*cursor).min(chars.len());
+            while at > 0 && chars[at - 1].is_whitespace() {
+                chars.remove(at - 1);
+                at -= 1;
+            }
+            while at > 0 && !chars[at - 1].is_whitespace() {
+                chars.remove(at - 1);
+                at -= 1;
+            }
+            *text = chars.into_iter().collect();
+            *cursor = at;
+            true
+        }
+        _ => false,
+    }
+}
+
 #[derive(Default)]
 pub struct Editor {
     buffer: Vec<char>,
@@ -435,15 +519,6 @@ impl Editor {
 
     pub(super) fn styled_layout(&self, width: usize, image_style: &str) -> InputLayout {
         self.layout_with_buffer(width, &self.buffer, &self.image_spans(), Some(image_style))
-    }
-
-    pub fn masked_layout(&self, width: usize) -> InputLayout {
-        let masked = self
-            .buffer
-            .iter()
-            .map(|character| if *character == '\n' { '\n' } else { '•' })
-            .collect::<Vec<_>>();
-        self.layout_with_buffer(width, &masked, &[], None)
     }
 
     fn layout_with_buffer(

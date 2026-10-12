@@ -116,6 +116,9 @@ pub(crate) struct Conversation {
     /// an error or an interrupt, so `/continue` can resume it in place.
     unfinished_mode: Option<turn::TurnMode>,
     catalog_cache: CatalogCache,
+    /// Catalog warnings already shown, so a broken manifest or skill is
+    /// reported once instead of on every model step.
+    reported_warnings: std::collections::HashSet<String>,
     cancellation: CancellationToken,
     print_mode: bool,
     steers: SteerInbox,
@@ -159,6 +162,7 @@ impl Conversation {
             plan_ready_this_turn: false,
             unfinished_mode: None,
             catalog_cache: CatalogCache::default(),
+            reported_warnings: Default::default(),
             cancellation: CancellationToken::default(),
             print_mode: false,
             steers: SteerInbox::default(),
@@ -189,6 +193,7 @@ impl Conversation {
             plan_ready_this_turn: false,
             unfinished_mode: None,
             catalog_cache: CatalogCache::default(),
+            reported_warnings: Default::default(),
             cancellation: CancellationToken::default(),
             print_mode: false,
             steers: SteerInbox::default(),
@@ -539,8 +544,11 @@ impl Conversation {
                 state.tool_allowlist.as_deref(),
             ),
         };
-        if matches!(&self.kind, ConversationKind::Persistent(_)) && self.questions.is_enabled() {
-            registry.advertise_user_input(self.questions.clone());
+        if matches!(&self.kind, ConversationKind::Persistent(_)) {
+            if self.questions.is_enabled() {
+                registry.advertise_user_input(self.questions.clone());
+            }
+            registry.advertise_define_tool(&self.config, &mut self.catalog_cache);
         }
         if let ConversationKind::Persistent(state) = &self.kind
             && state.session.active_plan().is_some()

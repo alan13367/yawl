@@ -10,7 +10,7 @@ pub(super) fn entry() -> ToolEntry {
     ToolEntry::new(
         ToolSpec {
             name: "read_skill".into(),
-            description: "Load full instructions for an advertised skill.".into(),
+            description: "Load an advertised skill's full instructions. Call this before acting on any task a skill's description matches: descriptions only say when a skill applies, and the commands, hosts, credentials, and paths the task needs are in the instructions.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

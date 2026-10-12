@@ -1,6 +1,7 @@
 //! First-run provider and model setup.
 
 mod discovery;
+mod field;
 mod flow;
 pub(crate) mod provider;
 mod select;

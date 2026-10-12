@@ -1,10 +1,11 @@
-//! Tool registry: builtins plus exec tools discovered from disk.
+//! Tool registry: builtins plus custom tool manifests discovered from disk.
 //!
 //! The registry is rescanned every agent-loop iteration, so a tool the model
-//! just wrote is usable on its next turn. On name collisions the last scan
-//! wins (builtins < `~/.yawl/tools` < `./.yawl/tools`).
+//! just defined is usable on its next step. Custom tools never replace
+//! builtins; between custom tools, `./.yawl/tools` overrides `~/.yawl/tools`.
 
 mod catalog;
+mod custom;
 pub mod exec;
 mod files;
 mod git;
@@ -28,7 +29,8 @@ use crate::skills::Skill;
 use crate::subagent::SubagentManager;
 
 pub use catalog::CatalogCache;
-pub use exec::DescribeCache;
+pub(crate) use custom::DEFINE_TOOL_NAME;
+pub use custom::has_project_tools;
 pub(crate) use user_input::{QuestionBroker, QuestionSnapshot};
 /// Short plain-language purposes for builtin tools named in restriction
 /// notices.
@@ -73,7 +75,8 @@ enum ToolImpl {
     PlanComplete,
     PlanAction,
     PlanImplemented,
-    Exec(exec::ExecTool),
+    DefineTool,
+    Custom(custom::CustomTool),
     Subagent(orchestration::SubagentTool),
 }
 
@@ -171,14 +174,16 @@ pub struct Registry {
     subagents: Option<orchestration::SubagentContext>,
     background: Option<BackgroundProcessManager>,
     web: Option<web::WebTools>,
+    /// Present once `define_tool` is advertised.
+    toolsmith: Option<custom::Toolsmith>,
     planning_only: bool,
     /// Set for preset children whose tools come from an allowlist.
     restricted: bool,
 }
 
 impl Registry {
-    /// Scans builtins + exec tool directories. Called every loop iteration;
-    /// `cache` reuses unchanged filesystem catalogs and `--describe` results.
+    /// Scans builtins + custom tool directories. Called every loop iteration;
+    /// `cache` reuses unchanged filesystem catalogs and parsed manifests.
     pub fn scan(config: &Config, cache: &mut CatalogCache) -> Registry {
         Self::scan_inner(config, cache, None)
     }
@@ -262,6 +267,7 @@ impl Registry {
         registry
             .entries
             .extend(shell::background_entries().into_iter().map(Arc::new));
+        registry.insert(custom::define_entry());
         registry
     }
 
@@ -278,6 +284,7 @@ impl Registry {
             subagents: None,
             background,
             web: config.web_browsing.then(|| web::WebTools::new(config)),
+            toolsmith: None,
             planning_only: false,
             restricted: false,
         };
@@ -287,19 +294,29 @@ impl Registry {
         if !registry.skills.is_empty() {
             registry.insert(skills::entry());
         }
-        for dir in config.tool_dirs() {
-            let (tools, warnings) = exec::scan_dir(&dir, cache.describe());
+        let [global_dir, project_dir] = config.tool_dirs();
+        for (dir, scope, trusted) in [
+            (global_dir, custom::Scope::Global, true),
+            (
+                project_dir,
+                custom::Scope::Project,
+                config.project_skills_trusted(),
+            ),
+        ] {
+            let (tools, warnings) = custom::scan_dir(&dir, scope, trusted, cache.manifests());
             registry.warnings.extend(warnings);
-            for tool in tools {
-                if reserved_tool_name(config, &tool.spec.name) {
-                    registry.warnings.push(format!(
-                        "{}: tool name '{}' is reserved by Yawl",
-                        tool.path.display(),
-                        tool.spec.name
-                    ));
+            for entry in tools {
+                if reserved_tool_name(config.web_browsing, &entry.spec.name) {
+                    if let ToolImpl::Custom(tool) = &entry.imp {
+                        registry.warnings.push(format!(
+                            "{}: tool name '{}' is reserved by Yawl",
+                            tool.path.display(),
+                            entry.spec.name
+                        ));
+                    }
                     continue;
                 }
-                registry.insert(ToolEntry::new(tool.spec.clone(), ToolImpl::Exec(tool)));
+                registry.insert_shared(entry);
             }
         }
         registry
@@ -348,7 +365,10 @@ impl Registry {
     }
 
     fn insert(&mut self, entry: ToolEntry) {
-        let entry = Arc::new(entry);
+        self.insert_shared(Arc::new(entry));
+    }
+
+    fn insert_shared(&mut self, entry: Arc<ToolEntry>) {
         if let Some(existing) = self
             .entries
             .iter_mut()
@@ -392,6 +412,13 @@ impl Registry {
         self.insert(mode::plan_implemented_entry());
     }
 
+    /// Lets the model save custom tools. Only the persistent main agent
+    /// personalizes Yawl; children work with the tools they are given.
+    pub(crate) fn advertise_define_tool(&mut self, config: &Config, cache: &mut CatalogCache) {
+        self.toolsmith = Some(custom::Toolsmith::new(config, cache.manifests()));
+        self.insert(custom::define_entry());
+    }
+
     /// Advertises every plan-mode tool at once. Keeping one tool list for
     /// the whole plan lifecycle lets servers reuse the cached prompt prefix
     /// across phases; the turn loop rejects tools the current phase forbids.
@@ -424,6 +451,31 @@ impl Registry {
             .any(|entry| matches!(&entry.imp, ToolImpl::Subagent(_)))
     }
 
+    /// Names of the custom tools loaded from manifests, in scan order.
+    pub fn custom_tool_names(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(&entry.imp, ToolImpl::Custom(_)))
+            .map(|entry| entry.spec.name.clone())
+            .collect()
+    }
+
+    /// Saved custom tools when `define_tool` is advertised, so the prompt
+    /// can name what was built for this user. `None` disables the guidance.
+    pub(crate) fn personalization(&self) -> Option<Vec<String>> {
+        self.toolsmith.as_ref()?;
+        Some(self.custom_tool_names())
+    }
+
+    /// The file a call is about to change, so `/undo` can snapshot it first.
+    pub(crate) fn mutating_path(&self, name: &str, args_json: &str) -> Option<std::path::PathBuf> {
+        if name == DEFINE_TOOL_NAME {
+            let args = serde_json::from_str(args_json).ok()?;
+            return self.toolsmith.as_ref()?.target(&args);
+        }
+        crate::checkpoint::mutating_tool_path(name, args_json)
+    }
+
     /// Name, description, and origin for `/tools` and `--list-tools`.
     pub fn describe_all(&self) -> Vec<(String, String, String)> {
         self.entries
@@ -431,7 +483,9 @@ impl Registry {
             .filter(|entry| !is_private_tool(&entry.imp))
             .map(|e| {
                 let origin = match &e.imp {
-                    ToolImpl::Exec(t) => t.path.display().to_string(),
+                    ToolImpl::Custom(tool) => {
+                        format!("{} tool · {}", tool.scope.label(), tool.path.display())
+                    }
                     ToolImpl::Subagent(_) => "orchestration".to_string(),
                     ToolImpl::ReadSkill => "skills".to_string(),
                     ToolImpl::GoalComplete => "internal".to_string(),
@@ -519,21 +573,18 @@ impl Registry {
             ToolImpl::PlanImplemented => {
                 mode::non_empty_arg(&args, "result", PLAN_IMPLEMENTED_TOOL_NAME)
             }
-            ToolImpl::Exec(tool) => {
-                let (content, is_error) = exec::invoke(tool, args_json, session_id);
-                ToolOutcome {
-                    content,
-                    images: Vec::new(),
-                    is_error,
-                }
-            }
+            ToolImpl::DefineTool => match &self.toolsmith {
+                Some(toolsmith) => toolsmith.define(&args),
+                None => ToolOutcome::error("define_tool is not available here"),
+            },
+            ToolImpl::Custom(tool) => tool.run(name, &args, session_id),
             ToolImpl::Subagent(tool) => {
                 orchestration::execute(self.subagents.as_ref(), *tool, &args)
             }
         };
         // `web_fetch` returns up to its configured limit inline and saves
         // longer pages itself.
-        let save_output = matches!(entry.imp, ToolImpl::Exec(_))
+        let save_output = matches!(entry.imp, ToolImpl::Custom(_))
             || (matches!(entry.imp, ToolImpl::Shell)
                 && args.get("background").and_then(Value::as_bool) != Some(true));
         if save_output {
@@ -550,11 +601,29 @@ impl Registry {
                 "(no output; command succeeded)".to_string()
             };
         }
+        if matches!(entry.imp, ToolImpl::Shell)
+            && !self.planning_only
+            && args.get("background").and_then(Value::as_bool) != Some(true)
+            && let Some(hint) = args
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(|command| custom::shell_hint(&self.entries, command))
+        {
+            outcome.content.push_str("\n\n");
+            outcome.content.push_str(&hint);
+        }
         outcome
     }
 }
 
+/// Builtin names a custom tool may never take, whether or not that builtin
+/// is advertised in the current scan.
 const RESERVED_TOOL_NAMES: &[&str] = &[
+    "shell",
+    "read_file",
+    "write_file",
+    "edit_file",
+    custom::DEFINE_TOOL_NAME,
     "list_files",
     "search_files",
     "git_inspect",
@@ -612,8 +681,8 @@ pub(crate) fn is_private_tool_name(name: &str) -> bool {
     )
 }
 
-fn reserved_tool_name(config: &Config, name: &str) -> bool {
-    RESERVED_TOOL_NAMES.contains(&name) || (config.web_browsing && WEB_TOOL_NAMES.contains(&name))
+fn reserved_tool_name(web_browsing: bool, name: &str) -> bool {
+    RESERVED_TOOL_NAMES.contains(&name) || (web_browsing && WEB_TOOL_NAMES.contains(&name))
 }
 
 fn truncate_result(content: &mut String) {
@@ -633,10 +702,14 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolOutcome> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("yawl-tools-{}-{name}", std::process::id()))
+    }
+
+    fn write_manifest(dir: &std::path::Path, name: &str, manifest: Value) {
+        std::fs::create_dir_all(dir).expect("tools directory");
+        std::fs::write(dir.join(format!("{name}.json")), manifest.to_string()).expect("manifest");
     }
 
     fn registry_config(home_dir: std::path::PathBuf, project_dir: std::path::PathBuf) -> Config {
@@ -704,28 +777,17 @@ mod tests {
     }
 
     #[test]
-    fn executable_web_names_are_reserved_only_when_builtins_are_enabled() -> std::io::Result<()> {
+    fn custom_web_names_are_reserved_only_when_builtins_are_enabled() {
         let root = temp_path("conditional-web-reservation");
+        let _ = std::fs::remove_dir_all(&root);
         let home_dir = root.join("home");
-        let project_dir = root.join("project");
-        let tools_dir = project_dir.join("tools");
-        std::fs::create_dir_all(&tools_dir)?;
-        let tool_path = tools_dir.join("custom-web-search");
-        std::fs::write(
-            &tool_path,
-            r#"#!/bin/sh
-if [ "$1" = "--describe" ]; then
-  echo '{"name":"web_search","description":"custom search","input_schema":{"type":"object"}}'
-else
-  echo custom
-fi
-"#,
-        )?;
-        let mut permissions = std::fs::metadata(&tool_path)?.permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&tool_path, permissions)?;
+        write_manifest(
+            &home_dir.join("tools"),
+            "web_search",
+            json!({"description": "custom search", "command": "echo custom"}),
+        );
 
-        let mut config = registry_config(home_dir, project_dir);
+        let mut config = registry_config(home_dir, root.join("project"));
         let mut cache = CatalogCache::default();
         let disabled = Registry::scan(&config, &mut cache);
         assert!(
@@ -748,7 +810,37 @@ fi
                 .any(|warning| warning.contains("reserved"))
         );
         let _ = std::fs::remove_dir_all(root);
-        Ok(())
+    }
+
+    #[test]
+    fn custom_tools_never_replace_core_builtins() {
+        let root = temp_path("core-builtin-reservation");
+        let _ = std::fs::remove_dir_all(&root);
+        let home_dir = root.join("home");
+        for name in ["shell", "read_file", "define_tool"] {
+            write_manifest(
+                &home_dir.join("tools"),
+                name,
+                json!({"description": "override", "command": "echo hijacked"}),
+            );
+        }
+        let config = registry_config(home_dir, root.join("project"));
+        let registry = Registry::scan(&config, &mut CatalogCache::default());
+        assert!(
+            registry
+                .describe_all()
+                .iter()
+                .all(|(_, description, _)| description != "override")
+        );
+        assert_eq!(
+            registry
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("reserved"))
+                .count(),
+            3
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -829,42 +921,123 @@ fi
     }
 
     #[test]
-    fn registry_discovers_and_invokes_exec_tool() -> std::io::Result<()> {
-        let root = temp_path("exec-registry");
+    fn registry_discovers_and_invokes_custom_tool() {
+        let root = temp_path("custom-registry");
+        let _ = std::fs::remove_dir_all(&root);
         let home_dir = root.join("home");
-        let project_dir = root.join("project");
-        let tools_dir = project_dir.join("tools");
-        std::fs::create_dir_all(&tools_dir)?;
-        let tool_path = tools_dir.join("echo_session");
-        std::fs::write(
-            &tool_path,
-            r#"#!/bin/sh
-if [ "$1" = "--describe" ]; then
-  echo '{"name":"echo_session","description":"test tool","input_schema":{"type":"object"}}'
-  exit 0
-fi
-input=$(cat)
-printf '%s:%s' "$YAWL_SESSION_ID" "$input"
-"#,
-        )?;
-        let mut permissions = std::fs::metadata(&tool_path)?.permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&tool_path, permissions)?;
+        write_manifest(
+            &home_dir.join("tools"),
+            "echo_session",
+            json!({
+                "description": "test tool",
+                "params": {"value": {"type": "integer"}, "label": {"type": "string", "default": "a b"}},
+                "command": "printf '%s|%s|' \"$YAWL_SESSION_ID\" {{label}}; cat"
+            }),
+        );
 
-        let config = registry_config(home_dir, project_dir);
+        let config = registry_config(home_dir, root.join("project"));
         let mut cache = CatalogCache::default();
         let registry = Registry::scan(&config, &mut cache);
         assert!(
-            registry
-                .describe_all()
-                .iter()
-                .any(|(name, _, _)| name == "echo_session")
+            registry.describe_all().iter().any(
+                |(name, _, origin)| name == "echo_session" && origin.starts_with("global tool")
+            )
         );
-        let outcome = registry.execute("echo_session", r#"{"value":1}"#, "session-7");
+        let outcome = registry.execute("echo_session", r#"{"value":"1"}"#, "session-7");
         assert!(!outcome.is_error, "{}", outcome.content);
-        assert_eq!(outcome.content, r#"session-7:{"value":1}"#);
+        assert_eq!(
+            outcome.content,
+            r#"session-7|a b|{"label":"a b","value":1}"#
+        );
+
+        let invalid = registry.execute("echo_session", r#"{"valeu":1}"#, "session-7");
+        assert!(invalid.is_error);
+        assert!(
+            invalid
+                .content
+                .contains("unknown argument 'valeu'; parameters are label, value"),
+            "{}",
+            invalid.content
+        );
+        assert!(
+            invalid
+                .content
+                .contains("Usage: echo_session(label?: string, value: integer)")
+        );
         let _ = std::fs::remove_dir_all(root);
-        Ok(())
+    }
+
+    #[test]
+    fn shell_results_point_at_custom_tools_that_wrap_the_command() {
+        let root = temp_path("shell-hint");
+        let _ = std::fs::remove_dir_all(&root);
+        write_manifest(
+            &root.join("home/tools"),
+            "say",
+            json!({
+                "description": "print a message",
+                "params": {"text": {"type": "string"}},
+                "command": "printf '%s' {{text}}"
+            }),
+        );
+        let config = registry_config(root.join("home"), root.join("project"));
+        let manager = BackgroundProcessManager::default();
+        let registry =
+            Registry::scan_with_background(&config, &mut CatalogCache::default(), manager.clone());
+
+        let nudged = registry.execute("shell", r#"{"command":"printf '%s' hi"}"#, "s");
+        assert!(!nudged.is_error, "{}", nudged.content);
+        assert_eq!(
+            nudged.content,
+            "hi\n\n[yawl] The custom tool `say` wraps this command; call it instead next time."
+        );
+        let unrelated = registry.execute("shell", r#"{"command":"printf ok"}"#, "s");
+        assert_eq!(unrelated.content, "ok");
+        let background = registry.execute(
+            "shell",
+            r#"{"command":"printf '%s' hi","background":true}"#,
+            "s",
+        );
+        assert!(
+            !background.content.contains("[yawl]"),
+            "{}",
+            background.content
+        );
+        manager.shutdown_and_discard();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_tools_override_global_tools_and_require_trust() {
+        let root = temp_path("custom-project-trust");
+        let _ = std::fs::remove_dir_all(&root);
+        let manifest = |text: &str| json!({"description": text, "command": format!("echo {text}")});
+        write_manifest(&root.join("home/tools"), "status", manifest("global"));
+        write_manifest(&root.join("project/tools"), "status", manifest("project"));
+        let mut config = registry_config(root.join("home"), root.join("project"));
+        let mut cache = CatalogCache::default();
+
+        let untrusted = Registry::scan(&config, &mut cache);
+        assert_eq!(
+            untrusted.execute("status", "{}", "s").content.trim(),
+            "global"
+        );
+
+        config.project_skills_trusted = true;
+        let trusted = Registry::scan(&config, &mut cache);
+        assert_eq!(
+            trusted.execute("status", "{}", "s").content.trim(),
+            "project"
+        );
+        assert_eq!(
+            trusted
+                .specs()
+                .iter()
+                .filter(|spec| spec.name == "status")
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -872,20 +1045,11 @@ printf '%s:%s' "$YAWL_SESSION_ID" "$input"
         let root = temp_path("reserved-subagent-tool");
         let home_dir = root.join("home");
         let project_dir = root.join("project");
-        let tools_dir = project_dir.join("tools");
-        std::fs::create_dir_all(&tools_dir)?;
-        let tool_path = tools_dir.join("reserved");
-        std::fs::write(
-            &tool_path,
-            r#"#!/bin/sh
-if [ "$1" = "--describe" ]; then
-  echo '{"name":"subagent_spawn","description":"override","input_schema":{"type":"object"}}'
-fi
-"#,
-        )?;
-        let mut permissions = std::fs::metadata(&tool_path)?.permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&tool_path, permissions)?;
+        write_manifest(
+            &home_dir.join("tools"),
+            "subagent_spawn",
+            json!({"description": "override", "command": "true"}),
+        );
         let mut config = registry_config(home_dir, project_dir);
         let mut cache = CatalogCache::default();
 
@@ -1078,7 +1242,6 @@ fi
     fn scout_discovers_code_with_native_tools_and_cannot_run_commands() {
         let root = temp_path("scout-native-discovery");
         let tools_dir = root.join("home/tools");
-        std::fs::create_dir_all(&tools_dir).expect("tools directory");
         std::fs::create_dir_all(root.join("project/src")).expect("source directory");
         std::fs::write(
             root.join("project/src/example.rs"),
@@ -1086,12 +1249,11 @@ fi
         )
         .expect("source");
         for name in ["list_files", "search_files", "git_inspect"] {
-            let path = tools_dir.join(name);
-            let spec = json!({"name": name, "description": "override", "input_schema": {"type": "object"}});
-            std::fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", spec))
-                .expect("exec fixture");
-            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .expect("executable");
+            write_manifest(
+                &tools_dir,
+                name,
+                json!({"description": "override", "command": "true"}),
+            );
         }
         let config = registry_config(root.join("home"), root.join("project"));
         let scout = crate::subagent::presets::bundled().remove(0);

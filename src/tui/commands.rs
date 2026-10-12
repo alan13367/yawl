@@ -50,7 +50,7 @@ Commands
 | `/compact` | Summarize older messages now |
 | `/copy` | Copy the last assistant reply |
 | `/copy-all` | Copy conversation without reasoning |
-| `/tools` | List builtin and discovered tools |
+| `/tools` | List builtin tools and your custom tools |
 | `/skills` | List discovered skills (run `/skill:NAME`) |
 | --- | --- |
 | `/goal [TEXT]` | Start, resume, cancel, or show goal |
@@ -341,6 +341,42 @@ fn notice_goal_status(agent: &Agent, state: &mut ViewState, running: bool) {
         )),
         None => state.notice("No active goal. Start one with /goal TEXT."),
     }
+}
+
+/// Lists builtin tools, then the custom tools saved for this user, so the
+/// personalization the model added is visible and easy to find on disk.
+pub(super) fn show_tools(agent: &mut Agent, state: &mut ViewState) {
+    let registry = agent.scan_tools();
+    let custom = registry.custom_tool_names();
+    let (saved, builtin): (Vec<_>, Vec<_>) = registry
+        .describe_all()
+        .into_iter()
+        .partition(|(name, _, _)| custom.contains(name));
+    let mut text = String::from("Builtin tools\n\n");
+    for (tool, description, origin) in builtin {
+        text.push_str(&format!("- `{tool}` ({origin}): {description}\n"));
+    }
+    text.push_str("\nCustom tools\n\n");
+    if saved.is_empty() {
+        text.push_str(
+            "None yet. Ask Yawl to turn a command or workflow you repeat into a tool; it saves \
+             tools as JSON in `~/.yawl/tools/` or `./.yawl/tools/` and keeps them across \
+             sessions.\n",
+        );
+    }
+    for (tool, description, origin) in saved {
+        text.push_str(&format!("- `{tool}` ({origin}): {description}\n"));
+    }
+    if !agent.config().project_skills_trusted() && crate::tools::has_project_tools(agent.config()) {
+        text.push_str("\nProject tools in `./.yawl/tools/` are not trusted for this invocation.\n");
+    }
+    if !registry.warnings.is_empty() {
+        text.push_str("\nSkipped\n\n");
+        for warning in &registry.warnings {
+            text.push_str(&format!("- {warning}\n"));
+        }
+    }
+    state.notice(text);
 }
 
 pub(super) fn show_skills(agent: &Agent, state: &mut ViewState) {

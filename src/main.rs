@@ -150,7 +150,7 @@ fn list_tools(config: &Config) {
         println!("{name}\t{origin}\n  {description}");
     }
     for warning in registry.warnings {
-        eprintln!("warning: {warning}");
+        eprintln!("warning: skipped {warning}");
     }
 }
 

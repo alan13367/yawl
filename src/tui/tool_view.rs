@@ -20,6 +20,7 @@ const DIFF_PREVIEW_LINES: usize = 12;
 const SUCCESS_BACKGROUND: &str = "\x1b[48;2;42;50;41m";
 const ERROR_BACKGROUND: &str = "\x1b[48;2;50;42;42m";
 const SKILL_BACKGROUND: &str = "\x1b[48;2;54;44;82m";
+const TOOLSMITH_BACKGROUND: &str = "\x1b[48;2;28;52;60m";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tone {
@@ -134,6 +135,8 @@ pub(super) fn render_labeled(
     } else if name == crate::tools::USER_INPUT_TOOL_NAME && !running && !is_error {
         render_question_answers(parsed.as_ref(), output)
             .unwrap_or_else(|| question_call(parsed.as_ref(), false, false, expanded))
+    } else if name == crate::tools::DEFINE_TOOL_NAME {
+        define_tool_lines(parsed.as_ref(), output, running, is_error, expanded)
     } else {
         render_call(
             name,
@@ -231,6 +234,8 @@ pub(super) fn render_labeled(
         ERROR_BACKGROUND
     } else if name == "read_skill" {
         SKILL_BACKGROUND
+    } else if name == crate::tools::DEFINE_TOOL_NAME && !running {
+        TOOLSMITH_BACKGROUND
     } else if name == crate::tools::USER_INPUT_TOOL_NAME {
         "\x1b[48;2;40;44;52m"
     } else if running {
@@ -477,6 +482,61 @@ fn render_call(
     }
 }
 
+/// The card for a tool the model saved: what it does, its command, and
+/// where it lives. The model-facing usage report stays out of the card.
+fn define_tool_lines(
+    args: Option<&Value>,
+    output: &str,
+    running: bool,
+    is_error: bool,
+    expanded: bool,
+) -> Vec<ToolLine> {
+    let name = string_arg(args, "name").unwrap_or("?");
+    let scope = string_arg(args, "scope").unwrap_or("custom");
+    let saved = (!running && !is_error)
+        .then(|| define_tool_report(output))
+        .flatten();
+    let title = match (saved, running, is_error) {
+        (Some((verb, _)), _, _) => format!("\u{2726} {verb} {scope} tool {name}"),
+        (None, true, _) => format!("Define {scope} tool {name}  [running]"),
+        (None, _, true) => format!("Define {scope} tool {name}  [error]"),
+        (None, false, false) => format!("Define {scope} tool {name}"),
+    };
+    let mut lines = vec![ToolLine::new(title, Tone::Header)];
+    if let Some(description) = string_arg(args, "description") {
+        lines.push(ToolLine::new("", Tone::Output));
+        lines.extend(text_lines(description.trim(), Tone::Output));
+    }
+    if let Some(command) = string_arg(args, "command") {
+        lines.push(ToolLine::new("", Tone::Output));
+        lines.extend(preview_lines(
+            prefixed_lines(command, "$ ", "  ", Tone::Output),
+            CALL_PREVIEW_LINES,
+            expanded,
+            false,
+        ));
+    }
+    if let Some((_, path)) = saved {
+        lines.push(ToolLine::new("", Tone::Output));
+        lines.push(ToolLine::new(
+            format!("Saved to {}", display_path(path)),
+            Tone::Muted,
+        ));
+    }
+    lines
+}
+
+/// Reads `Created|Updated <scope> tool `<name>` at <path>.` from the first
+/// line of a successful `define_tool` result.
+fn define_tool_report(output: &str) -> Option<(&str, &str)> {
+    let (verb, rest) = output.lines().next()?.split_once(' ')?;
+    if !matches!(verb, "Created" | "Updated") {
+        return None;
+    }
+    let path = rest.split_once(" at ")?.1.strip_suffix('.')?;
+    Some((verb, path))
+}
+
 /// Older sessions contain the original JSON file-tool envelopes. Decode only
 /// those known shapes so resumed transcripts benefit from readable output too.
 fn saved_file_output(name: &str, args: Option<&Value>, output: &str) -> Option<String> {
@@ -538,7 +598,10 @@ fn should_show_output(name: &str, output: &str, is_error: bool) -> bool {
     is_error
         || !matches!(
             name,
-            "write_file" | "edit_file" | crate::tools::USER_INPUT_TOOL_NAME
+            "write_file"
+                | "edit_file"
+                | crate::tools::USER_INPUT_TOOL_NAME
+                | crate::tools::DEFINE_TOOL_NAME
         )
 }
 
@@ -1227,6 +1290,47 @@ mod tests {
             false,
         );
         assert!(error.iter().all(|line| line.contains(ERROR_BACKGROUND)));
+    }
+
+    #[test]
+    fn defined_tools_render_as_a_personalization_card() {
+        let args = r#"{"name":"greet","description":"Greet someone by name","command":"printf 'hello %s' {{who}}","scope":"project","params":{"who":{"type":"string"}}}"#;
+        let saved = render(
+            crate::tools::DEFINE_TOOL_NAME,
+            args,
+            "Created project tool `greet` at /repo/.yawl/tools/greet.json.\nFrom your next step on, call greet(who: string) instead of running its command through shell.\nIt persists across sessions; delete the file to remove it.",
+            false,
+            false,
+            None,
+            60,
+            false,
+        );
+        let plain = markdown::strip_ansi(&saved.join("\n"));
+        for expected in [
+            "\u{2726} Created project tool greet",
+            "Greet someone by name",
+            "$ printf 'hello %s' {{who}}",
+            "Saved to /repo/.yawl/tools/greet.json",
+        ] {
+            assert!(plain.contains(expected), "missing {expected}:\n{plain}");
+        }
+        assert!(!plain.contains("From your next step on"));
+        assert!(saved.iter().all(|line| line.contains(TOOLSMITH_BACKGROUND)));
+
+        let rejected = render(
+            crate::tools::DEFINE_TOOL_NAME,
+            args,
+            "Tool not saved: 'shell' is a builtin tool name",
+            true,
+            false,
+            None,
+            60,
+            false,
+        );
+        let plain = markdown::strip_ansi(&rejected.join("\n"));
+        assert!(plain.contains("Define project tool greet  [error]"));
+        assert!(plain.contains("Tool not saved: 'shell' is a builtin tool name"));
+        assert!(rejected.iter().all(|line| line.contains(ERROR_BACKGROUND)));
     }
 
     #[test]

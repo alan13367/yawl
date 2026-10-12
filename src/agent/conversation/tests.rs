@@ -2515,3 +2515,100 @@ fn plan_phases_keep_the_prompt_prefix_and_gate_tools_in_history_notes() -> Resul
     );
     Ok(())
 }
+
+#[test]
+fn defined_tools_work_on_the_next_step_reach_the_prompt_and_undo_cleanly() {
+    let mut test = TestAgent::new("define-tool");
+    let home_tools = test.root.join("home/tools");
+    std::fs::create_dir_all(&home_tools).expect("home tools");
+    std::fs::write(home_tools.join("broken.json"), "{").expect("broken manifest");
+    let manifest = test.root.join("project/tools/greet.json");
+    let call = |id: &str, name: &str, arguments: serde_json::Value| ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: arguments.to_string(),
+    };
+    let output = |text: &'static str, tool_calls: Vec<ToolCall>| ProviderStep::Output {
+        text,
+        tool_calls,
+        input_tokens: 10,
+        output_tokens: 2,
+    };
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        output(
+            "",
+            vec![call(
+                "define",
+                crate::tools::DEFINE_TOOL_NAME,
+                serde_json::json!({
+                    "name": "greet",
+                    "description": "Greet someone by name",
+                    "params": {"who": {"type": "string"}},
+                    "command": "printf 'hello %s' {{who}}",
+                    "scope": "project"
+                }),
+            )],
+        ),
+        output(
+            "",
+            vec![call("use", "greet", serde_json::json!({"who": "Ada"}))],
+        ),
+        output("Saved and tried greet.", Vec::new()),
+        output("Still here.", Vec::new()),
+    ])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let systems = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = |_: &str, _: &Config| {
+        Ok::<(Box<dyn Provider>, String), Error>((
+            Box::new(ScriptedProvider {
+                steps: Rc::clone(&steps),
+                requests: Rc::clone(&requests),
+                systems: Some(Rc::clone(&systems)),
+            }),
+            "test".into(),
+        ))
+    };
+    let mut warnings = Vec::new();
+    let mut sink = |event: TurnEvent<'_>| {
+        if let TurnEvent::Warning(text) = event {
+            warnings.push(text);
+        }
+    };
+
+    test.agent
+        .run_turn_with(
+            Some("make me a greeting tool".into()),
+            &mut sink,
+            &mut resolve,
+        )
+        .expect("defining turn should complete");
+    test.agent
+        .run_turn_with(Some("thanks".into()), &mut sink, &mut resolve)
+        .expect("follow-up turn should complete");
+
+    let results = test
+        .agent
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .map(|message| (message.is_error, message.content.clone()))
+        .collect::<Vec<_>>();
+    assert!(!results[0].0, "{}", results[0].1);
+    assert!(results[0].1.starts_with("Created project tool `greet`"));
+    assert_eq!(results[1], (false, "hello Ada".to_string()));
+    let systems = systems.borrow();
+    assert!(systems[0].contains("Personalize Yawl with define_tool"));
+    assert!(!systems[0].contains("Custom tools saved for this user"));
+    assert!(systems[1].contains("Custom tools saved for this user: greet."));
+    let broken = warnings
+        .iter()
+        .filter(|warning| warning.contains("broken.json"))
+        .count();
+    assert_eq!(broken, 1, "{warnings:?}");
+
+    assert!(manifest.is_file());
+    test.agent.undo_last_turn().expect("undo follow-up");
+    let report = test.agent.undo_last_turn().expect("undo definition");
+    assert!(report.restored_files);
+    assert!(!manifest.exists(), "undo should remove the defined tool");
+}

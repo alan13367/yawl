@@ -69,3 +69,19 @@ impl Drop for RawMode {
         }
     }
 }
+
+/// Width of the terminal on stdout, or 80 when it cannot be read.
+pub(crate) fn terminal_columns() -> usize {
+    // SAFETY: A zeroed winsize has a valid all-integer representation and is
+    // passed to ioctl as writable storage for the stdout descriptor.
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: STDOUT_FILENO is a valid descriptor and `size` points to
+    // writable winsize storage.
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0
+        && size.ws_col > 0
+    {
+        usize::from(size.ws_col)
+    } else {
+        80
+    }
+}

@@ -43,7 +43,8 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tui/remote/hub.rs`, `remote/server.rs`, `remote/http.rs`, `remote/address.rs`, `remote/qr.rs`: shared session state and input wake-ups between UI and server threads, pairing and SSE/POST routes, minimal keep-alive HTTP/1.1, Tailscale address discovery with pairing secrets, and the QR encoder for the pairing link. `remote/index.html` is the embedded page for phones and computers
 - `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
-- `src/tools/`: builtin registry and executable-tool discovery
+- `src/tools/`: builtin registry and custom-tool discovery
+- `src/tools/custom.rs`: custom tool manifests (validation, `{{param}}` shell-quoted expansion, trust-gated discovery cache) and the `define_tool` builtin
 - `src/tools/catalog.rs`: per-scan caches for builtin entries, skills, and subagent presets
 - `src/tools/output.rs`: bounded excerpts and saved artifacts for verbose command and web output
 - `src/tools/shell.rs`: foreground/background shell schemas and execution
@@ -53,7 +54,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tools/mode.rs`: goal and plan single-call mode entries
 - `src/tools/orchestration.rs`: subagent spawn/send/wait/cancel/list entries and dispatch
 - `src/tools/skills.rs`: `read_skill` entry and execution
-- `src/tools/exec.rs`, `src/tools/planning_shell.rs`, `src/tools/user_input.rs`: exec-tool contract, gated planning inspection, and interactive question broker
+- `src/tools/exec.rs`, `src/tools/planning_shell.rs`, `src/tools/user_input.rs`: bounded child-process runner and result contract, gated planning inspection, and interactive question broker
 - `src/tools/web.rs`: web tool facade with the shared HTTP agent, bounded body reads, cancellation, and untrusted-content delimiters
 - `src/tools/web/search.rs`, `web/fetch.rs`, `web/html.rs`: DuckDuckGo, Brave, and Firecrawl search backends; page fetch with inline limits and saved full pages; HTML-to-Markdown extraction with bounded concurrency. `web/test_support.rs` holds local HTTP test fixtures
 - `src/subagent/manager.rs`: subagent capacity, execution, waiting, and delivery facade
@@ -92,6 +93,6 @@ Run `cargo fmt --all` after editing Rust. After making code changes, run `cargo 
 - Add a `// SAFETY:` comment to every `unsafe` block and keep its scope minimal.
 - Add focused tests for behavior changes. Preserve provider streaming, session replay, config merging, and terminal escape sanitization invariants.
 - Advertise `web_search` and `web_fetch` in the system prompt only when the current registry actually contains those builtins, not merely when `web_browsing` is enabled in config.
-- Update `README.md` when changing CLI behavior, configuration, slash commands, or the exec-tool contract. Update this file when the module layout above changes.
+- Update `README.md` when changing CLI behavior, configuration, slash commands, or the custom-tool manifest contract. Update this file when the module layout above changes.
 
 Before editing, check `git status` and preserve unrelated work. Before finishing, run the three validation commands above and review `git diff`.

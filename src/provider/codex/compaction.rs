@@ -16,26 +16,28 @@ const RETAINED_USER_TOKEN_BUDGET: usize = 20_000;
 pub(super) fn compact(codex: &Codex, request: &Request<'_>) -> Result<CompactionOutput, Error> {
     let input = build_input(request.messages, request.supports_images, request.model);
     let body = build_body(request, &input, codex.reasoning_effort.as_deref()).to_string();
-    let mut http = codex
-        .agent
-        .post(CODEX_RESPONSES_URL)
-        .header("authorization", format!("Bearer {}", codex.access_token))
-        .header("chatgpt-account-id", &codex.account_id)
-        .header("originator", "yawl")
-        .header("user-agent", format!("yawl/{}", env!("CARGO_PKG_VERSION")))
-        .header("openai-beta", "responses=experimental")
-        .header("x-codex-beta-features", REMOTE_COMPACTION_FEATURE)
-        .header("accept", "text/event-stream")
-        .header("content-type", "application/json");
-    if request.prompt_cache_control
-        && let Some(key) =
-            crate::provider::types::clamp_openai_prompt_cache_key(request.prompt_cache_key)
-    {
-        http = http
-            .header("session-id", key.as_ref())
-            .header("x-client-request-id", key.as_ref());
-    }
-    let mut response = http.send(body)?;
+    let mut response = codex.send_authorized(|token| {
+        let mut http = codex
+            .agent
+            .post(CODEX_RESPONSES_URL)
+            .header("authorization", format!("Bearer {token}"))
+            .header("chatgpt-account-id", &codex.account_id)
+            .header("originator", "yawl")
+            .header("user-agent", format!("yawl/{}", env!("CARGO_PKG_VERSION")))
+            .header("openai-beta", "responses=experimental")
+            .header("x-codex-beta-features", REMOTE_COMPACTION_FEATURE)
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json");
+        if request.prompt_cache_control
+            && let Some(key) =
+                crate::provider::types::clamp_openai_prompt_cache_key(request.prompt_cache_key)
+        {
+            http = http
+                .header("session-id", key.as_ref())
+                .header("x-client-request-id", key.as_ref());
+        }
+        Ok(http.send(body.as_str())?)
+    })?;
     let status = response.status().as_u16();
     if status != 200 {
         return Err(Error::Http {

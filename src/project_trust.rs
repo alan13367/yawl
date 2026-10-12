@@ -26,6 +26,7 @@ pub(super) fn resolve(
         }
         yawl::trust::Decision::Unknown
             if !yawl::skills::has_project_sources(config)
+                && !yawl::tools::has_project_tools(config)
                 && !config.project_config_restricted() =>
         {
             config.set_project_skills_trusted(false);
@@ -51,8 +52,8 @@ pub(super) fn resolve(
             config.set_project_skills_trusted(false);
             eprintln!(
                 "warning: project-controlled settings under {} are not trusted; project skills, \
-                 provider endpoints, and credentials from this repository are ignored. Pass \
-                 --trust-project to enable them for this invocation",
+                 tools, provider endpoints, and credentials from this repository are ignored. \
+                 Pass --trust-project to enable them for this invocation",
                 root.display()
             );
             Ok(())
@@ -82,7 +83,7 @@ fn prompt_project_trust(root: &Path) -> Result<ProjectTrustChoice, io::Error> {
             root.display()
         );
         eprintln!(
-            "Trusting enables project skills and any provider endpoints or credentials it defines."
+            "Trusting enables project skills, project tools, and any provider endpoints or credentials it defines."
         );
         eprintln!("  1. Trust this project permanently");
         eprintln!("  2. Trust for this session");

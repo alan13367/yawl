@@ -17,10 +17,10 @@ use super::events::{Event, EventReader, Key, MouseEvent, MouseKind, event_reques
 use super::input::{EditAction, Editor, Submission};
 use super::picker::{
     ActivePickers, PickerAction, SettingsCategory, SettingsItem, SettingsLocation,
-    open_model_picker_from_config, open_subagent_model_picker, picker_is_editing,
-    poll_model_picker, reasoning_picker_from_config, remove_model_confirm, select_picker_item,
-    settings_item_index, status_bar_editor_picker, sync_color_preview, take_picker_action,
-    web_search_provider_picker,
+    open_model_picker_from_config, open_subagent_model_picker, paste_into_picker,
+    picker_is_editing, poll_model_picker, reasoning_picker_from_config, remove_model_confirm,
+    select_picker_item, settings_item_index, status_bar_editor_picker, sync_color_preview,
+    take_picker_action, web_search_provider_picker,
 };
 use super::state::{
     COPY_TOAST_TICKS, Update, ViewState, advance_ticks, clear_jump_pointer,
@@ -344,7 +344,9 @@ pub(super) fn pump_events<R: Read, T>(
                             sync_color_preview(state);
                         }
                     }
-                    Event::Paste(text) if picker_is_editing(state) => editor.paste(&text),
+                    Event::Paste(text) if picker_is_editing(state) => {
+                        paste_into_picker(state, editor, &text);
+                    }
                     Event::Mouse(mouse) => {
                         needs_draw |= handle_mouse_selection(terminal, state, mouse)?;
                     }

@@ -377,19 +377,67 @@ fn now_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn auth_path(config: &Config) -> std::path::PathBuf {
+pub(super) fn auth_path(config: &Config) -> std::path::PathBuf {
     config.home_dir.join("auth.json")
 }
 
-pub(super) fn load_and_refresh_credential(config: &Config) -> Result<CodexCredential, Error> {
-    let mut credential = load_credential(config)?.ok_or_else(|| {
+/// Serializes every refresh in this process. Refresh tokens are single-use,
+/// so two requests refreshing the same login at once would leave one with a
+/// spent token; whoever waits rereads the file and reuses the new login.
+fn lock_refresh() -> std::sync::MutexGuard<'static, ()> {
+    static REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    REFRESH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn require_credential(path: &Path) -> Result<CodexCredential, Error> {
+    load_credential_from(path)?.ok_or_else(|| {
         Error::Config("OpenAI Codex is not logged in; run 'yawl --login openai-codex'".into())
-    })?;
-    if now_millis().saturating_add(REFRESH_MARGIN_MS) >= credential.expires {
-        credential = refresh_credential(&credential.refresh)?;
-        save_credential(config, &credential)?;
+    })
+}
+
+/// Replaces a login the server rejected, whatever its saved expiry says.
+/// ChatGPT can revoke an access token early, for example after the account
+/// signs in to another Codex client; trusting the local timestamp alone would
+/// fail every request until it passed. A token another request already
+/// replaced is reused instead of spending the refresh token twice.
+pub(super) fn refresh_rejected_credential(
+    path: &Path,
+    rejected_access: &str,
+) -> Result<CodexCredential, Error> {
+    let _guard = lock_refresh();
+    let credential = require_credential(path)?;
+    if credential.access != rejected_access {
+        return Ok(credential);
     }
-    Ok(credential)
+    let refreshed = refresh_credential(&credential.refresh)?;
+    save_credential_to(path, &refreshed)?;
+    Ok(refreshed)
+}
+
+pub(super) fn load_and_refresh_credential(config: &Config) -> Result<CodexCredential, Error> {
+    refresh_expiring_credential(&auth_path(config), now_millis())
+}
+
+/// Loads the login and refreshes it when it is about to expire. The check
+/// repeats under the refresh lock, so a login another request refreshed
+/// while this one waited is reused.
+fn refresh_expiring_credential(path: &Path, now: u64) -> Result<CodexCredential, Error> {
+    let expiring =
+        |credential: &CodexCredential| now.saturating_add(REFRESH_MARGIN_MS) >= credential.expires;
+    let credential = require_credential(path)?;
+    if !expiring(&credential) {
+        return Ok(credential);
+    }
+    let _guard = lock_refresh();
+    let credential = require_credential(path)?;
+    if !expiring(&credential) {
+        return Ok(credential);
+    }
+    let refreshed = refresh_credential(&credential.refresh)?;
+    save_credential_to(path, &refreshed)?;
+    Ok(refreshed)
 }
 
 /// Whether `auth.json` holds a Codex login the wizard can reuse. An expired
@@ -411,8 +459,11 @@ pub fn credential_status(config: &Config) -> CodexLoginStatus {
 }
 
 pub(super) fn load_credential(config: &Config) -> Result<Option<CodexCredential>, Error> {
-    let path = auth_path(config);
-    let text = match std::fs::read_to_string(&path) {
+    load_credential_from(&auth_path(config))
+}
+
+fn load_credential_from(path: &Path) -> Result<Option<CodexCredential>, Error> {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(Error::Config(format!("{}: {error}", path.display()))),
@@ -428,8 +479,11 @@ pub(super) fn load_credential(config: &Config) -> Result<Option<CodexCredential>
 }
 
 fn save_credential(config: &Config, credential: &CodexCredential) -> Result<(), Error> {
-    let path = auth_path(config);
-    let mut root = match std::fs::read_to_string(&path) {
+    save_credential_to(&auth_path(config), credential)
+}
+
+fn save_credential_to(path: &Path, credential: &CodexCredential) -> Result<(), Error> {
+    let mut root = match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str::<Value>(&text)
             .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
@@ -442,7 +496,7 @@ fn save_credential(config: &Config, credential: &CodexCredential) -> Result<(), 
         )));
     };
     object.insert("openai-codex".into(), serde_json::to_value(credential)?);
-    write_private_json(&path, &root)
+    write_private_json(path, &root)
 }
 
 fn write_private_json(path: &Path, value: &Value) -> Result<(), Error> {
@@ -519,5 +573,40 @@ mod tests {
         assert!(matches!(result, Err(Error::Interrupted)));
         assert!(!auth_path(&config).exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejected_token_reuses_a_login_another_request_already_refreshed() -> Result<(), Error> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "yawl-rejected-login-{}-{nonce}",
+            std::process::id()
+        ));
+        let path = root.join("auth.json");
+        let replaced = CodexCredential {
+            credential_type: oauth_type(),
+            access: "replacement".into(),
+            // Unusable on purpose: reaching the token endpoint would fail.
+            refresh: String::new(),
+            expires: u64::MAX,
+            account_id: "account".into(),
+        };
+        save_credential_to(&path, &replaced)?;
+
+        let credential = refresh_rejected_credential(&path, "rejected")?;
+
+        assert_eq!(credential.access, "replacement");
+        // A login that is not expiring is reused without spending the
+        // (unusable) refresh token.
+        assert_eq!(refresh_expiring_credential(&path, 0)?.access, "replacement");
+        let missing = refresh_rejected_credential(&root.join("missing.json"), "rejected");
+        assert!(
+            matches!(missing, Err(Error::Config(message)) if message.contains("--login openai-codex"))
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 }

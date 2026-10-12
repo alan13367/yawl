@@ -340,14 +340,10 @@ pub(super) fn build_frame_with_images(
     }
     let inner_width = columns.saturating_sub(2);
     let plan_handoff = state.picker.as_ref().is_some_and(picker_is_plan_handoff);
-    let layout = if super::picker::picker_is_secret(state) {
-        editor.masked_layout(inner_width)
-    } else {
-        editor.styled_layout(
-            inner_width,
-            &foreground_color(reasoning::thinking_color(state.accent_color)),
-        )
-    };
+    let layout = editor.styled_layout(
+        inner_width,
+        &foreground_color(reasoning::thinking_color(state.accent_color)),
+    );
     let background_count = state.background_processes.active_count();
     state.background_active_count = background_count;
     let background_snapshots = if background_count > 0 {
@@ -472,20 +468,23 @@ pub(super) fn build_frame_with_images(
     // welcome screens clear the map because no tool card is visible.
     let mut click_map = Vec::with_capacity(transcript_height);
     let mut showing_transcript = false;
+    let mut picker_cursor = None;
     if let Some(picker) = state
         .picker
         .as_ref()
         .filter(|picker| !picker_is_plan_handoff(picker))
     {
         let outline = foreground_color(state.accent_color);
-        region.extend(render_picker(
+        let (lines, cursor) = render_picker(
             picker,
             editor,
             &selection_style(state.selection_color),
             &outline,
             columns,
             transcript_height,
-        ));
+        );
+        region.extend(lines);
+        picker_cursor = cursor;
         state.transcript_row_entries.clear();
     } else if visible.is_empty() && state.transcript.is_empty() {
         region.extend(render_welcome(
@@ -597,7 +596,11 @@ pub(super) fn build_frame_with_images(
         render_copy_toast(&mut frame, columns, state.accent_color);
     }
 
-    let (cursor_row, cursor_col) = if hide_input_cursor || plan_handoff {
+    // A focused picker field owns the cursor; the composer keeps its draft
+    // untouched underneath. Frame rows and columns are one-based.
+    let (cursor_row, cursor_col) = if let Some((row, column)) = picker_cursor {
+        (row + 1, column + 1)
+    } else if hide_input_cursor || plan_handoff {
         HIDDEN_CURSOR
     } else if let Some(query) = state.transcript.search_query() {
         (

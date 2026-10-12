@@ -2,7 +2,6 @@
 
 use super::truncate_visible;
 use super::{DiffKind, DiffLine, GitFile, GitSection, GitStatus, HistoryEntry, LoadedDiff};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -123,7 +122,8 @@ fn run_git_output(
     if crate::cancellation::interrupted() {
         return Err("cancelled.".into());
     }
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    let mut child = crate::tools::exec::isolate_from_terminal(&mut command)
         .arg("-C")
         .arg(root)
         .args(args)
@@ -131,7 +131,6 @@ fn run_git_output(
         .env("GIT_PAGER", "cat")
         .env("LC_ALL", "C")
         .envs(env.iter().copied())
-        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

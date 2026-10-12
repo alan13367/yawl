@@ -98,7 +98,8 @@ pub struct Config {
     pub(crate) global_skill_dirs: Vec<PathBuf>,
     /// A `skill_dirs` override supplied by `./.yawl/config.json`.
     pub(crate) project_skill_dirs: Option<Vec<PathBuf>>,
-    /// Whether project-controlled skill sources may be read this invocation.
+    /// Whether project-controlled skill sources and `./.yawl/tools/` manifests
+    /// may be used this invocation.
     pub(crate) project_skills_trusted: bool,
     pub providers: HashMap<String, ProviderConfig>,
     /// Whether the user explicitly skipped onboarding, suppressing the

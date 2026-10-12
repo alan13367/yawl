@@ -10,7 +10,7 @@ use crate::onboarding::provider::{
 };
 use crate::provider::codex::{CodexLoginStatus, DeviceLoginPrompt};
 
-use super::picker::{Picker, PickerAction, PickerItem};
+use super::picker::{FieldTarget, Picker, PickerAction, PickerField, PickerItem, field_picker};
 use super::state::ViewState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,18 +213,90 @@ fn provider_description(provider: &ProviderDefinition) -> String {
     }
 }
 
+/// The text field for one connection value, labeled for someone setting up
+/// a provider for the first time.
+pub(super) fn field(field: ConnectEditField, initial: String) -> PickerField {
+    let target = FieldTarget::Connect(field);
+    match field {
+        ConnectEditField::ProviderName => PickerField::new(
+            target,
+            "Provider name",
+            "Becomes the model prefix, as in my-provider:model-id. Use letters, numbers, '-' and '_'.",
+            initial,
+        )
+        .placeholder("my-provider"),
+        ConnectEditField::Endpoint => PickerField::new(
+            target,
+            "API base URL",
+            "The OpenAI-compatible endpoint, usually ending in /v1",
+            initial,
+        )
+        .placeholder("http://localhost:8000/v1"),
+        ConnectEditField::Environment => PickerField::new(
+            target,
+            "Environment variable",
+            "Yawl saves a $NAME reference and reads the key from your environment",
+            initial,
+        )
+        .placeholder("OPENAI_API_KEY"),
+        ConnectEditField::Secret => PickerField::new(
+            target,
+            "API key",
+            "Saved in ~/.yawl/config.json, readable only by you",
+            initial,
+        )
+        .placeholder("Paste your key")
+        .secret(),
+        ConnectEditField::Model => PickerField::new(
+            target,
+            "Model ID",
+            "The exact model ID the provider expects",
+            initial,
+        ),
+    }
+}
+
+/// A validation error phrased for a field: without the internal error kind
+/// and starting with a capital letter.
+fn field_error(error: Error) -> String {
+    let message = match error {
+        Error::Config(message) => message,
+        other => other.to_string(),
+    };
+    let mut characters = message.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect()
+    })
+}
+
+fn provider_name_picker(value: String, error: Option<String>) -> Picker {
+    let mut name = field(ConnectEditField::ProviderName, value);
+    if let Some(error) = error {
+        name = name.with_error(error);
+    }
+    field_picker(
+        "Add an OpenAI-compatible provider",
+        name,
+        PickerAction::ConnectBack(ConnectStep::Provider),
+    )
+}
+
+fn endpoint_picker(flow: &ConnectFlow, value: String, error: Option<&str>) -> Picker {
+    let mut endpoint = field(ConnectEditField::Endpoint, value);
+    if let Some(error) = error {
+        endpoint = endpoint.with_error(error);
+    }
+    field_picker(
+        format!("{} endpoint", flow.provider_label),
+        endpoint,
+        PickerAction::ConnectBack(ConnectStep::Provider),
+    )
+}
+
 fn choose_provider(flow: &mut ConnectFlow, provider: ProviderId, state: &mut ViewState) {
     if provider == ProviderId::Other {
         flow.step = ConnectStep::ProviderName;
-        state.picker = Some(edit_picker(
-            "Provider name",
-            "Name",
-            "letters, numbers, '-' or '_'",
-            ConnectEditField::ProviderName,
-            String::new(),
-            false,
-            PickerAction::ConnectBack(ConnectStep::Provider),
-        ));
+        state.picker = Some(provider_name_picker(String::new(), None));
         return;
     }
     flow.provider_label = provider_label(&provider);
@@ -239,15 +311,7 @@ fn choose_provider(flow: &mut ConnectFlow, provider: ProviderId, state: &mut Vie
     }
     flow.endpoint = provider::default_endpoint(&provider, &flow.config);
     flow.step = ConnectStep::Endpoint;
-    state.picker = Some(edit_picker(
-        &format!("{} endpoint", flow.provider_label),
-        "API base URL",
-        "usually ends in /v1",
-        ConnectEditField::Endpoint,
-        flow.endpoint.clone(),
-        false,
-        PickerAction::ConnectBack(ConnectStep::Provider),
-    ));
+    state.picker = Some(endpoint_picker(flow, flow.endpoint.clone(), None));
 }
 
 fn provider_label(provider: &ProviderId) -> String {
@@ -265,6 +329,8 @@ fn provider_label(provider: &ProviderId) -> String {
     }
 }
 
+/// Applies a submitted value, or reopens its field with the problem shown
+/// under the value the user typed.
 fn apply_edit(
     flow: &mut ConnectFlow,
     field: ConnectEditField,
@@ -275,29 +341,15 @@ fn apply_edit(
         ConnectEditField::ProviderName => match provider::validate_provider_name(&value) {
             Ok(()) => choose_provider(flow, ProviderId::Compatible(value), state),
             Err(error) => {
-                state.notice(error.to_string());
-                state.picker = Some(edit_picker(
-                    "Provider name",
-                    "Name",
-                    "letters, numbers, '-' or '_'",
-                    field,
-                    value,
-                    false,
-                    PickerAction::ConnectBack(ConnectStep::Provider),
-                ));
+                state.picker = Some(provider_name_picker(value, Some(field_error(error))));
             }
         },
         ConnectEditField::Endpoint => {
             if !value.starts_with("http://") && !value.starts_with("https://") {
-                state.notice("The endpoint must start with http:// or https://.");
-                state.picker = Some(edit_picker(
-                    &format!("{} endpoint", flow.provider_label),
-                    "API base URL",
-                    "usually ends in /v1",
-                    field,
+                state.picker = Some(endpoint_picker(
+                    flow,
                     value,
-                    false,
-                    PickerAction::ConnectBack(ConnectStep::Endpoint),
+                    Some("Start the URL with http:// or https://."),
                 ));
                 return;
             }
@@ -308,28 +360,17 @@ fn apply_edit(
         ConnectEditField::Environment => {
             let name = value.trim().trim_start_matches('$').to_string();
             if let Err(error) = provider::validate_environment_name(&name) {
-                state.notice(error.to_string());
-                state.picker = Some(environment_picker(name));
+                state.picker = Some(environment_picker(flow, name, Some(field_error(error))));
                 return;
             }
             flow.credential = CredentialChoice::Environment(name);
             start_discovery(flow, state);
         }
         ConnectEditField::Secret => {
-            if value.is_empty() {
-                state.notice("The API key must not be empty.");
-                state.picker = Some(secret_picker(flow));
-                return;
-            }
             flow.credential = CredentialChoice::Literal(value);
             start_discovery(flow, state);
         }
         ConnectEditField::Model => {
-            if value.is_empty() {
-                state.notice("The model ID must not be empty.");
-                state.picker = Some(manual_model_picker(flow));
-                return;
-            }
             flow.model = value;
             configure_model_reasoning(flow, state);
         }
@@ -352,21 +393,21 @@ fn authentication_picker(flow: &ConnectFlow) -> Picker {
     }
     items.extend([
         PickerItem {
-            label: "Use environment variable…".into(),
-            description: "Store a $VARIABLE reference".into(),
-            action: PickerAction::EditConnect {
-                field: ConnectEditField::Environment,
-                initial: default_environment(flow),
-                secret: false,
-            },
-        },
-        PickerItem {
             label: "Enter API key…".into(),
-            description: "Masked while typing".into(),
+            description: "Paste or type it; Tab shows it while typing".into(),
             action: PickerAction::EditConnect {
                 field: ConnectEditField::Secret,
                 initial: String::new(),
                 secret: true,
+            },
+        },
+        PickerItem {
+            label: "Use environment variable…".into(),
+            description: environment_description(&default_environment(flow)),
+            action: PickerAction::EditConnect {
+                field: ConnectEditField::Environment,
+                initial: default_environment(flow),
+                secret: false,
             },
         },
     ]);
@@ -394,55 +435,33 @@ fn default_environment(flow: &ConnectFlow) -> String {
         .unwrap_or_default()
 }
 
-fn environment_picker(initial: String) -> Picker {
-    edit_picker(
-        "Environment credential",
-        "Variable",
-        "stored as a $VARIABLE reference",
-        ConnectEditField::Environment,
-        initial,
-        false,
-        PickerAction::ConnectBack(ConnectStep::Authentication),
-    )
-}
-
-fn secret_picker(flow: &ConnectFlow) -> Picker {
-    edit_picker(
-        &format!("{} API key", flow.provider_label),
-        "API key",
-        "secret input is masked",
-        ConnectEditField::Secret,
-        String::new(),
-        true,
-        PickerAction::ConnectBack(ConnectStep::Authentication),
-    )
-}
-
-fn edit_picker(
-    title: &str,
-    label: &str,
-    description: &str,
-    field: ConnectEditField,
-    initial: String,
-    secret: bool,
-    parent: PickerAction,
-) -> Picker {
-    Picker {
-        title: title.into(),
-        hint: "Enter edit  Esc back".into(),
-        items: vec![PickerItem {
-            label: label.into(),
-            description: description.into(),
-            action: PickerAction::EditConnect {
-                field,
-                initial,
-                secret,
-            },
-        }],
-        selected: 0,
-        editing: None,
-        parent: Some(parent),
+/// Says which variable would be used and whether this shell has it, so
+/// choosing it is not a guess.
+fn environment_description(name: &str) -> String {
+    if name.is_empty() {
+        return "Read the key from a variable you name".into();
     }
+    let set = std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    format!(
+        "Read ${name}{}",
+        if set {
+            " · set here"
+        } else {
+            " · not set here"
+        }
+    )
+}
+
+fn environment_picker(flow: &ConnectFlow, initial: String, error: Option<String>) -> Picker {
+    let mut variable = field(ConnectEditField::Environment, initial);
+    if let Some(error) = error {
+        variable = variable.with_error(error);
+    }
+    field_picker(
+        format!("{} credential", flow.provider_label),
+        variable,
+        PickerAction::ConnectBack(ConnectStep::Authentication),
+    )
 }
 
 fn start_discovery(flow: &mut ConnectFlow, state: &mut ViewState) {
@@ -760,18 +779,6 @@ fn recovery_picker(flow: &ConnectFlow, message: &str) -> Picker {
     }
 }
 
-fn manual_model_picker(flow: &ConnectFlow) -> Picker {
-    edit_picker(
-        &format!("{} model", flow.provider_label),
-        "Model ID",
-        "exact ID expected by the provider",
-        ConnectEditField::Model,
-        String::new(),
-        false,
-        PickerAction::ConnectBack(ConnectStep::Recovery),
-    )
-}
-
 fn configure_model_reasoning(flow: &mut ConnectFlow, state: &mut ViewState) {
     if matches!(flow.provider, Some(ProviderId::Compatible(_))) {
         let saved = crate::model::saved_reasoning_efforts(&flow.config, &qualified_model(flow));
@@ -914,15 +921,7 @@ fn go_back(flow: &mut ConnectFlow, step: ConnectStep, state: &mut ViewState) {
     flow.step = step;
     state.picker = Some(match step {
         ConnectStep::Provider => provider_picker(&flow.config, flow.root_parent.clone()),
-        ConnectStep::Endpoint => edit_picker(
-            &format!("{} endpoint", flow.provider_label),
-            "API base URL",
-            "usually ends in /v1",
-            ConnectEditField::Endpoint,
-            flow.endpoint.clone(),
-            false,
-            PickerAction::ConnectBack(ConnectStep::Provider),
-        ),
+        ConnectStep::Endpoint => endpoint_picker(flow, flow.endpoint.clone(), None),
         ConnectStep::Authentication => authentication_picker(flow),
         ConnectStep::Models => models_picker(flow, &flow.models),
         ConnectStep::Reasoning => connection_reasoning_picker(flow),

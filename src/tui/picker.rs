@@ -4,8 +4,11 @@
 //! children build the settings and status-bar editor catalogs. TUI callers
 //! keep the entry points here.
 
+mod field;
 mod settings;
 mod status_bar;
+
+pub(super) use field::{FieldTarget, PickerField, field_picker};
 
 pub(super) use settings::{
     color_picker, open_settings_picker, selection_color_picker, settings_category_picker,
@@ -309,18 +312,11 @@ pub(super) struct Picker {
 
 #[derive(Clone)]
 pub(super) enum PickerEdit {
-    Setting(String),
-    SecretSetting(String),
-    Model {
-        save: bool,
-    },
+    /// A queued message, edited in the composer so multi-line text and
+    /// images keep working.
     Queued(usize),
-    StatusBarLabel(usize),
-    StatusBarSeparator,
-    Connect {
-        field: ConnectEditField,
-        secret: bool,
-    },
+    /// A single-line value typed into the picker's own field.
+    Field(Box<PickerField>),
 }
 
 pub(super) struct ActivePickers {
@@ -725,13 +721,16 @@ pub(super) fn picker_is_editing(state: &ViewState) -> bool {
         .is_some_and(|picker| picker.editing.is_some())
 }
 
-pub(super) fn picker_is_secret(state: &ViewState) -> bool {
-    state.picker.as_ref().is_some_and(|picker| {
-        matches!(
-            picker.editing,
-            Some(PickerEdit::Connect { secret: true, .. } | PickerEdit::SecretSetting(_))
-        )
-    })
+/// Routes pasted text to an open picker field, or else to the composer.
+pub(super) fn paste_into_picker(state: &mut ViewState, editor: &mut Editor, text: &str) {
+    match state
+        .picker
+        .as_mut()
+        .and_then(|picker| picker.editing.as_mut())
+    {
+        Some(PickerEdit::Field(field)) => field.paste(text),
+        _ => editor.paste(text),
+    }
 }
 
 pub(super) fn picker_is_plan_handoff(picker: &Picker) -> bool {
@@ -789,74 +788,34 @@ pub(super) fn take_picker_action(
 ) -> Option<PickerAction> {
     let picker = state.picker.as_mut()?;
 
-    if let Some(editing) = picker.editing.clone() {
+    if let Some(PickerEdit::Field(field)) = picker.editing.as_mut() {
+        match field.handle_key(key) {
+            field::FieldKey::Submit(action) => {
+                state.picker = None;
+                return Some(action);
+            }
+            // A field opened on its own has no list to return to.
+            field::FieldKey::Cancel if picker.items.is_empty() => {
+                let cancel = picker_cancel_action(picker);
+                state.picker = None;
+                return cancel;
+            }
+            field::FieldKey::Cancel => picker.editing = None,
+            field::FieldKey::Handled => {}
+        }
+        return None;
+    }
+
+    if let Some(PickerEdit::Queued(index)) = picker.editing {
         match key {
             Key::Escape | Key::Ctrl('c') => {
                 editor.clear();
                 picker.editing = None;
             }
             Key::Enter => {
-                match editing {
-                    PickerEdit::StatusBarLabel(index) => {
-                        let value = editor.text();
-                        editor.clear();
-                        state.picker = None;
-                        return Some(PickerAction::ApplyStatusBarLabel {
-                            index,
-                            label: value,
-                        });
-                    }
-                    PickerEdit::StatusBarSeparator => {
-                        let value = editor.text();
-                        editor.clear();
-                        state.picker = None;
-                        return Some(PickerAction::ApplyStatusBarSeparator(value));
-                    }
-                    PickerEdit::Queued(index) => {
-                        let input = editor.take_queued_edit()?;
-                        state.picker = None;
-                        return Some(PickerAction::ApplyQueued { index, input });
-                    }
-                    _ => {}
-                }
-                if let Some(value) = editor.take_text() {
-                    let location =
-                        picker
-                            .items
-                            .get(picker.selected)
-                            .and_then(|item| match &item.action {
-                                PickerAction::EditSetting { location, .. } => *location,
-                                PickerAction::EditSecretSetting { location, .. } => *location,
-                                _ => None,
-                            });
-                    state.picker = None;
-                    return Some(match editing {
-                        PickerEdit::Setting(key) => PickerAction::ApplySetting {
-                            argument: format!("{key} {}", value.trim()),
-                            location,
-                        },
-                        PickerEdit::SecretSetting(key) => PickerAction::ApplySetting {
-                            argument: format!("{key} {}", value.trim()),
-                            location,
-                        },
-                        PickerEdit::Model { save } => {
-                            if save {
-                                PickerAction::SaveModel(value.trim().to_string())
-                            } else {
-                                PickerAction::SwitchModel(value.trim().to_string())
-                            }
-                        }
-                        PickerEdit::Queued(_)
-                        | PickerEdit::StatusBarLabel(_)
-                        | PickerEdit::StatusBarSeparator => {
-                            unreachable!("queued and status-bar edits return before text handling")
-                        }
-                        PickerEdit::Connect { field, .. } => PickerAction::ApplyConnect {
-                            field,
-                            value: value.trim().to_string(),
-                        },
-                    });
-                }
+                let input = editor.take_queued_edit()?;
+                state.picker = None;
+                return Some(PickerAction::ApplyQueued { index, input });
             }
             Key::Up | Key::Down => {}
             _ => {
@@ -906,50 +865,15 @@ pub(super) fn take_picker_action(
             picker.selected = (picker.selected + 5).min(picker.items.len().saturating_sub(1));
         }
         Key::Enter => {
-            let action = picker
-                .items
-                .get(picker.selected)
-                .map(|item| item.action.clone());
-            match action {
-                Some(PickerAction::EditSetting { key, initial, .. }) => {
-                    editor.clear();
-                    editor.paste(&initial);
-                    picker.editing = Some(PickerEdit::Setting(key));
-                }
-                Some(PickerAction::EditSecretSetting { key, .. }) => {
-                    editor.clear();
-                    picker.editing = Some(PickerEdit::SecretSetting(key));
-                }
-                Some(PickerAction::EditModel { save, initial }) => {
-                    editor.clear();
-                    editor.paste(&initial);
-                    picker.editing = Some(PickerEdit::Model { save });
-                }
-                Some(PickerAction::EditConnect {
-                    field,
-                    initial,
-                    secret,
-                }) => {
-                    editor.clear();
-                    editor.paste(&initial);
-                    picker.editing = Some(PickerEdit::Connect { field, secret });
-                }
-                Some(PickerAction::EditStatusBarLabel { index, initial }) => {
-                    editor.clear();
-                    editor.paste(&initial);
-                    picker.editing = Some(PickerEdit::StatusBarLabel(index));
-                }
-                Some(PickerAction::EditStatusBarSeparator(initial)) => {
-                    editor.clear();
-                    editor.paste(&initial);
-                    picker.editing = Some(PickerEdit::StatusBarSeparator);
-                }
-                Some(action) => {
-                    state.picker = None;
-                    return Some(action);
-                }
-                None => {}
+            let item = picker.items.get(picker.selected)?;
+            // Edit rows open their field in place, focused and ready to type.
+            if let Some(field) = field::from_item(item) {
+                picker.editing = Some(PickerEdit::Field(Box::new(field)));
+                return None;
             }
+            let action = item.action.clone();
+            state.picker = None;
+            return Some(action);
         }
         Key::Char('e') => {
             if let Some(PickerAction::SendQueued(index)) = picker
@@ -1105,6 +1029,8 @@ pub(super) fn select_picker_item(state: &mut ViewState, selected: usize) {
     }
 }
 
+/// Draws the picker panel centered in `height` rows. Returns the lines and,
+/// while a field is focused, the cursor's row and column within them.
 pub(super) fn render_picker(
     picker: &Picker,
     editor: &Editor,
@@ -1112,9 +1038,9 @@ pub(super) fn render_picker(
     outline: &str,
     columns: usize,
     height: usize,
-) -> Vec<String> {
+) -> (Vec<String>, Option<(usize, usize)>) {
     if height == 0 {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     // Narrow screens, such as a phone driving `/remote`, drop the margins and
     // move the selected description below the list instead of cutting every
@@ -1126,6 +1052,71 @@ pub(super) fn render_picker(
         columns.saturating_sub(4).max(16).min(columns)
     };
     let inner = box_width.saturating_sub(2);
+    let left = " ".repeat(columns.saturating_sub(box_width) / 2);
+    let boxed = |content: &str| {
+        format!(
+            "{left}{outline}│\x1b[0m{}{outline}│\x1b[0m",
+            markdown::fit_width(content, inner)
+        )
+    };
+    let separator = format!("{left}{outline}├{}┤\x1b[0m", "─".repeat(inner));
+    let mut panel = vec![format!("{left}{outline}┌{}┐\x1b[0m", "─".repeat(inner))];
+    panel.push(boxed(&format!(" \x1b[1m{}\x1b[0m", picker.title)));
+    panel.push(separator.clone());
+    let mut cursor = None;
+    let hint = if let Some(PickerEdit::Field(field)) = &picker.editing {
+        let (rows, (row, column)) = field.render(inner, outline);
+        cursor = Some((panel.len() + row, left.len() + 1 + column));
+        panel.extend(rows.iter().map(|row| boxed(row)));
+        field.hint(picker.items.is_empty())
+    } else {
+        render_items(
+            picker, editor, selection, compact, inner, height, &boxed, &separator, &mut panel,
+        );
+        if picker.editing.is_some() {
+            "Edit below  Enter save  Esc cancel edit"
+        } else {
+            &picker.hint
+        }
+    };
+    panel.push(boxed(&format!(" \x1b[2m{hint}\x1b[0m")));
+    panel.push(format!("{left}{outline}└{}┘\x1b[0m", "─".repeat(inner)));
+
+    if panel.len() > height {
+        panel.truncate(height);
+    }
+    let top = height.saturating_sub(panel.len()) / 2;
+    let cursor = cursor
+        .filter(|(row, _)| *row < panel.len())
+        .map(|(row, column)| (top + row, column.min(columns.saturating_sub(1))));
+    let mut lines = Vec::with_capacity(height);
+    lines.extend(std::iter::repeat_n(" ".repeat(columns), top));
+    lines.extend(
+        panel
+            .into_iter()
+            .map(|line| markdown::fit_width(&line, columns)),
+    );
+    lines.extend(std::iter::repeat_n(
+        " ".repeat(columns),
+        height.saturating_sub(lines.len()),
+    ));
+    (lines, cursor)
+}
+
+/// The scrolling item list, plus a detail area for the selected row on
+/// compact screens.
+#[expect(clippy::too_many_arguments)]
+fn render_items(
+    picker: &Picker,
+    editor: &Editor,
+    selection: &str,
+    compact: bool,
+    inner: usize,
+    height: usize,
+    boxed: &dyn Fn(&str) -> String,
+    separator: &str,
+    panel: &mut Vec<String>,
+) {
     let detail_rows = if compact { COMPACT_DETAIL_ROWS } else { 0 };
     let capacity = height
         .saturating_sub(5 + detail_rows)
@@ -1134,26 +1125,12 @@ pub(super) fn render_picker(
     let mut start = picker.selected.saturating_sub(capacity / 2);
     start = start.min(picker.items.len().saturating_sub(capacity));
     let end = (start + capacity).min(picker.items.len());
-    let left = " ".repeat(columns.saturating_sub(box_width) / 2);
-    let boxed = |content: &str| {
-        format!(
-            "{left}{outline}│\x1b[0m{}{outline}│\x1b[0m",
-            markdown::fit_width(content, inner)
-        )
-    };
-    let mut panel = vec![format!("{left}{outline}┌{}┐\x1b[0m", "─".repeat(inner))];
-    panel.push(boxed(&format!(" \x1b[1m{}\x1b[0m", picker.title)));
-    panel.push(format!("{left}{outline}├{}┤\x1b[0m", "─".repeat(inner)));
+    // A queued message being edited shows its draft in the selected row.
     let description_of = |absolute: usize, item: &PickerItem| {
         if absolute == picker.selected && picker.editing.is_some() {
             let value = editor.text();
             if value.is_empty() {
                 "type a value below…".into()
-            } else if matches!(
-                picker.editing,
-                Some(PickerEdit::Connect { secret: true, .. } | PickerEdit::SecretSetting(_))
-            ) {
-                "•".repeat(value.chars().count())
             } else {
                 value.replace('\n', " ")
             }
@@ -1192,7 +1169,7 @@ pub(super) fn render_picker(
             .get(picker.selected)
             .map(|item| description_of(picker.selected, item))
             .unwrap_or_default();
-        panel.push(format!("{left}{outline}├{}┤\x1b[0m", "─".repeat(inner)));
+        panel.push(separator.to_string());
         let mut details =
             markdown::wrapped_plain_lines(&description, inner.saturating_sub(2).max(1));
         details.resize(COMPACT_DETAIL_ROWS - 1, String::new());
@@ -1200,28 +1177,4 @@ pub(super) fn render_picker(
             panel.push(boxed(&format!(" \x1b[2m{line}\x1b[0m")));
         }
     }
-    let hint = if picker.editing.is_some() {
-        "Edit below  Enter save  Esc cancel edit"
-    } else {
-        &picker.hint
-    };
-    panel.push(boxed(&format!(" \x1b[2m{hint}\x1b[0m")));
-    panel.push(format!("{left}{outline}└{}┘\x1b[0m", "─".repeat(inner)));
-
-    if panel.len() > height {
-        panel.truncate(height);
-    }
-    let top = height.saturating_sub(panel.len()) / 2;
-    let mut lines = Vec::with_capacity(height);
-    lines.extend(std::iter::repeat_n(" ".repeat(columns), top));
-    lines.extend(
-        panel
-            .into_iter()
-            .map(|line| markdown::fit_width(&line, columns)),
-    );
-    lines.extend(std::iter::repeat_n(
-        " ".repeat(columns),
-        height.saturating_sub(lines.len()),
-    ));
-    lines
 }

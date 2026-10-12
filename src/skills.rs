@@ -232,6 +232,11 @@ fn agent_skill_roots(cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Directories walked per skill root. Discovery reruns before every model
+/// step and follows symlinks, so a link to a large tree such as `~` must not
+/// turn each step into a full filesystem walk.
+const MAX_SKILL_DIRECTORIES: usize = 2_000;
+
 fn collect_candidates(
     root: &Path,
     directory: &Path,
@@ -247,9 +252,20 @@ fn collect_candidates(
             return;
         }
     };
-    if !visited.insert(canonical) {
+    if visited.contains(&canonical) {
         return;
     }
+    if visited.len() >= MAX_SKILL_DIRECTORIES {
+        let limit = format!(
+            "{}: stopped after {MAX_SKILL_DIRECTORIES} directories; check for a symlink to a large tree",
+            root.display()
+        );
+        if !warnings.contains(&limit) {
+            warnings.push(limit);
+        }
+        return;
+    }
+    visited.insert(canonical);
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) => {
@@ -261,11 +277,16 @@ fn collect_candidates(
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
+        let Ok(mut file_type) = entry.file_type() else {
             continue;
         };
+        // Follow linked skills; `visited` stops directory cycles and dangling
+        // links are skipped.
         if file_type.is_symlink() {
-            continue;
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            file_type = metadata.file_type();
         }
         if file_type.is_dir() {
             collect_candidates(root, &path, candidates, visited, warnings);
@@ -510,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_descriptions_and_does_not_follow_symlinks() {
+    fn rejects_missing_descriptions_and_survives_symlink_cycles() {
         let root = std::env::temp_dir().join(format!("yawl-skills-bad-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("global/bad")).unwrap();
@@ -519,12 +540,74 @@ mod tests {
             "---\nname: bad\n---\nInstructions",
         )
         .unwrap();
-        std::os::unix::fs::symlink(&root, root.join("global/loop")).unwrap();
+        std::os::unix::fs::symlink(root.join("global"), root.join("global/loop")).unwrap();
+        std::os::unix::fs::symlink(root.join("missing"), root.join("global/dangling")).unwrap();
 
         let catalog = discover(&test_config(&root));
         assert!(catalog.skills.is_empty());
         assert_eq!(catalog.warnings.len(), 1);
         assert!(catalog.warnings[0].contains("nonempty description"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn links_to_large_trees_stop_at_the_directory_limit() {
+        let root = std::env::temp_dir().join(format!("yawl-skills-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let big = root.join("big");
+        for index in 0..=MAX_SKILL_DIRECTORIES {
+            std::fs::create_dir_all(big.join(format!("d{index}"))).unwrap();
+        }
+        std::fs::create_dir_all(root.join("global")).unwrap();
+        std::os::unix::fs::symlink(&big, root.join("global/everything")).unwrap();
+
+        let catalog = discover(&test_config(&root));
+        let limited = catalog
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("stopped after"))
+            .count();
+        assert_eq!(limited, 1, "{:?}", catalog.warnings);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn follows_symlinked_skill_directories_and_files() {
+        let root = std::env::temp_dir().join(format!("yawl-skills-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("global")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere/minipc")).unwrap();
+        std::fs::write(
+            root.join("elsewhere/minipc/SKILL.md"),
+            skill("minipc", "Mini PC", "ssh"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("elsewhere/notes.md"),
+            skill("notes", "Notes", "write"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere/minipc"), root.join("global/minipc"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("elsewhere/notes.md"),
+            root.join("global/notes.md"),
+        )
+        .unwrap();
+
+        let catalog = discover(&test_config(&root));
+        assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+        let names = catalog
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["minipc", "notes"]);
+        let minipc = &catalog.skills[0];
+        assert_eq!(
+            minipc.directory,
+            std::fs::canonicalize(root.join("elsewhere/minipc")).unwrap()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -11,7 +11,7 @@
   </p>
 </div>
 
-Yawl is a terminal AI agent for macOS and Linux. Use the full-screen interface for interactive work or pipe input into print mode. It supports persistent sessions, custom providers, and executable tools you can add without recompiling.
+Yawl is a terminal AI agent for macOS and Linux. Use the full-screen interface for interactive work or pipe input into print mode. It supports persistent sessions, custom providers, and custom tools the agent builds for you and keeps across sessions.
 
 <table>
   <tr>
@@ -179,7 +179,7 @@ Use `/reasoning` to change the session's effort, `/reasoning default` to let the
 
 ### Project trust
 
-Project skills and provider endpoints, base URLs, and credentials require trust before use. Yawl stores your decision in `~/.yawl/trust.json`. `--trust-project` grants trust for one invocation, including piped runs that cannot prompt.
+Project skills, project tools, and provider endpoints, base URLs, and credentials require trust before use. A project tool the agent defines during a session works for the rest of that session; later sessions load it once you trust the project. Yawl stores your decision in `~/.yawl/trust.json`. `--trust-project` grants trust for one invocation, including piped runs that cannot prompt.
 
 ### Interface settings
 
@@ -189,7 +189,7 @@ Project skills and provider endpoints, base URLs, and credentials require trust 
 
 Sessions live under `~/.yawl/sessions/projects/<project-key>/`. `yawl -c` resumes the latest session in the working directory; `/resume` opens its session picker. `--session ID` resumes from any directory. Sessions restore the selected model and reasoning effort; `-m MODEL` overrides the model for one run.
 
-`/undo` restores files changed through `write_file` and `edit_file` and removes the last turn. It does not track shell or executable-tool file changes. Snapshots are limited to 32 MiB per file. If the agent moved Git `HEAD`, undo also soft-resets it to the pre-turn commit. `/diff` compares files touched by the file tools with their original session contents.
+`/undo` restores files changed through `write_file`, `edit_file`, and `define_tool`, and removes the last turn. It does not track file changes made by shell commands or custom tools. Snapshots are limited to 32 MiB per file. If the agent moved Git `HEAD`, undo also soft-resets it to the pre-turn commit. `/diff` compares files touched by the file tools with their original session contents.
 
 Automatic compaction summarizes older conversation near the context limit, at 85% by default, while retaining recent exchanges. `/compact` requests it manually. The full transcript remains in the session log. `/usage` reports input, output, and prompt-cache usage.
 
@@ -220,6 +220,7 @@ Long reports are saved under `~/.yawl/artifacts/subagents/`, with a summary and 
 | `read_file` | Read text, line or byte ranges, and supported images |
 | `write_file` | Write a file, creating parent directories as needed |
 | `edit_file` | Replace exact text; repeated matches require `replace_all` |
+| `define_tool` | Save a custom tool for later steps and sessions |
 | `read_skill` | Load a skill's instructions |
 | `list_files`, `search_files`, `git_inspect` | File discovery and Git inspection for restricted children |
 
@@ -227,33 +228,43 @@ Use `shell` with `background: true` for servers and watchers so Yawl can track a
 
 Large command output is saved under `~/.yawl/artifacts/tool-output/`. The model receives an excerpt and a path for paged reading. These artifacts persist until manually removed. `edit_file` accepts files up to 16 MiB; use shell tools for larger files.
 
-### Executable tools
+Shell and custom-tool results contain stdout, followed by any stderr under a `[stderr]` marker, even when the command succeeds. That way, compiler and linter warnings reach the model. Commands run without a terminal, so password and passphrase prompts from tools such as `ssh`, `sudo`, and `git` fail at once with their error instead of waiting for input; use keys, an agent, or `sudo -n`.
 
-Put executables in `~/.yawl/tools/` or `./.yawl/tools/`. Yawl rescans during turns, and project tools override global tools with the same name. Each executable implements two operations:
+### Custom tools
 
-1. `--describe` prints a JSON object with `name`, `description`, `input_schema`, and optional `timeout_secs`.
-2. A normal call reads JSON arguments from stdin and prints its result. A nonzero exit marks an error.
+Yawl adapts to you by building its own tools. Ask for a command or workflow you repeat, such as "make a tool that runs our e2e suite against staging", and the agent saves it with `define_tool`. The tool can be called from the agent's next step and stays available in later sessions. The agent also creates tools without being asked when it notices a workflow you will need again. A card in the transcript shows each tool it saves, and `/tools` lists them separately from the builtins. To remove a tool, delete its file or ask the agent to.
 
-```python
-#!/usr/bin/env python3
-import json, sys
+Each tool is one JSON manifest named after the tool. Global tools live in `~/.yawl/tools/NAME.json` and follow you to every project. Project tools live in `./.yawl/tools/NAME.json`, and when both scopes define the same name, the project tool wins. Yawl rereads the directories before each model step and never runs anything to discover tools.
 
-if "--describe" in sys.argv:
-    print(json.dumps({
-        "name": "word_count",
-        "description": "Count words in supplied text",
-        "input_schema": {"type": "object",
-                         "properties": {"text": {"type": "string"}},
-                         "required": ["text"]}}))
-else:
-    print(len(json.load(sys.stdin)["text"].split()))
+```json
+{
+  "description": "Run the test suite, optionally filtered by test name",
+  "params": {
+    "filter": { "type": "string", "description": "Substring of test names", "required": false },
+    "release": { "type": "boolean", "flag": "--release" }
+  },
+  "command": "cargo test {{release}} -- {{filter}}",
+  "timeout_secs": 600
+}
 ```
 
-Make the file executable with `chmod +x`. It inherits the working directory and receives `YAWL_SESSION_ID`. The `list_files`, `search_files`, `git_inspect`, and `subagent_*` names are reserved; `web_search` and `web_fetch` are reserved while browsing is enabled.
+- `command` runs with `sh -c` in the working directory, with a 120-second default timeout.
+- `{{name}}` expands to that argument, already shell-quoted, so spaces and quotes in values stay intact. Don't wrap a placeholder in quotes; the manifest is rejected if you do.
+- A missing optional argument expands to nothing. An array expands to one word per item.
+- A boolean with a `flag` expands to the flag text when true and to nothing when false.
+- The full arguments, with defaults applied, also arrive as a JSON object on stdin.
+- `YAWL_TOOL_DIR` holds the manifest's absolute directory, for helper scripts kept next to it. `YAWL_SESSION_ID` is also set.
+- A nonzero exit marks an error. Output over 16 KB is saved under `~/.yawl/artifacts/tool-output/` like shell output.
+
+Parameter types are `string`, `integer`, `number`, `boolean`, `array` (of strings), and `object`. A parameter is required unless it sets `"required": false`, has a `default`, or has a `flag`. String and number parameters may list allowed values in `enum`. Yawl checks arguments before running the command and returns errors that include the tool's signature, so the model can correct its call.
+
+Manifests reject unknown fields. Problems with one, such as an undeclared or quoted placeholder, appear once as a warning and under `/tools`. Custom tools can't take a builtin's name: `shell`, the file tools, `define_tool`, `read_skill`, and the orchestration and mode tools. `web_search` and `web_fetch` are reserved while browsing is enabled. Custom tools don't run while planning.
+
+Executables written for the old `--describe` protocol no longer load. To keep one, add a manifest whose command runs it, for example `"command": "\"$YAWL_TOOL_DIR/my_tool\""`. It still receives its JSON arguments on stdin.
 
 ## Skills and project instructions
 
-Skills are Markdown files discovered recursively in `~/.yawl/skills/` and `~/.agents/skills/`. Trusted projects also load `./.yawl/skills/`, `.agents/skills/` directories from the Git root down, and configured `skill_dirs`.
+Skills are Markdown files discovered recursively in `~/.yawl/skills/` and `~/.agents/skills/`. Trusted projects also load `./.yawl/skills/`, `.agents/skills/` directories from the Git root down, and configured `skill_dirs`. Discovery follows symlinked skill directories and files, so a skill can be linked in from elsewhere; link cycles and dangling links are skipped, and each skill directory stops after 2,000 subdirectories.
 
 ```markdown
 ---

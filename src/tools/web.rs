@@ -36,18 +36,29 @@ pub(super) struct WebTools {
     firecrawl_api_key: Option<String>,
 }
 
+/// One transport for every scan. The registry rebuilds `WebTools` on each
+/// model step; sharing the agent keeps pooled connections and TLS state
+/// across steps instead of reconnecting for every search or fetch.
+fn shared_agent() -> ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .timeout_global(Some(Duration::from_secs(30)))
+                .max_redirects(5)
+                .max_redirects_will_error(true)
+                .user_agent("Yawl/0.1 web tools")
+                .build()
+                .into()
+        })
+        .clone()
+}
+
 impl WebTools {
     pub(super) fn new(config: &Config) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(30)))
-            .max_redirects(5)
-            .max_redirects_will_error(true)
-            .user_agent("Yawl/0.1 web tools")
-            .build()
-            .into();
         WebTools {
-            agent,
+            agent: shared_agent(),
             provider: config.web_search_provider,
             fetch_max_chars: config.web_fetch_max_chars,
             artifact_dir: config.home_dir.join("artifacts/tool-output"),

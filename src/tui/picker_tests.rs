@@ -52,7 +52,8 @@ fn picker_is_bounded_and_highlights_selection() {
         "\x1b[38;2;116;199;213m",
         50,
         10,
-    );
+    )
+    .0;
     assert_eq!(rendered.len(), 10);
     assert!(
         rendered
@@ -87,7 +88,7 @@ fn narrow_picker_lists_labels_and_wraps_the_selected_description() {
         editing: None,
         parent: None,
     };
-    let rendered = render_picker(&picker, &Editor::default(), "\x1b[7m", "", 40, 14);
+    let rendered = render_picker(&picker, &Editor::default(), "\x1b[7m", "", 40, 14).0;
     assert!(
         rendered
             .iter()
@@ -123,7 +124,7 @@ fn picker_uses_available_width_and_accent_colored_outline() {
     };
     let outline = "\x1b[38;2;117;169;255m";
 
-    let rendered = render_picker(&picker, &Editor::default(), "\x1b[7m", outline, 129, 8);
+    let rendered = render_picker(&picker, &Editor::default(), "\x1b[7m", outline, 129, 8).0;
     let panel = rendered.join("\n");
 
     assert!(panel.contains(model));
@@ -295,8 +296,7 @@ fn a_rejected_custom_color_ends_the_preview() {
     state.picker.as_mut().expect("picker").selected = custom;
     let mut editor = Editor::default();
     take_picker_action(&mut state, &mut editor, Key::Enter);
-    editor.clear();
-    editor.paste("not-a-color");
+    replace_field_text(&mut state, &mut editor, "not-a-color");
     let action = take_picker_action(&mut state, &mut editor, Key::Enter);
     let argument = match action.expect("a custom value submits a setting change") {
         PickerAction::ApplySetting { argument, .. } => argument,
@@ -438,41 +438,105 @@ fn plan_handoff_number_keys_choose_before_confirmation() {
 }
 
 #[test]
-fn secret_picker_edit_masks_the_row_and_editor_layout() {
+fn api_key_field_opens_focused_masks_input_and_keeps_the_composer_draft() {
     let secret = "sk-secret-value";
-    let mut editor = Editor::default();
-    editor.paste(secret);
     let picker = Picker {
-        title: "API key".into(),
+        title: "OMLX authentication".into(),
         hint: String::new(),
         items: vec![PickerItem {
-            label: "API key".into(),
-            description: "masked".into(),
-            action: PickerAction::ShowSettings,
+            label: "Enter API key…".into(),
+            description: "Paste or type it".into(),
+            action: PickerAction::EditConnect {
+                field: super::connection::ConnectEditField::Secret,
+                initial: String::new(),
+                secret: true,
+            },
         }],
         selected: 0,
-        editing: Some(super::picker::PickerEdit::Connect {
-            field: super::connection::ConnectEditField::Secret,
-            secret: true,
-        }),
+        editing: None,
         parent: None,
     };
+    let mut state = test_picker_state(picker);
+    let mut editor = Editor::default();
+    editor.paste("my unsent draft");
 
-    let panel = render_picker(
-        &picker,
-        &editor,
-        "\x1b[7m",
-        "\x1b[38;2;116;199;213m",
-        60,
-        10,
-    )
-    .join("\n");
-    let input = editor.masked_layout(60).lines.join("\n");
+    assert!(take_picker_action(&mut state, &mut editor, Key::Enter).is_none());
+    super::picker::paste_into_picker(&mut state, &mut editor, &format!("{secret}\n"));
+    let picker = state.picker.as_ref().expect("field stays open");
+    let (lines, cursor) = render_picker(picker, &editor, "\x1b[7m", "", 60, 16);
+    let panel = markdown::strip_ansi(&lines.join("\n"));
 
+    assert_eq!(editor.text(), "my unsent draft");
     assert!(!panel.contains(secret));
-    assert!(!input.contains(secret));
-    assert!(panel.contains('•'));
-    assert!(input.contains('•'));
+    assert!(panel.contains(&"•".repeat(secret.len())));
+    assert!(panel.contains("API key"));
+    assert!(panel.contains("Tab show/hide"));
+    let (row, column) = cursor.expect("focused field shows a cursor");
+    assert!(markdown::strip_ansi(&lines[row]).contains('•'));
+    assert!(column > 0);
+
+    take_picker_action(&mut state, &mut editor, Key::Tab);
+    let picker = state.picker.as_ref().expect("field stays open");
+    let revealed = render_picker(picker, &editor, "\x1b[7m", "", 60, 16)
+        .0
+        .join("\n");
+    assert!(markdown::strip_ansi(&revealed).contains(secret));
+
+    let action = take_picker_action(&mut state, &mut editor, Key::Enter);
+    assert!(matches!(
+        action,
+        Some(PickerAction::ApplyConnect { value, .. }) if value == secret
+    ));
+    assert_eq!(editor.text(), "my unsent draft");
+}
+
+#[test]
+fn escape_returns_from_a_list_field_but_leaves_a_standalone_field() {
+    let mut state = test_picker_state(super::picker::model_picker(
+        test_agent().config(),
+        "test",
+        false,
+    ));
+    let mut editor = Editor::default();
+    let last = state
+        .picker
+        .as_ref()
+        .map_or(0, |picker| picker.items.len() - 1);
+    super::picker::select_picker_item(&mut state, last);
+    take_picker_action(&mut state, &mut editor, Key::Enter);
+    assert!(super::picker::picker_is_editing(&state));
+    assert!(take_picker_action(&mut state, &mut editor, Key::Escape).is_none());
+    assert!(state.picker.is_some() && !super::picker::picker_is_editing(&state));
+
+    state.picker = Some(super::picker::field_picker(
+        "Add a provider",
+        super::connection::field(
+            super::connection::ConnectEditField::ProviderName,
+            String::new(),
+        ),
+        PickerAction::CloseConnect,
+    ));
+    let action = take_picker_action(&mut state, &mut editor, Key::Escape);
+    assert!(matches!(action, Some(PickerAction::CloseConnect)));
+    assert!(state.picker.is_none());
+}
+
+fn field_text(state: &ViewState) -> String {
+    match state
+        .picker
+        .as_ref()
+        .and_then(|picker| picker.editing.as_ref())
+    {
+        Some(super::picker::PickerEdit::Field(field)) => field.value().to_string(),
+        _ => panic!("expected an open picker field"),
+    }
+}
+
+/// Clears the focused field the way a user would, then pastes `text`.
+fn replace_field_text(state: &mut ViewState, editor: &mut Editor, text: &str) {
+    take_picker_action(state, editor, Key::End);
+    take_picker_action(state, editor, Key::Ctrl('u'));
+    super::picker::paste_into_picker(state, editor, text);
 }
 
 fn test_picker_state(picker: Picker) -> ViewState {
@@ -679,10 +743,10 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
 
     assert!(take_picker_action(&mut state, &mut editor, Key::Enter).is_none());
     assert!(picker_is_editing(&state));
-    assert_eq!(editor.text(), "8192");
+    assert_eq!(field_text(&state), "8192");
+    assert!(editor.is_empty(), "the composer draft stays untouched");
 
-    editor.clear();
-    editor.paste("16384");
+    replace_field_text(&mut state, &mut editor, "16384");
     let action = take_picker_action(&mut state, &mut editor, Key::Enter);
     assert!(matches!(
         action,
@@ -776,9 +840,9 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
     // Enter starts editing
     assert!(take_picker_action(&mut state, &mut editor, Key::Enter).is_none());
     assert!(picker_is_editing(&state));
-    assert_eq!(editor.text(), "8192");
+    assert_eq!(field_text(&state), "8192");
 
-    // Esc cancels editing, clears text, but keeps the picker open
+    // Esc cancels editing but keeps the picker open
     assert!(take_picker_action(&mut state, &mut editor, Key::Escape).is_none());
     assert!(!picker_is_editing(&state));
     assert!(editor.is_empty());
@@ -964,7 +1028,7 @@ fn subagent_model_manual_entry_and_escape_return_to_setting() {
     let mut state = test_picker_state(picker);
     let mut editor = Editor::default();
     assert!(take_picker_action(&mut state, &mut editor, Key::Enter).is_none());
-    editor.paste("local:manual");
+    super::picker::paste_into_picker(&mut state, &mut editor, "local:manual");
     assert!(
         matches!(take_picker_action(&mut state, &mut editor, Key::Enter), Some(PickerAction::ApplySetting { argument, location: Some(SettingsLocation { category: SettingsCategory::Subagents, item: SettingsItem::SubagentModel }) }) if argument == "subagent_model local:manual")
     );
@@ -1085,5 +1149,114 @@ fn model_picker_removes_configured_models_only_after_confirmation() {
     assert!(
         remove_model_confirm(agent.config(), "openai-codex:gpt-test", false, 0)
             .is_err_and(|message| message.contains("Codex account catalog"))
+    );
+}
+
+#[test]
+fn custom_provider_setup_types_straight_into_fields_and_shows_errors_inline() {
+    use super::connection::{self, ConnectStep};
+    use crate::onboarding::provider::ProviderId;
+
+    let agent = test_agent();
+    let mut state = ViewState::from_agent(&agent);
+    let mut editor = Editor::default();
+    connection::open(&mut state, agent.config(), false);
+    connection::handle_action(
+        &mut state,
+        PickerAction::ConnectChooseProvider(ProviderId::Other),
+    );
+    assert!(picker_is_editing(&state), "the name field opens focused");
+
+    for character in "bad name".chars() {
+        take_picker_action(&mut state, &mut editor, Key::Char(character));
+    }
+    let action = take_picker_action(&mut state, &mut editor, Key::Enter).expect("submits");
+    connection::handle_action(&mut state, action);
+    assert_eq!(field_text(&state), "bad name", "the typed value is kept");
+    let picker = state.picker.as_ref().expect("field reopens");
+    let (lines, cursor) = render_picker(picker, &editor, "\x1b[7m", "", 72, 18);
+    let panel = markdown::strip_ansi(&lines.join("\n"));
+    if std::env::var_os("YAWL_PRINT_PICKER").is_some() {
+        println!("{panel}");
+    }
+    assert!(panel.contains("Provider name"));
+    assert!(panel.contains('✗'), "{panel}");
+    assert!(cursor.is_some());
+    assert!(
+        !state
+            .transcript
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Notice(_))),
+        "validation stays beside the field"
+    );
+
+    replace_field_text(&mut state, &mut editor, "my-server");
+    let action = take_picker_action(&mut state, &mut editor, Key::Enter).expect("submits");
+    connection::handle_action(&mut state, action);
+    assert!(
+        picker_is_editing(&state),
+        "the endpoint field opens focused"
+    );
+    assert_eq!(state.picker.as_ref().unwrap().title, "my-server endpoint");
+    assert!(matches!(
+        state.picker.as_ref().unwrap().parent,
+        Some(PickerAction::ConnectBack(ConnectStep::Provider))
+    ));
+}
+
+#[test]
+fn focused_field_owns_the_full_frame_cursor_and_keeps_the_composer_draft() {
+    use super::connection::{self, ConnectEditField};
+    use crate::onboarding::provider::ProviderId;
+
+    let agent = test_agent();
+    let mut state = ViewState::from_agent(&agent);
+    let mut editor = Editor::default();
+    editor.paste("unsent composer draft");
+    connection::open(&mut state, agent.config(), false);
+    connection::handle_action(
+        &mut state,
+        PickerAction::ConnectChooseProvider(ProviderId::Other),
+    );
+    for character in "my-server".chars() {
+        take_picker_action(&mut state, &mut editor, Key::Char(character));
+    }
+
+    let (frame, cursor) = build_frame(&mut state, &editor, 60, 20);
+    assert_eq!(frame.len(), 20);
+    assert_ne!(
+        cursor, HIDDEN_CURSOR,
+        "the hardware cursor leaves the composer"
+    );
+    let (row, column) = cursor;
+    assert!((1..=20).contains(&row), "cursor row {row} is on screen");
+    let cursor_line = markdown::strip_ansi(&frame[row - 1]);
+    assert!(
+        cursor_line.contains("my-server"),
+        "cursor lands inside the field, got {cursor_line:?}"
+    );
+    assert!((1..=60).contains(&column));
+    let plain = markdown::strip_ansi(&frame.join("\n"));
+    assert!(plain.contains("Provider name"));
+    assert!(
+        plain.contains("unsent composer draft"),
+        "the composer draft stays visible underneath"
+    );
+    assert_eq!(editor.text(), "unsent composer draft");
+
+    // A masked key keeps its value out of the frame while still owning the cursor.
+    let mut secret_state = test_picker_state(super::picker::field_picker(
+        "Add a provider",
+        super::connection::field(ConnectEditField::Secret, "sk-hidden".into()),
+        PickerAction::CloseConnect,
+    ));
+    let (secret_frame, secret_cursor) = build_frame(&mut secret_state, &Editor::default(), 60, 20);
+    assert_ne!(secret_cursor, HIDDEN_CURSOR);
+    let secret_line = markdown::strip_ansi(&secret_frame[secret_cursor.0 - 1]);
+    assert!(secret_line.contains('•'), "{secret_line:?}");
+    assert!(
+        !markdown::strip_ansi(&secret_frame.join("\n")).contains("sk-hidden"),
+        "secrets never reach the frame in plain text"
     );
 }

@@ -10,7 +10,7 @@ Options:
   -m, --model MODEL           Override the configured model
   -c, --continue              Resume the most recent session
       --session ID            Resume a session by id
-      --list-tools            List builtin and discovered exec tools
+      --list-tools            List builtin and custom tools
       --trust-project         Trust project skills and provider settings for this invocation
       --login PROVIDER        Log into a subscription provider
       --setup                 Run provider and model onboarding again

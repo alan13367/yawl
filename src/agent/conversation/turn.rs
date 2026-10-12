@@ -584,6 +584,7 @@ impl Conversation {
             // list and system prompt so local servers keep their prompt
             // cache; phases differ only in execution gates and a hidden note.
             let mut registry = self.scan_tools();
+            self.report_catalog_warnings(&registry, sink);
             match mode {
                 TurnMode::Goal => registry.advertise_goal_complete(),
                 TurnMode::Plan | TurnMode::PlanRevise | TurnMode::PlanFollowUp => {
@@ -592,6 +593,7 @@ impl Conversation {
                 TurnMode::PlanImplement | TurnMode::Normal | TurnMode::Init => {}
             }
             let specs = registry.specs();
+            let custom_tools = registry.personalization();
             let system = match &self.kind {
                 ConversationKind::Persistent(state) => crate::prompt::build_system_prompt(
                     &self.config.home_dir,
@@ -604,6 +606,7 @@ impl Conversation {
                             .then_some(state.session.active_goal())
                             .flatten(),
                         init: mode == TurnMode::Init,
+                        custom_tools: custom_tools.as_deref(),
                     },
                 ),
                 ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(
@@ -980,8 +983,7 @@ impl Conversation {
                     name: &call.name,
                     args: &call.arguments,
                 });
-                if let Some(path) =
-                    crate::checkpoint::mutating_tool_path(&call.name, &call.arguments)
+                if let Some(path) = registry.mutating_path(&call.name, &call.arguments)
                     && let Some(Err(error)) = self.checkpoint_path(&path)
                 {
                     sink(TurnEvent::Warning(format!(
@@ -1029,6 +1031,23 @@ impl Conversation {
             }
         }
         Ok(aborted)
+    }
+
+    /// Shows each new catalog warning once per conversation. Broken custom
+    /// tool manifests and skills are otherwise visible only in `/tools`.
+    fn report_catalog_warnings(
+        &mut self,
+        registry: &Registry,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) {
+        if !matches!(self.kind, ConversationKind::Persistent(_)) {
+            return;
+        }
+        for warning in &registry.warnings {
+            if self.reported_warnings.insert(warning.clone()) {
+                sink(TurnEvent::Warning(format!("Skipped {warning}")));
+            }
+        }
     }
 
     fn persist_assistant(
@@ -1286,6 +1305,7 @@ impl Conversation {
         sink(TurnEvent::Compacting);
         let registry = self.scan_tools();
         let specs = registry.specs();
+        let custom_tools = registry.personalization();
         let system = match &self.kind {
             ConversationKind::Persistent(state) => crate::prompt::build_system_prompt(
                 &self.config.home_dir,
@@ -1296,6 +1316,7 @@ impl Conversation {
                 crate::prompt::MainPromptState {
                     goal: state.session.active_goal(),
                     init: false,
+                    custom_tools: custom_tools.as_deref(),
                 },
             ),
             ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(

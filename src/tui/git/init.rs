@@ -1,12 +1,12 @@
 //! Repository initialization, retryable first push, and its modal.
 
-use super::input::{line_edit, line_insert};
 use super::render::{accent_of, commit_visible_text};
 use super::repository::run_git_env;
 use super::{jobs, operations};
 use super::{sanitize_plain, truncate_visible};
 use crate::tui::events::{Event, Key};
 use crate::tui::input::Editor;
+use crate::tui::input::{line_edit, line_insert};
 use crate::tui::render::{HIDDEN_CURSOR, status_style};
 use crate::tui::{ViewState, markdown};
 use std::path::{Path, PathBuf};

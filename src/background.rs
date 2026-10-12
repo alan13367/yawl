@@ -3,7 +3,6 @@
 use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -273,11 +272,10 @@ impl BackgroundProcessManager {
         }
 
         let mut command = Command::new("sh");
-        command
+        crate::tools::exec::isolate_from_terminal(&mut command)
             .arg("-c")
             .arg(&spec.command)
             .current_dir(&spec.cwd)
-            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
