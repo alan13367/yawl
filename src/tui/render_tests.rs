@@ -778,7 +778,7 @@ fn a_turn_without_a_typed_message_starts_with_a_fresh_quiet_timer() {
 }
 
 #[test]
-fn stalled_thinking_tag_shows_how_long_the_stream_was_quiet() {
+fn quiet_thinking_is_not_reported_as_a_stall() {
     let mut state = overflow_state();
     state.apply(Update::Transcript(TranscriptEvent::ReasoningDelta {
         kind: ReasoningKind::Summary,
@@ -793,12 +793,10 @@ fn stalled_thinking_tag_shows_how_long_the_stream_was_quiet() {
             .find(|line| line.contains("Thinking"))
             .expect("thinking tag on screen")
     };
-    assert!(!tag_row(&mut state).contains("quiet"));
-
     state
         .transcript
         .set_last_progress(std::time::Instant::now() - std::time::Duration::from_secs(75));
-    assert!(tag_row(&mut state).starts_with("⠋ Thinking · quiet 1m 15s"));
+    assert_eq!(tag_row(&mut state).trim_end(), "⠋ Thinking");
 }
 
 #[test]

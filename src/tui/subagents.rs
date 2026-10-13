@@ -996,7 +996,6 @@ fn render_snapshot_item(
             lines.extend(render_thinking_tag(
                 *duration,
                 false,
-                None,
                 expanded,
                 0,
                 style.accent,
@@ -1040,7 +1039,6 @@ fn render_snapshot_tail(
         lines.extend(render_thinking_tag(
             snapshot.live_reasoning_duration,
             streaming,
-            None,
             thinking_expanded,
             spinner_tick,
             style.accent,

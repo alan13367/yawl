@@ -10,7 +10,6 @@ use crate::config::UiColor;
 use super::super::tool_view::SubagentLabel;
 use super::ImageSupport;
 use super::entries::{RenderedEntry, entry_default_expanded, render_entry};
-use super::transcript::stalled_for;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RenderSettings {
@@ -91,7 +90,7 @@ impl CacheSlot {
             changed_from = Some(entries.len());
         }
 
-        let render_at = |index: usize, quiet| {
+        let render_at = |index: usize| {
             let entry = &entries[index];
             let expanded =
                 transcript.entry_expanded(index, entry_default_expanded(entry, tools_expanded));
@@ -104,11 +103,10 @@ impl CacheSlot {
                 self.accent_color,
                 labels,
                 spinner_tick,
-                quiet,
             )
         };
         for index in self.frozen_count..frozen_boundary {
-            self.entries[index] = render_at(index, None);
+            self.entries[index] = render_at(index);
             changed_from = Some(changed_from.map_or(index, |changed| changed.min(index)));
         }
         self.frozen_count = frozen_boundary;
@@ -116,7 +114,7 @@ impl CacheSlot {
         if let Some(idx) = mutable_index
             && idx < entries.len()
         {
-            self.entries[idx] = render_at(idx, stalled_for(transcript));
+            self.entries[idx] = render_at(idx);
             changed_from = Some(changed_from.map_or(idx, |changed| changed.min(idx)));
 
             // Notices raised mid-turn land after the in-flight entry and must
@@ -125,7 +123,7 @@ impl CacheSlot {
                 if self.entries[index].is_some() && transcript.running_tool_index() != Some(index) {
                     continue;
                 }
-                self.entries[index] = render_at(index, None);
+                self.entries[index] = render_at(index);
                 changed_from = Some(changed_from.map_or(index, |changed| changed.min(index)));
             }
         }

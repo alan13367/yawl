@@ -47,9 +47,6 @@ pub(super) fn render_entry(
     accent_color: UiColor,
     labels: &[tool_view::SubagentLabel],
     spinner_tick: usize,
-    // How long the live turn has been stalled; only the streaming entry
-    // receives it.
-    quiet: Option<std::time::Duration>,
 ) -> Option<RenderedEntry> {
     let lines = match entry {
         Entry::User(content) if !expanded => render_collapsed("Prompt", content, width),
@@ -77,7 +74,6 @@ pub(super) fn render_entry(
             let mut lines = render_thinking_tag(
                 *duration,
                 started.is_some(),
-                quiet,
                 expanded,
                 spinner_tick,
                 accent_color,
@@ -221,7 +217,6 @@ pub(in crate::tui) fn render_entries(
             UiColor::WHITE,
             &[],
             0,
-            None,
         ) {
             lines.extend(rendered.lines);
             lines.push(String::new());
@@ -241,7 +236,6 @@ pub(in crate::tui) fn render_expanded(entry: &Entry, width: usize) -> Vec<String
         UiColor::WHITE,
         &[],
         0,
-        None,
     )
     .map(|rendered| rendered.lines)
     .unwrap_or_default()

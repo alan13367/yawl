@@ -545,7 +545,6 @@ fn render_block_viewer(
         state.accent_color,
         &labels,
         state.spinner_tick,
-        transcript::stalled_for(&state.transcript),
     )
     .unwrap_or_default();
     let body = body.lines;

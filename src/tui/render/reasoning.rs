@@ -4,17 +4,16 @@ use crate::config::UiColor;
 use crate::provider::ReasoningKind;
 
 use super::super::markdown;
-use super::super::tool_view::format_elapsed;
 use super::{SPINNER_FRAMES, foreground_color};
 
 /// Renders the thinking tag: a spinner frame and `Thinking` while the
-/// reasoning streams (the timer is not shown until it settles, but a stalled
-/// stream adds `· quiet 12s`), then `+ Thought: 4.2s` in an accent-derived
-/// colour, `- Thought: 4.2s` dimmed when expanded.
+/// reasoning streams (the timer is not shown until it settles, and gaps
+/// between summary bursts are still thinking, not a stall), then
+/// `+ Thought: 4.2s` in an accent-derived colour, `- Thought: 4.2s` dimmed
+/// when expanded.
 pub(in crate::tui) fn render_thinking_tag(
     elapsed: Option<std::time::Duration>,
     streaming: bool,
-    quiet: Option<std::time::Duration>,
     expanded: bool,
     spinner_tick: usize,
     accent_color: UiColor,
@@ -23,10 +22,7 @@ pub(in crate::tui) fn render_thinking_tag(
     let accent = foreground_color(thinking_color(accent_color));
     let line = if streaming {
         let frame = SPINNER_FRAMES[spinner_tick % SPINNER_FRAMES.len()];
-        let quiet = quiet.map_or_else(String::new, |quiet| {
-            format!(" \x1b[2m· quiet {}", format_elapsed(quiet))
-        });
-        format!("{accent}{frame} Thinking{quiet}\x1b[0m")
+        format!("{accent}{frame} Thinking\x1b[0m")
     } else {
         let marker = if expanded { "-" } else { "+" };
         let time = elapsed
@@ -132,7 +128,7 @@ mod tests {
             for (streaming, expanded) in
                 [(true, false), (true, true), (false, false), (false, true)]
             {
-                let lines = render_thinking_tag(None, streaming, None, expanded, 0, accent, 80);
+                let lines = render_thinking_tag(None, streaming, expanded, 0, accent, 80);
                 assert!(lines[0].starts_with(&foreground_color(color)));
             }
         }
