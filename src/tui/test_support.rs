@@ -17,5 +17,5 @@ pub(super) fn agent_in(root: &Path) -> Agent {
     let cwd = root.join("project");
     let session = crate::session::Session::create(&config.session_dirs(&cwd).project, &cwd, "test")
         .expect("test session should be created");
-    Agent::new(config, "test".into(), session, Vec::new())
+    Agent::new(config, "test".into(), session)
 }

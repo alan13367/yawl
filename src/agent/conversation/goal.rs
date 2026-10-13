@@ -8,24 +8,11 @@ pub(super) const GOAL_CONTINUATION: &str = "Continue working on the active goal.
 pub(super) const STEER_SKIPPED: &str = "[skipped because the user steered]";
 
 pub(super) fn parse_goal_complete_result(arguments: &str) -> Result<String, String> {
-    let value: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| format!("invalid tool arguments json: {error}"))?;
-    let Some(result) = value.get("result").and_then(serde_json::Value::as_str) else {
-        return Err("goal_complete requires a non-empty string 'result'".into());
-    };
-    let result = result.trim();
-    if result.is_empty() {
-        return Err("goal_complete requires a non-empty string 'result'".into());
-    }
-    Ok(result.to_string())
+    super::plan::parse_non_empty(arguments, "result", GOAL_COMPLETE_TOOL_NAME)
 }
 
 pub(super) fn is_goal_complete(call: &ToolCall) -> bool {
     call.name == GOAL_COMPLETE_TOOL_NAME
-}
-
-pub(super) fn split_goal_complete(calls: &[ToolCall]) -> (Vec<&ToolCall>, Vec<&ToolCall>) {
-    calls.iter().partition(|call| is_goal_complete(call))
 }
 
 #[cfg(test)]

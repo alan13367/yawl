@@ -392,17 +392,7 @@ fn styled(output: &mut String, style: &str, text: &str) {
 }
 
 fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|character| {
-            if character == '\t' {
-                ' '
-            } else if character.is_control() {
-                '�'
-            } else {
-                character
-            }
-        })
-        .collect()
+    crate::text::sanitize_line(text, crate::text::Tabs::Space)
 }
 
 #[cfg(test)]

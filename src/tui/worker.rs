@@ -1,7 +1,7 @@
-//! Scoped agent workers, busy input handling, and cancellation.
+//! Busy-mode input handling for the event loop: steering, commands and
+//! picker actions that run mid-turn, pending questions, and cancellation.
 
 use std::io::Read;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use crate::agent::{Agent, SteerInbox};
 use crate::cancellation::CancellationToken;
@@ -9,488 +9,24 @@ use crate::config::{Config, ConfigChange};
 use crate::error::Error;
 
 use super::commands::{
-    copy_all_from_transcript, copy_last_reply, handle_queue_picker_action, notice_config_effect,
-    promote_queued, sync_display_settings, unqueue,
+    Command, busy_command, copy_all_from_transcript, copy_last_reply, handle_queue_picker_action,
+    notice_config_effect, sync_display_settings, unqueue,
 };
-use super::completion::handle_completion_key;
-use super::events::{Event, EventReader, Key, MouseEvent, MouseKind, event_requests_redraw};
+use super::events::{Event, EventReader, Key, MouseEvent, MouseKind};
 use super::input::{EditAction, Editor, Submission};
 use super::picker::{
     ActivePickers, PickerAction, SettingsCategory, SettingsItem, SettingsLocation,
-    open_model_picker_from_config, open_subagent_model_picker, paste_into_picker,
-    picker_is_editing, poll_model_picker, reasoning_picker_from_config, remove_model_confirm,
-    select_picker_item, settings_item_index, status_bar_editor_picker, sync_color_preview,
-    take_picker_action, web_search_provider_picker,
+    open_model_picker_from_config, open_subagent_model_picker, reasoning_picker_from_config,
+    remove_model_confirm, select_picker_item, settings_item_index, status_bar_editor_picker,
+    web_search_provider_picker,
 };
 use super::state::{
-    COPY_TOAST_TICKS, Update, ViewState, advance_ticks, clear_jump_pointer,
-    handle_jump_button_mouse, handle_scroll_bar_mouse, handle_tool_click, pointer_over_jump_button,
-    scroll, toggle_tool_expansion,
+    COPY_TOAST_TICKS, ViewState, clear_jump_pointer, handle_jump_button_mouse,
+    handle_scroll_bar_mouse, handle_tool_click, pointer_over_jump_button,
 };
 use super::terminal::Terminal;
 
-#[derive(Clone, Copy)]
-pub(super) enum TurnKind {
-    Normal,
-    Init,
-    Goal,
-    Plan,
-    PlanFollowUp,
-    PlanRevise,
-    PlanImplement,
-    Continue,
-}
-
-pub(super) fn turn_interactive<R: Read>(
-    agent: &mut Agent,
-    input: Option<crate::provider::TurnInput>,
-    kind: TurnKind,
-    state: &mut ViewState,
-    editor: &mut Editor,
-    terminal: &mut Terminal,
-    events: &mut EventReader<R>,
-) -> Result<bool, Error> {
-    let result = run_agent_job_interactive(
-        agent,
-        state,
-        editor,
-        terminal,
-        events,
-        move |agent, sink| match kind {
-            TurnKind::Normal => agent.run_turn_input_preserving_cancellation(input, sink),
-            TurnKind::Init => agent.run_init_preserving_cancellation(
-                input.ok_or_else(|| Error::Protocol("init input is missing".into()))?,
-                sink,
-            ),
-            TurnKind::Goal => agent.run_goal_preserving_cancellation(sink),
-            TurnKind::Plan => agent.run_plan_preserving_cancellation(sink),
-            TurnKind::PlanFollowUp => agent.run_plan_follow_up_preserving_cancellation(
-                input.ok_or_else(|| Error::Protocol("plan follow-up input is missing".into()))?,
-                sink,
-            ),
-            TurnKind::PlanRevise => agent.run_plan_revision_preserving_cancellation(
-                input.ok_or_else(|| Error::Protocol("plan revision input is missing".into()))?,
-                sink,
-            ),
-            TurnKind::PlanImplement => {
-                agent.run_plan_implementation_preserving_cancellation(input, sink)
-            }
-            TurnKind::Continue => agent.run_continue_preserving_cancellation(sink),
-        },
-    );
-    state.active_goal = agent.active_goal().map(str::to_string);
-    state.active_plan = agent.active_plan().map(str::to_string);
-    state.plan_draft = matches!(
-        agent.plan_state(),
-        Some(crate::session::PlanState::Draft { .. })
-    );
-    result
-}
-
-pub(super) fn compact_interactive<R: Read>(
-    agent: &mut Agent,
-    state: &mut ViewState,
-    editor: &mut Editor,
-    terminal: &mut Terminal,
-    events: &mut EventReader<R>,
-) -> Result<(), Error> {
-    run_agent_job_interactive(agent, state, editor, terminal, events, |agent, sink| {
-        agent.compact_now_preserving_cancellation(sink)
-    })
-}
-
-pub(super) fn deferred_subagents_interactive<R: Read>(
-    agent: &mut Agent,
-    state: &mut ViewState,
-    editor: &mut Editor,
-    terminal: &mut Terminal,
-    events: &mut EventReader<R>,
-) -> Result<Option<bool>, Error> {
-    run_agent_job_interactive(agent, state, editor, terminal, events, |agent, sink| {
-        agent.run_deferred_subagent_results(sink)
-    })
-}
-
-fn run_agent_job_interactive<R, T, F>(
-    agent: &mut Agent,
-    state: &mut ViewState,
-    editor: &mut Editor,
-    terminal: &mut Terminal,
-    events: &mut EventReader<R>,
-    job: F,
-) -> Result<T, Error>
-where
-    R: Read,
-    T: Send,
-    F: FnOnce(&mut Agent, &mut dyn FnMut(crate::agent::TurnEvent<'_>)) -> Result<T, Error> + Send,
-{
-    let mut active_pickers = ActivePickers::from_agent(agent);
-    let mut active_config = agent.config().clone();
-    let active_cancellation = agent.cancellation_token();
-    let steers = agent.steer_inbox();
-    let background = agent.background_processes();
-    let questions = agent.question_broker();
-    agent.clear_cancellation();
-    let active_agent = &mut *agent;
-    let result = std::thread::scope(|scope| {
-        let (updates_tx, updates_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let (thread_tx, thread_rx) = mpsc::channel();
-        scope.spawn(move || {
-            let _ = thread_tx.send(native_thread_id());
-            let result = job(active_agent, &mut |event| {
-                let _ = updates_tx.send(Update::from_event(event));
-            });
-            let _ = done_tx.send(result);
-        });
-        let worker_thread = thread_rx
-            .recv()
-            .map_err(|_| Error::Protocol("agent worker did not start".into()))?;
-        pump_events(
-            WorkerChannels {
-                updates: updates_rx,
-                done: done_rx,
-                thread: worker_thread,
-                cancellation: active_cancellation,
-                steers,
-                background,
-                questions,
-            },
-            state,
-            editor,
-            terminal,
-            events,
-            &mut active_pickers,
-            &mut active_config,
-        )
-    });
-    finish_agent_job(agent, state, active_config, result)
-}
-
-fn finish_agent_job<T>(
-    agent: &mut Agent,
-    state: &mut ViewState,
-    active_config: Config,
-    result: Result<T, Error>,
-) -> Result<T, Error> {
-    recover_unaccepted_steers(agent, state);
-    agent.sync_display_config(&active_config);
-    if let Err(error) = agent.set_reasoning_effort(active_config.reasoning_effort) {
-        state.reasoning_effort =
-            crate::model::effective_reasoning_effort(agent.config(), agent.model())
-                .map(str::to_string);
-        state.notice(format!("Could not save reasoning effort: {error}"));
-    }
-    result
-}
-
-pub(super) struct WorkerChannels<T> {
-    updates: Receiver<Update>,
-    done: Receiver<Result<T, Error>>,
-    thread: usize,
-    cancellation: CancellationToken,
-    steers: SteerInbox,
-    background: crate::background::BackgroundProcessManager,
-    questions: crate::tools::QuestionBroker,
-}
-
-pub(super) fn pump_events<R: Read, T>(
-    worker: WorkerChannels<T>,
-    state: &mut ViewState,
-    editor: &mut Editor,
-    terminal: &mut Terminal,
-    events: &mut EventReader<R>,
-    active_pickers: &mut ActivePickers,
-    active_config: &mut Config,
-) -> Result<T, Error> {
-    let mut needs_draw = false;
-    let mut last_reasoning = active_config.reasoning_effort.clone();
-    loop {
-        needs_draw |= sync_question(terminal, state, &worker.questions);
-        while let Ok(update) = worker.updates.try_recv() {
-            state.apply(update);
-            needs_draw = true;
-        }
-        match worker.done.try_recv() {
-            Ok(result) => {
-                while let Ok(update) = worker.updates.try_recv() {
-                    state.apply(update);
-                }
-                state.question = None;
-                terminal.draw(state, editor)?;
-                return result;
-            }
-            Err(TryRecvError::Disconnected) => {
-                return Err(Error::Protocol("agent worker stopped unexpectedly".into()));
-            }
-            Err(TryRecvError::Empty) => {}
-        }
-        if needs_draw || terminal.size_changed() {
-            terminal.draw(state, editor)?;
-            needs_draw = false;
-        }
-        let mut event = events.read_event()?;
-        loop {
-            let (next, focus_redraw) = apply_focus_events(event, events, terminal, state)?;
-            needs_draw |= focus_redraw;
-            let Some(next) = next else {
-                break;
-            };
-            event = next;
-            needs_draw |= event_requests_redraw(&event);
-            if matches!(&event, Event::Tick) {
-                needs_draw |= terminal.remote().poll(state);
-            }
-            if matches!(&event, Event::Tick) && crate::interrupted() {
-                crate::set_interrupted(false);
-                if !super::git::handle_interrupt(state)
-                    && !super::processes::handle_interrupt(state)
-                {
-                    state.subagent_manager.interrupt_all();
-                    worker.questions.cancel_pending();
-                    cancel_worker(worker.thread, &worker.cancellation, state);
-                }
-                needs_draw = true;
-            }
-            if matches!(&event, Event::Tick) && worker.cancellation.is_canceled() {
-                // Keep waking a canceled worker until it settles: a wake that
-                // lands just before it blocks in a read is otherwise lost and
-                // the turn would hang on "canceling".
-                interrupt_thread(worker.thread);
-            }
-            if state.git_init.is_some() {
-                needs_draw = true;
-                super::git::handle_init_event(state, event);
-                break;
-            }
-            if state.subagent_view.is_some() {
-                needs_draw = true;
-                super::subagents::handle_event(state, editor, event);
-                break;
-            }
-            if state.git_view.is_some() {
-                needs_draw = true;
-                super::git::handle_event(state, editor, event);
-                break;
-            }
-            if state.process_view.is_some() {
-                needs_draw = true;
-                super::processes::handle_event(state, event);
-                break;
-            }
-            if state.question.is_some() {
-                match event {
-                    Event::Key(Key::Ctrl('c')) => {
-                        worker.questions.cancel_pending();
-                        cancel_worker(worker.thread, &worker.cancellation, state);
-                    }
-                    Event::Key(Key::Escape)
-                        if state
-                            .question
-                            .as_ref()
-                            .is_none_or(|question| !question.is_custom()) =>
-                    {
-                        worker.questions.cancel_pending();
-                        cancel_worker(worker.thread, &worker.cancellation, state);
-                    }
-                    Event::Key(key) => {
-                        if let Some(question) = state.question.as_mut() {
-                            handle_question_key(question, &worker.questions, key);
-                        }
-                    }
-                    Event::Tick => {
-                        needs_draw |= advance_ticks(state);
-                        needs_draw |= sync_question(terminal, state, &worker.questions);
-                    }
-                    Event::MouseScroll(amount) => {
-                        mark_question_present(state.question.as_ref(), &worker.questions);
-                        scroll(state, amount);
-                    }
-                    Event::Mouse(mouse) => {
-                        // Scroll-bar drags and jump-button clicks scroll the
-                        // transcript; bare pointer motion proves nothing.
-                        if mouse.kind != super::events::MouseKind::Move {
-                            mark_question_present(state.question.as_ref(), &worker.questions);
-                        }
-                        needs_draw |= handle_mouse_selection(terminal, state, mouse)?;
-                    }
-                    Event::Paste(text) => {
-                        mark_question_present(state.question.as_ref(), &worker.questions);
-                        paste_question_answer(state, &text);
-                    }
-                    Event::FocusGained | Event::FocusLost => {}
-                }
-                break;
-            }
-            if state.picker.is_some() {
-                match event {
-                    Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
-                    Event::Key(key) => {
-                        if let Some(action) = take_picker_action(state, editor, key) {
-                            if let PickerAction::SendQueued(index) = action {
-                                if promote_queued(state, index) {
-                                    worker.questions.cancel_pending();
-                                    cancel_worker(worker.thread, &worker.cancellation, state);
-                                    state.queue_paused = false;
-                                }
-                            } else {
-                                activate_picker_action_while_busy(
-                                    state,
-                                    action,
-                                    active_pickers,
-                                    active_config,
-                                );
-                            }
-                        } else {
-                            sync_color_preview(state);
-                        }
-                    }
-                    Event::Paste(text) if picker_is_editing(state) => {
-                        paste_into_picker(state, editor, &text);
-                    }
-                    Event::Mouse(mouse) => {
-                        needs_draw |= handle_mouse_selection(terminal, state, mouse)?;
-                    }
-                    Event::Tick => {
-                        needs_draw |= advance_ticks(state);
-                        needs_draw |= super::connection::poll(state);
-                        needs_draw |= poll_model_picker(state);
-                    }
-                    Event::MouseScroll(_)
-                    | Event::Paste(_)
-                    | Event::FocusGained
-                    | Event::FocusLost => {}
-                }
-                break;
-            }
-            match event {
-                Event::Tick => {
-                    needs_draw |= advance_ticks(state);
-                    needs_draw |= super::connection::poll(state);
-                    needs_draw |= poll_model_picker(state);
-                }
-                Event::FocusGained | Event::FocusLost => {}
-                Event::MouseScroll(amount) => scroll(state, amount),
-                Event::Mouse(mouse) => {
-                    needs_draw |= handle_mouse_selection(terminal, state, mouse)?;
-                }
-                Event::Paste(text) => {
-                    if state.transcript.search_active() {
-                        state.transcript.search_paste(&text);
-                    } else {
-                        state.transcript.blur();
-                        if text.is_empty() {
-                            paste_clipboard_image(active_config, state, editor);
-                        } else {
-                            editor.paste(&text);
-                        }
-                    }
-                }
-                Event::Key(key)
-                    if is_cancel_key(key)
-                        && !state.transcript.search_active()
-                        && !state.transcript.viewer_open() =>
-                {
-                    cancel_worker(worker.thread, &worker.cancellation, state)
-                }
-                Event::Key(key) => {
-                    if super::navigation::handle_key(state, terminal, key)? {
-                        // Transcript navigation owns the key.
-                    } else {
-                        match key {
-                            Key::Ctrl('l') => terminal.invalidate(),
-                            Key::Ctrl('o') => toggle_tool_expansion(state),
-                            Key::PageUp => scroll(state, 10),
-                            Key::PageDown => scroll(state, -10),
-                            Key::Ctrl('v') | Key::Super('v') => {
-                                paste_clipboard_image(active_config, state, editor);
-                            }
-                            _ if handle_completion_key(state, editor, key) => {
-                                // Keep accepting and completing input while the agent runs.
-                            }
-                            Key::Tab if editor.is_empty() => {
-                                super::navigation::focus_transcript(state)
-                            }
-                            _ => match if key == Key::Tab {
-                                editor.queue()
-                            } else {
-                                editor.handle_key(key)
-                            } {
-                                EditAction::Steer(input) => {
-                                    if matches!(
-                                        busy_command(&input.text),
-                                        Some(BusyCommand::Reasoning(_) | BusyCommand::Remote(_))
-                                    ) {
-                                        if input.has_images() {
-                                            state.notice("Images cannot accompany commands while a turn is running.");
-                                            editor.restore_submission(input);
-                                            continue;
-                                        }
-                                        handle_submission_while_busy(
-                                            input,
-                                            state,
-                                            active_pickers,
-                                            active_config,
-                                            &worker.background,
-                                            terminal,
-                                        )?;
-                                    } else {
-                                        handle_steering_while_busy(
-                                            input,
-                                            state,
-                                            editor,
-                                            &worker.steers,
-                                            active_config,
-                                        )?;
-                                    }
-                                }
-                                EditAction::Submit(input)
-                                    if !input.text.trim().starts_with('/') =>
-                                {
-                                    handle_steering_while_busy(
-                                        input,
-                                        state,
-                                        editor,
-                                        &worker.steers,
-                                        active_config,
-                                    )?;
-                                }
-                                EditAction::Submit(input) | EditAction::Queue(input) => {
-                                    if input.has_images() && busy_command(&input.text).is_some() {
-                                        state.notice("Images cannot accompany commands while a turn is running.");
-                                        editor.restore_submission(input);
-                                        continue;
-                                    }
-                                    let mut input = input;
-                                    editor.expand_pastes_in_submission(&mut input);
-                                    handle_submission_while_busy(
-                                        input,
-                                        state,
-                                        active_pickers,
-                                        active_config,
-                                        &worker.background,
-                                        terminal,
-                                    )?;
-                                }
-                                EditAction::None => {}
-                            },
-                        }
-                    }
-                }
-            }
-            if !events.has_pending() {
-                break;
-            }
-            event = events.read_event()?;
-        }
-        if active_config.reasoning_effort != last_reasoning {
-            last_reasoning.clone_from(&active_config.reasoning_effort);
-            worker.steers.set_reasoning_effort(last_reasoning.clone());
-        }
-    }
-}
-
-fn sync_question(
+pub(super) fn sync_question(
     terminal: &mut Terminal,
     state: &mut ViewState,
     broker: &crate::tools::QuestionBroker,
@@ -524,7 +60,7 @@ fn sync_question(
     }
 }
 
-fn handle_question_key(
+pub(super) fn handle_question_key(
     active: &mut super::state::ActiveQuestion,
     broker: &crate::tools::QuestionBroker,
     key: Key,
@@ -568,7 +104,7 @@ fn handle_question_key(
     }
 }
 
-fn mark_question_present(
+pub(super) fn mark_question_present(
     question: Option<&super::state::ActiveQuestion>,
     broker: &crate::tools::QuestionBroker,
 ) {
@@ -577,7 +113,7 @@ fn mark_question_present(
     }
 }
 
-fn paste_question_answer(state: &mut ViewState, text: &str) {
+pub(super) fn paste_question_answer(state: &mut ViewState, text: &str) {
     let Some(super::state::ActiveQuestion {
         input: super::state::QuestionInput::Custom(editor),
         ..
@@ -680,6 +216,24 @@ pub(super) fn cancel_worker(
     state.activity = "canceling turn".into();
 }
 
+/// Gives the agent what changed while it was busy: steers it never took
+/// become queued messages, and display and reasoning settings changed
+/// against the busy config snapshot apply to it.
+pub(super) fn hand_back_busy_changes(
+    agent: &mut Agent,
+    state: &mut ViewState,
+    active_config: &Config,
+) {
+    recover_unaccepted_steers(agent, state);
+    agent.sync_display_config(active_config);
+    if let Err(error) = agent.set_reasoning_effort(active_config.reasoning_effort.clone()) {
+        state.reasoning_effort =
+            crate::model::effective_reasoning_effort(agent.config(), agent.model())
+                .map(str::to_string);
+        state.notice(format!("Could not save reasoning effort: {error}"));
+    }
+}
+
 fn recover_unaccepted_steers(agent: &Agent, state: &mut ViewState) {
     let leftover = agent.take_unaccepted_steers();
     let mut recovered = std::mem::take(&mut state.pending_steers);
@@ -694,7 +248,7 @@ fn recover_unaccepted_steers(agent: &Agent, state: &mut ViewState) {
     }
 }
 
-fn handle_steering_while_busy(
+pub(super) fn handle_steering_while_busy(
     input: Submission,
     state: &mut ViewState,
     editor: &Editor,
@@ -744,12 +298,12 @@ pub(super) fn handle_submission_while_busy(
     terminal: &mut Terminal,
 ) -> Result<(), Error> {
     match busy_command(&input.text) {
-        Some(BusyCommand::Settings) => state.picker = Some(active_pickers.settings.clone()),
-        Some(BusyCommand::Model) => {
+        Some((Command::Settings, _)) => state.picker = Some(active_pickers.settings.clone()),
+        Some((Command::Model, _)) => {
             let selected_model = state.model.clone();
             open_model_picker_from_config(active_config, &selected_model, state, false);
         }
-        Some(BusyCommand::Reasoning(argument)) => {
+        Some((Command::Reasoning, argument)) => {
             if argument.is_empty() {
                 if crate::model::reasoning_efforts(active_config, &state.model).is_empty() {
                     state.notice(format!("{} does not expose reasoning levels.", state.model));
@@ -764,19 +318,21 @@ pub(super) fn handle_submission_while_busy(
                 set_reasoning_while_busy(active_config, state, &argument);
             }
         }
-        Some(BusyCommand::Connect) => super::connection::open(state, active_config, false),
-        Some(BusyCommand::Unqueue(argument)) => unqueue(&argument, state),
-        Some(BusyCommand::Subagents) => super::subagents::open_dashboard(state),
-        Some(BusyCommand::Git) => super::git::open_dashboard(state),
-        Some(BusyCommand::Processes) => super::processes::open_dashboard(state, background.clone()),
-        Some(BusyCommand::Copy) => copy_last_reply(terminal, state, &[])?,
-        Some(BusyCommand::CopyAll) => copy_all_from_transcript(terminal, state)?,
-        Some(BusyCommand::Usage) => super::commands::show_usage(state),
-        Some(BusyCommand::Goal(argument)) => super::commands::goal_while_busy(&argument, state),
-        Some(BusyCommand::Plan(argument)) => super::commands::plan_while_busy(&argument, state),
-        // Either side must be able to stop remote control mid-turn.
-        Some(BusyCommand::Remote(argument)) => super::remote::command(terminal, state, &argument),
-        None => {
+        Some((Command::Connect, _)) => super::connection::open(state, active_config, false),
+        Some((Command::Unqueue, argument)) => unqueue(&argument, state),
+        Some((Command::Subagents, _)) => super::subagents::open_dashboard(state),
+        Some((Command::Git, _)) => super::git::open_dashboard(state),
+        Some((Command::Processes, _)) => {
+            super::processes::open_dashboard(state, background.clone());
+        }
+        Some((Command::Copy, _)) => copy_last_reply(terminal, state, &[])?,
+        Some((Command::CopyAll, _)) => copy_all_from_transcript(terminal, state)?,
+        Some((Command::Usage, _)) => super::commands::show_usage(state),
+        Some((Command::Goal, argument)) => super::commands::goal_while_busy(&argument, state),
+        Some((Command::Plan, argument)) => super::commands::plan_while_busy(&argument, state),
+        Some((Command::Remote, argument)) => super::remote::command(terminal, state, &argument),
+        // The table only lets the commands above through while busy.
+        Some(_) | None => {
             state.queued_inputs.push_back(input);
             state.scroll_offset = 0;
         }
@@ -801,48 +357,6 @@ pub(super) fn set_reasoning_while_busy(config: &mut Config, state: &mut ViewStat
             state.model,
             supported.join(", ")
         ));
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum BusyCommand {
-    Settings,
-    Model,
-    Reasoning(String),
-    Connect,
-    Unqueue(String),
-    Subagents,
-    Git,
-    Processes,
-    Copy,
-    CopyAll,
-    Usage,
-    Goal(String),
-    Plan(String),
-    Remote(String),
-}
-
-pub(super) fn busy_command(input: &str) -> Option<BusyCommand> {
-    let command = input.trim().strip_prefix('/')?;
-    let (name, argument) = command
-        .split_once(char::is_whitespace)
-        .map_or((command, ""), |(name, argument)| (name, argument.trim()));
-    match name {
-        "settings" if argument.is_empty() => Some(BusyCommand::Settings),
-        "model" if argument.is_empty() => Some(BusyCommand::Model),
-        "reasoning" => Some(BusyCommand::Reasoning(argument.to_string())),
-        "connect" if argument.is_empty() => Some(BusyCommand::Connect),
-        "unqueue" => Some(BusyCommand::Unqueue(argument.to_string())),
-        "subagents" if argument.is_empty() => Some(BusyCommand::Subagents),
-        "git" if argument.is_empty() => Some(BusyCommand::Git),
-        "ps" if argument.is_empty() => Some(BusyCommand::Processes),
-        "copy" if argument.is_empty() => Some(BusyCommand::Copy),
-        "copy-all" if argument.is_empty() => Some(BusyCommand::CopyAll),
-        "usage" if argument.is_empty() => Some(BusyCommand::Usage),
-        "goal" => Some(BusyCommand::Goal(argument.to_string())),
-        "plan" => Some(BusyCommand::Plan(argument.to_string())),
-        "remote" => Some(BusyCommand::Remote(argument.to_string())),
-        _ => None,
     }
 }
 
@@ -1267,7 +781,7 @@ mod completion_tests {
     use super::*;
 
     #[test]
-    fn reasoning_save_failure_preserves_job_outcome() {
+    fn reasoning_save_failure_is_reported_and_reverts_the_view() {
         for successful in [true, false] {
             let root = crate::test_support::unique_temp_dir(&format!("worker-save-{successful}"));
             let config = Config {
@@ -1284,27 +798,12 @@ mod completion_tests {
             )
             .unwrap();
             session.fail_append_after(0);
-            let mut agent = Agent::new(config, "openai-codex:gpt-5.4".into(), session, Vec::new());
+            let mut agent = Agent::new(config, "openai-codex:gpt-5.4".into(), session);
             let mut state = ViewState::from_agent(&agent);
             state.reasoning_effort = Some("high".into());
             let mut active_config = agent.config().clone();
             active_config.reasoning_effort = Some("high".into());
-            let outcome = if successful {
-                Ok(true)
-            } else {
-                Err(Error::Protocol("original failure".into()))
-            };
-            let result = finish_agent_job(&mut agent, &mut state, active_config, outcome);
-            if successful {
-                assert!(
-                    matches!(result, Ok(true)),
-                    "completed job must remain successful: {result:?}"
-                );
-            } else {
-                assert!(
-                    matches!(result, Err(Error::Protocol(ref message)) if message == "original failure")
-                );
-            }
+            hand_back_busy_changes(&mut agent, &mut state, &active_config);
             assert_eq!(agent.config().reasoning_effort.as_deref(), Some("low"));
             assert_eq!(state.reasoning_effort.as_deref(), Some("low"));
             assert!(state.transcript.entries().iter().any(|entry| matches!(

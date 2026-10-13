@@ -5,30 +5,51 @@ use super::*;
 
 #[test]
 fn settings_and_model_pickers_are_recognized_during_an_active_turn() {
-    assert_eq!(busy_command(" /settings "), Some(BusyCommand::Settings));
-    assert_eq!(busy_command("/model"), Some(BusyCommand::Model));
+    assert_eq!(
+        busy_command(" /settings "),
+        Some((Command::Settings, String::new()))
+    );
+    assert_eq!(
+        busy_command("/model"),
+        Some((Command::Model, String::new()))
+    );
     assert_eq!(
         busy_command("/reasoning"),
-        Some(BusyCommand::Reasoning(String::new()))
+        Some((Command::Reasoning, String::new()))
     );
     assert_eq!(
         busy_command("/reasoning HIGH"),
-        Some(BusyCommand::Reasoning("HIGH".into()))
+        Some((Command::Reasoning, "HIGH".into()))
     );
-    assert_eq!(busy_command("/connect"), Some(BusyCommand::Connect));
-    assert_eq!(busy_command("/subagents"), Some(BusyCommand::Subagents));
-    assert_eq!(busy_command("/git"), Some(BusyCommand::Git));
-    assert_eq!(busy_command("/ps"), Some(BusyCommand::Processes));
-    assert_eq!(busy_command("/copy"), Some(BusyCommand::Copy));
-    assert_eq!(busy_command("/copy-all"), Some(BusyCommand::CopyAll));
-    assert_eq!(busy_command("/usage"), Some(BusyCommand::Usage));
+    assert_eq!(
+        busy_command("/connect"),
+        Some((Command::Connect, String::new()))
+    );
+    assert_eq!(
+        busy_command("/subagents"),
+        Some((Command::Subagents, String::new()))
+    );
+    assert_eq!(busy_command("/git"), Some((Command::Git, String::new())));
+    assert_eq!(
+        busy_command("/ps"),
+        Some((Command::Processes, String::new()))
+    );
+    assert_eq!(busy_command("/copy"), Some((Command::Copy, String::new())));
+    assert_eq!(
+        busy_command("/copy-all"),
+        Some((Command::CopyAll, String::new()))
+    );
+    assert_eq!(
+        busy_command("/usage"),
+        Some((Command::Usage, String::new()))
+    );
     assert_eq!(
         busy_command("/unqueue 2"),
-        Some(BusyCommand::Unqueue("2".into()))
+        Some((Command::Unqueue, "2".into()))
     );
     assert_eq!(
         busy_command("/remote off"),
-        Some(BusyCommand::Remote("off".into()))
+        Some((Command::Remote, "off".into()))
     );
     assert_eq!(busy_command("/settings max_tokens 1"), None);
     assert_eq!(busy_command("hello"), None);

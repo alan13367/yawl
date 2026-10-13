@@ -1468,7 +1468,7 @@ mod tests {
             "undo must snapshot the file a padded name saves to"
         );
 
-        let created = registry.execute(DEFINE_TOOL_NAME, &definition.to_string(), "s");
+        let created = registry.execute(DEFINE_TOOL_NAME, &definition.to_string(), "s", false);
         assert!(!created.is_error, "{}", created.content);
         assert!(created.content.starts_with("Created project tool `greet`"));
         assert!(
@@ -1480,12 +1480,12 @@ mod tests {
 
         let next = main_registry(&config, &mut cache);
         assert_eq!(next.personalization(), Some(vec!["greet".to_string()]));
-        let greeting = next.execute("greet", r#"{"who":"Ada Lovelace"}"#, "s");
+        let greeting = next.execute("greet", r#"{"who":"Ada Lovelace"}"#, "s", false);
         assert_eq!(greeting.content, "hello Ada Lovelace");
 
         let mut global = definition.clone();
         global["scope"] = json!("global");
-        let shadowed = next.execute(DEFINE_TOOL_NAME, &global.to_string(), "s");
+        let shadowed = next.execute(DEFINE_TOOL_NAME, &global.to_string(), "s", false);
         assert!(
             shadowed
                 .content
@@ -1493,7 +1493,7 @@ mod tests {
             "{}",
             shadowed.content
         );
-        let updated = next.execute(DEFINE_TOOL_NAME, &definition.to_string(), "s");
+        let updated = next.execute(DEFINE_TOOL_NAME, &definition.to_string(), "s", false);
         assert!(updated.content.starts_with("Updated project tool `greet`"));
         assert!(updated.content.contains("overrides the global tool"));
     }
@@ -1535,7 +1535,7 @@ mod tests {
                 "{{x}} is inside quotes",
             ),
         ] {
-            let outcome = registry.execute(DEFINE_TOOL_NAME, &args.to_string(), "s");
+            let outcome = registry.execute(DEFINE_TOOL_NAME, &args.to_string(), "s", false);
             assert!(outcome.is_error, "{args}");
             assert!(outcome.content.starts_with("Tool not saved: "));
             assert!(outcome.content.contains(expected), "{}", outcome.content);
@@ -1546,6 +1546,7 @@ mod tests {
             DEFINE_TOOL_NAME,
             &with("timeout_secs", json!("30")).to_string(),
             "s",
+            false,
         );
         assert!(!saved.is_error, "{}", saved.content);
         let manifest: Value = serde_json::from_str(
@@ -1578,14 +1579,13 @@ mod tests {
             DEFINE_TOOL_NAME,
             &json!({"name": "mine", "description": "d", "command": "echo mine", "scope": "project"})
                 .to_string(),
-            "s",
-        );
+            "s", false);
         assert!(!defined.is_error, "{}", defined.content);
         assert!(defined.content.contains("This project is not trusted yet"));
 
         let next = main_registry(&config, &mut cache);
         assert_eq!(next.personalization(), Some(vec!["mine".to_string()]));
-        assert!(next.execute("planted", "{}", "s").is_error);
+        assert!(next.execute("planted", "{}", "s", false).is_error);
 
         std::fs::write(
             tools.join("mine.json"),
@@ -1613,6 +1613,7 @@ mod tests {
             &json!({"name": "mine", "description": "d", "command": "true", "scope": "project"})
                 .to_string(),
             "s",
+            false,
         );
         assert!(refused.is_error);
         assert!(

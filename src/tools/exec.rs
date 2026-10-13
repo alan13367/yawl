@@ -1,5 +1,5 @@
-//! Bounded child-process execution shared by `shell`, custom tools, and Git
-//! inspection.
+//! The one child-process runner: `shell`, custom tools, Git inspection, the
+//! Git dashboard, and `/undo` checkpoints all run commands through it.
 //!
 //! Commands run in their own process group with piped output, a deadline,
 //! and live cancellation. Results follow one contract: stdout first, then
@@ -16,7 +16,11 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+/// Bytes kept from the start and from the end of each output stream. Build
+/// and test tools print their failures and summaries last, so the end is
+/// kept as well as the beginning.
+const CAPTURE_HEAD_BYTES: usize = 32 * 1024;
+const CAPTURE_TAIL_BYTES: usize = 32 * 1024;
 
 /// Starts `command` in a new session, which also makes it the leader of its
 /// own process group, so callers can still signal the whole group.
@@ -92,20 +96,58 @@ pub struct ExecResult {
     pub interrupted: bool,
 }
 
-/// Spawns a command with piped I/O and waits with a timeout, polling
-/// `try_wait` (no tokio). Also honors the global interrupt flag: Ctrl+C
-/// kills the child. Reader threads drain stdout/stderr to avoid pipe
-/// deadlock on chatty children.
+/// How much of one output stream a run keeps. Whatever is not kept is
+/// still read, so a chatty child never blocks on a full pipe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Keep {
+    All,
+    /// The first `n` bytes.
+    Head(usize),
+    /// The first and last 32 KiB, with a marker for what was dropped between.
+    HeadAndTail,
+}
+
+pub(crate) struct RunOptions<'a> {
+    /// Written to the child's stdin, which then closes. `None` gives the
+    /// child an empty stdin.
+    pub(crate) stdin: Option<&'a [u8]>,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) stdout: Keep,
+    pub(crate) stderr: Keep,
+}
+
+/// Runs a tool command with a deadline, keeping the start and end of its
+/// output. See [`run`].
 pub fn run_with_timeout(
-    mut cmd: Command,
+    cmd: Command,
     stdin_data: Option<&[u8]>,
     timeout: Duration,
 ) -> std::io::Result<ExecResult> {
-    // Put the command in its own session and process group. Killing only
-    // the immediate shell would leave grandchildren running and could keep
-    // our output pipes open forever.
+    run(
+        cmd,
+        RunOptions {
+            stdin: stdin_data,
+            timeout: Some(timeout),
+            stdout: Keep::HeadAndTail,
+            stderr: Keep::HeadAndTail,
+        },
+    )
+}
+
+/// Runs `cmd` in its own session and process group with piped output.
+///
+/// The run ends when the child has exited and both output pipes reached
+/// end of file, when the deadline passes, or when the current job is
+/// interrupted; the last two kill the whole process group. Completion waits
+/// for end of file because a shell can exit while a background descendant
+/// still writes, and that descendant cannot hold the run open past the
+/// deadline or an interrupt either.
+pub(crate) fn run(mut cmd: Command, options: RunOptions<'_>) -> std::io::Result<ExecResult> {
+    // Killing only the immediate shell would leave grandchildren running and
+    // could keep the output pipes open forever, so the child leads its own
+    // process group.
     isolate_from_terminal(&mut cmd);
-    cmd.stdin(if stdin_data.is_some() {
+    cmd.stdin(if options.stdin.is_some() {
         Stdio::piped()
     } else {
         Stdio::null()
@@ -115,72 +157,89 @@ pub fn run_with_timeout(
     let mut child = cmd.spawn()?;
 
     let mut stdin = child.stdin.take();
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        kill_and_reap(&mut child);
+        return Err(std::io::Error::other("child output pipes were not created"));
+    };
     if let Err(error) = set_nonblocking(&stdout)
         .and_then(|()| set_nonblocking(&stderr))
-        .and_then(|()| {
-            if let Some(stdin) = &stdin {
-                set_nonblocking(stdin)?;
-            }
-            Ok(())
-        })
+        .and_then(|()| stdin.as_ref().map_or(Ok(()), set_nonblocking))
     {
         kill_and_reap(&mut child);
         return Err(error);
     }
+    let process_group = i32::try_from(child.id()).ok();
     let stop_readers = Arc::new(AtomicBool::new(false));
-    let stop_out = Arc::clone(&stop_readers);
-    let stop_err = Arc::clone(&stop_readers);
-    let out_handle = std::thread::spawn(move || drain(stdout, &stop_out));
-    let err_handle = std::thread::spawn(move || drain(stderr, &stop_err));
+    let (stop_out, stop_err) = (Arc::clone(&stop_readers), Arc::clone(&stop_readers));
+    let (keep_out, keep_err) = (options.stdout, options.stderr);
+    let out_handle = std::thread::spawn(move || drain(stdout, keep_out, &stop_out));
+    let err_handle = std::thread::spawn(move || drain(stderr, keep_err, &stop_err));
+    // A blocking waiter reports the exit at once, so quick commands do not
+    // pay a polling interval. It leaves the child a zombie until this thread
+    // has finished signalling the group: reaping frees the pid, and a kill
+    // sent to a freed process group id could reach whatever group reuses it.
+    let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+    let (signalled_tx, signalled_rx) = std::sync::mpsc::channel::<()>();
+    let waiter = std::thread::spawn(move || {
+        wait_for_exit(child.id());
+        let _ = exited_tx.send(());
+        let _ = signalled_rx.recv();
+        child.wait()
+    });
 
-    let deadline = Instant::now().checked_add(timeout);
-    let mut timed_out = false;
-    let mut interrupted = false;
-    // The shell can exit while a background descendant still owns a pipe.
-    // Completion includes EOF on both pipes, so cancellation and the deadline
-    // remain active during output collection as well as process execution.
-    let mut status = None;
+    let deadline = options
+        .timeout
+        .and_then(|timeout| Instant::now().checked_add(timeout));
+    let (mut exited, mut timed_out, mut interrupted) = (false, false, false);
     let mut input_sent = 0;
-    let wait_result = (|| -> std::io::Result<()> {
-        loop {
-            if status.is_none() {
-                status = child.try_wait()?;
-            }
-            if status.is_some() && out_handle.is_finished() && err_handle.is_finished() {
-                return Ok(());
-            }
-            if crate::cancellation::interrupted() {
-                interrupted = true;
-                return Ok(());
-            }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                timed_out = true;
-                return Ok(());
-            }
-            if let (Some(pipe), Some(data)) = (stdin.as_mut(), stdin_data)
-                && write_available(pipe, data, &mut input_sent)
-            {
-                // EOF tells a reader that it has received the entire JSON input.
-                stdin = None;
-            }
-            std::thread::sleep(Duration::from_millis(30));
+    loop {
+        if exited && out_handle.is_finished() && err_handle.is_finished() {
+            break;
         }
-    })();
-    if interrupted || timed_out || wait_result.is_err() {
-        kill_and_reap(&mut child);
-        // An escaped descendant may be outside our process group. Do not
+        if crate::cancellation::interrupted() {
+            interrupted = true;
+            break;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            timed_out = true;
+            break;
+        }
+        if let (Some(pipe), Some(data)) = (stdin.as_mut(), options.stdin)
+            && write_available(pipe, data, &mut input_sent)
+        {
+            // EOF tells a reader that it has received the entire input.
+            stdin = None;
+        }
+        let wait = if exited || stdin.is_some() {
+            Duration::from_millis(5)
+        } else {
+            Duration::from_millis(25)
+        };
+        match exited_rx.recv_timeout(wait) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => exited = true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+    drop(stdin);
+    if interrupted || timed_out {
+        if let Some(process_group) = process_group {
+            kill_group(process_group);
+        }
+        // An escaped descendant may be outside the process group. Do not
         // wait indefinitely for it to close an inherited pipe.
         stop_readers.store(true, Ordering::Release);
-        status = None;
     }
-
+    drop(signalled_tx);
+    let status = waiter
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("process waiter panicked")));
     let stdout = out_handle.join().unwrap_or_default();
     let stderr = err_handle.join().unwrap_or_default();
-    wait_result?;
+    let status = status?;
     Ok(ExecResult {
-        status: status.and_then(|s| s.code()),
+        status: (!interrupted && !timed_out)
+            .then(|| status.code())
+            .flatten(),
         stdout,
         stderr,
         timed_out,
@@ -188,16 +247,38 @@ pub fn run_with_timeout(
     })
 }
 
-fn kill_and_reap(child: &mut Child) {
-    let process_group = i32::try_from(child.id()).ok();
-    if let Some(process_group) = process_group {
-        // SAFETY: `kill` receives a valid negative process-group id created
-        // for this child. SIGKILL requires no Rust-side memory invariants.
-        unsafe {
-            libc::kill(-process_group, libc::SIGKILL);
+fn kill_group(process_group: i32) {
+    // SAFETY: `kill` receives the negative id of the process group created
+    // for this child. SIGKILL requires no Rust-side memory invariants.
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+}
+
+/// Blocks until the child `pid` exits without reaping it, so its pid and
+/// process group id stay reserved until `Child::wait` collects it.
+fn wait_for_exit(pid: libc::id_t) {
+    loop {
+        // SAFETY: `siginfo_t` is plain data, so all zero bytes are a valid
+        // value for `waitid` to overwrite.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live, writable `siginfo_t`. `WNOWAIT` only
+        // observes the exit of this process's own child and does not reap it.
+        let result =
+            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if result == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+        {
+            return;
         }
-    } else {
-        let _ = child.kill();
+    }
+}
+
+fn kill_and_reap(child: &mut Child) {
+    match i32::try_from(child.id()) {
+        Ok(process_group) => kill_group(process_group),
+        Err(_) => {
+            let _ = child.kill();
+        }
     }
     let _ = child.wait();
 }
@@ -219,7 +300,7 @@ fn write_available(writer: &mut impl Write, data: &[u8], sent: &mut usize) -> bo
     true
 }
 
-fn set_nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
+pub(crate) fn set_nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
     // SAFETY: the borrowed pipe owns a valid descriptor throughout both calls.
     let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 {
@@ -233,34 +314,121 @@ fn set_nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
     Ok(())
 }
 
-fn drain(mut reader: impl Read, stop: &AtomicBool) -> String {
-    let mut captured = Vec::with_capacity(MAX_CAPTURE_BYTES);
+/// Waits up to 10 ms for `pipe` to become readable or reach end of file.
+fn wait_readable(pipe: &impl AsRawFd) {
+    let mut descriptor = libc::pollfd {
+        fd: pipe.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `descriptor` is one initialized pollfd for a descriptor the
+    // borrowed pipe keeps open for the duration of the call.
+    unsafe {
+        libc::poll(&mut descriptor, 1, 10);
+    }
+}
+
+fn drain(mut reader: impl Read + AsRawFd, keep: Keep, stop: &AtomicBool) -> String {
+    let mut capture = Capture::new(keep);
     let mut chunk = [0u8; 8 * 1024];
-    let mut truncated = false;
     while !stop.load(Ordering::Acquire) {
         let read = match reader.read(&mut chunk) {
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
+                wait_readable(&reader);
                 continue;
             }
             Ok(0) | Err(_) => break,
             Ok(read) => read,
         };
-        let remaining = MAX_CAPTURE_BYTES.saturating_sub(captured.len());
-        captured.extend_from_slice(&chunk[..read.min(remaining)]);
-        truncated |= read > remaining;
+        capture.push(&chunk[..read]);
     }
-    let mut output = String::from_utf8_lossy(&captured).into_owned();
-    if truncated {
-        output.push_str("\n[process output truncated]");
+    capture.finish()
+}
+
+/// What a run keeps of one output stream, with a count of what it dropped.
+struct Capture {
+    keep: Keep,
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    omitted: u64,
+}
+
+impl Capture {
+    fn new(keep: Keep) -> Self {
+        Self {
+            keep,
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            omitted: 0,
+        }
     }
-    output
+
+    fn push(&mut self, bytes: &[u8]) {
+        let head_limit = match self.keep {
+            Keep::All => usize::MAX,
+            Keep::Head(limit) => limit,
+            Keep::HeadAndTail => CAPTURE_HEAD_BYTES,
+        };
+        let room = head_limit.saturating_sub(self.head.len());
+        let (head, rest) = bytes.split_at(room.min(bytes.len()));
+        self.head.extend_from_slice(head);
+        if self.keep != Keep::HeadAndTail {
+            self.omitted = self.omitted.saturating_add(rest.len() as u64);
+            return;
+        }
+        self.tail.extend(rest);
+        let excess = self.tail.len().saturating_sub(CAPTURE_TAIL_BYTES);
+        if excess > 0 {
+            self.tail.drain(..excess);
+            self.omitted = self.omitted.saturating_add(excess as u64);
+        }
+    }
+
+    fn finish(self) -> String {
+        let tail = Vec::from(self.tail);
+        // A bounded head keeps its exact bytes: callers detect a partial
+        // capture from its length.
+        if self.omitted == 0 || self.keep != Keep::HeadAndTail {
+            let mut bytes = self.head;
+            bytes.extend_from_slice(&tail);
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
+        // Cut on character boundaries so the gap leaves no replacement
+        // characters behind.
+        let head_end = match std::str::from_utf8(&self.head) {
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            _ => self.head.len(),
+        };
+        let head = String::from_utf8_lossy(&self.head[..head_end]);
+        let tail_start = tail
+            .iter()
+            .take(3)
+            .take_while(|byte| (**byte & 0b1100_0000) == 0b1000_0000)
+            .count();
+        format!(
+            "{head}\n[... output truncated: {} bytes omitted ...]\n{}",
+            self.omitted + (self.head.len() - head_end + tail_start) as u64,
+            String::from_utf8_lossy(&tail[tail_start..]),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_wait_keeps_the_pid_reserved_until_reaped() -> std::io::Result<()> {
+        let mut child = Command::new("true").spawn()?;
+        let pid = libc::pid_t::try_from(child.id()).map_err(std::io::Error::other)?;
+        wait_for_exit(child.id());
+        // SAFETY: signal 0 only checks that the pid exists.
+        let exists = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(exists, "the exited child was reaped before `wait`");
+        assert!(child.wait()?.success());
+        Ok(())
+    }
 
     #[test]
     fn cancellation_stops_descendants_holding_pipes_after_shell_exit() {
@@ -335,7 +503,7 @@ mod tests {
         set_nonblocking(&reader).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let reader_stop = Arc::clone(&stop);
-        let handle = std::thread::spawn(move || drain(reader, &reader_stop));
+        let handle = std::thread::spawn(move || drain(reader, Keep::HeadAndTail, &reader_stop));
         std::thread::sleep(Duration::from_millis(40));
         stop.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -438,7 +606,54 @@ mod tests {
         cmd.arg("-c").arg("yes x | head -c 100000");
         let result = run_with_timeout(cmd, None, Duration::from_secs(5))?;
         assert!(result.stdout.len() < 70_000);
-        assert!(result.stdout.ends_with("[process output truncated]"));
+        assert!(result.stdout.contains("output truncated:"));
         Ok(())
+    }
+
+    #[test]
+    fn long_output_keeps_its_final_lines() -> std::io::Result<()> {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("seq 1 30000; echo 'test result: FAILED. 1 failed'");
+        let result = run_with_timeout(cmd, None, Duration::from_secs(30))?;
+        assert!(result.stdout.starts_with("1\n2\n3\n"));
+        assert!(
+            result
+                .stdout
+                .ends_with("30000\ntest result: FAILED. 1 failed\n"),
+            "{}",
+            &result.stdout[result.stdout.len().saturating_sub(80)..]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_capture_still_drains_the_pipe() -> std::io::Result<()> {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("yes x | head -c 300000");
+        let result = run(
+            cmd,
+            RunOptions {
+                stdin: None,
+                timeout: Some(Duration::from_secs(10)),
+                stdout: Keep::Head(256),
+                stderr: Keep::All,
+            },
+        )?;
+        assert_eq!(result.status, Some(0), "the writer must not block");
+        assert_eq!(result.stdout, "x\n".repeat(128));
+        Ok(())
+    }
+
+    #[test]
+    fn capture_cuts_multibyte_characters_cleanly() {
+        let mut capture = Capture::new(Keep::HeadAndTail);
+        let text = "é".repeat(CAPTURE_HEAD_BYTES);
+        capture.push(text.as_bytes());
+        capture.push(b"x");
+        let output = capture.finish();
+        assert!(!output.contains('\u{fffd}'));
+        assert!(output.contains("output truncated:"));
+        assert!(output.ends_with('x'));
     }
 }

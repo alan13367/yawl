@@ -10,7 +10,6 @@ use crate::config::{Config, working_dir};
 pub struct Skill {
     pub name: String,
     pub description: String,
-    pub path: PathBuf,
     pub directory: PathBuf,
     pub instructions: String,
     pub disable_model_invocation: bool,
@@ -321,7 +320,6 @@ fn load_skill(path: &Path) -> Result<Skill, String> {
     Ok(Skill {
         name,
         description,
-        path,
         directory,
         instructions: parsed.body.trim().to_string(),
         disable_model_invocation: parsed.disable_model_invocation,
@@ -721,7 +719,6 @@ mod tests {
         let skill = Skill {
             name: "review".into(),
             description: "Review code".into(),
-            path: Path::new("/tmp/review/SKILL.md").into(),
             directory: Path::new("/tmp/review").into(),
             instructions: "Check the patch.".into(),
             disable_model_invocation: false,

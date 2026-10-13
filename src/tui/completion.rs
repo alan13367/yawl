@@ -17,44 +17,13 @@ pub(super) struct Completion {
 }
 
 pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
-    let mut completions = [
-        ("/model", "List or switch models"),
-        ("/reasoning", "Show or set the reasoning effort"),
-        ("/connect", "Configure a model provider"),
-        ("/settings", "Show or change settings"),
-        ("/subagents", "Open the subagent dashboard"),
-        ("/git", "Open the git dashboard"),
-        ("/ps", "Open the background process dashboard"),
-        ("/remote", "Control this session from another device"),
-        ("/new", "Start a session without changing directories"),
-        ("/clear", "Alias for /new"),
-        ("/compact", "Summarize older messages"),
-        ("/usage", "Show token and prompt-cache usage"),
-        ("/undo", "Undo the last turn"),
-        ("/continue", "Resume a failed or interrupted turn"),
-        ("/init", "Create or update AGENTS.md"),
-        ("/copy", "Copy the last assistant reply"),
-        ("/copy-all", "Copy the conversation without reasoning"),
-        ("/tools", "List available tools"),
-        ("/skills", "List available skills"),
-        ("/resume", "List or resume sessions"),
-        ("/unqueue", "Cancel queued messages"),
-        ("/goal", "Start, resume, or cancel a persistent goal"),
-        (
-            "/plan",
-            "Start, revise, implement, resume, or cancel a plan",
-        ),
-        ("/help", "Show help"),
-        ("/hotkeys", "List every keyboard shortcut"),
-        ("/diff", "Show files changed this session"),
-        ("/quit", "Exit Yawl"),
-    ]
-    .into_iter()
-    .map(|(command, description)| Completion {
-        command: command.into(),
-        description: description.into(),
-    })
-    .collect::<Vec<_>>();
+    let mut completions = super::commands::command_menu()
+        .into_iter()
+        .map(|(command, description)| Completion {
+            command,
+            description,
+        })
+        .collect::<Vec<_>>();
     completions.extend(
         crate::skills::scan(agent.config())
             .into_iter()

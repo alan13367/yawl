@@ -33,12 +33,21 @@ pub(in crate::tui) enum PlanAction {
 /// The request after a `/plan revise` subcommand, trimmed. `None` when
 /// `argument` is not that subcommand.
 pub(in crate::tui) fn revision_text(argument: &str) -> Option<&str> {
-    let rest = argument.strip_prefix("revise")?;
-    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+    let (word, rest) = argument
+        .split_once(char::is_whitespace)
+        .unwrap_or((argument, ""));
+    word.eq_ignore_ascii_case("revise").then(|| rest.trim())
+}
+
+/// The `/goal` or `/plan` argument with ASCII letters lowercased, so
+/// one-word subcommands match regardless of case. Objectives keep the
+/// original text.
+fn subcommand(argument: &str) -> String {
+    argument.to_ascii_lowercase()
 }
 
 pub(in crate::tui) fn plan(agent: &mut Agent, argument: &str, state: &mut ViewState) -> PlanAction {
-    match argument {
+    match subcommand(argument).as_str() {
         "" => {
             notice_plan_status(agent, state);
             PlanAction::None
@@ -46,8 +55,7 @@ pub(in crate::tui) fn plan(agent: &mut Agent, argument: &str, state: &mut ViewSt
         "cancel" => {
             match agent.cancel_plan() {
                 Ok(true) => {
-                    state.active_plan = None;
-                    state.plan_draft = false;
+                    state.sync_modes(agent);
                     state.notice("Plan canceled.");
                 }
                 Ok(false) => state.notice("No active plan."),
@@ -81,29 +89,32 @@ pub(in crate::tui) fn plan(agent: &mut Agent, argument: &str, state: &mut ViewSt
                 PlanAction::None
             }
         },
-        argument if let Some(revision) = revision_text(argument) => match agent.plan_state() {
-            _ if revision.is_empty() => {
-                state.notice("Usage: /plan revise TEXT");
-                PlanAction::None
+        // With no plan to revise, `/plan revise the auth flow` is an
+        // objective like any other.
+        _ if let Some(revision) = revision_text(argument)
+            && (revision.is_empty() || agent.plan_state().is_some()) =>
+        {
+            match agent.plan_state() {
+                Some(crate::session::PlanState::Ready { .. }) if !revision.is_empty() => {
+                    PlanAction::Revise(revision.into())
+                }
+                Some(crate::session::PlanState::Draft { .. }) => {
+                    state.notice(
+                        "The plan is still a draft. Finish it, or run /plan resume to continue it.",
+                    );
+                    PlanAction::None
+                }
+                _ => {
+                    state.notice("Usage: /plan revise TEXT");
+                    PlanAction::None
+                }
             }
-            Some(crate::session::PlanState::Ready { .. }) => PlanAction::Revise(revision.into()),
-            Some(crate::session::PlanState::Draft { .. }) => {
-                state.notice(
-                    "The plan is still a draft. Finish it, or run /plan resume to continue it.",
-                );
-                PlanAction::None
-            }
-            None => {
-                state.notice("No active plan.");
-                PlanAction::None
-            }
-        },
-        objective => {
+        }
+        _ => {
             let replaced = agent.active_plan().is_some();
-            match agent.start_plan(objective.to_string().into()) {
+            match agent.start_plan(argument.to_string().into()) {
                 Ok(warning) => {
-                    state.active_plan = None;
-                    state.plan_draft = true;
+                    state.sync_modes(agent);
                     if let Some(warning) = warning {
                         state.notice(warning);
                     }
@@ -158,7 +169,7 @@ pub(in crate::tui) fn plan_handoff_picker() -> Picker {
 }
 
 pub(in crate::tui) fn goal(agent: &mut Agent, argument: &str, state: &mut ViewState) -> GoalAction {
-    match argument {
+    match subcommand(argument).as_str() {
         "" => {
             notice_goal_status(agent, state, false);
             GoalAction::None
@@ -166,7 +177,7 @@ pub(in crate::tui) fn goal(agent: &mut Agent, argument: &str, state: &mut ViewSt
         "cancel" => {
             match agent.cancel_goal() {
                 Ok(true) => {
-                    state.active_goal = None;
+                    state.sync_modes(agent);
                     state.notice("Goal canceled.");
                 }
                 Ok(false) => state.notice("No active goal."),
@@ -181,9 +192,9 @@ pub(in crate::tui) fn goal(agent: &mut Agent, argument: &str, state: &mut ViewSt
             }
             GoalAction::Resume
         }
-        goal => match agent.start_goal(goal.to_string().into()) {
+        _ => match agent.start_goal(argument.to_string().into()) {
             Ok(warning) => {
-                state.active_goal = agent.active_goal().map(str::to_string);
+                state.sync_modes(agent);
                 if let Some(warning) = warning {
                     state.notice(warning);
                 }
@@ -198,7 +209,7 @@ pub(in crate::tui) fn goal(agent: &mut Agent, argument: &str, state: &mut ViewSt
 }
 
 pub(in crate::tui) fn goal_while_busy(argument: &str, state: &mut ViewState) {
-    match argument {
+    match subcommand(argument).as_str() {
         "" => {
             if let Some(goal) = state.active_goal.as_deref() {
                 if state.goal_running {
@@ -220,7 +231,7 @@ pub(in crate::tui) fn goal_while_busy(argument: &str, state: &mut ViewState) {
 }
 
 pub(in crate::tui) fn plan_while_busy(argument: &str, state: &mut ViewState) {
-    match argument {
+    match subcommand(argument).as_str() {
         "" => {
             if state.plan_draft {
                 state.notice("A planning workflow is currently running.");
@@ -233,7 +244,9 @@ pub(in crate::tui) fn plan_while_busy(argument: &str, state: &mut ViewState) {
         "implement" => {
             state.notice("Wait for the current turn to settle, then run /plan implement.")
         }
-        argument if revision_text(argument).is_some() => {
+        _ if revision_text(argument).is_some()
+            && (state.active_plan.is_some() || state.plan_draft) =>
+        {
             state.notice("Wait for the current turn to settle, then run /plan revise TEXT.");
         }
         _ => state.notice("Wait for the current turn to settle before changing the plan."),

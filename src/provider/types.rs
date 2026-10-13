@@ -95,6 +95,9 @@ pub enum MessageControl {
     PlanPhase,
     Steering,
     ToolSkipped,
+    /// The portable summary that replaced compacted history. Built at
+    /// replay from compaction events, so session logs never store it.
+    Summary,
 }
 
 /// Metadata for one synthetic background result delivered to the parent.
@@ -171,6 +174,10 @@ pub struct Message {
 }
 
 const REASONING_DURATIONS_TYPE: &str = "yawl.reasoning_durations.v1";
+
+/// Leads every compaction summary so the model reads it as context, not as
+/// a new request.
+const SUMMARY_MARKER: &str = "[conversation summary]";
 
 pub(super) fn reasoning_durations_data(durations_ms: &[Option<u64>]) -> Option<Value> {
     durations_ms.iter().any(Option::is_some).then(|| {
@@ -340,6 +347,51 @@ impl Message {
         matches!(self.control, Some(MessageControl::ToolSkipped))
     }
 
+    pub(crate) fn is_summary(&self) -> bool {
+        matches!(self.control, Some(MessageControl::Summary))
+    }
+
+    /// Whether this message begins a user turn, which `/undo` drops as a
+    /// unit: a visible prompt, a goal or plan start, or the hidden prompt
+    /// that starts plan implementation. Summaries, handoffs, steering, and
+    /// delivered subagent results continue a turn instead.
+    pub(crate) fn starts_user_turn(&self) -> bool {
+        self.role == Role::User
+            && self.subagent_results.is_empty()
+            && !self.is_summary()
+            && !self.is_plan_handoff()
+            && (!self.is_hidden_control() || self.is_plan_implementation_start())
+            && !self.is_steering()
+    }
+
+    /// The user message that replaces compacted history. Providers see
+    /// ordinary user content; `provider_data` carries a provider-native
+    /// replacement history when remote compaction produced one.
+    pub(crate) fn summary(
+        summary: &str,
+        provider_data: Vec<Value>,
+        provider_data_model: Option<String>,
+    ) -> Message {
+        Message {
+            provider_data,
+            provider_data_model,
+            ..Self::text(
+                Role::User,
+                format!(
+                    "{SUMMARY_MARKER}\nEarlier conversation, summarized to free context:\n\n{summary}"
+                ),
+            )
+        }
+        .with_control(MessageControl::Summary)
+    }
+
+    /// The implementation handoff that replaces a planning conversation.
+    /// Providers see ordinary user content; it is not a summary, so the UI
+    /// renders it as a handoff and `/undo` never treats it as a prompt.
+    pub(crate) fn plan_handoff(handoff: &str) -> Message {
+        Message::user(handoff).with_control(MessageControl::PlanHandoff)
+    }
+
     pub fn subagent_results(results: Vec<SubagentResult>) -> Message {
         let mut content = String::from("Background subagent results:\n");
         for result in &results {
@@ -430,15 +482,6 @@ impl UsageSummary {
 
     pub fn record_cache_reset(&mut self) {
         self.cache_resets = self.cache_resets.saturating_add(1);
-    }
-
-    pub fn merge(&mut self, other: Self) {
-        self.requests = self.requests.saturating_add(other.requests);
-        self.tokens = self.tokens.saturating_add(other.tokens);
-        self.cache_reported_input_tokens = self
-            .cache_reported_input_tokens
-            .saturating_add(other.cache_reported_input_tokens);
-        self.cache_resets = self.cache_resets.saturating_add(other.cache_resets);
     }
 
     pub fn cache_hit_percent(self) -> u64 {

@@ -7,59 +7,57 @@ use std::fs;
 use std::path::PathBuf;
 
 impl Session {
-    fn plan_path(&self, revision: usize) -> PathBuf {
-        self.directory
-            .join(&self.id)
-            .join("plans")
-            .join(format!("{revision}.md"))
+    /// Where plan revisions are saved; `None` for memory-only sessions.
+    fn plans_directory(&self) -> Option<PathBuf> {
+        let storage = self.storage.as_ref()?;
+        Some(storage.directory.join(&self.id).join("plans"))
     }
 
-    fn save_plan(&self, revision: usize, plan: &str) -> Result<PathBuf, Error> {
-        let path = self.plan_path(revision);
+    fn save_plan(&self, revision: usize, plan: &str) -> Result<Option<PathBuf>, Error> {
+        let Some(directory) = self.plans_directory() else {
+            return Ok(None);
+        };
+        let path = directory.join(format!("{revision}.md"));
         match fs::read_to_string(&path) {
-            Ok(saved) if saved == plan => return Ok(path),
+            Ok(saved) if saved == plan => return Ok(Some(path)),
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let directory = self.directory.join(&self.id).join("plans");
         fs::create_dir_all(directory)?;
         // The log is authoritative. Rename also repairs partial or externally
         // modified artifacts without exposing a partially written plan.
         let temporary = path.with_extension("md.tmp");
         fs::write(&temporary, plan)?;
         fs::rename(&temporary, &path)?;
-        Ok(path)
+        Ok(Some(path))
     }
 
     pub(crate) fn ensure_plan_file(&self) -> Result<Option<PathBuf>, Error> {
-        match &self.active_plan {
-            Some(PlanState::Ready { plan, revision }) => self.save_plan(*revision, plan).map(Some),
+        match &self.state.active_plan {
+            Some(PlanState::Ready { plan, revision }) => self.save_plan(*revision, plan),
             _ => Ok(None),
         }
     }
 
+    /// Saves the completed plan as the next revision's file, then records
+    /// it. Returns the file, or `None` for memory-only sessions.
     pub(crate) fn append_plan_ready(
         &mut self,
         plan: &str,
-        message: &Message,
-    ) -> Result<PathBuf, Error> {
-        let revision = self.plan_revision_count + 1;
+        message: Message,
+    ) -> Result<Option<PathBuf>, Error> {
+        let revision = self.state.plan_revisions.len() + 1;
         let path = self.save_plan(revision, plan)?;
-        self.append(&SessionEvent::PlanReady {
+        self.record(SessionEvent::PlanReady {
             plan: plan.to_string(),
-            message: message.clone(),
+            message,
         })?;
-        self.plan_revision_count = revision;
-        self.active_plan = Some(PlanState::Ready {
-            plan: plan.to_string(),
-            revision,
-        });
         Ok(path)
     }
 
     pub(crate) fn plan_has_handoff(&self, revision: usize) -> bool {
-        self.plan_handoffs.contains(&revision)
+        self.state.plan_handoffs.contains(&revision)
     }
 
     /// Records that `range` of the history was replaced by the handoff for
@@ -70,36 +68,15 @@ impl Session {
         handoff: &str,
         range: std::ops::Range<usize>,
     ) -> Result<(), Error> {
-        self.append(&SessionEvent::Compaction {
+        self.record(SessionEvent::Compaction {
             summary: handoff.to_string(),
             start: range.start,
             replaced: range.len(),
             provider_data: Vec::new(),
             provider_data_model: None,
             plan_revision: Some(revision),
-        })?;
-        self.plan_handoffs.insert(revision);
-        self.context = None;
-        self.usage.record_cache_reset();
-        Ok(())
+        })
     }
-}
-
-/// Undo records written before revision IDs were introduced still contain
-/// the plan text, which identifies the latest matching earlier revision.
-pub(super) fn restore_revision(
-    mut state: Option<PlanState>,
-    revisions: &[String],
-) -> Option<PlanState> {
-    if let Some(PlanState::Ready { plan, revision }) = &mut state
-        && *revision == 0
-    {
-        *revision = revisions
-            .iter()
-            .rposition(|saved| saved == plan)
-            .map_or(0, |i| i + 1);
-    }
-    state
 }
 
 #[cfg(test)]
@@ -126,21 +103,21 @@ mod tests {
         let mut session = Session::create(&fixture.0, &fixture.0, "test")?;
         let id = session.id.clone();
         let first = "# First\n\nPreserve Unicode: café.\n";
-        session.append_plan_ready(first, &Message::assistant(first.into(), vec![]))?;
-        let previous = session.active_plan.clone();
+        session.append_plan_ready(first, Message::assistant(first.into(), vec![]))?;
+        let previous = session.active_plan().cloned();
         let first_path = session.ensure_plan_file()?.unwrap();
         assert!(first_path.is_absolute());
         assert_eq!(fs::read_to_string(&first_path)?, first);
         session.append_plan_handoff(1, "summary and first plan", 0..1)?;
-        session.append_plan_ready("# Second", &Message::assistant("# Second".into(), vec![]))?;
+        session.append_plan_ready("# Second", Message::assistant("# Second".into(), vec![]))?;
         let second_path = session.ensure_plan_file()?.unwrap();
         assert_ne!(first_path, second_path);
         assert_eq!(fs::read_to_string(&first_path)?, first);
         assert!(!session.plan_has_handoff(2));
-        session.append_undo_event_with_plan(1, false, previous)?;
+        session.append_undo(1, false, previous)?;
         fs::remove_file(&first_path)?;
         drop(session);
-        let (session, _) = Session::open(&fixture.0, &id)?;
+        let session = Session::open(&fixture.0, &id)?;
         assert_eq!(session.ensure_plan_file()?, Some(first_path.clone()));
         assert_eq!(fs::read_to_string(&first_path)?, first);
         assert!(session.plan_has_handoff(1));
@@ -159,15 +136,15 @@ mod tests {
         let mut session = Session::create(&fixture.0, &fixture.0, "test")?;
         let id = session.id.clone();
         // Old PlanReady records have the same wire shape and no artifact.
-        session.append(&SessionEvent::PlanReady {
+        session.record(SessionEvent::PlanReady {
             plan: "# Legacy".into(),
             message: Message::assistant("# Legacy".into(), vec![]),
         })?;
         let legacy: PlanState = serde_json::from_str(r##"{"status":"ready","plan":"# Legacy"}"##)?;
-        session.append_undo_event_with_plan(0, false, Some(legacy))?;
+        session.append_undo(0, false, Some(legacy))?;
         drop(session);
         assert!(!fixture.0.join(&id).exists());
-        let (session, _) = Session::open(&fixture.0, &id)?;
+        let session = Session::open(&fixture.0, &id)?;
         assert!(!fixture.0.join(&id).exists());
         let path = session.ensure_plan_file()?.unwrap();
         assert_eq!(path.file_name().unwrap(), "1.md");
@@ -181,12 +158,13 @@ mod tests {
         let fixture = Fixture::new();
         let mut session = Session::create(&fixture.0, &fixture.0, "test")?;
         let id = session.id.clone();
-        session.append_plan_ready("# Plan", &Message::assistant("# Plan".into(), vec![]))?;
+        session.append_plan_ready("# Plan", Message::assistant("# Plan".into(), vec![]))?;
         session.fail_append_after(0);
         assert!(session.append_plan_handoff(1, "handoff", 0..1).is_err());
         assert!(!session.plan_has_handoff(1));
         drop(session);
-        let (session, messages) = Session::open(&fixture.0, &id)?;
+        let session = Session::open(&fixture.0, &id)?;
+        let messages = session.messages().to_vec();
         assert!(!session.plan_has_handoff(1));
         assert_eq!(messages[0].content, "# Plan");
         Ok(())

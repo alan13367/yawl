@@ -792,7 +792,6 @@ mod tests {
         let skill = Skill {
             name: "review".into(),
             description: long.clone(),
-            path: dirs.0.join("secret/SKILL.md"),
             directory: dirs.0.join("secret"),
             instructions: "instructions are loaded later".into(),
             disable_model_invocation: false,

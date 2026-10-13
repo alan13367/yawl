@@ -167,7 +167,7 @@ fn render_strip(strip: &Strip, width: usize, accent: UiColor, columns: Columns) 
         let name = markdown::strip_ansi(&strip.name)
             .chars()
             .map(|character| {
-                if character.is_control() {
+                if crate::text::is_unsafe(character) {
                     ' '
                 } else {
                     character

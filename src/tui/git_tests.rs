@@ -5,9 +5,9 @@ use super::init::{GitInitFlow, render_init};
 use super::input::{handle_key, handle_mouse, pointer_over_control};
 use super::render::{file_area_start, render, render_branches, render_log};
 use super::repository::{
-    MAX_DIFF_BYTES, MAX_DIFF_LINES, STATUS_ARGS, drain_pipe, git_available, load_commit_diff,
-    load_diff, load_history_limit, load_status, parse_status_porcelain, parse_unified_diff,
-    run_git, run_git_files,
+    MAX_DIFF_BYTES, MAX_DIFF_LINES, STATUS_ARGS, git_available, load_commit_diff, load_diff,
+    load_history_limit, load_status, parse_status_porcelain, parse_unified_diff, run_git,
+    run_git_files,
 };
 use super::{
     COMMIT_BOX_INPUT, CommitMenuState, Confirm, DiffKind, DiffLine, FileAreaRow, GitFile, GitFocus,
@@ -849,14 +849,6 @@ fn discard_targets_literal_paths_and_preserves_files_staged_since_confirmation()
     run_git(&repo.0, &["add", "other.txt"]).unwrap();
     confirm_action(&mut state);
     assert!(repo.0.join("other.txt").exists());
-}
-
-#[test]
-fn bounded_capture_still_drains_the_pipe() {
-    let mut pipe = std::io::Cursor::new(vec![b'x'; MAX_DIFF_BYTES * 2]);
-    let captured = drain_pipe(Some(&mut pipe), 256);
-    assert_eq!(captured, vec![b'x'; 256]);
-    assert_eq!(pipe.position(), (MAX_DIFF_BYTES * 2) as u64);
 }
 
 #[test]

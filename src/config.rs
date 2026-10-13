@@ -12,7 +12,6 @@ pub(crate) use change::{
     ConfigChange, ConfigChangeEffect, SkillDirectoryAction, parse_builtin_api_key, parse_on_off,
     parse_threshold, validate_environment_name,
 };
-pub use loading::normalize_reasoning_effort;
 pub(crate) use loading::{
     bounded_message, expand_home_path, parse_bounded, validate_bounded, validate_file_value,
 };

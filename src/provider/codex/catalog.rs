@@ -69,9 +69,51 @@ fn visible_models(models: Vec<CodexModel>) -> Vec<CodexModel> {
     listed
 }
 
+/// What identifies one version of a file on disk.
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    path: PathBuf,
+    state: Option<(u64, u64, std::time::SystemTime)>,
+}
+
+impl FileStamp {
+    fn of(path: PathBuf) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        let state = std::fs::metadata(&path).ok().map(|metadata| {
+            (
+                metadata.ino(),
+                metadata.len(),
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            )
+        });
+        Self { path, state }
+    }
+}
+
+/// Model lookups run several times per model step, so the parsed catalog is
+/// reused until the login or the catalog file changes on disk.
+static LOOKUP: Mutex<Option<(FileStamp, FileStamp, Vec<CodexModel>)>> = Mutex::new(None);
+
 /// Read only the catalog saved for the currently logged-in account. A missing
 /// or malformed snapshot simply leaves manual model selection available.
 pub(crate) fn cached_models(config: &Config) -> Vec<CodexModel> {
+    let auth = FileStamp::of(auth::auth_path(config));
+    let catalog = FileStamp::of(cache_path(config));
+    let mut lookup = LOOKUP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((cached_auth, cached_catalog, models)) = lookup.as_ref()
+        && *cached_auth == auth
+        && *cached_catalog == catalog
+    {
+        return models.clone();
+    }
+    let models = read_cached_models(config);
+    *lookup = Some((auth, catalog, models.clone()));
+    models
+}
+
+fn read_cached_models(config: &Config) -> Vec<CodexModel> {
     let Ok(Some(credential)) = auth::load_credential(config) else {
         return Vec::new();
     };

@@ -98,7 +98,7 @@ fn render_line(line: ToolLine, width: usize, expanded: bool, background: &str) -
     let mut chunks = if expanded || line.wrap {
         wrap_hanging(&sanitized, content_width, line.hang)
     } else {
-        vec![truncate_chars(&sanitized, content_width)]
+        vec![crate::text::ellipsize(&sanitized, content_width)]
     };
     if capped && chunks.len() > COLLAPSED_HANGING_ROWS {
         chunks.truncate(COLLAPSED_HANGING_ROWS);
@@ -128,34 +128,7 @@ fn render_line(line: ToolLine, width: usize, expanded: bool, background: &str) -
 }
 
 pub(super) fn sanitize_line(line: &str) -> String {
-    markdown::strip_ansi(line)
-        .chars()
-        .map(|character| {
-            if character == '\t' {
-                ' '
-            } else if character.is_control() {
-                '�'
-            } else {
-                character
-            }
-        })
-        .collect()
-}
-
-fn truncate_chars(text: &str, width: usize) -> String {
-    let Some((cut, _)) = text.char_indices().nth(width) else {
-        return text.to_string();
-    };
-    if width <= 1 {
-        return "…".chars().take(width).collect();
-    }
-    let end = text
-        .char_indices()
-        .nth(width - 1)
-        .map_or(cut, |(index, _)| index);
-    let mut truncated = text[..end].to_string();
-    truncated.push('…');
-    truncated
+    crate::text::sanitize_line(&markdown::strip_ansi(line), crate::text::Tabs::Space)
 }
 
 fn wrap_hanging(text: &str, width: usize, hang: usize) -> Vec<String> {

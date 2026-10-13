@@ -1,7 +1,9 @@
 //! Arrow-key list selection for the setup wizard. Draws in place with ANSI
 //! cursor movement; no alternate screen, so the transcript stays linear.
 
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
+
+use super::terminal::read_byte;
 
 use crate::error::Error;
 
@@ -270,21 +272,13 @@ fn visible_window(cursor: usize, length: usize, visible: usize) -> std::ops::Ran
 }
 
 fn render_row(choice: &Choice, selected: bool) -> String {
-    let label = truncate_chars(&choice.label, MAX_LABEL_CHARS);
-    let hint = truncate_chars(&choice.hint, MAX_HINT_CHARS);
+    let label = crate::text::ellipsize(&choice.label, MAX_LABEL_CHARS);
+    let hint = crate::text::ellipsize(&choice.hint, MAX_HINT_CHARS);
     if selected {
         format!("\x1b[1m ❯ {label} \x1b[0m \x1b[2m{hint}\x1b[0m")
     } else {
         format!("   {label}  \x1b[2m{hint}\x1b[0m")
     }
-}
-
-fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let cut: String = text.chars().take(max.saturating_sub(1)).collect();
-    format!("{cut}…")
 }
 
 enum Key {
@@ -341,11 +335,6 @@ fn decode(byte: u8) -> Result<Key, Error> {
         },
         _ => Ok(Key::Other),
     }
-}
-
-fn read_byte() -> io::Result<Option<u8>> {
-    let mut buffer = [0u8; 1];
-    Ok((io::stdin().read(&mut buffer)? == 1).then_some(buffer[0]))
 }
 
 fn select_numbered(title: &str, choices: &[Choice]) -> Result<Option<usize>, Error> {
@@ -405,8 +394,8 @@ mod tests {
 
     #[test]
     fn truncation_keeps_rows_short_and_appends_an_ellipsis() {
-        assert_eq!(truncate_chars("short", 8), "short");
-        let long = truncate_chars(&"x".repeat(50), MAX_LABEL_CHARS);
+        assert_eq!(crate::text::ellipsize("short", 8), "short");
+        let long = crate::text::ellipsize(&"x".repeat(50), MAX_LABEL_CHARS);
         assert_eq!(long.chars().count(), MAX_LABEL_CHARS);
         assert!(long.ends_with('…'));
     }

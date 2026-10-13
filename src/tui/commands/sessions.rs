@@ -6,10 +6,6 @@ use crate::agent::Agent;
 use super::super::picker::{Picker, PickerAction, PickerItem};
 use super::super::state::ViewState;
 
-pub(in crate::tui) fn is_new_session_command(name: &str) -> bool {
-    matches!(name, "new" | "clear")
-}
-
 pub(in crate::tui) fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
     let cwd = crate::config::working_dir();
     let dirs = agent.config().session_dirs(&cwd);
@@ -138,6 +134,9 @@ pub(in crate::tui) fn load_session(agent: &mut Agent, id: &str, state: &mut View
             } else {
                 format!("Resumed session {id} with {model}.")
             });
+            if let Some(warning) = agent.session_warning() {
+                state.notice(warning);
+            }
         }
         Err(error) => state.notice(format!("Could not resume '{id}': {error}")),
     }

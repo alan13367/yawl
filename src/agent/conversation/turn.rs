@@ -1,14 +1,20 @@
+//! The turn lifecycle: entry points, the per-turn preamble, and the model
+//! step loop. What happens with each response lives in [`super::step`].
+
+use std::sync::Arc;
+
 use crate::compaction;
 use crate::config::Config;
 use crate::error::Error;
 use crate::provider::{
-    self, Message, MessageControl, SubagentResult, ToolCall, TurnInput, stream_turn,
+    self, Message, MessageControl, SubagentResult, ToolCall, ToolSpec, TurnInput, TurnOutput,
+    stream_turn,
 };
 use crate::tools::Registry;
 
-use super::plan::{self, FollowUpAction, ImplementationStatus};
-use super::{Conversation, ConversationKind, last_undoable_user_index};
-use super::{context, goal};
+use super::step::{self, Flow};
+use super::{Conversation, RunLimits, RunStopReason, last_undoable_user_index};
+use super::{context, goal, plan};
 use crate::agent::events::{PlanPhase, TurnEvent, forward};
 
 /// Corrective retries after the server rejects an unparseable tool call.
@@ -17,25 +23,9 @@ const MALFORMED_TOOL_CALL_NOTE: &str = "[yawl] Your previous response contained 
 the server could not parse, so it was discarded and nothing ran. Continue the task: \
 re-issue the call with a valid tool name and JSON arguments, or answer in plain text.";
 
-/// Consecutive text-only replies a plan phase accepts before stopping the
-/// turn, so a model that is blocked or ignores the finishing tool cannot
-/// loop on continuation prompts forever.
-const MAX_IDLE_PLAN_REPLIES: u32 = 3;
-
-fn idle_plan_stop_notice(mode: TurnMode) -> String {
-    let next = match mode {
-        TurnMode::Plan => "/plan resume continues planning; /plan cancel clears it.",
-        TurnMode::PlanRevise => "The plan is unchanged. Reply to keep revising, or /plan cancel.",
-        _ => "The plan stays active. Reply or run /plan implement to continue, or /plan cancel.",
-    };
-    format!(
-        "Stopped after {MAX_IDLE_PLAN_REPLIES} replies in a row that did not finish this plan step. {next}"
-    )
-}
-
 /// Weaker models often invent tool names, so the retry note names the
 /// tools that actually exist.
-fn malformed_tool_call_note(specs: &[std::sync::Arc<crate::provider::ToolSpec>]) -> String {
+fn malformed_tool_call_note(specs: &[Arc<ToolSpec>]) -> String {
     if specs.is_empty() {
         return format!("{MALFORMED_TOOL_CALL_NOTE} No tools are available; answer in plain text.");
     }
@@ -47,14 +37,46 @@ fn malformed_tool_call_note(specs: &[std::sync::Arc<crate::provider::ToolSpec>])
     format!("{MALFORMED_TOOL_CALL_NOTE} Available tools: {names}.")
 }
 
-/// How a turn begins: with optional new input, or by resuming the history
-/// an unfinished turn left behind.
-enum TurnStart {
-    Input(Option<TurnInput>),
-    Resume,
+/// What one turn does. Every front end runs turns through
+/// [`Conversation::run`].
+pub(crate) enum TurnRequest {
+    /// An ordinary turn. `None` re-drives the history without new input.
+    Prompt(Option<TurnInput>),
+    /// `/init`, with its literal prompt.
+    Init(TurnInput),
+    /// Continue the active goal.
+    Goal,
+    /// Continue drafting the active plan.
+    Plan,
+    /// A message while a plan is ready; the model routes it to revision,
+    /// implementation, or a normal reply.
+    PlanFollowUp(TurnInput),
+    /// Revise the ready plan with this request.
+    PlanRevise(TurnInput),
+    /// Implement the ready plan, optionally with extra instructions.
+    PlanImplement(Option<TurnInput>),
+    /// Re-drive the last turn that stopped early, in the mode it stopped in.
+    Continue,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+impl TurnRequest {
+    /// The input to record and the mode to run. `Continue` takes its mode
+    /// from the history instead.
+    fn into_input_and_mode(self) -> Option<(Option<TurnInput>, TurnMode)> {
+        Some(match self {
+            Self::Prompt(input) => (input, TurnMode::Normal),
+            Self::Init(input) => (Some(input), TurnMode::Init),
+            Self::Goal => (None, TurnMode::Goal),
+            Self::Plan => (None, TurnMode::Plan),
+            Self::PlanFollowUp(input) => (Some(input), TurnMode::PlanFollowUp),
+            Self::PlanRevise(input) => (Some(input), TurnMode::PlanRevise),
+            Self::PlanImplement(input) => (input, TurnMode::PlanImplement),
+            Self::Continue => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TurnMode {
     Normal,
     Init,
@@ -101,7 +123,7 @@ fn plan_phase(mode: TurnMode) -> Option<PlanPhase> {
     }
 }
 
-fn plan_continuation(mode: TurnMode) -> Option<&'static str> {
+pub(super) fn plan_continuation(mode: TurnMode) -> Option<&'static str> {
     match mode {
         TurnMode::Plan => Some(plan::PLAN_CONTINUATION),
         TurnMode::PlanRevise => Some(plan::PLAN_REVISE_CONTINUATION),
@@ -112,146 +134,125 @@ fn plan_continuation(mode: TurnMode) -> Option<&'static str> {
     }
 }
 
-impl Conversation {
-    /// Runs one full turn. `user_input` is `None` when re-driving an existing
-    /// conversation (not used by the current front ends, but harmless).
-    ///
-    /// Returns `Ok(true)` if the turn completed, `Ok(false)` if it was
-    /// aborted by Ctrl+C.
-    pub fn run_turn(
-        &mut self,
-        user_input: Option<String>,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.run_turn_input(user_input.map(Into::into), sink)
-    }
+/// A subagent's request budget: a wrap-up steer once `max` requests have
+/// completed and a hard stop half again later (at least one more). Zero
+/// disables it.
+struct RequestBudget {
+    max: u64,
+    made: u64,
+    steered: bool,
+}
 
-    pub fn run_turn_input(
-        &mut self,
-        user_input: Option<TurnInput>,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        let cancellation = self.cancellation.clone();
-        crate::cancellation::scope(&cancellation, || {
-            self.cancellation.clear();
-            self.run_turn_input_with_mode(
-                user_input,
-                sink,
-                &mut provider::resolve,
-                TurnMode::Normal,
-            )
-        })
-    }
-
-    pub(crate) fn run_turn_preserving_cancellation(
-        &mut self,
-        user_input: Option<String>,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.run_turn_input_preserving_cancellation(user_input.map(Into::into), sink)
-    }
-
-    pub(crate) fn run_turn_input_preserving_cancellation(
-        &mut self,
-        user_input: Option<TurnInput>,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        if let ConversationKind::Child(state) = &mut self.kind {
-            state.stop_reason = None;
+impl RequestBudget {
+    fn new(limits: Option<RunLimits>) -> Self {
+        Self {
+            max: limits.map_or(0, |limits| limits.max_requests),
+            made: 0,
+            steered: false,
         }
+    }
+
+    fn hard_limit(&self) -> u64 {
+        self.max.saturating_add((self.max / 2).max(1))
+    }
+}
+
+/// What a turn carries from one model step to the next.
+pub(super) struct TurnProgress {
+    /// A plan follow-up can move to revision, implementation, or a normal
+    /// reply mid-turn.
+    pub(super) mode: TurnMode,
+    pub(super) asked_plan_questions: bool,
+    pub(super) idle_plan_replies: u32,
+    budget: RequestBudget,
+    /// Front ends start every turn without a plan phase label.
+    announced_phase: Option<PlanPhase>,
+}
+
+/// Everything one model request uses, rebuilt every step so a tool the
+/// model just wrote is available on its very next step.
+pub(super) struct Step {
+    pub(super) registry: Registry,
+    specs: Vec<Arc<ToolSpec>>,
+    system: String,
+    /// Estimated prompt tokens of the system prompt and tool schemas.
+    overhead: u64,
+    provider: Box<dyn provider::Provider>,
+    bare_model: String,
+}
+
+impl Conversation {
+    /// Runs one turn inside this conversation's cancellation scope. An
+    /// earlier cancel is kept, so callers clear it when a new job starts.
+    /// Subagent conversations also enforce their wall-clock limit.
+    ///
+    /// Returns `Ok(true)` if the turn completed and `Ok(false)` if it was
+    /// interrupted or stopped by a limit.
+    pub(crate) fn run(
+        &mut self,
+        request: TurnRequest,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.run_with(request, sink, &mut provider::resolve)
+    }
+
+    pub(super) fn run_with<F>(
+        &mut self,
+        request: TurnRequest,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        self.set_stop_reason(None);
         let cancellation = self.cancellation.clone();
         crate::cancellation::scope(&cancellation, || {
             let Some(timeout) = self.run_limits().and_then(|limits| limits.timeout) else {
-                return self.run_turn_input_with_mode(
-                    user_input,
-                    sink,
-                    &mut provider::resolve,
-                    TurnMode::Normal,
-                );
+                return self.run_request(request, sink, resolve_provider);
             };
             let (result, timed_out) =
                 crate::cancellation::with_timeout(&cancellation, timeout, || {
-                    self.run_turn_input_with_mode(
-                        user_input,
-                        sink,
-                        &mut provider::resolve,
-                        TurnMode::Normal,
-                    )
+                    self.run_request(request, sink, resolve_provider)
                 });
             if timed_out {
-                self.child_mut().stop_reason = Some(super::RunStopReason::Timeout);
-                sink(TurnEvent::Warning(
-                    super::RunStopReason::Timeout.message().into(),
-                ));
+                self.set_stop_reason(Some(RunStopReason::Timeout));
+                sink(TurnEvent::Warning(RunStopReason::Timeout.message().into()));
             }
             result
         })
     }
 
-    pub(crate) fn run_init_preserving_cancellation(
+    /// Runs the request and remembers whether it stopped short, so a failed
+    /// or interrupted turn can be continued.
+    fn run_request<F>(
         &mut self,
-        input: TurnInput,
+        request: TurnRequest,
         sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.run_mode_preserving_cancellation(Some(input), TurnMode::Init, sink)
-    }
-
-    pub(crate) fn run_goal_preserving_cancellation(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.run_mode_preserving_cancellation(None, TurnMode::Goal, sink)
-    }
-
-    pub(crate) fn run_plan_preserving_cancellation(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.run_mode_preserving_cancellation(None, TurnMode::Plan, sink)
-    }
-
-    pub(crate) fn run_plan_follow_up_preserving_cancellation(
-        &mut self,
-        input: TurnInput,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.run_mode_preserving_cancellation(Some(input), TurnMode::PlanFollowUp, sink)
-    }
-
-    /// Revises the ready plan from `input` without asking the model to
-    /// classify the request first.
-    pub(crate) fn run_plan_revision_preserving_cancellation(
-        &mut self,
-        input: TurnInput,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.run_mode_preserving_cancellation(Some(input), TurnMode::PlanRevise, sink)
-    }
-
-    pub(crate) fn run_plan_implementation_preserving_cancellation(
-        &mut self,
-        input: Option<TurnInput>,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.run_mode_preserving_cancellation(input, TurnMode::PlanImplement, sink)
-    }
-
-    /// Runs one turn in `mode` with the configured provider, inside this
-    /// conversation's cancellation scope without clearing an earlier cancel.
-    fn run_mode_preserving_cancellation(
-        &mut self,
-        input: Option<TurnInput>,
-        mode: TurnMode,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        let cancellation = self.cancellation.clone();
-        crate::cancellation::scope(&cancellation, || {
-            self.run_turn_input_with_mode(input, sink, &mut provider::resolve, mode)
-        })
+        resolve_provider: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        let (input, mode, resuming) = match request.into_input_and_mode() {
+            Some((input, mode)) => (input, mode, false),
+            None => {
+                self.recover_history()?;
+                let Some(mode) = self.continuable_mode() else {
+                    return Err(Error::Invalid("nothing to continue".into()));
+                };
+                (None, mode, true)
+            }
+        };
+        let result = self.drive_turn(input, resuming, mode, sink, resolve_provider);
+        if matches!(result, Ok(true)) {
+            self.unfinished_mode = None;
+        }
+        result
     }
 
     /// Whether the last turn stopped before the model finished answering,
-    /// so [`Self::run_continue_preserving_cancellation`] can pick it up.
+    /// so [`TurnRequest::Continue`] can pick it up.
     pub(crate) fn can_continue(&self) -> bool {
         self.continuable_mode().is_some()
     }
@@ -259,7 +260,7 @@ impl Conversation {
     fn continuable_mode(&self) -> Option<TurnMode> {
         // A trailing user message or tool result, or a tool call whose result
         // `recover_history` will repair, still owes the model a response.
-        let awaiting_model = self.messages.last().is_some_and(|message| {
+        let awaiting_model = self.messages().last().is_some_and(|message| {
             message.role != provider::Role::Assistant || !message.tool_calls.is_empty()
         });
         match self.unfinished_mode {
@@ -282,33 +283,6 @@ impl Conversation {
         }
     }
 
-    /// Re-drives the last unfinished turn from the saved history, in the
-    /// mode it stopped in, without adding a new user message.
-    pub(crate) fn run_continue_preserving_cancellation(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.run_continue_with(sink, &mut provider::resolve)
-    }
-
-    pub(super) fn run_continue_with<F>(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-        resolve_provider: &mut F,
-    ) -> Result<bool, Error>
-    where
-        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
-    {
-        self.recover_history()?;
-        let Some(mode) = self.continuable_mode() else {
-            return Err(Error::Config("nothing to continue".into()));
-        };
-        let cancellation = self.cancellation.clone();
-        crate::cancellation::scope(&cancellation, || {
-            self.run_turn_tracked(TurnStart::Resume, sink, resolve_provider, mode)
-        })
-    }
-
     /// Delivers settled subagent results and waits for still-running ones
     /// until nothing is pending. Blocking waits happen in `wait_slice_secs`
     /// slices so Ctrl+C stays responsive. Returns `false` when the pump was
@@ -321,7 +295,7 @@ impl Conversation {
         self.pump_subagent_results_with(sink, wait_slice_secs, &mut provider::resolve)
     }
 
-    pub(crate) fn pump_subagent_results_with<F>(
+    pub(super) fn pump_subagent_results_with<F>(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent<'_>),
         wait_slice_secs: u64,
@@ -334,9 +308,7 @@ impl Conversation {
             if crate::cancellation::interrupted() {
                 return Ok(false);
             }
-            let Some(manager) = self.persistent_subagents() else {
-                return Ok(true);
-            };
+            let manager = self.services.subagents.clone();
             if manager.has_deferred() {
                 if self.run_deferred_subagent_results_with(sink, resolve_provider)? == Some(false) {
                     return Ok(false);
@@ -347,10 +319,7 @@ impl Conversation {
             if active == 0 {
                 return Ok(true);
             }
-            if self.print_mode {
-                let noun = if active == 1 { "subagent" } else { "subagents" };
-                eprintln!("waiting for {active} {noun}…");
-            }
+            sink(TurnEvent::WaitingForSubagents { active });
             // False means the slice timed out or the process was
             // interrupted; the loop top sorts out which.
             let _ = manager.wait_all(wait_slice_secs);
@@ -359,7 +328,7 @@ impl Conversation {
 
     /// Appends one synthetic user message carrying the drained deferred
     /// results and runs a follow-up turn on it. Results are restored if the
-    /// append fails.
+    /// append fails. `None` means nothing was waiting.
     pub(crate) fn run_deferred_subagent_results(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent<'_>),
@@ -367,7 +336,7 @@ impl Conversation {
         self.run_deferred_subagent_results_with(sink, &mut provider::resolve)
     }
 
-    pub(crate) fn run_deferred_subagent_results_with<F>(
+    pub(super) fn run_deferred_subagent_results_with<F>(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent<'_>),
         resolve_provider: &mut F,
@@ -379,505 +348,337 @@ impl Conversation {
         if !self.drain_deferred_subagent_results_into_history()? {
             return Ok(None);
         }
-        let cancellation = self.cancellation.clone();
-        crate::cancellation::scope(&cancellation, || {
-            self.run_turn_with(None, sink, resolve_provider)
-        })
-        .map(Some)
-    }
-
-    pub(super) fn run_turn_with<F>(
-        &mut self,
-        user_input: Option<String>,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-        resolve_provider: &mut F,
-    ) -> Result<bool, Error>
-    where
-        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
-    {
-        self.run_turn_input_with(user_input.map(Into::into), sink, resolve_provider)
-    }
-
-    pub(super) fn run_turn_input_with<F>(
-        &mut self,
-        user_input: Option<TurnInput>,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-        resolve_provider: &mut F,
-    ) -> Result<bool, Error>
-    where
-        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
-    {
-        self.run_turn_input_with_mode(user_input, sink, resolve_provider, TurnMode::Normal)
-    }
-
-    pub(super) fn run_turn_input_with_mode<F>(
-        &mut self,
-        user_input: Option<TurnInput>,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-        resolve_provider: &mut F,
-        mode: TurnMode,
-    ) -> Result<bool, Error>
-    where
-        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
-    {
-        self.run_turn_tracked(TurnStart::Input(user_input), sink, resolve_provider, mode)
-    }
-
-    /// Runs a turn and remembers whether it stopped short, so a failed or
-    /// interrupted turn can be continued.
-    fn run_turn_tracked<F>(
-        &mut self,
-        start: TurnStart,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-        resolve_provider: &mut F,
-        mode: TurnMode,
-    ) -> Result<bool, Error>
-    where
-        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
-    {
-        let result = self.drive_turn(start, sink, resolve_provider, mode);
-        if matches!(result, Ok(true)) {
-            self.unfinished_mode = None;
-        }
-        result
+        self.run_with(TurnRequest::Prompt(None), sink, resolve_provider)
+            .map(Some)
     }
 
     fn drive_turn<F>(
         &mut self,
-        start: TurnStart,
+        input: Option<TurnInput>,
+        resuming: bool,
+        mode: TurnMode,
         sink: &mut dyn FnMut(TurnEvent<'_>),
         resolve_provider: &mut F,
-        mut mode: TurnMode,
     ) -> Result<bool, Error>
     where
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
     {
-        let (resuming, user_input) = match start {
-            TurnStart::Input(input) => (false, input),
-            TurnStart::Resume => (true, None),
-        };
         self.recover_history()?;
-        if mode == TurnMode::Goal && self.active_goal().is_none() {
-            return Err(Error::Config("no active goal to resume".into()));
+        self.check_turn_mode(mode)?;
+        self.questions.begin_turn();
+        self.plan_ready_this_turn = false;
+        self.latest_turn_result.clear();
+        if !resuming {
+            self.append_turn_input(input, mode, sink)?;
         }
+        let mut progress = TurnProgress {
+            mode,
+            asked_plan_questions: mode == TurnMode::Plan
+                && self
+                    .plan_state()
+                    .is_some_and(crate::session::PlanState::questions_asked),
+            idle_plan_replies: 0,
+            budget: RequestBudget::new(self.run_limits()),
+            announced_phase: None,
+        };
+        // Uncapped: the loop ends when the model stops calling tools, when a
+        // finishing tool completes the turn, or when the user interrupts.
+        loop {
+            self.unfinished_mode = Some(progress.mode);
+            if crate::cancellation::interrupted() {
+                return Ok(false);
+            }
+            if let Some(done) = self.begin_step(&mut progress, sink)? {
+                return Ok(done);
+            }
+            let step = self.prepare_step(progress.mode, sink, resolve_provider)?;
+            let Some(out) = self.request_step(&step, sink, resolve_provider)? else {
+                return Ok(false);
+            };
+            let (assistant, calls) = self.record_step(out, &step, &mut progress, sink)?;
+            let kind = step::classify(progress.mode, &calls, self.steers.has_pending());
+            match self.handle_step(kind, assistant, &calls, &step, &mut progress, sink)? {
+                Flow::Continue => {}
+                Flow::Finish(done) => return Ok(done),
+            }
+        }
+    }
+
+    fn check_turn_mode(&self, mode: TurnMode) -> Result<(), Error> {
         match mode {
+            TurnMode::Goal if self.active_goal().is_none() => {
+                Err(Error::Invalid("no active goal to resume".into()))
+            }
             TurnMode::Plan
                 if !matches!(
                     self.plan_state(),
                     Some(crate::session::PlanState::Draft { .. })
                 ) =>
             {
-                return Err(Error::Config("no draft plan to resume".into()));
+                Err(Error::Invalid("no draft plan to resume".into()))
             }
             TurnMode::PlanFollowUp | TurnMode::PlanRevise | TurnMode::PlanImplement
                 if self.active_plan().is_none() =>
             {
-                return Err(Error::Config("no completed plan is active".into()));
+                Err(Error::Invalid("no completed plan is active".into()))
             }
-            _ => {}
+            _ => Ok(()),
         }
-        self.questions.begin_turn();
-        self.plan_ready_this_turn = false;
-        self.latest_turn_result.clear();
-        if mode == TurnMode::PlanImplement && user_input.is_none() && !resuming {
-            if let Some(warning) = self.checkpoint_warning() {
-                sink(TurnEvent::Warning(warning));
-            }
-            self.append_input_message(
-                Message::user("Implement the active plan now.")
-                    .with_control(MessageControl::PlanImplementationStart),
-            )?;
-        }
-        if let Some(input) = user_input {
-            if !input.images.is_empty() && !crate::model::supports_images(&self.config, &self.model)
-            {
-                return Err(Error::Config(format!(
-                    "model '{}' does not accept image input",
-                    self.model
-                )));
-            }
-            if let Some(warning) = self.checkpoint_warning() {
-                sink(TurnEvent::Warning(warning));
-            }
-            self.append_input_message(Message::user_input(input))?;
-        }
-        // Per-run guard rails: only subagent conversations carry limits.
-        let limits = self.run_limits();
-        let max_requests = limits.map_or(0, |limits| limits.max_requests);
-        let hard_requests = max_requests.saturating_add((max_requests / 2).max(1));
-        let mut requests_made: u64 = 0;
-        let mut steer_sent = false;
-        let mut asked_plan_questions = mode == TurnMode::Plan
-            && self
-                .plan_state()
-                .is_some_and(crate::session::PlanState::questions_asked);
+    }
 
-        // Front ends start every turn without a plan phase label.
-        let mut announced_phase = None;
-        let mut idle_plan_replies = 0;
-
-        // Uncapped: the loop ends when the model stops calling tools, or
-        // when a goal completes through goal_complete.
-        loop {
-            self.unfinished_mode = Some(mode);
-            if crate::cancellation::interrupted() {
-                return Ok(false);
-            }
-            let phase = plan_phase(mode);
-            if phase != announced_phase {
-                announced_phase = phase;
-                sink(TurnEvent::PlanPhase(phase));
-            }
-            if matches!(mode, TurnMode::Goal | TurnMode::PlanImplement) {
-                self.drain_deferred_subagent_results_into_history()?;
-            }
-            if max_requests > 0 {
-                if requests_made == max_requests && !steer_sent {
-                    steer_sent = true;
-                    sink(TurnEvent::Warning(
-                        "subagent request budget reached; steering to wrap up".into(),
-                    ));
-                    self.append_input_message(Message::user(
-                        "Request budget reached. Finish your current step and reply with your final result now; do not start new work.",
-                    ))?;
-                }
-                if requests_made >= hard_requests {
-                    self.child_mut().stop_reason = Some(super::RunStopReason::RequestBudget);
-                    sink(TurnEvent::Warning(
-                        super::RunStopReason::RequestBudget.message().into(),
-                    ));
-                    self.cancellation.cancel();
-                    return Ok(false);
-                }
-            }
-            if mode == TurnMode::PlanImplement {
-                self.prepare_plan_handoff(sink)?;
-            }
-            // Planning decisions wait for the user; other modes auto-answer.
-            self.questions
-                .set_countdown(!matches!(mode, TurnMode::Plan | TurnMode::PlanRevise));
-            let plan_path = self.plan_file_reference()?;
-
-            // Rescan every iteration so a tool the model just wrote is
-            // available on its very next step. Plan phases share one tool
-            // list and system prompt so local servers keep their prompt
-            // cache; phases differ only in execution gates and a hidden note.
-            let mut registry = self.scan_tools();
-            self.report_catalog_warnings(&registry, sink);
-            match mode {
-                TurnMode::Goal => registry.advertise_goal_complete(),
-                TurnMode::Plan | TurnMode::PlanRevise | TurnMode::PlanFollowUp => {
-                    registry.restrict_to_planning();
-                }
-                TurnMode::PlanImplement | TurnMode::Normal | TurnMode::Init => {}
-            }
-            let specs = registry.specs();
-            let system =
-                self.system_prompt(&registry, mode == TurnMode::Goal, mode == TurnMode::Init);
-
-            let overhead = context::prompt_tokens(&system, registry.tool_tokens());
-            self.maybe_compact(overhead, sink, resolve_provider)?;
-            if let ConversationKind::Persistent(state) = &self.kind {
-                let active_plan = state.session.active_plan();
-                let implementation_started = matches!(
-                    active_plan,
-                    Some(crate::session::PlanState::Ready { revision, .. })
-                        if state.session.plan_has_handoff(*revision)
-                );
-                let note = plan_prompt(
-                    active_plan,
-                    plan_path.as_deref(),
-                    mode,
-                    implementation_started,
-                )
-                .map(crate::prompt::plan_phase_note);
-                self.sync_plan_phase_note(note)?;
-            }
-
-            if let Some(effort) = self.steers.take_reasoning_effort() {
-                self.set_reasoning_effort(effort)?;
-            }
-            let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;
-            let mut retried_context = false;
-            // Request-only history for malformed tool-call retries; never
-            // persisted, so the session keeps the clean transcript.
-            let mut corrected: Option<Vec<Message>> = None;
-            let mut tool_call_retries = 0;
-            let out = loop {
-                let request = provider::Request {
-                    model: &bare_model,
-                    system: &system,
-                    messages: corrected.as_deref().unwrap_or(&self.messages),
-                    tools: &specs,
-                    max_tokens: crate::model::max_tokens(&self.config, &self.model),
-                    supports_images: crate::model::supports_images(&self.config, &self.model),
-                    prompt_cache_control: true,
-                    prompt_cache_key: Some(self.prompt_cache_key()),
-                };
-                let response = stream_turn(provider.as_ref(), &request, &mut forward(sink));
-                match response {
-                    Ok(out) => break out,
-                    Err(Error::Interrupted) => return Ok(false),
-                    Err(error)
-                        if self.config.auto_compact
-                            && !retried_context
-                            && context::is_context_limit(&error) =>
-                    {
-                        retried_context = true;
-                        sink(TurnEvent::RetryReset);
-                        sink(TurnEvent::Warning(
-                            "Context limit reached; compacting before one retry".into(),
-                        ));
-                        self.compact_now_with(sink, resolve_provider)?;
-                        corrected = None;
-                    }
-                    Err(Error::MalformedToolCall(message))
-                        if tool_call_retries < MALFORMED_TOOL_CALL_RETRIES =>
-                    {
-                        tool_call_retries += 1;
-                        sink(TurnEvent::RetryReset);
-                        sink(TurnEvent::Warning(format!(
-                            "Model emitted a malformed tool call; asking it to retry \
-                             ({tool_call_retries}/{MALFORMED_TOOL_CALL_RETRIES}): {message}"
-                        )));
-                        corrected.get_or_insert_with(|| {
-                            let mut messages = self.messages.clone();
-                            messages.push(Message::user(malformed_tool_call_note(&specs)));
-                            messages
-                        });
-                    }
-                    Err(error) => return Err(error),
-                }
-            };
-            if crate::cancellation::interrupted() {
-                return Ok(false);
-            }
-
-            self.record_usage(out.usage)?;
-            self.record_context(out.usage.total_tokens(), overhead)?;
-            requests_made = requests_made.saturating_add(1);
-            sink(TurnEvent::Usage {
-                context_tokens: self.context_tokens,
-                context_window: self.context_window(),
-                request_usage: out.usage,
-                session_usage: self.usage(),
-            });
-
-            self.latest_turn_result.clone_from(&out.text);
-            if !out.tool_calls.is_empty() {
-                idle_plan_replies = 0;
-            }
-            let mut assistant = Message::assistant(out.text, out.tool_calls.clone());
-            assistant.reasoning = out.reasoning;
-            assistant.provider_data = out.provider_data;
-            if assistant.has_provider_replay_data() {
-                assistant.provider_data_model = Some(bare_model.clone());
-            }
-
-            if self.steers.has_pending() {
-                self.persist_message(&assistant)?;
-                self.messages.push(assistant);
-                sink(TurnEvent::AssistantDone);
-                self.skip_tool_calls(&out.tool_calls, goal::STEER_SKIPPED)?;
-                if self.inject_pending_steers(sink)? || !out.tool_calls.is_empty() {
-                    continue;
-                }
-                if mode == TurnMode::Goal {
-                    self.append_goal_continuation()?;
-                    continue;
-                }
-                if let Some(continuation) = plan_continuation(mode) {
-                    self.append_plan_continuation(continuation)?;
-                    continue;
-                }
-                return Ok(true);
-            }
-
-            if out.tool_calls.iter().any(plan::is_user_input) {
-                self.persist_assistant(assistant, sink)?;
-                let question_validation = crate::tools::validate_user_input(
-                    out.tool_calls
-                        .first()
-                        .map_or("{}", |call| call.arguments.as_str()),
-                );
-                if out.tool_calls.len() != 1 {
-                    self.reject_tool_calls(
-                        &out.tool_calls,
-                        "request_user_input must be the only tool call in its model step",
-                    )?;
-                    continue;
-                }
-                if let Err(error) = &question_validation
-                    && matches!(mode, TurnMode::Plan | TurnMode::PlanRevise)
+    /// Records the turn's new input after an undo checkpoint. Implementing
+    /// without input records the hidden prompt that starts implementation.
+    fn append_turn_input(
+        &mut self,
+        input: Option<TurnInput>,
+        mode: TurnMode,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<(), Error> {
+        let message = match input {
+            Some(input) => {
+                if !input.images.is_empty()
+                    && !crate::model::supports_images(&self.config, &self.model)
                 {
-                    self.reject_tool_calls(&out.tool_calls, error)?;
-                    continue;
+                    return Err(Error::Invalid(format!(
+                        "model '{}' does not accept image input",
+                        self.model
+                    )));
                 }
-                let aborted = self.run_tools(&registry, &out.tool_calls, sink)?;
-                if aborted {
-                    return Ok(false);
-                }
-                // Only drafting requires questions; revisions ask optionally.
-                if mode == TurnMode::Plan {
-                    asked_plan_questions = true;
-                    self.persistent_mut()
-                        .session
-                        .append_plan_questions_asked()?;
-                }
-                continue;
+                Message::user_input(input)
             }
-
-            let has_private_plan_call = out.tool_calls.iter().any(|call| {
-                plan::is_plan_complete(call)
-                    || plan::is_plan_action(call)
-                    || plan::is_plan_implemented(call)
-            });
-            if has_private_plan_call {
-                if out.tool_calls.len() != 1 {
-                    self.persist_assistant(assistant, sink)?;
-                    self.reject_tool_calls(
-                        &out.tool_calls,
-                        "private planning tools must be the only tool call in their model step",
-                    )?;
-                    continue;
-                }
-                let call = &out.tool_calls[0];
-                match mode {
-                    TurnMode::Plan | TurnMode::PlanRevise if plan::is_plan_complete(call) => {
-                        if mode == TurnMode::Plan && !asked_plan_questions {
-                            self.persist_assistant(assistant, sink)?;
-                            self.reject_tool_calls(&out.tool_calls, plan::PLAN_QUESTION_REQUIRED)?;
-                            continue;
-                        }
-                        match plan::parse_plan(&call.arguments) {
-                            Ok(result) => {
-                                self.finish_plan_complete(assistant, result, sink)?;
-                                return Ok(true);
-                            }
-                            Err(error) => {
-                                self.persist_assistant(assistant, sink)?;
-                                self.reject_tool_calls(&out.tool_calls, &error)?;
-                            }
-                        }
-                        continue;
-                    }
-                    TurnMode::PlanFollowUp if plan::is_plan_action(call) => {
-                        match plan::parse_action(&call.arguments) {
-                            Ok(action) => {
-                                self.persist_assistant(assistant, sink)?;
-                                if self.run_tools(&registry, &out.tool_calls, sink)? {
-                                    return Ok(false);
-                                }
-                                mode = match action {
-                                    FollowUpAction::Revise => TurnMode::PlanRevise,
-                                    FollowUpAction::Implement => TurnMode::PlanImplement,
-                                    FollowUpAction::Unrelated => TurnMode::Normal,
-                                };
-                            }
-                            Err(error) => {
-                                self.persist_assistant(assistant, sink)?;
-                                self.reject_tool_calls(&out.tool_calls, &error)?;
-                            }
-                        }
-                        continue;
-                    }
-                    TurnMode::PlanImplement if plan::is_plan_implemented(call) => {
-                        match plan::parse_implemented(&call.arguments) {
-                            Ok((result, ImplementationStatus::Completed)) => {
-                                self.finish_plan_implemented(assistant, result, sink)?;
-                                return Ok(true);
-                            }
-                            Ok((result, ImplementationStatus::Blocked)) => {
-                                self.finish_plan_blocked(assistant, result, sink)?;
-                                return Ok(true);
-                            }
-                            Err(error) => {
-                                self.persist_assistant(assistant, sink)?;
-                                self.reject_tool_calls(&out.tool_calls, &error)?;
-                            }
-                        }
-                        continue;
-                    }
-                    _ => {
-                        self.persist_assistant(assistant, sink)?;
-                        self.reject_tool_calls(
-                            &out.tool_calls,
-                            "that planning tool is unavailable in the current phase",
-                        )?;
-                        continue;
-                    }
-                }
+            None if mode == TurnMode::PlanImplement => {
+                Message::user("Implement the active plan now.")
+                    .with_control(MessageControl::PlanImplementationStart)
             }
-
-            let (completes, ordinary) = if mode == TurnMode::Goal {
-                goal::split_goal_complete(&out.tool_calls)
-            } else {
-                (Vec::new(), out.tool_calls.iter().collect())
-            };
-            if completes.len() == 1 && ordinary.is_empty() {
-                match goal::parse_goal_complete_result(&completes[0].arguments) {
-                    Ok(result) => {
-                        self.finish_goal_complete(assistant, result, sink)?;
-                        return Ok(true);
-                    }
-                    Err(error) => {
-                        self.persist_assistant(assistant, sink)?;
-                        self.reject_goal_complete(completes[0], &error)?;
-                    }
-                }
-                continue;
-            }
-            if !completes.is_empty() {
-                self.persist_assistant(assistant, sink)?;
-                let aborted = self.run_tools_rejecting_goal_complete(
-                    &registry,
-                    &out.tool_calls,
-                    sink,
-                    "goal_complete must be the only tool call in its step",
-                )?;
-                if aborted {
-                    return Ok(false);
-                }
-                if self.inject_pending_steers(sink)? {
-                    continue;
-                }
-                continue;
-            }
-
-            self.persist_assistant(assistant, sink)?;
-            if out.tool_calls.is_empty() {
-                if self.inject_pending_steers(sink)? {
-                    continue;
-                }
-                if mode == TurnMode::Goal {
-                    self.append_goal_continuation()?;
-                    continue;
-                }
-                if let Some(continuation) = plan_continuation(mode) {
-                    idle_plan_replies += 1;
-                    if idle_plan_replies >= MAX_IDLE_PLAN_REPLIES {
-                        sink(TurnEvent::Warning(idle_plan_stop_notice(mode)));
-                        return Ok(true);
-                    }
-                    self.append_plan_continuation(continuation)?;
-                    continue;
-                }
-                return Ok(true);
-            }
-            let aborted = self.run_tools(&registry, &out.tool_calls, sink)?;
-            if aborted {
-                return Ok(false);
-            }
-            if self.inject_pending_steers(sink)? {
-                continue;
-            }
+            None => return Ok(()),
+        };
+        if let Some(warning) = self.checkpoint_warning() {
+            sink(TurnEvent::Warning(warning));
         }
+        self.append_input_message(message)
+    }
+
+    /// Work before each model request: the phase label, deferred subagent
+    /// results, the request budget, the plan handoff, and the question
+    /// countdown. `Some` ends the turn.
+    fn begin_step(
+        &mut self,
+        progress: &mut TurnProgress,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<Option<bool>, Error> {
+        let mode = progress.mode;
+        let phase = plan_phase(mode);
+        if phase != progress.announced_phase {
+            progress.announced_phase = phase;
+            sink(TurnEvent::PlanPhase(phase));
+        }
+        if matches!(mode, TurnMode::Goal | TurnMode::PlanImplement) {
+            self.drain_deferred_subagent_results_into_history()?;
+        }
+        if self.enforce_budget(&mut progress.budget, sink)? {
+            return Ok(Some(false));
+        }
+        if mode == TurnMode::PlanImplement {
+            self.prepare_plan_handoff(sink)?;
+        }
+        // Planning decisions wait for the user; other modes auto-answer.
+        self.questions
+            .set_countdown(!matches!(mode, TurnMode::Plan | TurnMode::PlanRevise));
+        Ok(None)
+    }
+
+    /// Steers a subagent to wrap up at its budget and stops it at the hard
+    /// limit. Returns whether the run was stopped.
+    fn enforce_budget(
+        &mut self,
+        budget: &mut RequestBudget,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        if budget.max == 0 {
+            return Ok(false);
+        }
+        if budget.made == budget.max && !budget.steered {
+            budget.steered = true;
+            sink(TurnEvent::Warning(
+                "subagent request budget reached; steering to wrap up".into(),
+            ));
+            self.append_input_message(Message::user(
+                "Request budget reached. Finish your current step and reply with your final result now; do not start new work.",
+            ))?;
+        }
+        if budget.made >= budget.hard_limit() {
+            self.set_stop_reason(Some(RunStopReason::RequestBudget));
+            sink(TurnEvent::Warning(
+                RunStopReason::RequestBudget.message().into(),
+            ));
+            self.cancellation.cancel();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Builds the tools, prompt, and provider for the next request,
+    /// compacting first when the context is nearly full. Plan phases share
+    /// one tool list and system prompt so local servers keep their prompt
+    /// cache; phases differ only in execution gates and a hidden note.
+    fn prepare_step<F>(
+        &mut self,
+        mode: TurnMode,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<Step, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        let plan_path = self.plan_file_reference()?;
+        let mut registry = self.scan_tools();
+        self.report_catalog_warnings(&registry, sink);
+        match mode {
+            TurnMode::Goal => registry.advertise_goal_complete(),
+            TurnMode::Plan | TurnMode::PlanRevise | TurnMode::PlanFollowUp => {
+                registry.restrict_to_planning();
+            }
+            TurnMode::PlanImplement | TurnMode::Normal | TurnMode::Init => {}
+        }
+        let specs = registry.specs();
+        let system = self.system_prompt(&registry, mode == TurnMode::Goal, mode == TurnMode::Init);
+        let overhead = context::prompt_tokens(&system, registry.tool_tokens());
+        self.maybe_compact(overhead, sink, resolve_provider)?;
+
+        let active_plan = self.session.active_plan();
+        let implementation_started = matches!(
+            active_plan,
+            Some(crate::session::PlanState::Ready { revision, .. })
+                if self.session.plan_has_handoff(*revision)
+        );
+        let note = plan_prompt(
+            active_plan,
+            plan_path.as_deref(),
+            mode,
+            implementation_started,
+        )
+        .map(crate::prompt::plan_phase_note);
+        self.sync_plan_phase_note(note)?;
+
+        if let Some(effort) = self.steers.take_reasoning_effort() {
+            self.set_reasoning_effort(effort)?;
+        }
+        let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;
+        Ok(Step {
+            registry,
+            specs,
+            system,
+            overhead,
+            provider,
+            bare_model,
+        })
+    }
+
+    /// Streams one response, compacting once on a context-limit error and
+    /// asking again with a corrective note after a malformed tool call.
+    /// `None` means the user interrupted.
+    fn request_step<F>(
+        &mut self,
+        step: &Step,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+        resolve_provider: &mut F,
+    ) -> Result<Option<TurnOutput>, Error>
+    where
+        F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
+    {
+        let mut retried_context = false;
+        // Request-only history for malformed tool-call retries; never
+        // persisted, so the session keeps the clean transcript.
+        let mut corrected: Option<Vec<Message>> = None;
+        let mut tool_call_retries = 0;
+        let out = loop {
+            let request = provider::Request {
+                model: &step.bare_model,
+                system: &step.system,
+                messages: corrected.as_deref().unwrap_or(self.session.messages()),
+                tools: &step.specs,
+                max_tokens: crate::model::max_tokens(&self.config, &self.model),
+                supports_images: crate::model::supports_images(&self.config, &self.model),
+                prompt_cache_control: true,
+                prompt_cache_key: Some(self.prompt_cache_key()),
+            };
+            let response = stream_turn(step.provider.as_ref(), &request, &mut forward(sink));
+            match response {
+                Ok(out) => break out,
+                Err(Error::Interrupted) => return Ok(None),
+                Err(error)
+                    if self.config.auto_compact
+                        && !retried_context
+                        && context::is_context_limit(&error) =>
+                {
+                    retried_context = true;
+                    sink(TurnEvent::RetryReset);
+                    sink(TurnEvent::Warning(
+                        "Context limit reached; compacting before one retry".into(),
+                    ));
+                    self.compact_now_with(sink, resolve_provider)?;
+                    corrected = None;
+                }
+                Err(Error::MalformedToolCall(message))
+                    if tool_call_retries < MALFORMED_TOOL_CALL_RETRIES =>
+                {
+                    tool_call_retries += 1;
+                    sink(TurnEvent::RetryReset);
+                    sink(TurnEvent::Warning(format!(
+                        "Model emitted a malformed tool call; asking it to retry \
+                         ({tool_call_retries}/{MALFORMED_TOOL_CALL_RETRIES}): {message}"
+                    )));
+                    corrected.get_or_insert_with(|| {
+                        let mut messages = self.session.messages().to_vec();
+                        messages.push(Message::user(malformed_tool_call_note(&step.specs)));
+                        messages
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if crate::cancellation::interrupted() {
+            return Ok(None);
+        }
+        Ok(Some(out))
+    }
+
+    /// Records the response's usage and context and builds its assistant
+    /// message, which the step handler persists.
+    fn record_step(
+        &mut self,
+        out: TurnOutput,
+        step: &Step,
+        progress: &mut TurnProgress,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<(Message, Vec<ToolCall>), Error> {
+        self.session.append_usage(out.usage)?;
+        self.record_context(out.usage.total_tokens(), step.overhead)?;
+        progress.budget.made = progress.budget.made.saturating_add(1);
+        sink(TurnEvent::Usage {
+            context_tokens: self.context_tokens,
+            context_window: self.context_window(),
+            request_usage: out.usage,
+            session_usage: self.usage(),
+        });
+        self.latest_turn_result.clone_from(&out.text);
+        if !out.tool_calls.is_empty() {
+            progress.idle_plan_replies = 0;
+        }
+        let calls = out.tool_calls;
+        let mut assistant = Message::assistant(out.text, calls.clone());
+        assistant.reasoning = out.reasoning;
+        assistant.provider_data = out.provider_data;
+        if assistant.has_provider_replay_data() {
+            assistant.provider_data_model = Some(step.bare_model.clone());
+        }
+        Ok((assistant, calls))
     }
 
     /// Executes tool calls in order. On interrupt, remaining calls get
     /// synthetic error results so every tool call keeps a paired result and
     /// the history stays valid for the next request.
-    fn run_tools(
+    pub(super) fn run_tools(
         &mut self,
         registry: &Registry,
         calls: &[ToolCall],
@@ -892,7 +693,7 @@ impl Conversation {
         )
     }
 
-    fn run_tools_rejecting_goal_complete(
+    pub(super) fn run_tools_rejecting_goal_complete(
         &mut self,
         registry: &Registry,
         calls: &[ToolCall],
@@ -968,7 +769,7 @@ impl Conversation {
                         path.display()
                     )));
                 }
-                let outcome = registry.execute_with_capabilities(
+                let outcome = registry.execute(
                     &call.name,
                     &call.arguments,
                     self.session_id(),
@@ -1017,7 +818,7 @@ impl Conversation {
         registry: &Registry,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) {
-        if !matches!(self.kind, ConversationKind::Persistent(_)) {
+        if self.is_child() {
             return;
         }
         for warning in &registry.warnings {
@@ -1027,44 +828,7 @@ impl Conversation {
         }
     }
 
-    fn persist_assistant(
-        &mut self,
-        assistant: Message,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<(), Error> {
-        self.persist_message(&assistant)?;
-        self.messages.push(assistant);
-        sink(TurnEvent::AssistantDone);
-        Ok(())
-    }
-
-    fn skip_tool_calls(&mut self, calls: &[ToolCall], reason: &str) -> Result<(), Error> {
-        for call in calls {
-            let result = Message::tool_result(&call.id, &call.name, reason.to_string(), true)
-                .with_control(MessageControl::ToolSkipped);
-            self.persist_message(&result)?;
-            self.messages.push(result);
-        }
-        Ok(())
-    }
-
-    fn reject_goal_complete(&mut self, call: &ToolCall, error: &str) -> Result<(), Error> {
-        let result = Message::tool_result(&call.id, &call.name, error.to_string(), true);
-        self.persist_message(&result)?;
-        self.messages.push(result);
-        Ok(())
-    }
-
-    fn reject_tool_calls(&mut self, calls: &[ToolCall], error: &str) -> Result<(), Error> {
-        for call in calls {
-            let result = Message::tool_result(&call.id, &call.name, error.to_string(), true);
-            self.persist_message(&result)?;
-            self.messages.push(result);
-        }
-        Ok(())
-    }
-
-    fn inject_pending_steers(
+    pub(super) fn inject_pending_steers(
         &mut self,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
@@ -1095,118 +859,8 @@ impl Conversation {
         Ok(accepted)
     }
 
-    fn append_goal_continuation(&mut self) -> Result<(), Error> {
-        self.append_input_message(
-            Message::user(goal::GOAL_CONTINUATION).with_control(MessageControl::GoalContinuation),
-        )
-    }
-
-    fn append_plan_continuation(&mut self, text: &str) -> Result<(), Error> {
-        self.append_input_message(
-            Message::user(text).with_control(MessageControl::PlanContinuation),
-        )
-    }
-
-    fn finish_goal_complete(
-        &mut self,
-        mut assistant: Message,
-        result: String,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<(), Error> {
-        if assistant.content.is_empty() {
-            sink(TurnEvent::TextDelta(&result));
-        } else if assistant.content != result {
-            sink(TurnEvent::AssistantReplace(&result));
-        }
-        assistant.content.clone_from(&result);
-        assistant.tool_calls.clear();
-        self.persistent_mut()
-            .session
-            .append_goal_complete(&assistant)?;
-        self.messages.push(assistant);
-        self.latest_turn_result.clone_from(&result);
-        sink(TurnEvent::AssistantDone);
-        Ok(())
-    }
-
-    fn finish_plan_complete(
-        &mut self,
-        mut assistant: Message,
-        plan: String,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<(), Error> {
-        let streamed = std::mem::replace(&mut assistant.content, plan.clone());
-        assistant.tool_calls.clear();
-        let path = self
-            .persistent_mut()
-            .session
-            .append_plan_ready(&plan, &assistant)?;
-        let location = format!("\n\nSaved plan: {}", path.display());
-        if streamed.is_empty() {
-            sink(TurnEvent::TextDelta(&plan));
-        } else if streamed != plan {
-            sink(TurnEvent::AssistantReplace(&plan));
-        }
-        sink(TurnEvent::TextDelta(&location));
-        self.messages.push(assistant);
-        self.latest_turn_result.clone_from(&plan);
-        self.plan_ready_this_turn = true;
-        sink(TurnEvent::AssistantDone);
-        Ok(())
-    }
-
-    fn finish_plan_implemented(
-        &mut self,
-        mut assistant: Message,
-        result: String,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<(), Error> {
-        if assistant.content.is_empty() {
-            sink(TurnEvent::TextDelta(&result));
-        } else if assistant.content != result {
-            sink(TurnEvent::AssistantReplace(&result));
-        }
-        assistant.content.clone_from(&result);
-        assistant.tool_calls.clear();
-        self.persistent_mut()
-            .session
-            .append_plan_implemented(&assistant)?;
-        self.messages.push(assistant);
-        self.latest_turn_result.clone_from(&result);
-        sink(TurnEvent::AssistantDone);
-        Ok(())
-    }
-
-    /// Ends an implementation turn the model cannot finish without the
-    /// user. The plan stays active, so a reply continues implementing.
-    fn finish_plan_blocked(
-        &mut self,
-        mut assistant: Message,
-        result: String,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<(), Error> {
-        if assistant.content.is_empty() {
-            sink(TurnEvent::TextDelta(&result));
-        } else if assistant.content != result {
-            sink(TurnEvent::AssistantReplace(&result));
-        }
-        assistant.content.clone_from(&result);
-        assistant.tool_calls.clear();
-        self.persist_message(&assistant)?;
-        self.messages.push(assistant);
-        self.latest_turn_result.clone_from(&result);
-        sink(TurnEvent::AssistantDone);
-        sink(TurnEvent::Warning(
-            "Implementation is blocked and needs your input. The plan stays active: reply or run /plan implement to continue, or /plan cancel."
-                .into(),
-        ));
-        Ok(())
-    }
-
     fn drain_deferred_subagent_results_into_history(&mut self) -> Result<bool, Error> {
-        let Some(manager) = self.persistent_subagents() else {
-            return Ok(false);
-        };
+        let manager = self.services.subagents.clone();
         if !manager.has_deferred() {
             return Ok(false);
         }
@@ -1276,34 +930,24 @@ impl Conversation {
         }
     }
 
-    /// Summarizes the head of the conversation with the current model
-    /// (also the `/compact` slash command).
-    pub fn compact_now(&mut self, sink: &mut dyn FnMut(TurnEvent<'_>)) -> Result<(), Error> {
-        let cancellation = self.cancellation.clone();
-        crate::cancellation::scope(&cancellation, || {
-            self.cancellation.clear();
-            self.compact_now_with(sink, &mut provider::resolve)
-        })
-    }
-
     /// The system prompt for `registry`. `goal` includes the session's
     /// active goal and `init` adds the `/init` task; children use their own
     /// prompt.
     fn system_prompt(&self, registry: &Registry, goal: bool, init: bool) -> String {
-        match &self.kind {
-            ConversationKind::Persistent(state) => crate::prompt::build_system_prompt(
+        match &self.child {
+            None => crate::prompt::build_system_prompt(
                 &self.config.home_dir,
                 registry.has_subagent_tools(),
                 self.print_mode,
                 registry.has_web_tools(),
                 registry.skills(),
                 crate::prompt::MainPromptState {
-                    goal: goal.then(|| state.session.active_goal()).flatten(),
+                    goal: goal.then(|| self.session.active_goal()).flatten(),
                     init,
                     custom_tools: registry.personalization().as_deref(),
                 },
             ),
-            ConversationKind::Child(_) => crate::prompt::build_subagent_system_prompt(
+            Some(_) => crate::prompt::build_subagent_system_prompt(
                 &self.config.home_dir,
                 self.role_fragment(),
                 registry.restriction_summary().as_deref(),
@@ -1313,10 +957,9 @@ impl Conversation {
         }
     }
 
-    pub(crate) fn compact_now_preserving_cancellation(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<(), Error> {
+    /// Summarizes older history with the current model (`/compact`), inside
+    /// this conversation's cancellation scope.
+    pub(crate) fn compact(&mut self, sink: &mut dyn FnMut(TurnEvent<'_>)) -> Result<(), Error> {
         let cancellation = self.cancellation.clone();
         crate::cancellation::scope(&cancellation, || {
             self.compact_now_with(sink, &mut provider::resolve)
@@ -1344,17 +987,17 @@ impl Conversation {
             provider.as_ref(),
             &bare_model,
             crate::model::max_tokens(&self.config, &self.model),
-            &self.messages,
-            last_undoable_user_index(&self.messages),
+            self.session.messages(),
+            last_undoable_user_index(self.session.messages()),
             // Summarizer output is not user-facing; swallow its deltas.
             &mut |_| {},
         )?;
-        self.record_usage(summary_usage)?;
+        self.session.append_usage(summary_usage)?;
 
         let remote_request = provider::Request {
             model: &bare_model,
             system: &system,
-            messages: &self.messages[range.clone()],
+            messages: &self.session.messages()[range.clone()],
             tools: &specs,
             max_tokens: crate::model::max_tokens(&self.config, &self.model),
             supports_images: crate::model::supports_images(&self.config, &self.model),
@@ -1366,37 +1009,23 @@ impl Conversation {
             Err(_) if crate::cancellation::interrupted() => return Err(Error::Interrupted),
             Err(error) => {
                 sink(TurnEvent::Warning(format!(
-                    "Codex remote compaction failed; using the portable summary: {error}"
+                    "Remote compaction failed; using the portable summary: {error}"
                 )));
                 None
             }
         };
         let mut request_usage = summary_usage;
         let (provider_data, provider_data_model) = if let Some(remote) = remote {
-            self.record_usage(remote.usage)?;
+            self.session.append_usage(remote.usage)?;
             request_usage = request_usage.saturating_add(remote.usage);
             (remote.replacement_history, Some(bare_model.clone()))
         } else {
             (Vec::new(), None)
         };
 
-        let start = range.start;
         let replaced = range.len();
-        self.persist_compaction(
-            &summary,
-            start,
-            replaced,
-            &provider_data,
-            provider_data_model.as_deref(),
-        )?;
-        compaction::apply_summary_range_with_provider_data(
-            &mut self.messages,
-            &summary,
-            range,
-            provider_data,
-            provider_data_model,
-        );
-        self.record_cache_reset()?;
+        self.session
+            .append_compaction(&summary, range, provider_data, provider_data_model)?;
         // Old usage estimate is stale after compaction; a fresh number
         // arrives with the next response.
         self.context_tokens = 0;
@@ -1419,7 +1048,7 @@ mod note_tests {
     #[test]
     fn malformed_call_notes_name_the_available_tools() {
         let spec = |name: &str| {
-            std::sync::Arc::new(crate::provider::ToolSpec {
+            Arc::new(ToolSpec {
                 name: name.into(),
                 description: String::new(),
                 input_schema: serde_json::json!({}),

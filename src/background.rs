@@ -2,7 +2,6 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read};
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -297,14 +296,14 @@ impl BackgroundProcessManager {
             self.remove_failed_start(&id);
             return Err("background shell stderr was not piped".into());
         };
-        if let Err(error) = set_nonblocking(&stdout) {
+        if let Err(error) = crate::tools::exec::set_nonblocking(&stdout) {
             terminate_now(&mut child);
             self.remove_failed_start(&id);
             return Err(format!(
                 "failed to configure background shell stdout: {error}"
             ));
         }
-        if let Err(error) = set_nonblocking(&stderr) {
+        if let Err(error) = crate::tools::exec::set_nonblocking(&stderr) {
             terminate_now(&mut child);
             self.remove_failed_start(&id);
             return Err(format!(
@@ -741,22 +740,6 @@ fn take_decoded_utf8(bytes: &mut Vec<u8>, end_of_stream: bool) -> String {
     text
 }
 
-fn set_nonblocking(reader: &impl AsRawFd) -> io::Result<()> {
-    let file_descriptor = reader.as_raw_fd();
-    // SAFETY: `file_descriptor` belongs to the live pipe handle borrowed for
-    // this call, and `F_GETFL` does not access Rust-managed memory.
-    let flags = unsafe { libc::fcntl(file_descriptor, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: The descriptor remains live for this call. `F_SETFL` updates its
-    // status flags without taking ownership of the descriptor.
-    if unsafe { libc::fcntl(file_descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 fn terminate_gracefully(child: &mut Child, process_group: u32) {
     signal_group(process_group, libc::SIGTERM);
     let deadline = Instant::now().checked_add(STOP_GRACE);
@@ -988,7 +971,7 @@ mod tests {
     #[test]
     fn stream_reader_can_stop_while_a_writer_keeps_the_pipe_open() {
         let (reader, mut writer) = UnixStream::pair().expect("create stream pair");
-        set_nonblocking(&reader).expect("set reader nonblocking");
+        crate::tools::exec::set_nonblocking(&reader).expect("set reader nonblocking");
         writer.write_all(b"partial").expect("write stream content");
         let done = Arc::new(AtomicBool::new(false));
         let reader_done = done.clone();

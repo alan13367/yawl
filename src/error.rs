@@ -16,7 +16,13 @@ pub enum Error {
     /// the same request tends to reproduce it, so the turn loop retries with
     /// a corrective note instead of the transport-level backoff.
     MalformedToolCall(String),
+    /// Missing or invalid configuration: no model, an unusable provider,
+    /// or a credential that cannot be resolved.
     Config(String),
+    /// A request that does not fit the current state or input, such as
+    /// continuing a finished turn, resuming a missing plan, or sending an
+    /// image to a text-only model. The message is shown as written.
+    Invalid(String),
     /// The user aborted the in-flight turn with Ctrl+C.
     Interrupted,
 }
@@ -49,6 +55,7 @@ impl fmt::Display for Error {
             Error::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Error::MalformedToolCall(msg) => write!(f, "malformed tool call: {msg}"),
             Error::Config(msg) => write!(f, "config error: {msg}"),
+            Error::Invalid(msg) => f.write_str(msg),
             Error::Interrupted => write!(f, "interrupted"),
         }
     }

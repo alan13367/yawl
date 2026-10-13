@@ -1,7 +1,7 @@
 use std::io::{self, Read, Write};
 
-use yawl::agent::{Agent, TurnEvent};
-use yawl::provider::{Reasoning, ReasoningKind};
+use crate::agent::{Agent, TurnEvent};
+use crate::provider::{Reasoning, ReasoningKind};
 
 pub(super) fn read_prompt(
     words: Vec<String>,
@@ -31,7 +31,11 @@ pub(super) fn read_prompt(
 pub(super) fn run(agent: &mut Agent, prompt: String) -> Result<i32, Box<dyn std::error::Error>> {
     agent.set_print_mode();
     let mut sink = PrintSink::new(agent.config().hide_reasoning);
-    let completed = agent.run_turn(Some(prompt), &mut |event| sink.handle(event));
+    agent.clear_cancellation();
+    let completed = agent.run(
+        crate::agent::TurnRequest::Prompt(Some(prompt.into())),
+        &mut |event| sink.handle(event),
+    );
     if let Some(error) = sink.output_error.take() {
         return Err(Box::new(error));
     }
@@ -89,7 +93,7 @@ impl PrintSink {
                         Ok(()) => self.response_has_text = true,
                         Err(error) => {
                             self.output_error = Some(error);
-                            yawl::set_interrupted(true);
+                            crate::set_interrupted(true);
                         }
                     }
                 }
@@ -120,7 +124,7 @@ impl PrintSink {
                         .and_then(|()| self.stdout.flush())
                     {
                         self.output_error = Some(error);
-                        yawl::set_interrupted(true);
+                        crate::set_interrupted(true);
                     }
                     self.response_has_text = false;
                 }
@@ -133,6 +137,10 @@ impl PrintSink {
             }
             TurnEvent::PlanPhase(_) => {}
             TurnEvent::Warning(text) => eprintln!("{text}"),
+            TurnEvent::WaitingForSubagents { active } => {
+                let noun = if active == 1 { "subagent" } else { "subagents" };
+                eprintln!("waiting for {active} {noun}…");
+            }
             TurnEvent::ToolPreparing { .. }
             | TurnEvent::ToolStart { .. }
             | TurnEvent::ToolEnd { .. }
@@ -146,24 +154,7 @@ impl PrintSink {
 /// output. The TUI applies the same rule through its renderer; print mode
 /// writes straight to the stream, so it has to sanitize here.
 fn sanitize_terminal(text: &str) -> std::borrow::Cow<'_, str> {
-    if text
-        .chars()
-        .all(|character| matches!(character, '\n' | '\t') || !character.is_control())
-    {
-        std::borrow::Cow::Borrowed(text)
-    } else {
-        std::borrow::Cow::Owned(
-            text.chars()
-                .map(|character| {
-                    if matches!(character, '\n' | '\t') || !character.is_control() {
-                        character
-                    } else {
-                        char::REPLACEMENT_CHARACTER
-                    }
-                })
-                .collect(),
-        )
-    }
+    crate::text::sanitize_block(text)
 }
 
 fn append_reasoning(reasoning: &mut Vec<Reasoning>, kind: ReasoningKind, text: &str) {

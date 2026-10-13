@@ -6,7 +6,9 @@
 //! editable, keys are masked with a Tab toggle, and Esc goes back. Problems
 //! replace the help line instead of scrolling new prompts.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+
+use super::terminal::read_byte;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -352,11 +354,6 @@ fn decode(byte: u8, read: &mut impl FnMut() -> io::Result<Option<u8>>) -> Result
             }
         }
     })
-}
-
-fn read_byte() -> io::Result<Option<u8>> {
-    let mut buffer = [0u8; 1];
-    Ok((io::stdin().read(&mut buffer)? == 1).then_some(buffer[0]))
 }
 
 #[cfg(test)]

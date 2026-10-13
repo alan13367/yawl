@@ -466,11 +466,7 @@ impl Registry {
             .collect()
     }
 
-    pub fn execute(&self, name: &str, args_json: &str, session_id: &str) -> ToolOutcome {
-        self.execute_with_capabilities(name, args_json, session_id, false)
-    }
-
-    pub(crate) fn execute_with_capabilities(
+    pub(crate) fn execute(
         &self,
         name: &str,
         args_json: &str,
@@ -801,6 +797,7 @@ mod tests {
             "shell",
             r#"{"command":"printf ready; trap 'exit 0' TERM; while :; do sleep 1; done","background":true,"name":"dev"}"#,
             "session",
+            false,
         );
         assert!(!started.is_error, "{}", started.content);
         assert!(started.content.contains("bg-1"));
@@ -808,13 +805,14 @@ mod tests {
             "shell_output",
             r#"{"id":"bg-1","cursor":0,"wait_secs":2}"#,
             "session",
+            false,
         );
         assert!(!output.is_error, "{}", output.content);
         assert!(output.content.contains("ready"));
         assert!(output.content.contains("next_cursor:"));
-        let listed = registry.execute("shell_list", "{}", "session");
+        let listed = registry.execute("shell_list", "{}", "session", false);
         assert!(listed.content.contains("dev"));
-        let stopped = registry.execute("shell_stop", r#"{"id":"bg-1"}"#, "session");
+        let stopped = registry.execute("shell_stop", r#"{"id":"bg-1"}"#, "session", false);
         assert!(!stopped.is_error, "{}", stopped.content);
         manager.shutdown_and_discard();
     }
@@ -842,14 +840,14 @@ mod tests {
                 |(name, _, origin)| name == "echo_session" && origin.starts_with("global tool")
             )
         );
-        let outcome = registry.execute("echo_session", r#"{"value":"1"}"#, "session-7");
+        let outcome = registry.execute("echo_session", r#"{"value":"1"}"#, "session-7", false);
         assert!(!outcome.is_error, "{}", outcome.content);
         assert_eq!(
             outcome.content,
             r#"session-7|a b|{"label":"a b","value":1}"#
         );
 
-        let invalid = registry.execute("echo_session", r#"{"valeu":1}"#, "session-7");
+        let invalid = registry.execute("echo_session", r#"{"valeu":1}"#, "session-7", false);
         assert!(invalid.is_error);
         assert!(
             invalid
@@ -884,18 +882,19 @@ mod tests {
         let registry =
             Registry::scan_with_background(&config, &mut CatalogCache::default(), manager.clone());
 
-        let nudged = registry.execute("shell", r#"{"command":"printf '%s' hi"}"#, "s");
+        let nudged = registry.execute("shell", r#"{"command":"printf '%s' hi"}"#, "s", false);
         assert!(!nudged.is_error, "{}", nudged.content);
         assert_eq!(
             nudged.content,
             "hi\n\n[yawl] The custom tool `say` wraps this command; call it instead next time."
         );
-        let unrelated = registry.execute("shell", r#"{"command":"printf ok"}"#, "s");
+        let unrelated = registry.execute("shell", r#"{"command":"printf ok"}"#, "s", false);
         assert_eq!(unrelated.content, "ok");
         let background = registry.execute(
             "shell",
             r#"{"command":"printf '%s' hi","background":true}"#,
             "s",
+            false,
         );
         assert!(
             !background.content.contains("[yawl]"),
@@ -918,14 +917,14 @@ mod tests {
 
         let untrusted = Registry::scan(&config, &mut cache);
         assert_eq!(
-            untrusted.execute("status", "{}", "s").content.trim(),
+            untrusted.execute("status", "{}", "s", false).content.trim(),
             "global"
         );
 
         config.project_skills_trusted = true;
         let trusted = Registry::scan(&config, &mut cache);
         assert_eq!(
-            trusted.execute("status", "{}", "s").content.trim(),
+            trusted.execute("status", "{}", "s", false).content.trim(),
             "project"
         );
         assert_eq!(
@@ -1003,7 +1002,7 @@ mod tests {
             "required_tools": []
         });
 
-        let outcome = registry.execute("subagent_spawn", &args.to_string(), "session");
+        let outcome = registry.execute("subagent_spawn", &args.to_string(), "session", false);
 
         assert!(!outcome.is_error, "unexpected outcome: {}", outcome.content);
         assert_eq!(manager.snapshots()[0].model, "openai:active-parent");
@@ -1027,7 +1026,7 @@ mod tests {
             "required_tools": ["write_file"]
         });
 
-        let outcome = registry.execute("subagent_spawn", &args.to_string(), "session");
+        let outcome = registry.execute("subagent_spawn", &args.to_string(), "session", false);
 
         assert!(outcome.is_error, "unexpected outcome: {}", outcome.content);
         assert!(outcome.content.contains("scout"), "{}", outcome.content);
@@ -1067,7 +1066,7 @@ mod tests {
         let registry =
             Registry::scan_for_child(&config, &mut CatalogCache::default(), Some(&scout));
 
-        let rejected = registry.execute("shell", r#"{"command":"ls"}"#, "session");
+        let rejected = registry.execute("shell", r#"{"command":"ls"}"#, "session", false);
         assert!(rejected.is_error);
         for expected in [
             "'shell' is not available to this subagent, so nothing ran.",
@@ -1095,7 +1094,7 @@ mod tests {
 
         let unrestricted = Registry::scan_for_child(&config, &mut CatalogCache::default(), None);
         assert!(unrestricted.restriction_summary().is_none());
-        let unknown = unrestricted.execute("missing_tool", "{}", "session");
+        let unknown = unrestricted.execute("missing_tool", "{}", "session", false);
         assert!(
             unknown
                 .content
@@ -1131,7 +1130,7 @@ mod tests {
                     !names.iter().any(|candidate| candidate == name),
                     "main advertised {name}"
                 );
-                assert!(registry.execute(name, "{}", "main").is_error);
+                assert!(registry.execute(name, "{}", "main", false).is_error);
             }
         }
         manager.shutdown_and_discard();
@@ -1175,13 +1174,14 @@ mod tests {
         );
         assert!(
             registry
-                .execute("git_inspect", r#"{"operation":"reset"}"#, "scout")
+                .execute("git_inspect", r#"{"operation":"reset"}"#, "scout", false)
                 .is_error
         );
         let listing = registry.execute(
             "list_files",
             &json!({"path": root.join("project")}).to_string(),
             "scout",
+            false,
         );
         assert!(!listing.is_error, "{}", listing.content);
         assert!(listing.content.contains("example.rs"));
@@ -1189,6 +1189,7 @@ mod tests {
             "search_files",
             &json!({"path": root.join("project"), "query": "cancellation_entry"}).to_string(),
             "scout",
+            false,
         );
         assert!(!search.is_error, "{}", search.content);
         assert!(
@@ -1198,10 +1199,14 @@ mod tests {
         );
         assert!(
             registry
-                .execute("shell", r#"{"command":"true"}"#, "scout")
+                .execute("shell", r#"{"command":"true"}"#, "scout", false)
                 .is_error
         );
-        assert!(registry.execute("write_file", "{}", "scout").is_error);
+        assert!(
+            registry
+                .execute("write_file", "{}", "scout", false)
+                .is_error
+        );
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -1258,10 +1263,10 @@ mod tests {
         ]
         .into_iter()
         .zip(["write_file", "edit_file"])
-        .map(|(args, name)| registry.execute(name, args, "session"))
+        .map(|(args, name)| registry.execute(name, args, "session", false))
         .chain([
-            registry.execute("shell_list", "{}", "session"),
-            registry.execute("subagent_list", "{}", "session"),
+            registry.execute("shell_list", "{}", "session", false),
+            registry.execute("subagent_list", "{}", "session", false),
         ]) {
             assert!(forbidden.is_error);
             assert!(
@@ -1270,25 +1275,40 @@ mod tests {
                 forbidden.content
             );
         }
-        let background =
-            registry.execute("shell", r#"{"command":"ls","background":true}"#, "session");
+        let background = registry.execute(
+            "shell",
+            r#"{"command":"ls","background":true}"#,
+            "session",
+            false,
+        );
         assert!(background.is_error);
         let inspection = registry.execute(
             "shell",
             r#"{"command":"rg --files | head -n 1"}"#,
             "session",
+            false,
         );
         assert!(!inspection.is_error, "{}", inspection.content);
-        let git = registry.execute("shell", r#"{"command":"git status --short"}"#, "session");
+        let git = registry.execute(
+            "shell",
+            r#"{"command":"git status --short"}"#,
+            "session",
+            false,
+        );
         assert!(!git.is_error, "{}", git.content);
         let mutation = registry.execute(
             "shell",
             r#"{"command":"printf nope > changed.txt"}"#,
             "session",
+            false,
         );
         assert!(mutation.is_error);
-        let git_mutation =
-            registry.execute("shell", r#"{"command":"git reset --hard"}"#, "session");
+        let git_mutation = registry.execute(
+            "shell",
+            r#"{"command":"git reset --hard"}"#,
+            "session",
+            false,
+        );
         assert!(git_mutation.is_error);
         assert!(!root.join("project/changed.txt").exists());
         manager.shutdown_and_discard();
@@ -1327,11 +1347,11 @@ mod tests {
                 .iter()
                 .any(|spec| spec.name == "read_skill")
         );
-        let loaded = registry.execute("read_skill", r#"{"name":"automatic"}"#, "session");
+        let loaded = registry.execute("read_skill", r#"{"name":"automatic"}"#, "session", false);
         assert!(!loaded.is_error, "{}", loaded.content);
         assert!(loaded.content.contains("Read all relevant code."));
         assert!(loaded.content.contains(&root.display().to_string()));
-        let denied = registry.execute("read_skill", r#"{"name":"manual"}"#, "session");
+        let denied = registry.execute("read_skill", r#"{"name":"manual"}"#, "session", false);
         assert!(denied.is_error);
 
         registry.retain_names(&["read_file".into()]);

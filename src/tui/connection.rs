@@ -260,7 +260,7 @@ pub(super) fn field(field: ConnectEditField, initial: String) -> PickerField {
 /// and starting with a capital letter.
 fn field_error(error: Error) -> String {
     let message = match error {
-        Error::Config(message) => message,
+        Error::Config(message) | Error::Invalid(message) => message,
         other => other.to_string(),
     };
     let mut characters = message.chars();
@@ -874,7 +874,7 @@ fn build_plan(
     let provider = flow
         .provider
         .as_ref()
-        .ok_or_else(|| Error::Config("provider is not selected".into()))?;
+        .ok_or_else(|| Error::Invalid("provider is not selected".into()))?;
     let mut changes = Vec::new();
     if provider != &ProviderId::Codex {
         changes.push(provider::endpoint_change(

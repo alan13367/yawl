@@ -5,6 +5,7 @@ mod goal;
 mod plan;
 mod recovery;
 mod steer;
+mod step;
 mod turn;
 
 use std::time::Duration;
@@ -12,15 +13,15 @@ use std::time::Duration;
 use crate::background::BackgroundProcessManager;
 use crate::cancellation::CancellationToken;
 use crate::checkpoint::Checkpoints;
-use crate::compaction;
 use crate::config::{Config, ConfigChange, ConfigChangeEffect};
 use crate::error::Error;
-use crate::provider::{Message, MessageControl, TokenUsage, TurnInput, UsageSummary};
+use crate::provider::{Message, MessageControl, TurnInput, UsageSummary};
 use crate::session::{PlanState, Session};
 use crate::subagent::SubagentManager;
 use crate::tools::{CatalogCache, QuestionBroker, Registry};
 
 pub(crate) use steer::SteerInbox;
+pub(crate) use turn::TurnRequest;
 
 /// Per-run guard rails for a memory-only subagent conversation. At
 /// `max_requests` completed model requests a wrap-up instruction is injected;
@@ -57,55 +58,54 @@ pub struct UndoReport {
     pub warning: Option<String>,
 }
 
-pub(crate) fn is_undoable_user_prompt(message: &Message) -> bool {
-    message.role == crate::provider::Role::User
-        && message.subagent_results.is_empty()
-        && !compaction::is_summary_message(message)
-        && !message.is_plan_handoff()
-        && (!message.is_hidden_control() || message.is_plan_implementation_start())
-        && !message.is_steering()
-}
-
 pub(crate) fn last_undoable_user_index(messages: &[Message]) -> Option<usize> {
-    messages.iter().rposition(is_undoable_user_prompt)
+    messages.iter().rposition(Message::starts_user_turn)
 }
 
-struct PersistentState {
-    session: Box<Session>,
+/// Session-bound workers and undo snapshots. Subagent conversations get
+/// idle workers that never start anything and no snapshots.
+struct Services {
     subagents: SubagentManager,
-    checkpoints: Checkpoints,
     background: BackgroundProcessManager,
+    checkpoints: Option<Checkpoints>,
 }
 
-impl PersistentState {
-    /// Fresh per-session workers and undo snapshots for `session`.
-    fn open(config: &Config, session: Session, work_tree: std::path::PathBuf) -> Self {
+impl Services {
+    /// Fresh workers and undo snapshots for the session `session_id`.
+    fn persistent(config: &Config, session_id: &str, work_tree: std::path::PathBuf) -> Self {
         Self {
-            subagents: SubagentManager::new(session.id.clone(), config.max_subagents),
-            checkpoints: Checkpoints::open(&config.home_dir, &session.id, work_tree),
+            subagents: SubagentManager::new(session_id.to_string(), config.max_subagents),
             background: BackgroundProcessManager::default(),
-            session: Box::new(session),
+            checkpoints: Some(Checkpoints::open(&config.home_dir, session_id, work_tree)),
         }
+    }
+
+    fn child(session_id: &str) -> Self {
+        Self {
+            subagents: SubagentManager::new(session_id.to_string(), 1),
+            background: BackgroundProcessManager::default(),
+            checkpoints: None,
+        }
+    }
+
+    fn shutdown(&self) {
+        self.subagents.shutdown_and_discard();
+        self.background.shutdown_and_discard();
     }
 }
 
-struct ChildState {
-    session_id: String,
+/// Identity and guard rails of a subagent conversation.
+struct ChildPolicy {
     prompt_cache_key: String,
-    usage: UsageSummary,
     run_limits: Option<RunLimits>,
     stop_reason: Option<RunStopReason>,
     tool_allowlist: Option<Vec<String>>,
     role_fragment: Option<String>,
 }
 
-enum ConversationKind {
-    Persistent(PersistentState),
-    Child(ChildState),
-}
-
-/// Provider-neutral turn state with explicit persistent-agent and
-/// memory-only-child capabilities.
+/// Provider-neutral turn state. The main conversation records to a session
+/// file; subagent conversations record to a memory-only session and carry a
+/// [`ChildPolicy`].
 pub(crate) struct Conversation {
     config: Config,
     /// Reasoning effort from the saved config, independent of a session choice.
@@ -114,8 +114,11 @@ pub(crate) struct Conversation {
     /// Current model spec (may carry an `anthropic:`/`openai:` prefix);
     /// switchable mid-session via `/model`.
     model: String,
-    messages: Vec<Message>,
-    kind: ConversationKind,
+    /// The recorded history and everything derived from it.
+    session: Session,
+    services: Services,
+    /// Set for subagent conversations.
+    child: Option<ChildPolicy>,
     /// Last provider-reported total (input + output) tokens — the best
     /// estimate of current context usage.
     context_tokens: u64,
@@ -143,51 +146,46 @@ impl Conversation {
         config: Config,
         model: String,
         session: Session,
-        messages: Vec<Message>,
         work_tree: std::path::PathBuf,
     ) -> Self {
-        let context_usage = session
-            .context()
-            .filter(|usage| usage.model == model && usage.messages <= messages.len())
-            .cloned();
-        let reasoning_effort = session.recorded_reasoning();
-        let state = PersistentState::open(&config, session, work_tree);
-        let mut conversation =
-            Self::new(config, model, messages, ConversationKind::Persistent(state));
-        if let Some(effort) = reasoning_effort {
+        let services = Services::persistent(&config, &session.id, work_tree);
+        let mut conversation = Self::new(config, model, session, services, None);
+        if let Some(effort) = conversation.session.recorded_reasoning() {
             conversation.config.reasoning_effort = effort;
         }
-        conversation.context_tokens = context_usage.as_ref().map_or(0, |usage| usage.tokens);
-        conversation.context_usage = context_usage;
+        conversation.adopt_recorded_context();
         conversation
     }
 
     pub(crate) fn memory(config: Config, model: String, session_id: String) -> Self {
-        Self::new(
-            config,
-            model,
-            Vec::new(),
-            ConversationKind::Child(ChildState {
-                prompt_cache_key: session_id.clone(),
-                session_id,
-                usage: UsageSummary::default(),
-                run_limits: None,
-                stop_reason: None,
-                tool_allowlist: None,
-                role_fragment: None,
-            }),
-        )
+        let session = Session::memory(session_id.clone(), &model);
+        let services = Services::child(&session_id);
+        let child = ChildPolicy {
+            prompt_cache_key: session_id,
+            run_limits: None,
+            stop_reason: None,
+            tool_allowlist: None,
+            role_fragment: None,
+        };
+        Self::new(config, model, session, services, Some(child))
     }
 
     /// Turn state starts empty; the configured reasoning effort is kept
     /// apart so a session-chosen effort can be told from the default.
-    fn new(config: Config, model: String, messages: Vec<Message>, kind: ConversationKind) -> Self {
+    fn new(
+        config: Config,
+        model: String,
+        session: Session,
+        services: Services,
+        child: Option<ChildPolicy>,
+    ) -> Self {
         Self {
             configured_reasoning_effort: config.reasoning_effort.clone(),
             config,
             model,
-            messages,
-            kind,
+            session,
+            services,
+            child,
             context_tokens: 0,
             context_usage: None,
             pending_tool_results: Default::default(),
@@ -203,20 +201,41 @@ impl Conversation {
         }
     }
 
+    /// Adopts the session's last measured context when it still describes
+    /// this model and history.
+    fn adopt_recorded_context(&mut self) {
+        self.context_usage = self
+            .session
+            .context()
+            .filter(|usage| {
+                usage.model == self.model && usage.messages <= self.session.messages().len()
+            })
+            .cloned();
+        self.context_tokens = self.context_usage.as_ref().map_or(0, |usage| usage.tokens);
+    }
+
     pub(crate) fn set_run_limits(&mut self, limits: RunLimits) {
-        self.child_mut().run_limits = Some(limits);
+        if let Some(child) = &mut self.child {
+            child.run_limits = Some(limits);
+        }
     }
 
     pub(crate) fn set_tool_allowlist(&mut self, tools: Vec<String>) {
-        self.child_mut().tool_allowlist = Some(tools);
+        if let Some(child) = &mut self.child {
+            child.tool_allowlist = Some(tools);
+        }
     }
 
     pub(crate) fn set_role_fragment(&mut self, fragment: String) {
-        self.child_mut().role_fragment = Some(fragment);
+        if let Some(child) = &mut self.child {
+            child.role_fragment = Some(fragment);
+        }
     }
 
     pub(crate) fn set_prompt_cache_key(&mut self, key: String) {
-        self.child_mut().prompt_cache_key = key;
+        if let Some(child) = &mut self.child {
+            child.prompt_cache_key = key;
+        }
     }
 
     pub(crate) fn context_window(&self) -> u64 {
@@ -232,14 +251,16 @@ impl Conversation {
     }
 
     pub(crate) fn session_id(&self) -> &str {
-        match &self.kind {
-            ConversationKind::Persistent(state) => &state.session.id,
-            ConversationKind::Child(state) => &state.session_id,
-        }
+        &self.session.id
     }
 
     pub(crate) fn messages(&self) -> &[Message] {
-        &self.messages
+        self.session.messages()
+    }
+
+    /// A note about history the session log could not restore.
+    pub(crate) fn session_warning(&self) -> Option<String> {
+        self.session.replay_warning()
     }
 
     pub(crate) fn context_tokens(&self) -> u64 {
@@ -247,16 +268,13 @@ impl Conversation {
     }
 
     pub(crate) fn usage(&self) -> UsageSummary {
-        match &self.kind {
-            ConversationKind::Persistent(state) => state.session.usage(),
-            ConversationKind::Child(state) => state.usage,
-        }
+        self.session.usage()
     }
 
     fn prompt_cache_key(&self) -> &str {
-        match &self.kind {
-            ConversationKind::Persistent(state) => &state.session.id,
-            ConversationKind::Child(state) => &state.prompt_cache_key,
+        match &self.child {
+            Some(child) => &child.prompt_cache_key,
+            None => &self.session.id,
         }
     }
 
@@ -277,11 +295,11 @@ impl Conversation {
     }
 
     pub(crate) fn active_goal(&self) -> Option<&str> {
-        self.persistent_state().session.active_goal()
+        self.session.active_goal()
     }
 
     pub(crate) fn plan_state(&self) -> Option<&PlanState> {
-        self.persistent_state().session.active_plan()
+        self.session.active_plan()
     }
 
     pub(crate) fn active_plan(&self) -> Option<&str> {
@@ -304,19 +322,16 @@ impl Conversation {
         let warning = self.checkpoint_warning();
         let message = Message::user_input(input).with_control(MessageControl::GoalStart);
         let goal = message.content.clone();
-        self.persistent_mut()
-            .session
-            .append_goal_start(&goal, &message)?;
-        self.messages.push(message);
+        self.session.append_goal_start(&goal, message)?;
         Ok(warning)
     }
 
     pub(crate) fn cancel_goal(&mut self) -> Result<bool, Error> {
         self.recover_history()?;
-        if self.persistent_state().session.active_goal().is_none() {
+        if self.session.active_goal().is_none() {
             return Ok(false);
         }
-        self.persistent_mut().session.append_goal_cancel()?;
+        self.session.append_goal_cancel()?;
         Ok(true)
     }
 
@@ -324,14 +339,11 @@ impl Conversation {
         self.recover_history()?;
         let objective = input.text.clone();
         if objective.trim().is_empty() {
-            return Err(Error::Config("plan objective is empty".into()));
+            return Err(Error::Invalid("plan objective is empty".into()));
         }
         let warning = self.checkpoint_warning();
         let message = Message::user_input(input).with_control(MessageControl::PlanStart);
-        self.persistent_mut()
-            .session
-            .append_plan_start(&objective, &message)?;
-        self.messages.push(message);
+        self.session.append_plan_start(&objective, message)?;
         Ok(warning)
     }
 
@@ -340,7 +352,7 @@ impl Conversation {
         if self.plan_state().is_none() {
             return Ok(false);
         }
-        self.persistent_mut().session.append_plan_cancel()?;
+        self.session.append_plan_cancel()?;
         Ok(true)
     }
 
@@ -353,18 +365,15 @@ impl Conversation {
     }
 
     pub(crate) fn subagent_manager(&self) -> SubagentManager {
-        self.persistent_state().subagents.clone()
+        self.services.subagents.clone()
     }
 
     pub(crate) fn background_manager(&self) -> BackgroundProcessManager {
-        self.persistent_state().background.clone()
+        self.services.background.clone()
     }
 
     pub(crate) fn run_stop_reason(&self) -> Option<RunStopReason> {
-        match &self.kind {
-            ConversationKind::Child(state) => state.stop_reason,
-            ConversationKind::Persistent(_) => None,
-        }
+        self.child.as_ref().and_then(|child| child.stop_reason)
     }
 
     pub(crate) fn latest_turn_result(&self) -> String {
@@ -372,9 +381,7 @@ impl Conversation {
     }
 
     fn append_input_message(&mut self, message: Message) -> Result<(), Error> {
-        self.persist_message(&message)?;
-        self.messages.push(message);
-        Ok(())
+        self.session.append_message(message)
     }
 
     pub(crate) fn switch_model(&mut self, model: String) -> Result<(), Error> {
@@ -384,9 +391,7 @@ impl Conversation {
     /// Uses `model` for later requests and records it in the session log, so
     /// resuming this session continues with the last used model.
     fn adopt_model(&mut self, model: String) -> Result<(), Error> {
-        if let ConversationKind::Persistent(state) = &mut self.kind {
-            state.session.append_model_switch(&model)?;
-        }
+        self.session.append_model_switch(&model)?;
         self.model = model;
         self.context_tokens = 0;
         self.context_usage = None;
@@ -397,9 +402,7 @@ impl Conversation {
         if self.config.reasoning_effort == effort {
             return Ok(());
         }
-        if let ConversationKind::Persistent(state) = &mut self.kind {
-            state.session.append_reasoning_effort(effort.clone())?;
-        }
+        self.session.append_reasoning_effort(effort.clone())?;
         self.config.reasoning_effort = effort;
         Ok(())
     }
@@ -415,9 +418,16 @@ impl Conversation {
         self.config.bell = config.bell;
     }
 
+    /// Recovers what it can of the session being left. Whatever cannot be
+    /// recovered stays in its log and is retried when it is resumed, so a
+    /// damaged session never blocks starting or opening another one.
+    fn leave_session(&mut self) {
+        let _ = self.recover_history();
+    }
+
     /// Starts a fresh session (used by `/new` and `/clear`).
     pub fn reset(&mut self) -> Result<(), Error> {
-        self.recover_history()?;
+        self.leave_session();
         let cwd = crate::config::working_dir();
         let dirs = self.config.session_dirs(&cwd);
         let old_id = self.session_id().to_string();
@@ -427,11 +437,11 @@ impl Conversation {
             session.append_reasoning_effort(self.config.reasoning_effort.clone())?;
         }
         self.switch_session(session, cwd);
-        self.messages.clear();
         self.context_tokens = 0;
         self.context_usage = None;
         self.latest_turn_result.clear();
         self.unfinished_mode = None;
+        self.pending_tool_results.clear();
         let _ = self.steers.drain();
         Checkpoints::remove(&self.config.home_dir, &old_id);
         if abandon_empty {
@@ -443,10 +453,9 @@ impl Conversation {
     /// Stops the current session's subagents and background processes, then
     /// makes `session` current.
     fn switch_session(&mut self, session: Session, work_tree: std::path::PathBuf) {
-        self.persistent_state().subagents.shutdown_and_discard();
-        self.persistent_state().background.shutdown_and_discard();
-        self.kind =
-            ConversationKind::Persistent(PersistentState::open(&self.config, session, work_tree));
+        self.services.shutdown();
+        self.services = Services::persistent(&self.config, &session.id, work_tree);
+        self.session = session;
     }
 
     /// Deletes a saved session. If it is the active session, starts a fresh one.
@@ -471,7 +480,7 @@ impl Conversation {
         let cwd = crate::config::working_dir();
         let dirs = self.config.session_dirs(&cwd);
         let id = self.session_id().to_string();
-        if !self.messages.is_empty() || crate::session::has_message(&dirs.project, &id) {
+        if !self.messages().is_empty() || crate::session::has_message(&dirs.project, &id) {
             return Ok(false);
         }
         Session::delete(&dirs.project, &id)?;
@@ -481,65 +490,54 @@ impl Conversation {
 
     /// Replaces the conversation with a saved session (used by `/resume`).
     pub fn load_session(&mut self, id: &str) -> Result<(), Error> {
-        self.recover_history()?;
         let cwd = crate::config::working_dir();
-        let (session, messages) =
-            Session::open_searching(&self.config.session_dirs(&cwd).search, id)?;
+        let session = Session::open_searching(&self.config.session_dirs(&cwd).search, id)?;
+        self.leave_session();
         // Continue with the model the session last used, unless its provider is
         // gone from the config.
         let model = session.resumed_model(&self.config, &self.model);
         self.switch_session(session, cwd);
-        self.messages = messages;
         self.model = model;
-        self.config.reasoning_effort = match self.persistent_state().session.recorded_reasoning() {
+        self.config.reasoning_effort = match self.session.recorded_reasoning() {
             Some(effort) => effort,
             None => self.configured_reasoning_effort.clone(),
         };
-        self.context_usage = self
-            .persistent_state()
-            .session
-            .context()
-            .filter(|usage| usage.model == self.model && usage.messages <= self.messages.len())
-            .cloned();
-        self.context_tokens = self.context_usage.as_ref().map_or(0, |usage| usage.tokens);
+        self.adopt_recorded_context();
         self.latest_turn_result.clear();
         self.unfinished_mode = None;
+        self.pending_tool_results.clear();
         let _ = self.steers.drain();
         self.recover_history()?;
         Ok(())
     }
 
     pub fn scan_tools(&mut self) -> Registry {
-        let mut registry = match &self.kind {
-            ConversationKind::Persistent(state) if self.config.subagents => {
-                Registry::scan_with_subagents_and_background(
-                    &self.config,
-                    &mut self.catalog_cache,
-                    state.subagents.clone(),
-                    &self.model,
-                    state.background.clone(),
-                )
-            }
-            ConversationKind::Persistent(state) => Registry::scan_with_background(
+        let mut registry = match &self.child {
+            Some(child) => Registry::scan_for_child(
                 &self.config,
                 &mut self.catalog_cache,
-                state.background.clone(),
+                child.tool_allowlist.as_deref(),
             ),
-            ConversationKind::Child(state) => Registry::scan_for_child(
+            None if self.config.subagents => Registry::scan_with_subagents_and_background(
                 &self.config,
                 &mut self.catalog_cache,
-                state.tool_allowlist.as_deref(),
+                self.services.subagents.clone(),
+                &self.model,
+                self.services.background.clone(),
+            ),
+            None => Registry::scan_with_background(
+                &self.config,
+                &mut self.catalog_cache,
+                self.services.background.clone(),
             ),
         };
-        if matches!(&self.kind, ConversationKind::Persistent(_)) {
+        if self.child.is_none() {
             if self.questions.is_enabled() {
                 registry.advertise_user_input(self.questions.clone());
             }
             registry.advertise_define_tool(&self.config, &mut self.catalog_cache);
         }
-        if let ConversationKind::Persistent(state) = &self.kind
-            && state.session.active_plan().is_some()
-        {
+        if self.session.active_plan().is_some() {
             registry.advertise_plan_tools();
         }
         registry
@@ -550,13 +548,11 @@ impl Conversation {
     fn restore_session_reasoning(&mut self, reasoning_changed: bool) -> Result<(), Error> {
         self.configured_reasoning_effort
             .clone_from(&self.config.reasoning_effort);
-        let recorded = match &mut self.kind {
-            ConversationKind::Persistent(state) if reasoning_changed => {
-                state.session.clear_reasoning_effort()?;
-                None
-            }
-            ConversationKind::Persistent(state) => state.session.recorded_reasoning(),
-            ConversationKind::Child(_) => None,
+        let recorded = if reasoning_changed {
+            self.session.clear_reasoning_effort()?;
+            None
+        } else {
+            self.session.recorded_reasoning()
         };
         if let Some(effort) = recorded {
             self.config.reasoning_effort = effort;
@@ -568,22 +564,9 @@ impl Conversation {
         &mut self,
         change: ConfigChange,
     ) -> Result<ConfigChangeEffect, Error> {
-        let changes_model = matches!(&change, ConfigChange::Model(_));
-        let changes_reasoning = matches!(&change, ConfigChange::ReasoningEffort { .. });
+        let kinds = ChangedSettings::of(std::slice::from_ref(&change));
         let outcome = self.config.change_global(change)?;
-        self.config = outcome.config;
-        if let ConversationKind::Persistent(state) = &self.kind {
-            state.subagents.set_limit(self.config.max_subagents);
-        }
-        self.restore_session_reasoning(changes_reasoning)?;
-        if changes_model {
-            let model = self
-                .config
-                .model
-                .clone()
-                .ok_or_else(|| Error::Config("no model configured".into()))?;
-            self.adopt_model(model)?;
-        }
+        self.adopt_changed_config(outcome.config, kinds)?;
         Ok(outcome.effect)
     }
 
@@ -591,19 +574,23 @@ impl Conversation {
         &mut self,
         changes: Vec<ConfigChange>,
     ) -> Result<Vec<ConfigChangeEffect>, Error> {
-        let changes_model = changes
-            .iter()
-            .any(|change| matches!(change, ConfigChange::Model(_)));
-        let changes_reasoning = changes
-            .iter()
-            .any(|change| matches!(change, ConfigChange::ReasoningEffort { .. }));
+        let kinds = ChangedSettings::of(&changes);
         let outcome = self.config.change_global_batch(changes)?;
-        self.config = outcome.config;
-        if let ConversationKind::Persistent(state) = &self.kind {
-            state.subagents.set_limit(self.config.max_subagents);
-        }
-        self.restore_session_reasoning(changes_reasoning)?;
-        if changes_model {
+        self.adopt_changed_config(outcome.config, kinds)?;
+        Ok(outcome.effects)
+    }
+
+    /// Applies a saved config: new subagent capacity, the session's
+    /// reasoning choice, and a changed default model.
+    fn adopt_changed_config(
+        &mut self,
+        config: Config,
+        changed: ChangedSettings,
+    ) -> Result<(), Error> {
+        self.config = config;
+        self.services.subagents.set_limit(self.config.max_subagents);
+        self.restore_session_reasoning(changed.reasoning)?;
+        if changed.model {
             let model = self
                 .config
                 .model
@@ -611,7 +598,7 @@ impl Conversation {
                 .ok_or_else(|| Error::Config("no model configured".into()))?;
             self.adopt_model(model)?;
         }
-        Ok(outcome.effects)
+        Ok(())
     }
 
     /// Reverts the last user-initiated turn: restore files, then drop that
@@ -626,77 +613,63 @@ impl Conversation {
             return Ok(report);
         }
         self.recover_history()?;
-        let Some(start) = last_undoable_user_index(&self.messages) else {
+        let messages = self.session.messages();
+        let Some(start) = last_undoable_user_index(messages) else {
             return Ok(UndoReport::default());
         };
-        self.persistent_state().checkpoints.ensure_loaded()?;
+        let checkpoint = match &self.services.checkpoints {
+            Some(checkpoints) => {
+                checkpoints.ensure_loaded()?;
+                checkpoints.last_index()
+            }
+            None => None,
+        };
         let undo = crate::session::PendingUndo {
-            dropped: self.messages.len() - start,
-            clear_goal: self.messages[start..].iter().any(Message::is_goal_start),
-            plan_state: self.persistent_state().session.plan_before_turn().cloned(),
-            checkpoint: self.persistent_state().checkpoints.last_index(),
+            dropped: messages.len() - start,
+            clear_goal: messages[start..].iter().any(Message::is_goal_start),
+            plan_state: self.session.plan_before_turn().cloned(),
+            checkpoint,
             committed: false,
         };
-        self.persistent_mut().session.begin_undo(undo)?;
+        self.session.begin_undo(undo)?;
         Ok(self.recover_undo()?.unwrap_or_default())
-    }
-
-    fn persistent_state(&self) -> &PersistentState {
-        match &self.kind {
-            ConversationKind::Persistent(state) => state,
-            ConversationKind::Child(_) => panic!("operation requires a persistent conversation"),
-        }
     }
 
     /// Every path `write_file`/`edit_file` touched this session, each with its
     /// oldest pre-image. Child conversations track no checkpoints.
     pub fn touched_files(&self) -> Vec<crate::checkpoint::TouchedFile> {
-        match &self.kind {
-            ConversationKind::Persistent(state) => state.checkpoints.touched_files(),
-            ConversationKind::Child(_) => Vec::new(),
-        }
+        self.services
+            .checkpoints
+            .as_ref()
+            .map(Checkpoints::touched_files)
+            .unwrap_or_default()
     }
 
-    fn persistent_mut(&mut self) -> &mut PersistentState {
-        match &mut self.kind {
-            ConversationKind::Persistent(state) => state,
-            ConversationKind::Child(_) => panic!("operation requires a persistent conversation"),
-        }
-    }
-
-    fn child_mut(&mut self) -> &mut ChildState {
-        match &mut self.kind {
-            ConversationKind::Child(state) => state,
-            ConversationKind::Persistent(_) => panic!("operation requires a child conversation"),
-        }
+    fn is_child(&self) -> bool {
+        self.child.is_some()
     }
 
     fn run_limits(&self) -> Option<RunLimits> {
-        match &self.kind {
-            ConversationKind::Child(state) => state.run_limits,
-            ConversationKind::Persistent(_) => None,
-        }
+        self.child.as_ref().and_then(|child| child.run_limits)
     }
 
     fn role_fragment(&self) -> Option<&str> {
-        match &self.kind {
-            ConversationKind::Child(state) => state.role_fragment.as_deref(),
-            ConversationKind::Persistent(_) => None,
-        }
+        self.child
+            .as_ref()
+            .and_then(|child| child.role_fragment.as_deref())
     }
 
-    fn persistent_subagents(&self) -> Option<SubagentManager> {
-        match &self.kind {
-            ConversationKind::Persistent(state) => Some(state.subagents.clone()),
-            ConversationKind::Child(_) => None,
+    fn set_stop_reason(&mut self, reason: Option<RunStopReason>) {
+        if let Some(child) = &mut self.child {
+            child.stop_reason = reason;
         }
     }
 
     fn checkpoint_snapshot(&mut self) -> Option<Result<(), Error>> {
-        match &mut self.kind {
-            ConversationKind::Persistent(state) => Some(state.checkpoints.snapshot()),
-            ConversationKind::Child(_) => None,
-        }
+        self.services
+            .checkpoints
+            .as_mut()
+            .map(Checkpoints::snapshot)
     }
 
     /// Snapshots the work tree for `/undo`. A failure only becomes a warning
@@ -708,60 +681,29 @@ impl Conversation {
     }
 
     fn checkpoint_path(&mut self, path: &std::path::Path) -> Option<Result<(), Error>> {
-        match &mut self.kind {
-            ConversationKind::Persistent(state) => Some(state.checkpoints.remember_path(path)),
-            ConversationKind::Child(_) => None,
-        }
+        self.services
+            .checkpoints
+            .as_mut()
+            .map(|checkpoints| checkpoints.remember_path(path))
     }
+}
 
-    fn persist_message(&mut self, message: &Message) -> Result<(), Error> {
-        match &mut self.kind {
-            ConversationKind::Persistent(state) => state.session.append_message(message),
-            ConversationKind::Child(_) => Ok(()),
-        }
-    }
+/// Which settings a config change touches that the conversation reacts to.
+#[derive(Clone, Copy)]
+struct ChangedSettings {
+    model: bool,
+    reasoning: bool,
+}
 
-    fn persist_compaction(
-        &mut self,
-        summary: &str,
-        start: usize,
-        replaced: usize,
-        provider_data: &[serde_json::Value],
-        provider_data_model: Option<&str>,
-    ) -> Result<(), Error> {
-        match &mut self.kind {
-            ConversationKind::Persistent(state) => {
-                state.session.append_compaction_range_with_provider_data(
-                    summary,
-                    start,
-                    replaced,
-                    provider_data,
-                    provider_data_model,
-                )
-            }
-            ConversationKind::Child(_) => Ok(()),
-        }
-    }
-
-    fn record_usage(&mut self, usage: TokenUsage) -> Result<(), Error> {
-        match &mut self.kind {
-            ConversationKind::Persistent(state) => state.session.append_usage(usage),
-            ConversationKind::Child(state) => {
-                state.usage.record(usage);
-                Ok(())
-            }
-        }
-    }
-
-    fn record_cache_reset(&mut self) -> Result<(), Error> {
-        match &mut self.kind {
-            // Persistent compactions record the reset in their existing
-            // append-only compaction event.
-            ConversationKind::Persistent(_) => Ok(()),
-            ConversationKind::Child(state) => {
-                state.usage.record_cache_reset();
-                Ok(())
-            }
+impl ChangedSettings {
+    fn of(changes: &[ConfigChange]) -> Self {
+        Self {
+            model: changes
+                .iter()
+                .any(|change| matches!(change, ConfigChange::Model(_))),
+            reasoning: changes
+                .iter()
+                .any(|change| matches!(change, ConfigChange::ReasoningEffort { .. })),
         }
     }
 }

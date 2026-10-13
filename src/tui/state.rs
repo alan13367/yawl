@@ -336,6 +336,23 @@ impl ViewState {
     /// Gathers the welcome details only while the transcript is empty, since
     /// they cost session-list and instruction-file reads. Callers that can
     /// empty the transcript without rebuilding the view (`/undo`) call this.
+    /// Replaces the transcript with one rebuilt from `messages`.
+    pub(super) fn rebuild_transcript(&mut self, messages: &[crate::provider::Message]) {
+        self.transcript = super::transcript::Transcript::from_messages(messages);
+        self.render_cache.invalidate();
+    }
+
+    /// Mirrors the agent's goal and plan, which the composer and status bar
+    /// show.
+    pub(super) fn sync_modes(&mut self, agent: &Agent) {
+        self.active_goal = agent.active_goal().map(str::to_string);
+        self.active_plan = agent.active_plan().map(str::to_string);
+        self.plan_draft = matches!(
+            agent.plan_state(),
+            Some(crate::session::PlanState::Draft { .. })
+        );
+    }
+
     pub(super) fn refresh_welcome(&mut self, agent: &Agent) {
         if !self.transcript.is_empty() {
             return;
@@ -507,6 +524,10 @@ impl ViewState {
                 self.transcript.mark_progress();
                 self.activity = "compacting conversation".into();
             }
+            Update::WaitingForSubagents { active } => {
+                let noun = if active == 1 { "subagent" } else { "subagents" };
+                self.activity = format!("waiting for {active} {noun}");
+            }
             Update::Compacted { replaced } => {
                 self.activity.clear();
                 self.transcript
@@ -560,6 +581,9 @@ pub(super) enum Update {
     },
     PlanPhase(Option<crate::agent::PlanPhase>),
     Warning(String),
+    WaitingForSubagents {
+        active: usize,
+    },
     SteerAccepted {
         text: String,
     },
@@ -625,6 +649,7 @@ impl Update {
             },
             TurnEvent::PlanPhase(phase) => Self::PlanPhase(phase),
             TurnEvent::Warning(text) => Self::Warning(text),
+            TurnEvent::WaitingForSubagents { active } => Self::WaitingForSubagents { active },
             TurnEvent::Usage {
                 context_tokens,
                 context_window,

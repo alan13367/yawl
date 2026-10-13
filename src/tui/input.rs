@@ -243,15 +243,6 @@ impl Editor {
         self.buffer.iter().collect()
     }
 
-    pub fn take_text(&mut self) -> Option<String> {
-        let text = self.expand_pastes(&self.text());
-        if text.trim().is_empty() {
-            return None;
-        }
-        self.clear();
-        Some(text)
-    }
-
     pub(super) fn next_image_id(&self) -> usize {
         self.images
             .iter()
@@ -1569,16 +1560,6 @@ mod tests {
     }
 
     #[test]
-    fn transient_text_does_not_enter_submission_history() {
-        let mut editor = Editor::default();
-        editor.paste("16384");
-
-        assert_eq!(editor.take_text().as_deref(), Some("16384"));
-        editor.handle_key(Key::Up);
-        assert_eq!(editor.layout(20).lines, ["> "]);
-    }
-
-    #[test]
     fn long_paste_is_shown_as_a_placeholder_and_expanded_on_submit() {
         let mut editor = Editor::default();
         let pasted = "x".repeat(LONG_PASTE_CHARS + 1);
@@ -1670,14 +1651,5 @@ mod tests {
             editor.expand_submission("@render.rs.bak stays"),
             "@render.rs.bak stays"
         );
-    }
-
-    #[test]
-    fn take_text_expands_a_long_paste() {
-        let mut editor = Editor::default();
-        let pasted = "y".repeat(LONG_PASTE_CHARS + 1);
-        editor.paste("before ");
-        editor.paste(&pasted);
-        assert_eq!(editor.take_text(), Some(format!("before {pasted}")));
     }
 }

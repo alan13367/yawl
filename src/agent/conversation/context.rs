@@ -1,4 +1,4 @@
-use super::{Conversation, ConversationKind};
+use super::Conversation;
 use crate::error::Error;
 use crate::provider::Message;
 use crate::session::ContextUsage;
@@ -23,7 +23,7 @@ impl Conversation {
             Some(usage)
                 if self.context_tokens > 0
                     && usage.model == self.model
-                    && usage.messages <= self.messages.len() =>
+                    && usage.messages <= self.messages().len() =>
             {
                 (
                     usage
@@ -31,16 +31,18 @@ impl Conversation {
                         .saturating_sub(usage.overhead.saturating_sub(overhead))
                         .saturating_add(overhead.saturating_sub(usage.overhead)),
                     usage.messages
-                        + usize::from(self.messages.get(usage.messages).is_some_and(|message| {
+                        + usize::from(self.messages().get(usage.messages).is_some_and(|message| {
                             message.role == crate::provider::Role::Assistant
                         })),
                 )
             }
             _ => (overhead, 0),
         };
-        self.messages[start..].iter().fold(base, |tokens, message| {
-            tokens.saturating_add(message_tokens(message))
-        })
+        self.messages()[start..]
+            .iter()
+            .fold(base, |tokens, message| {
+                tokens.saturating_add(message_tokens(message))
+            })
     }
 
     pub(super) fn record_context(&mut self, tokens: u64, overhead: u64) -> Result<(), Error> {
@@ -48,13 +50,11 @@ impl Conversation {
             tokens,
             // Anchor at the request history. A failed assistant append must
             // not let the next user message masquerade as measured output.
-            messages: self.messages.len(),
+            messages: self.messages().len(),
             model: self.model.clone(),
             overhead,
         };
-        if let ConversationKind::Persistent(state) = &mut self.kind {
-            state.session.record_context(context.clone())?;
-        }
+        self.session.record_context(context.clone())?;
         self.context_usage = Some(context);
         self.context_tokens = tokens;
         Ok(())

@@ -15,7 +15,7 @@ use crate::subagent::SubagentManager;
 use crate::tools::Registry;
 
 pub use conversation::UndoReport;
-pub(crate) use conversation::{Conversation, RunLimits, SteerInbox};
+pub(crate) use conversation::{Conversation, RunLimits, SteerInbox, TurnRequest};
 pub use events::{PlanPhase, TurnEvent};
 
 /// A persistent user-facing conversation.
@@ -24,13 +24,12 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(config: Config, model: String, session: Session, messages: Vec<Message>) -> Self {
+    pub fn new(config: Config, model: String, session: Session) -> Self {
         Self {
             conversation: Conversation::persistent(
                 config,
                 model,
                 session,
-                messages,
                 crate::config::working_dir(),
             ),
         }
@@ -54,6 +53,11 @@ impl Agent {
 
     pub fn messages(&self) -> &[Message] {
         self.conversation.messages()
+    }
+
+    /// A note about history the session log could not restore.
+    pub(crate) fn session_warning(&self) -> Option<String> {
+        self.conversation.session_warning()
     }
 
     pub fn context_tokens(&self) -> u64 {
@@ -195,93 +199,20 @@ impl Agent {
         self.conversation.change_global_config_batch(changes)
     }
 
-    pub fn run_turn(
+    /// Runs one turn. Callers clear the cancellation token when a new job
+    /// starts; an earlier cancel is kept so an interrupt is never lost.
+    pub(crate) fn run(
         &mut self,
-        user_input: Option<String>,
+        request: TurnRequest,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
-        self.conversation.run_turn(user_input, sink)
-    }
-
-    /// Runs a turn with text and optional inline images.
-    pub fn run_turn_input(
-        &mut self,
-        user_input: Option<TurnInput>,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.conversation.run_turn_input(user_input, sink)
-    }
-
-    pub(crate) fn run_turn_input_preserving_cancellation(
-        &mut self,
-        user_input: Option<TurnInput>,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.conversation
-            .run_turn_input_preserving_cancellation(user_input, sink)
-    }
-
-    pub(crate) fn run_init_preserving_cancellation(
-        &mut self,
-        input: TurnInput,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.conversation
-            .run_init_preserving_cancellation(input, sink)
-    }
-
-    pub(crate) fn run_goal_preserving_cancellation(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.conversation.run_goal_preserving_cancellation(sink)
-    }
-
-    pub(crate) fn run_plan_preserving_cancellation(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.conversation.run_plan_preserving_cancellation(sink)
-    }
-
-    pub(crate) fn run_plan_follow_up_preserving_cancellation(
-        &mut self,
-        input: TurnInput,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.conversation
-            .run_plan_follow_up_preserving_cancellation(input, sink)
-    }
-
-    pub(crate) fn run_plan_revision_preserving_cancellation(
-        &mut self,
-        input: TurnInput,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.conversation
-            .run_plan_revision_preserving_cancellation(input, sink)
-    }
-
-    pub(crate) fn run_plan_implementation_preserving_cancellation(
-        &mut self,
-        input: Option<TurnInput>,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.conversation
-            .run_plan_implementation_preserving_cancellation(input, sink)
+        self.conversation.run(request, sink)
     }
 
     /// Whether the last turn stopped early through an error or interrupt
     /// and can be continued from the saved history.
     pub(crate) fn can_continue(&self) -> bool {
         self.conversation.can_continue()
-    }
-
-    pub(crate) fn run_continue_preserving_cancellation(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<bool, Error> {
-        self.conversation.run_continue_preserving_cancellation(sink)
     }
 
     pub(crate) fn has_deferred_subagent_results(&self) -> bool {
@@ -307,15 +238,9 @@ impl Agent {
             .pump_subagent_results(sink, wait_slice_secs)
     }
 
-    pub fn compact_now(&mut self, sink: &mut dyn FnMut(TurnEvent<'_>)) -> Result<(), Error> {
-        self.conversation.compact_now(sink)
-    }
-
-    pub(crate) fn compact_now_preserving_cancellation(
-        &mut self,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<(), Error> {
-        self.conversation.compact_now_preserving_cancellation(sink)
+    /// Summarizes older history (`/compact`).
+    pub(crate) fn compact(&mut self, sink: &mut dyn FnMut(TurnEvent<'_>)) -> Result<(), Error> {
+        self.conversation.compact(sink)
     }
 }
 

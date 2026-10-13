@@ -1,6 +1,6 @@
 //! Planning-mode parsing, continuation prompts, and state helpers.
 
-use super::{Conversation, ConversationKind, last_undoable_user_index};
+use super::{Conversation, last_undoable_user_index};
 use crate::agent::events::TurnEvent;
 use crate::error::Error;
 use crate::provider::{Message, MessageControl, Role, TokenUsage, ToolCall};
@@ -20,13 +20,10 @@ pub(super) const PLAN_MODE_ENDED: &str =
 
 impl Conversation {
     pub(super) fn plan_file_reference(&self) -> Result<Option<String>, Error> {
-        match &self.kind {
-            ConversationKind::Persistent(state) => Ok(state
-                .session
-                .ensure_plan_file()?
-                .map(|path| path.to_string_lossy().into_owned())),
-            ConversationKind::Child(_) => Ok(None),
-        }
+        Ok(self
+            .session
+            .ensure_plan_file()?
+            .map(|path| path.to_string_lossy().into_owned()))
     }
 
     /// Replaces the planning conversation, from the prompt that started the
@@ -40,32 +37,28 @@ impl Conversation {
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<(), Error> {
         let Some(PlanState::Ready { plan, revision }) = self.plan_state() else {
-            return Err(Error::Config("no completed plan is active".into()));
+            return Err(Error::Invalid("no completed plan is active".into()));
         };
-        if self.persistent_state().session.plan_has_handoff(*revision) {
+        if self.session.plan_has_handoff(*revision) {
             return Ok(());
         }
         let revision = *revision;
         let plan = plan.clone();
         let path = self
             .plan_file_reference()?
-            .ok_or_else(|| Error::Config("no saved plan file".into()))?;
-        let end = last_undoable_user_index(&self.messages)
+            .ok_or_else(|| Error::Protocol("no saved plan file".into()))?;
+        let messages = self.messages();
+        let end = last_undoable_user_index(messages)
             .ok_or_else(|| Error::Protocol("plan implementation has no user prompt".into()))?;
         // Sessions from before plan-start markers, or whose start was later
         // compacted away, hand off everything before the prompt.
-        let start = self.messages[..end]
+        let start = messages[..end]
             .iter()
             .rposition(Message::is_plan_start)
             .unwrap_or(0);
-        let handoff = handoff_text(&path, &plan, &self.messages[start..end]);
-        self.persistent_mut()
-            .session
+        let handoff = handoff_text(&path, &plan, &messages[start..end]);
+        self.session
             .append_plan_handoff(revision, &handoff, start..end)?;
-        drop(self.messages.splice(
-            start..end,
-            std::iter::once(crate::compaction::plan_handoff_message(&handoff)),
-        ));
         self.context_tokens = 0;
         self.context_usage = None;
         sink(TurnEvent::Usage {
@@ -86,7 +79,7 @@ impl Conversation {
     /// already cached by the server stays valid.
     pub(super) fn sync_plan_phase_note(&mut self, note: Option<String>) -> Result<(), Error> {
         let latest = self
-            .messages
+            .messages()
             .iter()
             .rev()
             .find(|message| message.control == Some(MessageControl::PlanPhase))
@@ -146,7 +139,7 @@ fn planning_record(messages: &[Message]) -> Vec<String> {
             Role::User
                 if !message.is_hidden_control()
                     && message.subagent_results.is_empty()
-                    && !crate::compaction::is_summary_message(message)
+                    && !message.is_summary()
                     && !message.is_plan_handoff() =>
             {
                 let prompt = crate::error::truncate(message.content.trim(), HANDOFF_PROMPT_CHARS);
@@ -246,9 +239,8 @@ pub(super) enum ImplementationStatus {
 }
 
 pub(super) fn parse_implemented(arguments: &str) -> Result<(String, ImplementationStatus), String> {
-    let result = parse_non_empty(arguments, "result", PLAN_IMPLEMENTED_TOOL_NAME)?;
-    let value: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| format!("invalid tool arguments json: {error}"))?;
+    let value = parse_arguments(arguments)?;
+    let result = non_empty_string(&value, "result", PLAN_IMPLEMENTED_TOOL_NAME)?;
     let status = match value.get("status").and_then(serde_json::Value::as_str) {
         None | Some("completed") => ImplementationStatus::Completed,
         Some("blocked") => ImplementationStatus::Blocked,
@@ -260,8 +252,7 @@ pub(super) fn parse_implemented(arguments: &str) -> Result<(String, Implementati
 }
 
 pub(super) fn parse_action(arguments: &str) -> Result<FollowUpAction, String> {
-    let value: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| format!("invalid tool arguments json: {error}"))?;
+    let value = parse_arguments(arguments)?;
     match value.get("action").and_then(serde_json::Value::as_str) {
         Some("revise") => Ok(FollowUpAction::Revise),
         Some("implement") => Ok(FollowUpAction::Implement),
@@ -286,18 +277,23 @@ pub(super) fn is_user_input(call: &ToolCall) -> bool {
     call.name == USER_INPUT_TOOL_NAME
 }
 
-fn parse_non_empty(arguments: &str, key: &str, tool: &str) -> Result<String, String> {
-    let value: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| format!("invalid tool arguments json: {error}"))?;
-    let Some(result) = value
+/// The trimmed, non-empty string `key` of a finishing tool's JSON arguments.
+pub(super) fn parse_non_empty(arguments: &str, key: &str, tool: &str) -> Result<String, String> {
+    non_empty_string(&parse_arguments(arguments)?, key, tool)
+}
+
+fn parse_arguments(arguments: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(arguments).map_err(|error| format!("invalid tool arguments json: {error}"))
+}
+
+fn non_empty_string(value: &serde_json::Value, key: &str, tool: &str) -> Result<String, String> {
+    value
         .get(key)
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|result| !result.is_empty())
-    else {
-        return Err(format!("{tool} requires a non-empty string '{key}'"));
-    };
-    Ok(result.to_string())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{tool} requires a non-empty string '{key}'"))
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use yawl::config::Config;
+use crate::config::Config;
 
 pub(super) fn resolve(
     config: &mut Config,
@@ -14,41 +14,43 @@ pub(super) fn resolve(
         config.set_project_skills_trusted(true);
         return apply_trusted_project_config(config);
     }
-    let root = yawl::trust::project_root(&yawl::config::working_dir());
-    match yawl::trust::load(&config.home_dir, &root)? {
-        yawl::trust::Decision::Trusted => {
+    let root = crate::trust::project_root(&crate::config::working_dir());
+    match crate::trust::load(&config.home_dir, &root)? {
+        crate::trust::Decision::Trusted => {
             config.set_project_skills_trusted(true);
             apply_trusted_project_config(config)
         }
-        yawl::trust::Decision::Denied => {
+        crate::trust::Decision::Denied => {
             config.set_project_skills_trusted(false);
             Ok(())
         }
-        yawl::trust::Decision::Unknown
-            if !yawl::skills::has_project_sources(config)
-                && !yawl::tools::has_project_tools(config)
+        crate::trust::Decision::Unknown
+            if !crate::skills::has_project_sources(config)
+                && !crate::tools::has_project_tools(config)
                 && !config.project_config_restricted() =>
         {
             config.set_project_skills_trusted(false);
             Ok(())
         }
-        yawl::trust::Decision::Unknown if stdin_is_terminal => match prompt_project_trust(&root)? {
-            ProjectTrustChoice::Permanent => {
-                yawl::trust::store(&config.home_dir, &root, true)?;
-                config.set_project_skills_trusted(true);
-                apply_trusted_project_config(config)
+        crate::trust::Decision::Unknown if stdin_is_terminal => {
+            match prompt_project_trust(&root)? {
+                ProjectTrustChoice::Permanent => {
+                    crate::trust::store(&config.home_dir, &root, true)?;
+                    config.set_project_skills_trusted(true);
+                    apply_trusted_project_config(config)
+                }
+                ProjectTrustChoice::Session => {
+                    config.set_project_skills_trusted(true);
+                    apply_trusted_project_config(config)
+                }
+                ProjectTrustChoice::Deny => {
+                    crate::trust::store(&config.home_dir, &root, false)?;
+                    config.set_project_skills_trusted(false);
+                    Ok(())
+                }
             }
-            ProjectTrustChoice::Session => {
-                config.set_project_skills_trusted(true);
-                apply_trusted_project_config(config)
-            }
-            ProjectTrustChoice::Deny => {
-                yawl::trust::store(&config.home_dir, &root, false)?;
-                config.set_project_skills_trusted(false);
-                Ok(())
-            }
-        },
-        yawl::trust::Decision::Unknown => {
+        }
+        crate::trust::Decision::Unknown => {
             config.set_project_skills_trusted(false);
             eprintln!(
                 "warning: project-controlled settings under {} are not trusted; project skills, \

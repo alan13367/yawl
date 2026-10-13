@@ -1,50 +1,19 @@
 //! Auto-compaction: when the context is ~85% full (estimated from
 //! provider-reported usage), the same model summarizes older messages while
-//! retaining up to ~10 recent messages within an estimated token budget. The latest undoable user prompt is also
-//! retained so `/undo` keeps its checkpoint anchor. The session JSONL keeps
-//! the full original history; compaction is recorded as an event.
+//! retaining up to ~10 recent messages within an estimated token budget. The
+//! latest undoable user prompt is also retained so `/undo` keeps its
+//! checkpoint anchor. The session JSONL keeps the full original history;
+//! compaction is recorded as an event that the session applies.
 
 use std::fmt::Write as _;
 use std::ops::Range;
 
 use crate::error::Error;
-use crate::provider::{
-    Message, MessageControl, Provider, Request, Role, StreamNotice, TokenUsage, stream_turn,
-};
+use crate::provider::{Message, Provider, Request, Role, StreamNotice, TokenUsage, stream_turn};
 
 /// Maximum ordinary tail length before applying the estimated token budget.
 pub const KEEP_TAIL: usize = 10;
 const TAIL_TOKEN_BUDGET: u64 = 8_000;
-
-const SUMMARY_MARKER: &str = "[conversation summary]";
-
-pub fn summary_message(summary: &str) -> Message {
-    summary_message_with_provider_data(summary, Vec::new(), None)
-}
-
-pub(crate) fn summary_message_with_provider_data(
-    summary: &str,
-    provider_data: Vec<serde_json::Value>,
-    provider_data_model: Option<String>,
-) -> Message {
-    let mut message = Message::user(format!(
-        "{SUMMARY_MARKER}\nEarlier conversation, summarized to free context:\n\n{summary}"
-    ));
-    message.provider_data = provider_data;
-    message.provider_data_model = provider_data_model;
-    message
-}
-
-/// The implementation handoff that replaces a planning conversation.
-/// Providers see ordinary user content; it is not a summary, so the UI
-/// renders it as a handoff and `/undo` never treats it as a prompt.
-pub(crate) fn plan_handoff_message(handoff: &str) -> Message {
-    Message::user(handoff).with_control(MessageControl::PlanHandoff)
-}
-
-pub(crate) fn is_summary_message(message: &Message) -> bool {
-    message.role == Role::User && message.content.starts_with(SUMMARY_MARKER)
-}
 
 /// True once the last known context usage crosses the threshold.
 pub fn should_compact(context_tokens: u64, context_window: u64, threshold: f64) -> bool {
@@ -164,25 +133,9 @@ constraints, decisions made and why, exact file paths, code identifiers, command
 and their key outcomes, unresolved problems, and what was about to happen next. Be dense and \
 factual; use bullet points; do not add commentary.";
 
-/// Runs one compaction: asks `provider`/`model` for a summary of
-/// `messages[..split]` and splices it in as the new head. Returns
-/// `(summary, replaced_count)` so the caller can log the session event.
-pub fn compact(
-    provider: &dyn Provider,
-    model: &str,
-    max_tokens: u32,
-    messages: &mut Vec<Message>,
-    sink: &mut dyn FnMut(StreamNotice<'_>),
-) -> Result<(String, usize), Error> {
-    let (summary, range, _) = summarize(provider, model, max_tokens, messages, None, sink)?;
-    debug_assert_eq!(range.start, 0);
-    let split = range.end;
-    apply_summary(messages, &summary, split);
-    Ok((summary, split))
-}
-
-/// Produces a compaction summary without changing the conversation. The
-/// caller can persist the summary before applying it in memory.
+/// Produces a compaction summary of the range [`compaction_range`] picks,
+/// without changing the conversation. The caller records it as a session
+/// event, which applies it.
 pub(crate) fn summarize(
     provider: &dyn Provider,
     model: &str,
@@ -193,7 +146,7 @@ pub(crate) fn summarize(
 ) -> Result<(String, Range<usize>, TokenUsage), Error> {
     let range = compaction_range(messages, protected);
     if range.is_empty() {
-        return Err(Error::Config(
+        return Err(Error::Invalid(
             "nothing to compact: conversation is too short".into(),
         ));
     }
@@ -219,31 +172,6 @@ pub(crate) fn summarize(
     }
     let summary = out.text.trim().to_string();
     Ok((summary, range, out.usage))
-}
-
-pub(crate) fn apply_summary(messages: &mut Vec<Message>, summary: &str, split: usize) {
-    apply_summary_range(messages, summary, 0..split);
-}
-
-pub(crate) fn apply_summary_range(messages: &mut Vec<Message>, summary: &str, range: Range<usize>) {
-    apply_summary_range_with_provider_data(messages, summary, range, Vec::new(), None);
-}
-
-pub(crate) fn apply_summary_range_with_provider_data(
-    messages: &mut Vec<Message>,
-    summary: &str,
-    range: Range<usize>,
-    provider_data: Vec<serde_json::Value>,
-    provider_data_model: Option<String>,
-) {
-    drop(messages.splice(
-        range,
-        std::iter::once(summary_message_with_provider_data(
-            summary,
-            provider_data,
-            provider_data_model,
-        )),
-    ));
 }
 
 #[cfg(test)]
@@ -361,20 +289,6 @@ mod tests {
     }
 
     #[test]
-    fn applying_summary_reuses_the_tail_unchanged() {
-        let mut messages = (0..12)
-            .map(|index| Message::user(format!("message {index}")))
-            .collect::<Vec<_>>();
-
-        apply_summary(&mut messages, "earlier work", 2);
-
-        assert_eq!(messages.len(), 11);
-        assert!(messages[0].content.contains("earlier work"));
-        assert_eq!(messages[1].content, "message 2");
-        assert_eq!(messages[10].content, "message 11");
-    }
-
-    #[test]
     fn compaction_preserves_a_protected_user_prompt() {
         let messages = (0..24)
             .map(|index| Message::user(format!("message {index}")))
@@ -387,35 +301,16 @@ mod tests {
     }
 
     #[test]
-    fn applying_a_middle_summary_keeps_the_undo_anchor() {
-        let mut messages = (0..24)
+    fn summarize_leaves_the_tail_and_sends_no_cache_hints() -> Result<(), Error> {
+        let messages = (0..12)
             .map(|index| Message::user(format!("message {index}")))
             .collect::<Vec<_>>();
 
-        apply_summary_range(&mut messages, "goal progress", 4..14);
-
-        assert_eq!(messages[3].content, "message 3");
-        assert!(messages[4].content.contains("goal progress"));
-        assert_eq!(messages[5].content, "message 14");
-        assert_eq!(
-            messages.last().map(|message| message.content.as_str()),
-            Some("message 23")
-        );
-    }
-
-    #[test]
-    fn compact_keeps_its_public_mutation_contract() -> Result<(), Error> {
-        let mut messages = (0..12)
-            .map(|index| Message::user(format!("message {index}")))
-            .collect::<Vec<_>>();
-
-        let (summary, replaced) =
-            compact(&SummaryProvider, "test", 100, &mut messages, &mut |_| {})?;
+        let (summary, range, _) =
+            summarize(&SummaryProvider, "test", 100, &messages, None, &mut |_| {})?;
 
         assert_eq!(summary, "earlier work");
-        assert_eq!(replaced, 2);
-        assert!(messages[0].content.contains("earlier work"));
-        assert_eq!(messages[1].content, "message 2");
+        assert_eq!(range, 0..2);
         Ok(())
     }
 }

@@ -1276,7 +1276,7 @@ fn reconstructed_deferred_follow_up_replaces_frozen_cache_entries() {
         }]),
         crate::provider::Message::assistant("fresh follow-up".into(), Vec::new()),
     ];
-    rebuild_transcript_after_deferred_follow_up(&mut state, &rebuilt_messages);
+    state.rebuild_transcript(&rebuilt_messages);
 
     let rendered = state
         .render_cache

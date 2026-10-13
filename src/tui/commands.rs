@@ -11,6 +11,7 @@ mod modes;
 mod queue;
 mod sessions;
 mod settings;
+mod table;
 
 pub(super) use copy::{copy_all_from_transcript, copy_all_messages, copy_last_reply};
 #[cfg(test)]
@@ -26,14 +27,14 @@ pub(super) use modes::{
 pub(super) use queue::open_queue_picker;
 pub(super) use queue::{handle_queue_picker_action, promote_queued, unqueue};
 pub(super) use sessions::{
-    delete_session, is_new_session_command, load_session, new_session, notice_undo,
-    open_resume_picker, resume,
+    delete_session, load_session, new_session, notice_undo, open_resume_picker, resume,
 };
 pub(super) use settings::{
     apply_config_change, notice_config_effect, reasoning, refresh_model_selection, settings,
     show_settings, show_usage, sync_display_settings,
 };
 use settings::{apply_reasoning_effort, interface_location, open_settings_location};
+pub(super) use table::{Command, busy_command, help, menu as command_menu, parse as parse_command};
 
 use crate::agent::Agent;
 use crate::config::ConfigChange;
@@ -45,50 +46,6 @@ use super::picker::{
     status_bar_editor_picker, web_search_provider_picker,
 };
 use super::state::ViewState;
-
-pub(super) const HELP: &str = "\
-Commands
-
-| Command | Description |
-| --- | --- |
-| `/new`, `/clear` | Start a fresh session in the current directory |
-| `/resume [ID]` | Open session picker or resume directly |
-| `/undo` | Restore files and drop the last turn |
-| `/continue` | Resume a turn that failed or was interrupted |
-| `/diff` | Show files changed this session |
-| `/init` | Create or update project agent guidance |
-| `/quit` | Leave Yawl |
-| --- | --- |
-| `/model [MODEL]` | Open model picker or switch directly |
-| `/reasoning [LVL]` | Show supported reasoning levels or set one |
-| `/settings [KEY]` | Open settings picker or change directly |
-| `/connect` | Configure a model provider interactively |
-| --- | --- |
-| `/usage` | Show token and prompt-cache usage |
-| `/compact` | Summarize older messages now |
-| `/copy` | Copy the last assistant reply |
-| `/copy-all` | Copy conversation without reasoning |
-| `/tools` | List builtin tools and your custom tools |
-| `/skills` | List discovered skills (run `/skill:NAME`) |
-| --- | --- |
-| `/goal [TEXT]` | Start, resume, cancel, or show goal |
-| `/plan [TEXT]` | Start, revise, implement, resume, cancel, or show plan |
-| `/unqueue [N]` | Cancel or manage queued messages |
-| `/subagents` | Open the subagent dashboard |
-| `/git` | Open the git dashboard (offers repo setup outside a repo) |
-| `/ps` | Open the background process dashboard |
-| `/remote [off]` | Control this session from a device in your tailnet |
-| --- | --- |
-| `/hotkeys` | Show keyboard shortcuts grid |
-| `/help` | Show this command reference |
-
-Input
-
-- `Enter` submits when idle, or steers while a response runs
-- `Enter` on an empty prompt continues a turn that just failed
-- `Tab` completes in menus, or queues a message while busy
-- Run `/hotkeys` for all editing, transcript, and dashboard shortcuts
-";
 
 pub(super) const HOTKEYS: &str = "\
 Keyboard shortcuts

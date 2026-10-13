@@ -176,7 +176,7 @@ pub(super) struct TextSelection {
 impl Terminal {
     pub(super) fn enter() -> Result<Self, Error> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            return Err(Error::Config("the terminal UI needs a TTY".into()));
+            return Err(Error::Invalid("the terminal UI needs a TTY".into()));
         }
         let raw_mode = RawMode::enter()?;
 

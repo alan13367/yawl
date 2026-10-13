@@ -3,8 +3,10 @@
 //! layout under `~/.yawl/sessions/`; this module stays layout-agnostic.
 //!
 //! The file keeps the full original history forever; compaction is recorded
-//! as an event and applied at replay time, so the in-memory conversation is
-//! rebuilt by replaying the log.
+//! as an event and applied at replay time. A session owns the history it
+//! records: every change is an event, written first and then applied by the
+//! one reducer in [`state`], so replaying the log rebuilds exactly the live
+//! state. Memory-only sessions apply the same events without a file.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -21,7 +23,11 @@ use crate::provider::{Message, Role, TokenUsage, UsageSummary};
 mod index;
 mod plans;
 mod recovery;
-pub(crate) use recovery::{PendingUndo, missing_tool_results};
+mod state;
+pub(crate) use recovery::PendingUndo;
+#[cfg(test)]
+pub(crate) use recovery::missing_tool_results;
+use state::SessionState;
 
 /// Planning state retained with a session, outside the working tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +99,8 @@ enum SessionEvent {
     },
     /// `replaced` messages beginning at `start` (at that point in replay)
     /// were folded into `summary`. Older logs omit `start` and default to the
-    /// original prefix-compaction behavior.
+    /// original prefix-compaction behavior. With `plan_revision`, the
+    /// summary is the implementation handoff for that plan revision.
     Compaction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan_revision: Option<usize>,
@@ -167,49 +174,32 @@ pub(crate) struct ContextUsage {
     pub overhead: u64,
 }
 
+/// The log file behind a persistent session.
 #[derive(Debug)]
-pub struct Session {
-    pub id: String,
+struct Storage {
     file: File,
+    /// Canonical directory holding `<id>.jsonl` and `<id>/plans/`.
     directory: PathBuf,
-    plan_revision_count: usize,
-    plan_handoffs: std::collections::HashSet<usize>,
+    /// Length to truncate back to when an earlier append failed partway.
     rollback_to: Option<u64>,
-    #[cfg(test)]
-    fail_after_appends: Option<usize>,
-    /// Last model used in this log: the header model unless a later switch
-    /// event exists.
-    model: String,
-    /// `None` when the session has no reasoning choice of its own.
-    /// `Some(None)` is an explicit provider default. `Some(Some(level))` is
-    /// an explicit effort.
-    reasoning_effort: Option<Option<String>>,
-    active_goal: Option<String>,
-    active_plan: Option<PlanState>,
-    plan_before_turn: Option<PlanState>,
-    usage: UsageSummary,
-    pending_undo: Option<Box<PendingUndo>>,
-    context: Option<ContextUsage>,
 }
 
-struct ReplayedSession {
-    plan_revision_count: usize,
-    plan_handoffs: std::collections::HashSet<usize>,
-    messages: Vec<Message>,
-    model: String,
-    reasoning_effort: Option<Option<String>>,
-    active_goal: Option<String>,
-    active_plan: Option<PlanState>,
-    plan_before_turn: Option<PlanState>,
-    usage: UsageSummary,
-    pending_undo: Option<Box<PendingUndo>>,
-    context: Option<ContextUsage>,
+#[derive(Debug)]
+pub(crate) struct Session {
+    pub(crate) id: String,
+    /// `None` for memory-only sessions, such as subagent conversations.
+    storage: Option<Storage>,
+    state: SessionState,
+    /// Log lines replay could not decode and skipped.
+    skipped_lines: usize,
+    #[cfg(test)]
+    fail_after_appends: Option<usize>,
 }
 
 impl Session {
     /// Creates a new session with a timestamp-derived id, recording the
     /// working directory and model in the header event.
-    pub fn create(dir: &Path, cwd: &Path, model: &str) -> Result<Session, Error> {
+    pub(crate) fn create(dir: &Path, cwd: &Path, model: &str) -> Result<Session, Error> {
         fs::create_dir_all(dir)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -234,26 +224,20 @@ impl Session {
                 }
             })
             .transpose()?
-            .ok_or_else(|| Error::Config("could not allocate a session id".into()))?;
+            .ok_or_else(|| std::io::Error::other("could not allocate a session id"))?;
         let mut session = Session {
-            directory: fs::canonicalize(dir)?,
-            plan_revision_count: 0,
-            plan_handoffs: std::collections::HashSet::new(),
             id: id.clone(),
-            file,
-            rollback_to: None,
+            storage: Some(Storage {
+                file,
+                directory: fs::canonicalize(dir)?,
+                rollback_to: None,
+            }),
+            state: SessionState::default(),
+            skipped_lines: 0,
             #[cfg(test)]
             fail_after_appends: None,
-            model: model.to_string(),
-            reasoning_effort: None,
-            active_goal: None,
-            active_plan: None,
-            plan_before_turn: None,
-            usage: UsageSummary::default(),
-            pending_undo: None,
-            context: None,
         };
-        session.append(&SessionEvent::Meta {
+        session.record(SessionEvent::Meta {
             id,
             created_unix: now.as_secs(),
             cwd: cwd.to_string_lossy().into_owned(),
@@ -262,14 +246,33 @@ impl Session {
         Ok(session)
     }
 
-    /// Opens an existing session by id and replays its messages.
-    pub fn open(dir: &Path, id: &str) -> Result<(Session, Vec<Message>), Error> {
+    /// A session that applies events in memory and writes nothing.
+    pub(crate) fn memory(id: String, model: &str) -> Session {
+        Session {
+            id,
+            storage: None,
+            state: SessionState {
+                model: model.to_string(),
+                ..SessionState::default()
+            },
+            skipped_lines: 0,
+            #[cfg(test)]
+            fail_after_appends: None,
+        }
+    }
+
+    /// Opens an existing session by id and replays its history.
+    pub(crate) fn open(dir: &Path, id: &str) -> Result<Session, Error> {
         validate_id(id)?;
         let path = dir.join(format!("{id}.jsonl"));
-        let mut replayed = replay(&path)?;
+        let replayed = replay(&path)?;
         let mut file = OpenOptions::new().read(true).append(true).open(&path)?;
-        // Separate an unterminated crash tail from subsequent JSONL events.
-        if file.metadata()?.len() > 0 {
+        if let Some(start) = replayed.torn_tail {
+            // An append that never completed; it was never applied either.
+            file.set_len(start)?;
+        } else if file.metadata()?.len() > 0 {
+            // Separate a complete but unterminated final event from
+            // subsequent JSONL events.
             file.seek(SeekFrom::End(-1))?;
             let mut last = [0];
             file.read_exact(&mut last)?;
@@ -278,31 +281,25 @@ impl Session {
             }
         }
         let mut session = Session {
-            directory: fs::canonicalize(dir)?,
-            plan_revision_count: replayed.plan_revision_count,
-            plan_handoffs: replayed.plan_handoffs,
             id: id.to_string(),
-            file,
-            rollback_to: None,
+            storage: Some(Storage {
+                file,
+                directory: fs::canonicalize(dir)?,
+                rollback_to: None,
+            }),
+            state: replayed.state,
+            skipped_lines: replayed.skipped_lines,
             #[cfg(test)]
             fail_after_appends: None,
-            model: replayed.model,
-            reasoning_effort: replayed.reasoning_effort,
-            active_goal: replayed.active_goal,
-            active_plan: replayed.active_plan,
-            plan_before_turn: replayed.plan_before_turn,
-            usage: replayed.usage,
-            pending_undo: replayed.pending_undo,
-            context: replayed.context,
         };
-        if session.pending_undo.is_none() {
-            session.repair_tool_results(&mut replayed.messages)?;
+        if session.state.pending_undo.is_none() {
+            session.repair_tool_results()?;
         }
-        Ok((session, replayed.messages))
+        Ok(session)
     }
 
     /// Opens the most recently modified session, if any.
-    pub fn open_latest(dir: &Path) -> Result<Option<(Session, Vec<Message>)>, Error> {
+    pub(crate) fn open_latest(dir: &Path) -> Result<Option<Session>, Error> {
         match list(dir)?.first() {
             Some(info) => Ok(Some(Session::open(dir, &info.id)?)),
             None => Ok(None),
@@ -312,14 +309,14 @@ impl Session {
     /// Opens the unique session matching `id` across project directories.
     /// Missing files are skipped. Replay, permission, and other I/O errors
     /// are returned, and duplicate ids are rejected as ambiguous.
-    pub fn open_searching(dirs: &[PathBuf], id: &str) -> Result<(Session, Vec<Message>), Error> {
+    pub(crate) fn open_searching(dirs: &[PathBuf], id: &str) -> Result<Session, Error> {
         validate_id(id)?;
-        let mut found: Option<(PathBuf, (Session, Vec<Message>))> = None;
+        let mut found: Option<(PathBuf, Session)> = None;
         for dir in dirs {
             match Session::open(dir, id) {
                 Ok(session) => {
                     if let Some((found_dir, _)) = &found {
-                        return Err(Error::Config(format!(
+                        return Err(Error::Invalid(format!(
                             "session '{id}' is ambiguous; found in '{}' and '{}'",
                             found_dir.display(),
                             dir.display()
@@ -333,34 +330,62 @@ impl Session {
         }
         found
             .map(|(_, session)| session)
-            .ok_or_else(|| Error::Config(format!("session '{id}' not found")))
+            .ok_or_else(|| Error::Invalid(format!("session '{id}' not found")))
+    }
+
+    /// The conversation history this session has recorded.
+    pub(crate) fn messages(&self) -> &[Message] {
+        &self.state.messages
+    }
+
+    /// Direct history access for tests that stage conversations the log
+    /// never recorded.
+    #[cfg(test)]
+    pub(crate) fn messages_mut(&mut self) -> &mut Vec<Message> {
+        &mut self.state.messages
+    }
+
+    /// A note for the user when replay skipped log lines it could not read.
+    pub(crate) fn replay_warning(&self) -> Option<String> {
+        (self.skipped_lines > 0).then(|| {
+            let (noun, verb) = if self.skipped_lines == 1 {
+                ("entry", "was")
+            } else {
+                ("entries", "were")
+            };
+            format!(
+                "Session {} has {} unreadable log {noun} that {verb} skipped; \
+                 the restored history may be incomplete.",
+                self.id, self.skipped_lines
+            )
+        })
     }
 
     /// The model recorded at creation, replaced by the most recent switch.
-    pub fn model(&self) -> &str {
-        &self.model
+    #[cfg(test)]
+    pub(crate) fn model(&self) -> &str {
+        &self.state.model
     }
 
     /// The model to continue a resumed session with: the last one it used,
     /// unless its provider is no longer configured, in which case `fallback`
     /// stays in effect.
-    pub fn resumed_model(&self, config: &Config, fallback: &str) -> String {
-        if self.model.is_empty() || !crate::model::is_resolvable(config, &self.model) {
+    pub(crate) fn resumed_model(&self, config: &Config, fallback: &str) -> String {
+        let model = &self.state.model;
+        if model.is_empty() || !crate::model::is_resolvable(config, model) {
             return fallback.to_string();
         }
-        self.model.clone()
+        model.clone()
     }
 
     /// Records a mid-session model change so later resumes adopt it.
-    pub fn append_model_switch(&mut self, model: &str) -> Result<(), Error> {
-        if model == self.model {
+    pub(crate) fn append_model_switch(&mut self, model: &str) -> Result<(), Error> {
+        if model == self.state.model {
             return Ok(());
         }
-        self.append(&SessionEvent::ModelSwitch {
+        self.record(SessionEvent::ModelSwitch {
             model: model.to_string(),
-        })?;
-        self.model = model.to_string();
-        Ok(())
+        })
     }
 
     /// The session's own reasoning choice, if it has one.
@@ -368,170 +393,106 @@ impl Session {
     /// `None` means resume should use the saved config default. `Some(None)`
     /// is an explicit provider default. `Some(Some(level))` is an explicit
     /// effort.
-    pub fn recorded_reasoning(&self) -> Option<Option<String>> {
-        self.reasoning_effort.clone()
+    pub(crate) fn recorded_reasoning(&self) -> Option<Option<String>> {
+        self.state.reasoning_effort.clone()
     }
 
     /// Records a reasoning choice so a later resume keeps it instead of the
     /// saved config default. Repeating the current choice writes nothing.
-    pub fn append_reasoning_effort(&mut self, effort: Option<String>) -> Result<(), Error> {
-        if self.reasoning_effort.as_ref() == Some(&effort) {
+    pub(crate) fn append_reasoning_effort(&mut self, effort: Option<String>) -> Result<(), Error> {
+        if self.state.reasoning_effort.as_ref() == Some(&effort) {
             return Ok(());
         }
-        self.append(&SessionEvent::ReasoningEffort {
-            effort: effort.clone(),
+        self.record(SessionEvent::ReasoningEffort {
+            effort,
             inherit: false,
-        })?;
-        self.reasoning_effort = Some(effort);
-        Ok(())
+        })
     }
 
     /// Drops a session reasoning choice so later resumes follow the saved
     /// config default. A session that already inherits writes nothing.
-    pub fn clear_reasoning_effort(&mut self) -> Result<(), Error> {
-        if self.reasoning_effort.is_none() {
+    pub(crate) fn clear_reasoning_effort(&mut self) -> Result<(), Error> {
+        if self.state.reasoning_effort.is_none() {
             return Ok(());
         }
-        self.append(&SessionEvent::ReasoningEffort {
+        self.record(SessionEvent::ReasoningEffort {
             effort: None,
             inherit: true,
-        })?;
-        self.reasoning_effort = None;
-        Ok(())
+        })
     }
 
-    pub fn append_message(&mut self, message: &Message) -> Result<(), Error> {
-        self.append(&SessionEvent::Message {
-            message: message.clone(),
-        })?;
-        if message.role == Role::User
-            && (!message.is_hidden_control() || message.is_plan_implementation_start())
-            && !message.is_steering()
-        {
-            self.plan_before_turn.clone_from(&self.active_plan);
-        }
-        Ok(())
+    pub(crate) fn append_message(&mut self, message: Message) -> Result<(), Error> {
+        self.record(SessionEvent::Message { message })
     }
 
-    pub fn append_compaction(&mut self, summary: &str, replaced: usize) -> Result<(), Error> {
-        self.append_compaction_range(summary, 0, replaced)
-    }
-
-    pub(crate) fn append_compaction_range(
+    /// Replaces `range` of the history with `summary`. `provider_data` is a
+    /// provider-native replacement history from remote compaction.
+    pub(crate) fn append_compaction(
         &mut self,
         summary: &str,
-        start: usize,
-        replaced: usize,
+        range: std::ops::Range<usize>,
+        provider_data: Vec<serde_json::Value>,
+        provider_data_model: Option<String>,
     ) -> Result<(), Error> {
-        self.append_compaction_range_with_provider_data(summary, start, replaced, &[], None)
-    }
-
-    pub(crate) fn append_compaction_range_with_provider_data(
-        &mut self,
-        summary: &str,
-        start: usize,
-        replaced: usize,
-        provider_data: &[serde_json::Value],
-        provider_data_model: Option<&str>,
-    ) -> Result<(), Error> {
-        self.append(&SessionEvent::Compaction {
+        self.record(SessionEvent::Compaction {
             plan_revision: None,
             summary: summary.to_string(),
-            start,
-            replaced,
-            provider_data: provider_data.to_vec(),
-            provider_data_model: provider_data_model.map(str::to_string),
-        })?;
-        self.context = None;
-        self.usage.record_cache_reset();
-        Ok(())
+            start: range.start,
+            replaced: range.len(),
+            provider_data,
+            provider_data_model,
+        })
     }
 
-    pub fn append_undo(&mut self, dropped: usize) -> Result<(), Error> {
-        self.append_undo_event(dropped, false)
-    }
-
-    pub(crate) fn append_undo_event(
-        &mut self,
-        dropped: usize,
-        clear_goal: bool,
-    ) -> Result<(), Error> {
-        self.append_undo_event_with_plan(dropped, clear_goal, None)
-    }
-
-    pub(crate) fn append_undo_event_with_plan(
+    /// Drops the last `dropped` messages and restores `plan_state`.
+    pub(crate) fn append_undo(
         &mut self,
         dropped: usize,
         clear_goal: bool,
         plan_state: Option<PlanState>,
     ) -> Result<(), Error> {
-        self.append(&SessionEvent::Undo {
+        self.record(SessionEvent::Undo {
             dropped,
             clear_goal,
-            plan_state: plan_state.clone(),
-        })?;
-        if clear_goal {
-            self.active_goal = None;
-        }
-        self.active_plan = plan_state;
-        self.plan_before_turn = None;
-        self.context = None;
-        if let Some(undo) = &mut self.pending_undo {
-            undo.committed = true;
-        }
-        Ok(())
+            plan_state,
+        })
     }
 
-    pub(crate) fn append_goal_start(&mut self, goal: &str, message: &Message) -> Result<(), Error> {
-        self.append(&SessionEvent::GoalStart {
+    pub(crate) fn append_goal_start(&mut self, goal: &str, message: Message) -> Result<(), Error> {
+        self.record(SessionEvent::GoalStart {
             goal: goal.to_string(),
-            message: message.clone(),
-        })?;
-        self.active_goal = Some(goal.to_string());
-        Ok(())
+            message,
+        })
     }
 
-    pub(crate) fn append_goal_complete(&mut self, message: &Message) -> Result<(), Error> {
-        self.append(&SessionEvent::GoalComplete {
-            message: message.clone(),
-        })?;
-        self.active_goal = None;
-        Ok(())
+    pub(crate) fn append_goal_complete(&mut self, message: Message) -> Result<(), Error> {
+        self.record(SessionEvent::GoalComplete { message })
     }
 
     pub(crate) fn append_goal_cancel(&mut self) -> Result<(), Error> {
-        self.append(&SessionEvent::GoalCancel)?;
-        self.active_goal = None;
-        Ok(())
+        self.record(SessionEvent::GoalCancel)
     }
 
     pub(crate) fn active_goal(&self) -> Option<&str> {
-        self.active_goal.as_deref()
+        self.state.active_goal.as_deref()
     }
 
     pub(crate) fn append_plan_start(
         &mut self,
         objective: &str,
-        message: &Message,
+        message: Message,
     ) -> Result<(), Error> {
-        let previous = self.active_plan.clone();
-        self.append(&SessionEvent::PlanStart {
+        self.record(SessionEvent::PlanStart {
             objective: objective.to_string(),
-            message: message.clone(),
-            previous: previous.clone(),
-        })?;
-        self.plan_before_turn = previous;
-        self.active_plan = Some(PlanState::Draft {
-            objective: objective.to_string(),
-            questions_asked: false,
-        });
-        Ok(())
+            message,
+            previous: self.state.active_plan.clone(),
+        })
     }
 
     pub(crate) fn append_plan_questions_asked(&mut self) -> Result<(), Error> {
         let Some(PlanState::Draft {
             questions_asked, ..
-        }) = self.active_plan.as_ref()
+        }) = self.state.active_plan.as_ref()
         else {
             return Err(Error::Protocol(
                 "cannot record planning questions without a draft plan".into(),
@@ -540,51 +501,35 @@ impl Session {
         if *questions_asked {
             return Ok(());
         }
-        self.append(&SessionEvent::PlanQuestionsAsked)?;
-        if let Some(PlanState::Draft {
-            questions_asked, ..
-        }) = self.active_plan.as_mut()
-        {
-            *questions_asked = true;
-        }
-        Ok(())
+        self.record(SessionEvent::PlanQuestionsAsked)
     }
 
-    pub(crate) fn append_plan_implemented(&mut self, message: &Message) -> Result<(), Error> {
-        self.append(&SessionEvent::PlanImplemented {
-            message: message.clone(),
-        })?;
-        self.active_plan = None;
-        Ok(())
+    pub(crate) fn append_plan_implemented(&mut self, message: Message) -> Result<(), Error> {
+        self.record(SessionEvent::PlanImplemented { message })
     }
 
     pub(crate) fn append_plan_cancel(&mut self) -> Result<(), Error> {
-        self.append(&SessionEvent::PlanCancel)?;
-        self.active_plan = None;
-        self.plan_before_turn = None;
-        Ok(())
+        self.record(SessionEvent::PlanCancel)
     }
 
     pub(crate) fn active_plan(&self) -> Option<&PlanState> {
-        self.active_plan.as_ref()
+        self.state.active_plan.as_ref()
     }
 
     pub(crate) fn plan_before_turn(&self) -> Option<&PlanState> {
-        self.plan_before_turn.as_ref()
+        self.state.plan_before_turn.as_ref()
     }
 
     pub(crate) fn usage(&self) -> UsageSummary {
-        self.usage
+        self.state.usage
     }
 
     pub(crate) fn append_usage(&mut self, usage: TokenUsage) -> Result<(), Error> {
-        self.append(&SessionEvent::Usage { usage })?;
-        self.usage.record(usage);
-        Ok(())
+        self.record(SessionEvent::Usage { usage })
     }
 
     /// Removes a session log from `dir`. Missing files are treated as success.
-    pub fn delete(dir: &Path, id: &str) -> Result<(), Error> {
+    pub(crate) fn delete(dir: &Path, id: &str) -> Result<(), Error> {
         validate_id(id)?;
         let path = dir.join(format!("{id}.jsonl"));
         match fs::remove_file(&path) {
@@ -599,11 +544,15 @@ impl Session {
         }
     }
 
-    fn append(&mut self, event: &SessionEvent) -> Result<(), Error> {
-        if let Some(start) = self.rollback_to {
-            self.file.set_len(start)?;
-            self.rollback_to = None;
-        }
+    /// Writes `event` to the log, then applies it. A failed write changes
+    /// nothing.
+    fn record(&mut self, event: SessionEvent) -> Result<(), Error> {
+        self.write(&event)?;
+        self.state.apply(event);
+        Ok(())
+    }
+
+    fn write(&mut self, event: &SessionEvent) -> Result<(), Error> {
         #[cfg(test)]
         let fail_write = if let Some(remaining) = &mut self.fail_after_appends {
             if *remaining == 0 {
@@ -616,27 +565,38 @@ impl Session {
         } else {
             false
         };
+        let Some(storage) = &mut self.storage else {
+            #[cfg(test)]
+            if fail_write {
+                return Err(std::io::Error::other("injected session append failure").into());
+            }
+            return Ok(());
+        };
+        if let Some(start) = storage.rollback_to {
+            storage.file.set_len(start)?;
+            storage.rollback_to = None;
+        }
         let mut line = serde_json::to_string(event)?;
         line.push('\n');
-        let start = self.file.metadata()?.len();
-        self.rollback_to = Some(start);
+        let start = storage.file.metadata()?.len();
+        storage.rollback_to = Some(start);
         let written = (|| {
             #[cfg(test)]
             if fail_write {
-                self.file.write_all(&line.as_bytes()[..line.len() / 2])?;
+                storage.file.write_all(&line.as_bytes()[..line.len() / 2])?;
                 return Err(std::io::Error::other(
                     "injected partial session append failure",
                 ));
             }
-            self.file.write_all(line.as_bytes())?;
-            self.file.sync_data()
+            storage.file.write_all(line.as_bytes())?;
+            storage.file.sync_data()
         })();
         if let Err(error) = written {
-            self.file.set_len(start)?;
-            self.rollback_to = None;
+            storage.file.set_len(start)?;
+            storage.rollback_to = None;
             return Err(error.into());
         }
-        self.rollback_to = None;
+        storage.rollback_to = None;
         Ok(())
     }
 
@@ -652,190 +612,69 @@ fn validate_id(id: &str) -> Result<(), Error> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
-        return Err(Error::Config(format!("invalid session id '{id}'")));
+        return Err(Error::Invalid(format!("invalid session id '{id}'")));
     }
     Ok(())
 }
 
-/// Rebuilds the effective conversation from a session log.
-fn replay(path: &Path) -> Result<ReplayedSession, Error> {
-    let file = File::open(path)?;
-    let mut messages: Vec<Message> = Vec::new();
-    let mut model = String::new();
-    let mut reasoning_effort = None;
-    let mut active_goal = None;
-    let mut active_plan = None;
-    let mut plan_before_turn = None;
-    let mut usage = UsageSummary::default();
-    let mut pending_undo: Option<Box<PendingUndo>> = None;
-    let mut context = None;
-    let mut plan_revisions = Vec::new();
-    let mut plan_handoffs = std::collections::HashSet::new();
+struct Replayed {
+    state: SessionState,
+    /// Lines after the header that could not be decoded.
+    skipped_lines: usize,
+    /// Start of an unterminated, undecodable final line: an append that was
+    /// cut short by a crash.
+    torn_tail: Option<u64>,
+}
+
+/// Rebuilds a session's state from its log.
+fn replay(path: &Path) -> Result<Replayed, Error> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut replayed = Replayed {
+        state: SessionState::default(),
+        skipped_lines: 0,
+        torn_tail: None,
+    };
     let mut has_meta = false;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut offset = 0u64;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        let start = offset;
+        offset = offset.saturating_add(read as u64);
+        let terminated = line.last() == Some(&b'\n');
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
+        let event = serde_json::from_slice::<SessionEvent>(&line);
         if !has_meta {
-            match serde_json::from_str::<SessionEvent>(&line)? {
-                SessionEvent::Meta {
-                    model: header_model,
-                    ..
-                } => {
-                    has_meta = true;
-                    model = header_model;
-                    continue;
-                }
-                _ => {
-                    return Err(Error::Protocol(
-                        "session log does not start with metadata".into(),
-                    ));
-                }
+            let event = event?;
+            if !matches!(event, SessionEvent::Meta { .. }) {
+                return Err(Error::Protocol(
+                    "session log does not start with metadata".into(),
+                ));
             }
-        }
-        // Tolerate unknown/corrupt lines after the required metadata rather
-        // than losing the rest of the session.
-        let Ok(event) = serde_json::from_str::<SessionEvent>(&line) else {
+            has_meta = true;
+            replayed.state.apply(event);
             continue;
-        };
+        }
+        // Tolerate unknown or corrupt lines after the required metadata
+        // rather than losing the rest of the session, but count them so the
+        // user learns the history may be incomplete.
         match event {
-            SessionEvent::Meta { .. } => {}
-            SessionEvent::ModelSwitch { model: switched } => model = switched,
-            SessionEvent::ReasoningEffort { effort, inherit } => {
-                reasoning_effort = if inherit { None } else { Some(effort) };
-            }
-            SessionEvent::UndoStarted { mut undo } => {
-                undo.plan_state = plans::restore_revision(undo.plan_state, &plan_revisions);
-                pending_undo = Some(Box::new(undo));
-            }
-            SessionEvent::UndoFinished => pending_undo = None,
-            SessionEvent::Context { context: value } => context = Some(value),
-            SessionEvent::ToolResultsRecovered { index, results } => {
-                let index = index.min(messages.len());
-                messages.splice(index..index, results);
-                context = None;
-            }
-            SessionEvent::Message { message } => {
-                if message.role == Role::User
-                    && (!message.is_hidden_control() || message.is_plan_implementation_start())
-                    && !message.is_steering()
-                {
-                    plan_before_turn.clone_from(&active_plan);
-                }
-                messages.push(message);
-            }
-            SessionEvent::Compaction {
-                plan_revision,
-                summary,
-                start,
-                replaced,
-                provider_data,
-                provider_data_model,
-            } => {
-                if let Some(revision) = plan_revision {
-                    plan_handoffs.insert(revision);
-                }
-                let start = start.min(messages.len());
-                let end = start.saturating_add(replaced).min(messages.len());
-                let replacement = if plan_revision.is_some() {
-                    crate::compaction::plan_handoff_message(&summary)
-                } else {
-                    crate::compaction::summary_message_with_provider_data(
-                        &summary,
-                        provider_data,
-                        provider_data_model,
-                    )
-                };
-                drop(messages.splice(start..end, std::iter::once(replacement)));
-                context = None;
-                usage.record_cache_reset();
-            }
-            SessionEvent::Undo {
-                dropped,
-                clear_goal,
-                plan_state,
-            } => {
-                let keep = messages.len().saturating_sub(dropped);
-                messages.truncate(keep);
-                if clear_goal {
-                    active_goal = None;
-                }
-                active_plan = plans::restore_revision(plan_state, &plan_revisions);
-                plan_before_turn = None;
-                context = None;
-                if let Some(undo) = &mut pending_undo {
-                    undo.committed = true;
-                }
-            }
-            SessionEvent::GoalStart { goal, message } => {
-                active_goal = Some(goal);
-                messages.push(message);
-            }
-            SessionEvent::GoalComplete { message } => {
-                active_goal = None;
-                messages.push(message);
-            }
-            SessionEvent::GoalCancel => {
-                active_goal = None;
-            }
-            SessionEvent::PlanStart {
-                objective,
-                message,
-                previous,
-            } => {
-                plan_before_turn = plans::restore_revision(previous, &plan_revisions);
-                active_plan = Some(PlanState::Draft {
-                    objective,
-                    questions_asked: false,
-                });
-                messages.push(message);
-            }
-            SessionEvent::PlanReady { plan, message } => {
-                plan_revisions.push(plan.clone());
-                active_plan = Some(PlanState::Ready {
-                    plan,
-                    revision: plan_revisions.len(),
-                });
-                messages.push(message);
-            }
-            SessionEvent::PlanQuestionsAsked => {
-                if let Some(PlanState::Draft {
-                    questions_asked, ..
-                }) = active_plan.as_mut()
-                {
-                    *questions_asked = true;
-                }
-            }
-            SessionEvent::PlanImplemented { message } => {
-                active_plan = None;
-                messages.push(message);
-            }
-            SessionEvent::PlanCancel => {
-                active_plan = None;
-                plan_before_turn = None;
-            }
-            SessionEvent::Usage {
-                usage: request_usage,
-            } => usage.record(request_usage),
+            Ok(SessionEvent::Meta { .. }) => {}
+            Ok(event) => replayed.state.apply(event),
+            Err(_) if !terminated => replayed.torn_tail = Some(start),
+            Err(_) => replayed.skipped_lines += 1,
         }
     }
     if !has_meta {
         return Err(Error::Protocol("session log is missing metadata".into()));
     }
-    Ok(ReplayedSession {
-        plan_revision_count: plan_revisions.len(),
-        plan_handoffs,
-        messages,
-        model,
-        reasoning_effort,
-        active_goal,
-        active_plan,
-        plan_before_turn,
-        usage,
-        pending_undo,
-        context,
-    })
+    Ok(replayed)
 }
 
 pub struct SessionInfo {
@@ -843,8 +682,6 @@ pub struct SessionInfo {
     pub modified: SystemTime,
     /// First line of the first user message, for pickers.
     pub preview: String,
-    /// Canonical working directory recorded at session creation.
-    pub cwd: String,
     /// Last model used in the session: created with, then any `/model` switch.
     pub model: String,
 }
@@ -883,7 +720,6 @@ pub fn list(dir: &Path) -> Result<Vec<SessionInfo>, Error> {
             id: id.to_string(),
             modified,
             preview: header.preview,
-            cwd: header.cwd,
             model: header.model,
         });
     }
@@ -894,7 +730,6 @@ pub fn list(dir: &Path) -> Result<Vec<SessionInfo>, Error> {
 /// Header metadata and preview extracted from a session log in one pass.
 #[derive(Clone)]
 struct SessionHeader {
-    cwd: String,
     model: String,
     preview: String,
     has_message: bool,
@@ -908,7 +743,6 @@ const MODEL_SWITCH_MARKER: &str = "\"type\":\"model_switch\"";
 
 fn read_header(path: &Path) -> SessionHeader {
     let mut header = SessionHeader {
-        cwd: String::new(),
         model: String::new(),
         preview: String::new(),
         has_message: false,
@@ -935,8 +769,7 @@ fn read_header(path: &Path) -> SessionHeader {
             continue;
         }
         match serde_json::from_slice::<SessionEvent>(&buf) {
-            Ok(SessionEvent::Meta { cwd, model, .. }) => {
-                header.cwd = cwd;
+            Ok(SessionEvent::Meta { model, .. }) => {
                 header.model = model;
             }
             Ok(SessionEvent::ModelSwitch { model }) => header.model = model,
@@ -1003,10 +836,10 @@ mod tests {
         let path = dir.join(format!("{}.jsonl", session.id));
         let before = fs::read(&path)?;
         session.fail_append_after(0);
-        assert!(session.append_message(&Message::user("failed")).is_err());
+        assert!(session.append_message(Message::user("failed")).is_err());
         assert_eq!(fs::read(&path)?, before);
-        session.append_message(&Message::user("saved"))?;
-        let (_, messages) = Session::open(&dir, &session.id)?;
+        session.append_message(Message::user("saved"))?;
+        let messages = Session::open(&dir, &session.id)?.messages().to_vec();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "saved");
         let _ = fs::remove_dir_all(dir);
@@ -1022,9 +855,9 @@ mod tests {
             .append(true)
             .open(&path)?
             .write_all(b"{\"type\":\"message\",\"message\":")?;
-        let (mut resumed, _) = Session::open(&dir, &session.id)?;
-        resumed.append_message(&Message::user("after crash"))?;
-        let (_, messages) = Session::open(&dir, &session.id)?;
+        let mut resumed = Session::open(&dir, &session.id)?;
+        resumed.append_message(Message::user("after crash"))?;
+        let messages = Session::open(&dir, &session.id)?.messages().to_vec();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "after crash");
         let _ = fs::remove_dir_all(dir);
@@ -1043,14 +876,14 @@ mod tests {
         let dir = crate::test_support::unique_temp_dir("test");
         let mut s = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = s.id.clone();
-        s.append_message(&Message::user("one"))?;
-        s.append_message(&Message::assistant("two".into(), vec![]))?;
-        s.append_message(&Message::user("three"))?;
-        s.append_compaction("summary of one+two", 2)?;
-        s.append_message(&Message::user("four"))?;
+        s.append_message(Message::user("one"))?;
+        s.append_message(Message::assistant("two".into(), vec![]))?;
+        s.append_message(Message::user("three"))?;
+        s.append_compaction("summary of one+two", 0..2, Vec::new(), None)?;
+        s.append_message(Message::user("four"))?;
         drop(s);
 
-        let (_, messages) = Session::open(&dir, &id)?;
+        let messages = Session::open(&dir, &id)?.messages().to_vec();
         assert_eq!(messages.len(), 3);
         assert!(messages[0].content.contains("summary of one+two"));
         assert_eq!(messages[1].content, "three");
@@ -1064,7 +897,7 @@ mod tests {
         let dir = temp_root("usage");
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
-        session.append_message(&Message::user("one"))?;
+        session.append_message(Message::user("one"))?;
         session.append_usage(TokenUsage {
             input_tokens: 100,
             output_tokens: 20,
@@ -1072,10 +905,10 @@ mod tests {
             cache_write_input_tokens: 10,
             cache_details_reported: true,
         })?;
-        session.append_compaction("summary", 1)?;
+        session.append_compaction("summary", 0..1, Vec::new(), None)?;
         drop(session);
 
-        let (session, _) = Session::open(&dir, &id)?;
+        let session = Session::open(&dir, &id)?;
         assert_eq!(session.usage().requests, 1);
         assert_eq!(session.usage().tokens.cached_input_tokens, 75);
         assert_eq!(session.usage().cache_hit_percent(), 75);
@@ -1090,12 +923,12 @@ mod tests {
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
         for content in ["before", "goal", "progress one", "progress two", "tail"] {
-            session.append_message(&Message::user(content))?;
+            session.append_message(Message::user(content))?;
         }
-        session.append_compaction_range("progress summary", 2, 2)?;
+        session.append_compaction("progress summary", 2..4, Vec::new(), None)?;
         drop(session);
 
-        let (_, messages) = Session::open(&dir, &id)?;
+        let messages = Session::open(&dir, &id)?.messages().to_vec();
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].content, "before");
         assert_eq!(messages[1].content, "goal");
@@ -1110,21 +943,20 @@ mod tests {
         let dir = temp_root("remote-compaction");
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "gpt-test")?;
         let id = session.id.clone();
-        session.append_message(&Message::user("one"))?;
+        session.append_message(Message::user("one"))?;
         let provider_data = [serde_json::json!({
             "type": "compaction",
             "encrypted_content": "opaque"
         })];
-        session.append_compaction_range_with_provider_data(
+        session.append_compaction(
             "portable summary",
-            0,
-            1,
-            &provider_data,
-            Some("gpt-test"),
+            0..1,
+            provider_data.to_vec(),
+            Some("gpt-test".into()),
         )?;
         drop(session);
 
-        let (_, messages) = Session::open(&dir, &id)?;
+        let messages = Session::open(&dir, &id)?.messages().to_vec();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].content.contains("portable summary"));
         assert_eq!(messages[0].provider_data, provider_data);
@@ -1138,17 +970,17 @@ mod tests {
         let dir = crate::test_support::unique_temp_dir("undo-session");
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
-        session.append_message(&Message::user("one"))?;
-        session.append_message(&Message::assistant("two".into(), vec![]))?;
-        session.append_message(&Message::user("three"))?;
-        session.append_message(&Message::assistant("four".into(), vec![]))?;
-        session.append_undo(2)?;
-        session.append_message(&Message::user("five"))?;
-        session.append_message(&Message::assistant("six".into(), vec![]))?;
-        session.append_undo(2)?;
+        session.append_message(Message::user("one"))?;
+        session.append_message(Message::assistant("two".into(), vec![]))?;
+        session.append_message(Message::user("three"))?;
+        session.append_message(Message::assistant("four".into(), vec![]))?;
+        session.append_undo(2, false, None)?;
+        session.append_message(Message::user("five"))?;
+        session.append_message(Message::assistant("six".into(), vec![]))?;
+        session.append_undo(2, false, None)?;
         drop(session);
 
-        let (_, messages) = Session::open(&dir, &id)?;
+        let messages = Session::open(&dir, &id)?.messages().to_vec();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "one");
         assert_eq!(messages[1].content, "two");
@@ -1163,11 +995,12 @@ mod tests {
         let id = session.id.clone();
         let start = Message::user("ship the feature")
             .with_control(crate::provider::MessageControl::GoalStart);
-        session.append_goal_start("ship the feature", &start)?;
-        session.append_message(&Message::assistant("working".into(), vec![]))?;
+        session.append_goal_start("ship the feature", start)?;
+        session.append_message(Message::assistant("working".into(), vec![]))?;
         drop(session);
 
-        let (session, messages) = Session::open(&dir, &id)?;
+        let session = Session::open(&dir, &id)?;
+        let messages = session.messages().to_vec();
         assert_eq!(session.active_goal(), Some("ship the feature"));
         assert_eq!(messages.len(), 2);
         assert!(messages[0].is_goal_start());
@@ -1183,11 +1016,12 @@ mod tests {
         let id = session.id.clone();
         let start =
             Message::user("done later").with_control(crate::provider::MessageControl::GoalStart);
-        session.append_goal_start("done later", &start)?;
-        session.append_goal_complete(&Message::assistant("finished".into(), vec![]))?;
+        session.append_goal_start("done later", start)?;
+        session.append_goal_complete(Message::assistant("finished".into(), vec![]))?;
         drop(session);
 
-        let (session, messages) = Session::open(&dir, &id)?;
+        let session = Session::open(&dir, &id)?;
+        let messages = session.messages().to_vec();
         assert_eq!(session.active_goal(), None);
         assert_eq!(
             messages.last().map(|message| message.content.as_str()),
@@ -1198,11 +1032,12 @@ mod tests {
         let canceled_id = session.id.clone();
         let start =
             Message::user("cancel me").with_control(crate::provider::MessageControl::GoalStart);
-        session.append_goal_start("cancel me", &start)?;
+        session.append_goal_start("cancel me", start)?;
         session.append_goal_cancel()?;
         drop(session);
 
-        let (session, messages) = Session::open(&dir, &canceled_id)?;
+        let session = Session::open(&dir, &canceled_id)?;
+        let messages = session.messages().to_vec();
         assert_eq!(session.active_goal(), None);
         assert_eq!(messages.len(), 1);
         let _ = fs::remove_dir_all(&dir);
@@ -1215,17 +1050,18 @@ mod tests {
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
         let start = Message::user("add planning mode");
-        session.append_plan_start("add planning mode", &start)?;
+        session.append_plan_start("add planning mode", start)?;
         let ready = Message::assistant("# Plan".into(), vec![]);
-        session.append_plan_ready("# Plan", &ready)?;
-        session.append_message(&Message::user("implement it"))?;
+        session.append_plan_ready("# Plan", ready)?;
+        session.append_message(Message::user("implement it"))?;
         let before_implementation = session.plan_before_turn().cloned();
-        session.append_plan_implemented(&Message::assistant("done".into(), vec![]))?;
+        session.append_plan_implemented(Message::assistant("done".into(), vec![]))?;
         assert_eq!(session.active_plan(), None);
-        session.append_undo_event_with_plan(2, false, before_implementation)?;
+        session.append_undo(2, false, before_implementation)?;
         drop(session);
 
-        let (mut session, messages) = Session::open(&dir, &id)?;
+        let mut session = Session::open(&dir, &id)?;
+        let messages = session.messages().to_vec();
         assert_eq!(messages.len(), 2);
         assert_eq!(
             session.active_plan(),
@@ -1236,7 +1072,7 @@ mod tests {
         );
         session.append_plan_cancel()?;
         drop(session);
-        let (session, _) = Session::open(&dir, &id)?;
+        let session = Session::open(&dir, &id)?;
         assert_eq!(session.active_plan(), None);
         let _ = fs::remove_dir_all(&dir);
         Ok(())
@@ -1248,7 +1084,7 @@ mod tests {
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
         let start = Message::user("add planning mode");
-        session.append_plan_start("add planning mode", &start)?;
+        session.append_plan_start("add planning mode", start.clone())?;
 
         let listed = list(&dir)?;
         assert_eq!(listed.len(), 1);
@@ -1257,7 +1093,8 @@ mod tests {
 
         session.append_plan_questions_asked()?;
         drop(session);
-        let (session, messages) = Session::open(&dir, &id)?;
+        let session = Session::open(&dir, &id)?;
+        let messages = session.messages().to_vec();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, start.content);
         assert!(
@@ -1275,12 +1112,13 @@ mod tests {
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
         let start = Message::user("goal").with_control(crate::provider::MessageControl::GoalStart);
-        session.append_goal_start("goal", &start)?;
-        session.append_message(&Message::assistant("partial".into(), vec![]))?;
-        session.append_undo_event(2, true)?;
+        session.append_goal_start("goal", start)?;
+        session.append_message(Message::assistant("partial".into(), vec![]))?;
+        session.append_undo(2, true, None)?;
         drop(session);
 
-        let (session, messages) = Session::open(&dir, &id)?;
+        let session = Session::open(&dir, &id)?;
+        let messages = session.messages().to_vec();
         assert_eq!(session.active_goal(), None);
         assert!(messages.is_empty());
         let _ = fs::remove_dir_all(&dir);
@@ -1298,7 +1136,7 @@ mod tests {
         let dir = crate::test_support::unique_temp_dir("subagent-session-test");
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
-        session.append_message(&Message::subagent_results(vec![SubagentResult {
+        session.append_message(Message::subagent_results(vec![SubagentResult {
             id: "sa-1".into(),
             name: "review".into(),
             status: "completed".into(),
@@ -1307,7 +1145,7 @@ mod tests {
         }]))?;
         drop(session);
 
-        let (_, messages) = Session::open(&dir, &id)?;
+        let messages = Session::open(&dir, &id)?.messages().to_vec();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].subagent_results[0].id, "sa-1");
         assert_eq!(messages[0].subagent_results[0].content, "result");
@@ -1342,13 +1180,14 @@ mod tests {
         let dir = root.join("sessions");
         let mut session = Session::create(&dir, Path::new("/projects/yawl"), "glm-5.3")?;
         let id = session.id.clone();
-        session.append_message(&Message::user("hello there"))?;
+        session.append_message(Message::user("hello there"))?;
         drop(session);
 
         let infos = list(&dir)?;
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].id, id);
-        assert_eq!(infos[0].cwd, "/projects/yawl");
+        let header = fs::read_to_string(dir.join(format!("{id}.jsonl")))?;
+        assert!(header.contains(r#""cwd":"/projects/yawl""#));
         assert_eq!(infos[0].model, "glm-5.3");
         assert_eq!(infos[0].preview, "hello there");
         let _ = fs::remove_dir_all(&root);
@@ -1361,17 +1200,18 @@ mod tests {
         let dir = root.join("sessions");
         let mut session = Session::create(&dir, Path::new("/projects/yawl"), "first-model")?;
         let id = session.id.clone();
-        session.append_message(&Message::user("hello there"))?;
+        session.append_message(Message::user("hello there"))?;
         assert_eq!(session.model(), "first-model");
         // A switch to the current model writes nothing.
         session.append_model_switch("first-model")?;
         session.append_model_switch("second-model")?;
-        session.append_message(&Message::assistant("answer".into(), vec![]))?;
+        session.append_message(Message::assistant("answer".into(), vec![]))?;
         session.append_model_switch("third-model")?;
         assert_eq!(session.model(), "third-model");
         drop(session);
 
-        let (session, messages) = Session::open(&dir, &id)?;
+        let session = Session::open(&dir, &id)?;
+        let messages = session.messages().to_vec();
         assert_eq!(session.model(), "third-model");
         assert_eq!(messages.len(), 2);
 
@@ -1387,7 +1227,7 @@ mod tests {
         let dir = temp_root("resumed-model");
         let config = Config::test_default();
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "first-model")?;
-        session.append_message(&Message::user("hi"))?;
+        session.append_message(Message::user("hi"))?;
         assert_eq!(session.resumed_model(&config, "configured"), "first-model");
 
         session.append_model_switch("openai-codex:gpt-5.6-sol")?;
@@ -1400,7 +1240,7 @@ mod tests {
         session.append_model_switch("removed-provider:some-model")?;
         assert_eq!(session.resumed_model(&config, "configured"), "configured");
 
-        let (reopened, _) = Session::open(&dir, &session.id)?;
+        let reopened = Session::open(&dir, &session.id)?;
         assert_eq!(reopened.model(), "removed-provider:some-model");
         let _ = fs::remove_dir_all(&dir);
         Ok(())
@@ -1415,20 +1255,20 @@ mod tests {
         assert_eq!(session.recorded_reasoning(), None);
         session.append_reasoning_effort(Some("medium".into()))?;
         session.append_reasoning_effort(Some("medium".into()))?;
-        session.append_message(&Message::user("hello"))?;
+        session.append_message(Message::user("hello"))?;
         drop(session);
 
-        let (mut session, _) = Session::open(&dir, &id)?;
+        let mut session = Session::open(&dir, &id)?;
         assert_eq!(session.recorded_reasoning(), Some(Some("medium".into())));
         session.append_reasoning_effort(None)?;
         drop(session);
 
-        let (mut session, _) = Session::open(&dir, &id)?;
+        let mut session = Session::open(&dir, &id)?;
         assert_eq!(session.recorded_reasoning(), Some(None));
         session.clear_reasoning_effort()?;
         drop(session);
 
-        let (session, _) = Session::open(&dir, &id)?;
+        let session = Session::open(&dir, &id)?;
         assert_eq!(session.recorded_reasoning(), None);
         let _ = fs::remove_dir_all(&root);
         Ok(())
@@ -1442,7 +1282,7 @@ mod tests {
         drop(empty);
         let mut kept = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let kept_id = kept.id.clone();
-        kept.append_message(&Message::user("real turn"))?;
+        kept.append_message(Message::user("real turn"))?;
         drop(kept);
 
         let infos = list(&dir)?;
@@ -1458,7 +1298,7 @@ mod tests {
         let dir = root.join("sessions");
         let mut session = Session::create(&dir, Path::new("/projects/demo"), "test-model")?;
         let id = session.id.clone();
-        session.append_message(&Message::user("bye"))?;
+        session.append_message(Message::user("bye"))?;
         drop(session);
 
         Session::delete(&dir, &id)?;
@@ -1492,8 +1332,8 @@ mod tests {
         fs::create_dir_all(&found)?;
         write_session(&found, "20260101-000000-0001", "found elsewhere")?;
 
-        let (_, messages) = Session::open_searching(&[missing, found], "20260101-000000-0001")?;
-        assert_eq!(messages[0].content, "found elsewhere");
+        let session = Session::open_searching(&[missing, found], "20260101-000000-0001")?;
+        assert_eq!(session.messages()[0].content, "found elsewhere");
 
         let error = Session::open_searching(std::slice::from_ref(&root), "20990101-000000-0000")
             .unwrap_err();
@@ -1520,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn open_searching_propagates_replay_io_errors() -> Result<(), Error> {
+    fn open_searching_propagates_replay_errors() -> Result<(), Error> {
         let root = temp_root("search-error");
         let broken = root.join("broken");
         let valid = root.join("valid");
@@ -1530,9 +1370,174 @@ mod tests {
         fs::write(broken.join(format!("{id}.jsonl")), [0xff])?;
         write_session(&valid, id, "must not mask the error")?;
 
+        // A log whose header cannot be decoded fails loudly instead of
+        // falling through to the other directory.
         let error = Session::open_searching(&[broken, valid], id).unwrap_err();
-        assert!(matches!(error, Error::Io(_)));
+        assert!(matches!(error, Error::Protocol(_)), "{error}");
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    fn subagent_delivery() -> Message {
+        Message::subagent_results(vec![SubagentResult {
+            id: "sa-1".into(),
+            name: "scout".into(),
+            status: "completed".into(),
+            run_number: 1,
+            content: "found it".into(),
+        }])
+    }
+
+    #[test]
+    fn replay_rebuilds_exactly_the_live_state() -> Result<(), Error> {
+        use crate::provider::MessageControl;
+        let dir = temp_root("live-equals-replay");
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "model-a")?;
+        session.append_message(Message::user("first"))?;
+        session.append_message(Message::assistant("answer".into(), vec![]))?;
+        session.append_model_switch("model-b")?;
+        session.append_reasoning_effort(Some("high".into()))?;
+        session.append_usage(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            ..TokenUsage::default()
+        })?;
+        session.record_context(ContextUsage {
+            tokens: 12,
+            messages: 2,
+            model: "model-b".into(),
+            overhead: 1,
+        })?;
+        session.append_plan_start(
+            "objective",
+            Message::user("objective").with_control(MessageControl::PlanStart),
+        )?;
+        session.append_plan_questions_asked()?;
+        session.append_plan_ready("# Plan", Message::assistant("# Plan".into(), vec![]))?;
+        session.append_message(
+            Message::user("Implement the active plan now.")
+                .with_control(MessageControl::PlanImplementationStart),
+        )?;
+        session.append_plan_handoff(1, "handoff", 2..4)?;
+        session.append_goal_start(
+            "goal",
+            Message::user("goal").with_control(MessageControl::GoalStart),
+        )?;
+        session.append_message(subagent_delivery())?;
+        session.append_compaction("summary", 0..1, Vec::new(), None)?;
+        let restored = session.plan_before_turn().cloned();
+        session.append_undo(2, true, restored)?;
+        session.append_plan_implemented(Message::assistant("done".into(), vec![]))?;
+        session.clear_reasoning_effort()?;
+        let live = format!("{:?}", session.state);
+        let id = session.id.clone();
+        drop(session);
+
+        let replayed = Session::open(&dir, &id)?;
+        assert_eq!(format!("{:?}", replayed.state), live);
+        assert_eq!(replayed.replay_warning(), None);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_deliveries_and_goal_starts_snapshot_the_plan_correctly() -> Result<(), Error> {
+        use crate::provider::MessageControl;
+        let ready = || PlanState::Ready {
+            plan: "# Plan".into(),
+            revision: 1,
+        };
+        let mut session = Session::memory("memory".into(), "test");
+        session.append_plan_start(
+            "objective",
+            Message::user("objective").with_control(MessageControl::PlanStart),
+        )?;
+        session.append_plan_ready("# Plan", Message::assistant("# Plan".into(), vec![]))?;
+        // Starting a goal begins a turn while the plan is ready.
+        session.append_goal_start(
+            "goal",
+            Message::user("goal").with_control(MessageControl::GoalStart),
+        )?;
+        assert_eq!(session.plan_before_turn(), Some(&ready()));
+        session.append_plan_implemented(Message::assistant("done".into(), vec![]))?;
+        // A late subagent delivery continues the turn; it must not move the
+        // point `/undo` restores to.
+        session.append_message(subagent_delivery())?;
+        assert_eq!(session.plan_before_turn(), Some(&ready()));
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_splices_a_middle_range_and_keeps_the_undo_anchor() -> Result<(), Error> {
+        let mut session = Session::memory("memory".into(), "test");
+        for index in 0..24 {
+            session.append_message(Message::user(format!("message {index}")))?;
+        }
+        session.append_compaction("goal progress", 4..14, Vec::new(), None)?;
+        let messages = session.messages();
+        assert_eq!(messages[3].content, "message 3");
+        assert!(messages[4].is_summary());
+        assert!(messages[4].content.contains("goal progress"));
+        assert_eq!(messages[5].content, "message 14");
+        assert_eq!(
+            messages.last().map(|m| m.content.as_str()),
+            Some("message 23")
+        );
+        assert_eq!(session.usage().cache_resets, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_prompt_that_looks_like_a_summary_is_still_a_prompt() {
+        let prompt = Message::user("[conversation summary]\nplease review this");
+        assert!(!prompt.is_summary());
+        assert!(prompt.starts_user_turn());
+    }
+
+    #[test]
+    fn replay_drops_a_torn_tail_and_reports_unreadable_entries() -> Result<(), Error> {
+        let dir = temp_root("torn-tail");
+        let mut session = Session::create(&dir, Path::new("/projects/demo"), "test")?;
+        let id = session.id.clone();
+        session.append_message(Message::user("kept"))?;
+        drop(session);
+        let path = dir.join(format!("{id}.jsonl"));
+        let mut log = OpenOptions::new().append(true).open(&path)?;
+        log.write_all(b"{\"type\":\"bogus\"}\n{\"type\":\"message\",\"mess")?;
+        drop(log);
+
+        let mut session = Session::open(&dir, &id)?;
+        assert_eq!(session.messages().len(), 1);
+        let warning = session
+            .replay_warning()
+            .expect("unreadable entry is reported");
+        assert!(warning.contains("1 unreadable log entry"), "{warning}");
+        assert!(!fs::read_to_string(&path)?.contains("\"mess\n"));
+        session.append_message(Message::user("after crash"))?;
+        drop(session);
+
+        let session = Session::open(&dir, &id)?;
+        let contents: Vec<_> = session
+            .messages()
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(contents, ["kept", "after crash"]);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn memory_sessions_apply_events_without_a_file() -> Result<(), Error> {
+        let mut session = Session::memory("child".into(), "test");
+        session.append_message(Message::user("hello"))?;
+        session.append_usage(TokenUsage {
+            input_tokens: 3,
+            ..TokenUsage::default()
+        })?;
+        assert_eq!(session.messages().len(), 1);
+        assert_eq!(session.usage().requests, 1);
+        assert_eq!(session.ensure_plan_file()?, None);
         Ok(())
     }
 }

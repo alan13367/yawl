@@ -69,7 +69,7 @@ pub(in crate::tools) fn write_file(args: &Value) -> ToolOutcome {
         .ok()
         .filter(fs::Metadata::is_file)
         .map(|metadata| metadata.len());
-    match std::fs::write(path, content) {
+    match write_atomically(Path::new(path), content.as_bytes()) {
         Ok(()) => ToolOutcome::ok(match previous {
             Some(previous) => format!(
                 "overwrote {path} ({} bytes; previously {previous} bytes)",
@@ -133,7 +133,7 @@ pub(in crate::tools) fn edit_file(args: &Value) -> ToolOutcome {
         ));
     }
     let (updated, lines) = replace_matches(&text, &old_string, &new_string);
-    if let Err(e) = std::fs::write(path, updated) {
+    if let Err(e) = write_atomically(Path::new(path), updated.as_bytes()) {
         return ToolOutcome::error(format!("cannot write {path}: {e}"));
     }
     let mut message = if count > 1 {
@@ -155,6 +155,81 @@ pub(in crate::tools) fn edit_file(args: &Value) -> ToolOutcome {
         message.push_str("; matched CRLF line endings");
     }
     ToolOutcome::ok(message)
+}
+
+/// Replaces a file's contents so that a crash or a full disk never leaves
+/// it half written: the new contents go to a temporary file beside it,
+/// which then takes its place. A symlink is written through to its target.
+///
+/// The temporary file gets the original group and mode before any contents
+/// reach it. A file that a new inode cannot stand in for is rewritten in
+/// place instead: one with other hard links, one owned by another user, one
+/// whose group the new file cannot take, anything other than a regular file,
+/// and any file whose temporary sibling cannot be created. Extended
+/// attributes and ACLs are not copied to the replacement.
+fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let target = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::canonicalize(path) {
+            Ok(target) => target,
+            // A dangling link: create its target the usual way.
+            Err(_) => return fs::write(path, contents),
+        },
+        Ok(_) => path.to_path_buf(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(error) => return Err(error),
+    };
+    let original = match fs::metadata(&target) {
+        Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => Some(metadata),
+        Ok(_) => return fs::write(&target, contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let directory = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let name = target
+        .file_name()
+        .map_or_else(|| "file".into(), |name| name.to_string_lossy());
+    let temporary = directory.join(format!(".{name}.yawl-{}.tmp", std::process::id()));
+    // An existing file's contents stay private until the temporary file has
+    // its final mode; a new file starts with the default mode.
+    let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(if original.is_some() { 0o600 } else { 0o666 })
+        .open(&temporary)
+    else {
+        return fs::write(&target, contents);
+    };
+    let replaced = (|| {
+        if let Some(original) = &original {
+            let created = file.metadata()?;
+            if created.uid() != original.uid() {
+                return Ok(false);
+            }
+            if created.gid() != original.gid()
+                && std::os::unix::fs::fchown(&file, None, Some(original.gid())).is_err()
+            {
+                return Ok(false);
+            }
+            // After the group change, which may clear set-id bits.
+            file.set_permissions(original.permissions())?;
+        }
+        std::io::Write::write_all(&mut file, contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &target)?;
+        Ok(true)
+    })();
+    if !matches!(replaced, Ok(true)) {
+        let _ = fs::remove_file(&temporary);
+    }
+    match replaced {
+        Ok(true) => Ok(()),
+        Ok(false) => fs::write(&target, contents),
+        Err(error) => Err(error),
+    }
 }
 
 /// Files with CRLF line endings rarely match model text, which uses `\n`.
@@ -390,6 +465,72 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(std::fs::read_to_string(&file)?, "hi");
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn writes_replace_atomically_and_keep_links_and_permissions() -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new();
+        let file = dir.0.join("script.sh");
+        std::fs::write(&file, "old")?;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o750))?;
+        write_atomically(&file, b"new")?;
+        assert_eq!(std::fs::read_to_string(&file)?, "new");
+        assert_eq!(
+            std::fs::metadata(&file)?.permissions().mode() & 0o777,
+            0o750
+        );
+
+        // Writing through a symlink changes the target and keeps the link.
+        let link = dir.0.join("link.sh");
+        std::os::unix::fs::symlink(&file, &link)?;
+        write_atomically(&link, b"through link")?;
+        assert!(std::fs::symlink_metadata(&link)?.file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&file)?, "through link");
+
+        // A hard-linked file is rewritten in place so both names see it.
+        let alias = dir.0.join("alias.sh");
+        std::fs::hard_link(&file, &alias)?;
+        write_atomically(&file, b"shared")?;
+        assert_eq!(std::fs::read_to_string(&alias)?, "shared");
+
+        // So is a hard-linked file reached through a symlink.
+        write_atomically(&link, b"shared through link")?;
+        assert_eq!(std::fs::read_to_string(&alias)?, "shared through link");
+
+        // A private file stays private.
+        let secret = dir.0.join("secret");
+        std::fs::write(&secret, "old")?;
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))?;
+        write_atomically(&secret, b"new")?;
+        assert_eq!(std::fs::read_to_string(&secret)?, "new");
+        assert_eq!(
+            std::fs::metadata(&secret)?.permissions().mode() & 0o777,
+            0o600
+        );
+
+        // No temporary files are left behind.
+        let leftovers = std::fs::read_dir(&dir.0)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn writes_fall_back_to_in_place_when_the_temporary_name_is_taken() -> std::io::Result<()> {
+        let dir = TestDir::new();
+        let file = dir.0.join("notes.txt");
+        std::fs::write(&file, "old")?;
+        let stale = dir
+            .0
+            .join(format!(".notes.txt.yawl-{}.tmp", std::process::id()));
+        std::fs::write(&stale, "left by a crash")?;
+        write_atomically(&file, b"new")?;
+        assert_eq!(std::fs::read_to_string(&file)?, "new");
+        assert_eq!(std::fs::read_to_string(&stale)?, "left by a crash");
         Ok(())
     }
 }

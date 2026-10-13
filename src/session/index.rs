@@ -80,7 +80,7 @@ mod tests {
     fn metadata_invalidates_on_append_and_file_replacement() {
         let directory = crate::test_support::unique_temp_dir("index");
         let mut session = Session::create(&directory, &directory, "first").unwrap();
-        session.append_message(&Message::user("Preview")).unwrap();
+        session.append_message(Message::user("Preview")).unwrap();
         let path = directory.join(format!("{}.jsonl", session.id));
         assert_eq!(header(&path).model, "first");
         assert_eq!(header(&path).preview, "Preview");

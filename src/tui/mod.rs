@@ -10,6 +10,7 @@ mod completion;
 #[cfg(test)]
 mod completion_tests;
 mod connection;
+mod controller;
 mod dashboard;
 pub mod events;
 mod files;
@@ -44,52 +45,54 @@ mod worker;
 #[cfg(test)]
 mod worker_tests;
 
-use std::io::Read;
-
-use crate::agent::Agent;
+use crate::agent::{Agent, TurnRequest};
 use crate::error::Error;
 
 use self::commands::{
-    GoalAction, HELP, HOTKEYS, PlanAction, activate_picker_action, copy_all_messages,
-    copy_last_reply, goal, is_new_session_command, notice_undo, open_resume_picker, plan,
-    plan_handoff_picker, reasoning, resume, revision_text, settings, show_diff, show_skills,
-    unqueue,
+    Command, GoalAction, HOTKEYS, PlanAction, copy_all_messages, copy_last_reply, goal, help,
+    notice_undo, open_resume_picker, parse_command, plan, reasoning, resume, revision_text,
+    settings, show_diff, show_skills, unqueue,
 };
-use self::completion::handle_completion_key;
-use self::events::{Event, EventReader, Key, event_requests_redraw};
-use self::input::{EditAction, Editor, Submission};
-use self::picker::{
-    open_model_picker, open_settings_picker, paste_into_picker, picker_is_editing,
-    picker_is_plan_handoff, poll_model_picker, sync_color_preview, take_picker_action,
-};
-use self::state::{Update, ViewState, advance_ticks, scroll, toggle_tool_expansion};
+use self::controller::Job;
+use self::events::EventReader;
+use self::input::{Editor, Submission};
+use self::picker::{open_model_picker, open_settings_picker};
+use self::state::ViewState;
 use self::subagents::open_dashboard as open_subagent_dashboard;
 use self::terminal::Terminal;
 use self::transcript::Transcript;
-use self::worker::{
-    TurnKind, apply_focus_events, compact_interactive, deferred_subagents_interactive,
-    handle_mouse_selection, paste_clipboard_image, turn_interactive,
-};
 
+#[cfg(test)]
+use self::commands::{activate_picker_action, busy_command};
 #[cfg(test)]
 use self::commands::{
     format_copy_all, handle_queue_picker_action, last_assistant_reply, open_queue_picker,
 };
+#[cfg(test)]
+use self::completion::handle_completion_key;
 #[cfg(test)]
 use self::completion::{
     COMPLETION_MENU_ROWS, Completion, completion_window, matching_completions,
     sync_completion_filter,
 };
 #[cfg(test)]
+use self::events::Key;
+#[cfg(test)]
+use self::input::EditAction;
+#[cfg(test)]
 use self::picker::{
     ActivePickers, Picker, PickerAction, PickerItem, color_picker, render_picker,
     selection_color_picker,
 };
 #[cfg(test)]
+use self::picker::{picker_is_editing, sync_color_preview, take_picker_action};
+#[cfg(test)]
 use self::render::{
     HIDDEN_CURSOR, RenderCache, WELCOME_ANIMATION_TICKS, build_frame, render_entries,
     render_loading_state, render_queued_panel, selected_row, selection_style,
 };
+#[cfg(test)]
+use self::state::{Update, advance_ticks};
 #[cfg(test)]
 use self::terminal::{
     ScreenPoint, TextSelection, cursor_control, highlighted_selection, selected_text,
@@ -97,7 +100,7 @@ use self::terminal::{
 #[cfg(test)]
 use self::transcript::{Entry, TranscriptEvent};
 #[cfg(test)]
-use self::worker::{BusyCommand, activate_picker_action_while_busy, busy_command, is_cancel_key};
+use self::worker::{activate_picker_action_while_busy, is_cancel_key};
 #[cfg(test)]
 use crate::config::{Config, UiColor};
 #[cfg(test)]
@@ -120,265 +123,30 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
         (None, Vec::new())
     };
     theme::init(agent.config().theme, light_background);
-    let mut events = EventReader::with_pending(
+    let events = EventReader::with_pending(
         terminal.remote().terminal_input(remote::FdInput::stdin()),
         &typed,
     );
-    let mut editor = Editor::default();
+    let editor = Editor::default();
     let mut state = ViewState::from_agent(agent);
-    terminal.draw(&mut state, &editor)?;
-
-    loop {
-        if state.pending_plan_implementation {
-            state.pending_plan_implementation = false;
-            run_agent_turn(
-                agent,
-                None,
-                TurnDispatch::PlanImplement(None),
-                &mut state,
-                &mut editor,
-                &mut terminal,
-                &mut events,
-            )?;
-            continue;
-        }
-        if agent.has_deferred_subagent_results() {
-            state.begin_turn("delivering subagent results");
-            terminal.draw(&mut state, &editor)?;
-            match deferred_subagents_interactive(
-                agent,
-                &mut state,
-                &mut editor,
-                &mut terminal,
-                &mut events,
-            ) {
-                Ok(Some(true) | None) => {}
-                Ok(Some(false)) | Err(Error::Interrupted) => {
-                    state.notice("Subagent result follow-up interrupted.")
-                }
-                Err(error) => state.notice(format!("Subagent result follow-up failed: {error}")),
-            }
-            rebuild_transcript_after_deferred_follow_up(&mut state, agent.messages());
-            state.activity.clear();
-            state.turn_started = None;
-            notify_settled(&mut terminal, &state);
-            terminal.draw(&mut state, &editor)?;
-            continue;
-        }
-        if let Some(action) = state.pending_actions.pop_front() {
-            activate_picker_action(agent, &mut state, action);
-            terminal.draw(&mut state, &editor)?;
-            continue;
-        }
-        if state.picker.is_none()
-            && !state.queue_paused
-            && let Some(input) = state.queued_inputs.pop_front()
-        {
-            if handle_submission(
-                agent,
-                input,
-                &mut state,
-                &mut editor,
-                &mut terminal,
-                &mut events,
-            )? {
-                return Ok(());
-            }
-            continue;
-        }
-
-        let mut event = events.read_event()?;
-        let mut needs_draw = false;
-        loop {
-            let (next, focus_redraw) =
-                apply_focus_events(event, &mut events, &mut terminal, &mut state)?;
-            needs_draw |= focus_redraw;
-            let Some(next) = next else {
-                break;
-            };
-            event = next;
-            needs_draw |= event_requests_redraw(&event);
-            if matches!(&event, Event::Tick) {
-                needs_draw |= terminal.remote().poll(&mut state);
-            }
-            if matches!(&event, Event::Tick) && crate::interrupted() {
-                crate::set_interrupted(false);
-                if !git::handle_interrupt(&mut state) && !processes::handle_interrupt(&mut state) {
-                    state.subagent_manager.interrupt_all();
-                    if !editor.is_empty() {
-                        editor.clear();
-                    }
-                    state.activity = "input cleared".into();
-                }
-                needs_draw = true;
-            }
-            if state.git_init.is_some() {
-                needs_draw = true;
-                git::handle_init_event(&mut state, event);
-                break;
-            }
-            if state.subagent_view.is_some() {
-                needs_draw = true;
-                subagents::handle_event(&mut state, &mut editor, event);
-                break;
-            }
-            if state.process_view.is_some() {
-                needs_draw = true;
-                processes::handle_event(&mut state, event);
-                break;
-            }
-            if state.git_view.is_some() {
-                needs_draw = true;
-                git::handle_event(&mut state, &mut editor, event);
-                break;
-            }
-            if state.picker.is_some() {
-                let plan_handoff = state.picker.as_ref().is_some_and(picker_is_plan_handoff);
-                match event {
-                    Event::Key(Key::Ctrl('l')) => terminal.invalidate(),
-                    Event::Key(Key::PageUp) if plan_handoff => scroll(&mut state, 10),
-                    Event::Key(Key::PageDown) if plan_handoff => scroll(&mut state, -10),
-                    Event::Key(key) => {
-                        if let Some(action) = take_picker_action(&mut state, &mut editor, key) {
-                            activate_picker_action(agent, &mut state, action);
-                        } else {
-                            sync_color_preview(&mut state);
-                        }
-                    }
-                    Event::Paste(text) if picker_is_editing(&state) => {
-                        paste_into_picker(&mut state, &mut editor, &text);
-                    }
-                    Event::MouseScroll(amount) if plan_handoff => scroll(&mut state, amount),
-                    Event::Mouse(mouse) => {
-                        needs_draw |= handle_mouse_selection(&mut terminal, &mut state, mouse)?;
-                    }
-                    Event::Tick => {
-                        needs_draw |= advance_ticks(&mut state);
-                        needs_draw |= connection::poll(&mut state);
-                        needs_draw |= poll_model_picker(&mut state);
-                    }
-                    Event::MouseScroll(_)
-                    | Event::Paste(_)
-                    | Event::FocusGained
-                    | Event::FocusLost => {}
-                }
-                break;
-            }
-            match event {
-                Event::Tick => {
-                    needs_draw |= advance_ticks(&mut state);
-                    needs_draw |= connection::poll(&mut state);
-                    needs_draw |= poll_model_picker(&mut state);
-                }
-                Event::FocusGained | Event::FocusLost => {}
-                Event::MouseScroll(amount) => scroll(&mut state, amount),
-                Event::Mouse(mouse) => {
-                    needs_draw |= handle_mouse_selection(&mut terminal, &mut state, mouse)?;
-                }
-                Event::Paste(text) => {
-                    if state.transcript.search_active() {
-                        state.transcript.search_paste(&text);
-                    } else {
-                        state.transcript.blur();
-                        if text.is_empty() {
-                            paste_clipboard_image(agent.config(), &mut state, &mut editor);
-                        } else {
-                            editor.paste(&text);
-                        }
-                        state.scroll_offset = 0;
-                    }
-                }
-                Event::Key(key) => {
-                    if navigation::handle_key(&mut state, &mut terminal, key)? {
-                        // Transcript search, focus, or the block viewer owns the key.
-                    } else {
-                        match key {
-                            Key::PageUp => scroll(&mut state, 10),
-                            Key::PageDown => scroll(&mut state, -10),
-                            Key::Ctrl('c') => {
-                                editor.clear();
-                                state.activity = "input cleared".into();
-                            }
-                            Key::Ctrl('l') => terminal.invalidate(),
-                            Key::Ctrl('o') => toggle_tool_expansion(&mut state),
-                            Key::Ctrl('v') | Key::Super('v') => {
-                                paste_clipboard_image(agent.config(), &mut state, &mut editor)
-                            }
-                            _ if handle_completion_key(&mut state, &mut editor, key) => {
-                                // The completion menu consumed navigation or Tab.
-                            }
-                            Key::Tab => navigation::focus_transcript(&mut state),
-                            Key::Enter if state.continue_offered && editor.is_empty() => {
-                                continue_turn(
-                                    agent,
-                                    &mut state,
-                                    &mut editor,
-                                    &mut terminal,
-                                    &mut events,
-                                )?;
-                            }
-                            _ => match editor.handle_key(key) {
-                                EditAction::Submit(input)
-                                | EditAction::Queue(input)
-                                | EditAction::Steer(input) => {
-                                    if handle_submission(
-                                        agent,
-                                        input,
-                                        &mut state,
-                                        &mut editor,
-                                        &mut terminal,
-                                        &mut events,
-                                    )? {
-                                        return Ok(());
-                                    }
-                                }
-                                EditAction::None => {}
-                            },
-                        }
-                    }
-                }
-            }
-            if !events.has_pending() {
-                break;
-            }
-            event = events.read_event()?;
-        }
-        if needs_draw || terminal.size_changed() {
-            terminal.draw(&mut state, &editor)?;
-        }
+    if let Some(warning) = agent.session_warning() {
+        state.notice(warning);
     }
+    controller::run(agent, state, editor, terminal, events)
 }
 
-fn rebuild_transcript_after_deferred_follow_up(
-    state: &mut ViewState,
-    messages: &[crate::provider::Message],
-) {
-    state.transcript = Transcript::from_messages(messages);
-    state.render_cache.invalidate();
-}
-
-/// Re-drives a turn that stopped through an error or interrupt.
-fn continue_turn<R: Read>(
-    agent: &mut Agent,
-    state: &mut ViewState,
-    editor: &mut Editor,
-    terminal: &mut Terminal,
-    events: &mut EventReader<R>,
-) -> Result<(), Error> {
+/// The job that re-drives a turn that stopped through an error or
+/// interrupt, or `None` with a notice when the last turn finished.
+fn continue_turn(agent: &Agent, state: &mut ViewState) -> Option<Job> {
     if !agent.can_continue() {
         state.continue_offered = false;
         state.notice("Nothing to continue: the last turn finished.");
-        return Ok(());
+        return None;
     }
-    run_agent_turn(
-        agent,
-        None,
-        TurnDispatch::Continue,
-        state,
-        editor,
-        terminal,
-        events,
-    )
+    Some(Job::Turn {
+        displayed: None,
+        request: TurnRequest::Continue,
+    })
 }
 
 /// Announces a settled turn through the terminal bell when the user may be
@@ -394,14 +162,24 @@ fn displayed_submission(editor: &Editor, input: &Submission) -> String {
     editor.expand_pastes(&input.text)
 }
 
-fn handle_submission<R: Read>(
+/// What an idle submission asks the event loop to do next.
+enum Submitted {
+    Handled,
+    Quit,
+    Start(Job),
+}
+
+fn turn(displayed: Option<String>, request: TurnRequest) -> Submitted {
+    Submitted::Start(Job::Turn { displayed, request })
+}
+
+fn handle_submission(
     agent: &mut Agent,
     input: Submission,
     state: &mut ViewState,
     editor: &mut Editor,
     terminal: &mut Terminal,
-    events: &mut EventReader<R>,
-) -> Result<bool, Error> {
+) -> Result<Submitted, Error> {
     let command = input.text.trim().to_string();
     if input.has_images() && !crate::model::supports_images(agent.config(), agent.model()) {
         state.notice(format!(
@@ -409,7 +187,7 @@ fn handle_submission<R: Read>(
             agent.model()
         ));
         editor.restore_submission(input);
-        return Ok(false);
+        return Ok(Submitted::Handled);
     }
     if let Some(skill_command) = command.strip_prefix("/skill:") {
         let (name, arguments) = skill_command
@@ -425,194 +203,119 @@ fn handle_submission<R: Read>(
                 Err(error) => {
                     state.notice(format!("Could not prepare images: {error}."));
                     editor.restore_submission(input);
-                    return Ok(false);
+                    return Ok(Submitted::Handled);
                 }
             };
-            run_agent_turn(
-                agent,
+            return Ok(turn(
                 Some(displayed_submission(editor, &input)),
-                TurnDispatch::Normal(Some(agent_input)),
-                state,
-                editor,
-                terminal,
-                events,
-            )?;
+                TurnRequest::Prompt(Some(agent_input)),
+            ));
         } else {
             state.notice(format!(
                 "Unknown skill '{name}'. Type /skills to list skills."
             ));
             editor.restore_submission(input);
         }
-        return Ok(false);
+        return Ok(Submitted::Handled);
     }
-    if let Some(command) = command.strip_prefix('/') {
+    if let Some(typed) = parse_command(&command) {
         if input.has_images() {
             state.notice("Images can accompany prompts and /skill commands, not local commands.");
             editor.restore_submission(input);
-            return Ok(false);
+            return Ok(Submitted::Handled);
         }
-        let (name, argument) = command
-            .split_once(char::is_whitespace)
-            .map_or((command, ""), |(name, argument)| (name, argument.trim()));
-        match name {
-            "quit" | "q" => return Ok(true),
-            "help" => state.notice(HELP),
-            "hotkeys" => state.notice(HOTKEYS),
-            "diff" => show_diff(agent, state),
-            "continue" => continue_turn(agent, state, editor, terminal, events)?,
-            "init" => match commands::init(argument) {
-                Ok(input) => {
-                    run_agent_turn(
-                        agent,
-                        Some("/init".into()),
-                        TurnDispatch::Init(input),
-                        state,
-                        editor,
-                        terminal,
-                        events,
-                    )?;
+        let argument = typed.argument;
+        let Some(command) = typed.command else {
+            if !typed.name.is_empty() {
+                state.notice(format!("Unknown command '/{}'. Type /help.", typed.name));
+            }
+            return Ok(Submitted::Handled);
+        };
+        match command {
+            Command::Quit => return Ok(Submitted::Quit),
+            Command::Help => state.notice(help()),
+            Command::Hotkeys => state.notice(HOTKEYS),
+            Command::Diff => show_diff(agent, state),
+            Command::Continue => {
+                if let Some(job) = continue_turn(agent, state) {
+                    return Ok(Submitted::Start(job));
                 }
+            }
+            Command::Init => match commands::init(argument) {
+                Ok(input) => return Ok(turn(Some("/init".into()), TurnRequest::Init(input))),
                 Err(usage) => state.notice(usage),
             },
-            "model" if argument.is_empty() => open_model_picker(agent, state, false),
-            "model" => commands::switch_model(agent, argument.to_string(), state),
-            "reasoning" => reasoning(agent, argument, state),
-            "settings" if argument.is_empty() => open_settings_picker(agent, state),
-            "settings" => {
+            Command::Model if argument.is_empty() => open_model_picker(agent, state, false),
+            Command::Model => commands::switch_model(agent, argument.to_string(), state),
+            Command::Reasoning => reasoning(agent, argument, state),
+            Command::Settings if argument.is_empty() => open_settings_picker(agent, state),
+            Command::Settings => {
                 let _ = settings(agent, argument, state);
                 state.refresh_completions(agent);
             }
-            "connect" if argument.is_empty() => connection::open(state, agent.config(), false),
-            "connect" => state.notice("Usage: /connect"),
-            name if is_new_session_command(name) => commands::new_session(agent, state),
-            "compact" => {
-                state.apply(Update::Compacting);
-                terminal.draw(state, editor)?;
-                let result = compact_interactive(agent, state, editor, terminal, events);
-                state.activity.clear();
-                match result {
-                    Ok(()) => {}
-                    Err(Error::Interrupted) => state.notice("Compaction interrupted."),
-                    Err(error) => state.notice(format!("Compaction failed: {error}")),
-                }
+            Command::Connect if argument.is_empty() => {
+                connection::open(state, agent.config(), false)
             }
-            "usage" if argument.is_empty() => commands::show_usage(state),
-            "usage" => state.notice("Usage: /usage"),
-            "tools" => commands::show_tools(agent, state),
-            "skills" => show_skills(agent, state),
-            "subagents" if argument.is_empty() => open_subagent_dashboard(state),
-            "subagents" => state.notice("Usage: /subagents"),
-            "ps" if argument.is_empty() => {
+            Command::Connect => state.notice("Usage: /connect"),
+            Command::New => commands::new_session(agent, state),
+            Command::Compact => return Ok(Submitted::Start(Job::Compact)),
+            Command::Usage if argument.is_empty() => commands::show_usage(state),
+            Command::Usage => state.notice("Usage: /usage"),
+            Command::Tools => commands::show_tools(agent, state),
+            Command::Skills => show_skills(agent, state),
+            Command::Subagents if argument.is_empty() => open_subagent_dashboard(state),
+            Command::Subagents => state.notice("Usage: /subagents"),
+            Command::Processes if argument.is_empty() => {
                 processes::open_dashboard(state, agent.background_processes())
             }
-            "ps" => state.notice("Usage: /ps"),
-            "git" if argument.is_empty() => git::open_dashboard(state),
-            "git" => state.notice("Usage: /git"),
-            "remote" => remote::command(terminal, state, argument),
-            "resume" if argument.is_empty() => open_resume_picker(agent, state),
-            "resume" => resume(agent, argument, state),
-            "unqueue" => unqueue(argument, state),
-            "goal" => {
+            Command::Processes => state.notice("Usage: /ps"),
+            Command::Git if argument.is_empty() => git::open_dashboard(state),
+            Command::Git => state.notice("Usage: /git"),
+            Command::Remote => remote::command(terminal, state, argument),
+            Command::Resume if argument.is_empty() => open_resume_picker(agent, state),
+            Command::Resume => resume(agent, argument, state),
+            Command::Unqueue => unqueue(argument, state),
+            Command::Goal => {
                 let (agent_argument, displayed) = prepare_goal_submission(editor, argument);
-                match goal_command(agent, &agent_argument, displayed, state) {
-                    GoalDispatch::Idle => {}
-                    GoalDispatch::Start(displayed) => {
-                        run_agent_turn(
-                            agent,
-                            Some(displayed),
-                            TurnDispatch::Goal,
-                            state,
-                            editor,
-                            terminal,
-                            events,
-                        )?;
-                    }
-                    GoalDispatch::Resume => {
-                        run_agent_turn(
-                            agent,
-                            None,
-                            TurnDispatch::Goal,
-                            state,
-                            editor,
-                            terminal,
-                            events,
-                        )?;
-                    }
+                match goal(agent, &agent_argument, state) {
+                    GoalAction::None => {}
+                    GoalAction::Start => return Ok(turn(Some(displayed), TurnRequest::Goal)),
+                    GoalAction::Resume => return Ok(turn(None, TurnRequest::Goal)),
                 }
             }
-            "plan" => {
+            Command::Plan => {
                 let (agent_argument, displayed) = prepare_goal_submission(editor, argument);
                 match plan(agent, &agent_argument, state) {
                     PlanAction::None => {}
-                    PlanAction::Start => {
-                        run_agent_turn(
-                            agent,
-                            Some(displayed),
-                            TurnDispatch::Plan,
-                            state,
-                            editor,
-                            terminal,
-                            events,
-                        )?;
-                    }
-                    PlanAction::Resume => {
-                        run_agent_turn(
-                            agent,
-                            None,
-                            TurnDispatch::Plan,
-                            state,
-                            editor,
-                            terminal,
-                            events,
-                        )?;
-                    }
+                    PlanAction::Start => return Ok(turn(Some(displayed), TurnRequest::Plan)),
+                    PlanAction::Resume => return Ok(turn(None, TurnRequest::Plan)),
                     PlanAction::Implement => {
-                        run_agent_turn(
-                            agent,
-                            None,
-                            TurnDispatch::PlanImplement(None),
-                            state,
-                            editor,
-                            terminal,
-                            events,
-                        )?;
+                        return Ok(turn(None, TurnRequest::PlanImplement(None)));
                     }
                     PlanAction::Revise(revision) => {
                         let displayed = revision_text(&displayed).unwrap_or(&revision);
-                        run_agent_turn(
-                            agent,
+                        return Ok(turn(
                             Some(displayed.to_string()),
-                            TurnDispatch::PlanRevise(revision.into()),
-                            state,
-                            editor,
-                            terminal,
-                            events,
-                        )?;
+                            TurnRequest::PlanRevise(revision.into()),
+                        ));
                     }
                 }
             }
-            "undo" => match agent.undo_last_turn() {
+            Command::Undo => match agent.undo_last_turn() {
                 Ok(report) => {
                     state.transcript = Transcript::from_messages(agent.messages());
                     state.refresh_welcome(agent);
                     state.render_cache.invalidate();
                     state.context_tokens = agent.context_tokens();
-                    state.active_goal = agent.active_goal().map(str::to_string);
-                    state.active_plan = agent.active_plan().map(str::to_string);
-                    state.plan_draft = matches!(
-                        agent.plan_state(),
-                        Some(crate::session::PlanState::Draft { .. })
-                    );
+                    state.sync_modes(agent);
                     notice_undo(state, report);
                 }
                 Err(error) => state.notice(format!("Could not undo: {error}")),
             },
-            "copy" => copy_last_reply(terminal, state, agent.messages())?,
-            "copy-all" => copy_all_messages(terminal, state, agent.messages())?,
-            "" => {}
-            other => state.notice(format!("Unknown command '/{other}'. Type /help.")),
+            Command::Copy => copy_last_reply(terminal, state, agent.messages())?,
+            Command::CopyAll => copy_all_messages(terminal, state, agent.messages())?,
         }
-        return Ok(false);
+        return Ok(Submitted::Handled);
     }
 
     let displayed_input = displayed_submission(editor, &input);
@@ -622,41 +325,15 @@ fn handle_submission<R: Read>(
         Err(error) => {
             state.notice(format!("Could not prepare images: {error}."));
             editor.restore_submission(input);
-            return Ok(false);
+            return Ok(Submitted::Handled);
         }
     };
-    let dispatch = if agent.active_plan().is_some() {
-        TurnDispatch::PlanFollowUp(agent_input)
+    let request = if agent.active_plan().is_some() {
+        TurnRequest::PlanFollowUp(agent_input)
     } else {
-        TurnDispatch::Normal(Some(agent_input))
+        TurnRequest::Prompt(Some(agent_input))
     };
-    run_agent_turn(
-        agent,
-        Some(displayed_input),
-        dispatch,
-        state,
-        editor,
-        terminal,
-        events,
-    )?;
-    Ok(false)
-}
-
-enum GoalDispatch {
-    Idle,
-    Start(String),
-    Resume,
-}
-
-enum TurnDispatch {
-    Normal(Option<crate::provider::TurnInput>),
-    Init(crate::provider::TurnInput),
-    Goal,
-    Plan,
-    PlanFollowUp(crate::provider::TurnInput),
-    PlanRevise(crate::provider::TurnInput),
-    PlanImplement(Option<crate::provider::TurnInput>),
-    Continue,
+    Ok(turn(Some(displayed_input), request))
 }
 
 fn prepare_goal_submission(editor: &Editor, argument: &str) -> (String, String) {
@@ -664,103 +341,4 @@ fn prepare_goal_submission(editor: &Editor, argument: &str) -> (String, String) 
         editor.expand_submission(argument),
         editor.expand_pastes(argument),
     )
-}
-
-fn goal_command(
-    agent: &mut Agent,
-    argument: &str,
-    displayed: String,
-    state: &mut ViewState,
-) -> GoalDispatch {
-    match goal(agent, argument, state) {
-        GoalAction::None => GoalDispatch::Idle,
-        GoalAction::Start => GoalDispatch::Start(displayed),
-        GoalAction::Resume => GoalDispatch::Resume,
-    }
-}
-
-fn run_agent_turn<R: Read>(
-    agent: &mut Agent,
-    displayed_input: Option<String>,
-    turn: TurnDispatch,
-    state: &mut ViewState,
-    editor: &mut Editor,
-    terminal: &mut Terminal,
-    events: &mut EventReader<R>,
-) -> Result<(), Error> {
-    let goal_mode = matches!(&turn, TurnDispatch::Goal);
-    let kind = match &turn {
-        TurnDispatch::Normal(_) => TurnKind::Normal,
-        TurnDispatch::Init(_) => TurnKind::Init,
-        TurnDispatch::Goal => TurnKind::Goal,
-        TurnDispatch::Plan => TurnKind::Plan,
-        TurnDispatch::PlanFollowUp(_) => TurnKind::PlanFollowUp,
-        TurnDispatch::PlanRevise(_) => TurnKind::PlanRevise,
-        TurnDispatch::PlanImplement(_) => TurnKind::PlanImplement,
-        TurnDispatch::Continue => TurnKind::Continue,
-    };
-    state.continue_offered = false;
-    if let Some(displayed_input) = displayed_input {
-        state.transcript.push_user(displayed_input);
-    }
-    state.begin_turn("sending");
-    state.active_goal = agent.active_goal().map(str::to_string);
-    state.active_plan = agent.active_plan().map(str::to_string);
-    state.plan_draft = matches!(
-        agent.plan_state(),
-        Some(crate::session::PlanState::Draft { .. })
-    );
-    state.goal_running = goal_mode;
-    state.scroll_offset = 0;
-    terminal.draw(state, editor)?;
-    let agent_input = match turn {
-        TurnDispatch::Normal(input) => input,
-        TurnDispatch::Init(input) => Some(input),
-        TurnDispatch::Goal => None,
-        TurnDispatch::Plan => None,
-        TurnDispatch::PlanFollowUp(input) | TurnDispatch::PlanRevise(input) => Some(input),
-        TurnDispatch::PlanImplement(input) => input,
-        TurnDispatch::Continue => None,
-    };
-    let result = turn_interactive(agent, agent_input, kind, state, editor, terminal, events);
-    state.transcript.finish_streaming_response();
-    let completed = match result {
-        Ok(true) => true,
-        Ok(false) | Err(Error::Interrupted) => {
-            if agent.can_continue() {
-                state.notice("Turn interrupted. Type /continue to pick it up again.");
-            } else {
-                state.notice("Turn interrupted.");
-            }
-            false
-        }
-        Err(error) => {
-            state.continue_offered = agent.can_continue();
-            if state.continue_offered {
-                state.notice(format!(
-                    "Request failed: {error}\nPress Enter to continue where it stopped, or type a new message."
-                ));
-            } else {
-                state.notice(format!("Request failed: {error}"));
-            }
-            false
-        }
-    };
-    crate::set_interrupted(false);
-    state.activity.clear();
-    state.turn_started = None;
-    state.active_goal = agent.active_goal().map(str::to_string);
-    state.active_plan = agent.active_plan().map(str::to_string);
-    state.plan_draft = matches!(
-        agent.plan_state(),
-        Some(crate::session::PlanState::Draft { .. })
-    );
-    state.goal_running = false;
-    notify_settled(terminal, state);
-    // Only a turn that ended through plan_complete offers the handoff;
-    // follow-up turns replying to unrelated requests must not.
-    if completed && agent.plan_ready_this_turn() {
-        state.picker = Some(plan_handoff_picker());
-    }
-    Ok(())
 }

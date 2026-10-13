@@ -107,7 +107,7 @@ impl Transcript {
                 Role::User if message.is_steering() => {
                     entries.push(Entry::Steer(message.content.clone()));
                 }
-                Role::User if message.content.starts_with("[conversation summary]") => {
+                Role::User if message.is_summary() => {
                     entries.push(Entry::Notice(message.content.clone()));
                 }
                 Role::User if !message.subagent_results.is_empty() => {
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn plan_handoff_replays_as_a_notice_without_the_summary_marker() {
-        let handoff = crate::compaction::plan_handoff_message(
+        let handoff = crate::provider::Message::plan_handoff(
             "Implementation handoff: the planning conversation was replaced.\n\nPlan:\n\n# Plan",
         );
         let transcript = Transcript::from_messages(&[handoff]);

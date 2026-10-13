@@ -621,17 +621,7 @@ fn truncate_visible(text: &str, width: usize) -> String {
 }
 
 fn sanitize_plain(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c == '\t' {
-                ' '
-            } else if c.is_control() {
-                '�'
-            } else {
-                c
-            }
-        })
-        .collect()
+    crate::text::sanitize_line(text, crate::text::Tabs::Space)
 }
 
 #[cfg(test)]

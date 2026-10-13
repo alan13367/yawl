@@ -6,7 +6,7 @@
   Stream answers, run tools, keep sessions, and bring your own model.</p>
   <p>
     <a href="https://github.com/alan13367/yawl/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-7aa2f7?style=flat-square" alt="MIT license"></a>
-    <img src="https://img.shields.io/badge/Rust-1.98%2B-orange?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.98 or newer">
+    <img src="https://img.shields.io/badge/Rust-1.99%2B-orange?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.99 or newer">
     <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-8fbcbb?style=flat-square" alt="macOS and Linux">
   </p>
 </div>
@@ -22,7 +22,7 @@ Yawl is a terminal AI agent for macOS and Linux. Use the full-screen interface f
 
 ## Install
 
-Requires Rust 1.98 or newer.
+Requires Rust 1.99 or newer.
 
 ```sh
 git clone https://github.com/alan13367/yawl.git
@@ -105,7 +105,7 @@ The Git dashboard supports keyboard and mouse navigation. Click a file or commit
 
 ### Goals and plans
 
-`/goal TEXT` keeps the agent working until it marks the goal complete. `/plan TEXT` starts a read-only workflow that asks one to three questions (more only while material choices remain) and saves a Markdown plan. Once the plan is ready, a typed prompt is classified as a revision, an implementation request, or an unrelated message; `/plan revise TEXT` revises the plan directly and `/plan implement` implements it, with no classification step. Revisions ask questions only when the change leaves material choices open. `/plan TEXT` with a ready plan replaces it with a new plan, and `/undo` restores the ready one. `revise` and `implement` are reserved first words, so start a plan about them with different wording. When implementation starts, the planning conversation, from `/plan` up to the implementation prompt, is replaced in the model's context by the saved plan, the objective, and your answers and prompts from planning, without an extra summarization request. Conversation from before `/plan` stays in context, and the full history stays in the session log. If implementation needs something only you can provide, or the model replies three times in a row without finishing a plan step, the turn stops and the plan stays active. A reply that answers or continues the work resumes implementation, and `/plan implement` resumes it directly. Plan phases keep the same system prompt and tool list and add their instructions as hidden messages, so local servers can reuse their prompt cache; planning still rejects any tool that is not read-only.
+`/goal TEXT` keeps the agent working until it marks the goal complete. `/plan TEXT` starts a read-only workflow that asks one to three questions (more only while material choices remain) and saves a Markdown plan. Once the plan is ready, a typed prompt is classified as a revision, an implementation request, or an unrelated message; `/plan revise TEXT` revises the plan directly and `/plan implement` implements it, with no classification step. Revisions ask questions only when the change leaves material choices open. `/plan TEXT` with a ready plan replaces it with a new plan, and `/undo` restores the ready one. While a plan is active, `revise` and `implement` are reserved first words; with no plan, `/plan revise …` starts a plan like any other objective. Subcommands match regardless of case. When implementation starts, the planning conversation, from `/plan` up to the implementation prompt, is replaced in the model's context by the saved plan, the objective, and your answers and prompts from planning, without an extra summarization request. Conversation from before `/plan` stays in context, and the full history stays in the session log. If implementation needs something only you can provide, or the model replies three times in a row without finishing a plan step, the turn stops and the plan stays active. A reply that answers or continues the work resumes implementation, and `/plan implement` resumes it directly. Plan phases keep the same system prompt and tool list and add their instructions as hidden messages, so local servers can reuse their prompt cache; planning still rejects any tool that is not read-only.
 
 ### Remote control
 
@@ -189,9 +189,9 @@ The `theme` setting (`auto`, `dark`, or `light`) picks interface colors for the 
 
 ## Sessions and undo
 
-Sessions live under `~/.yawl/sessions/projects/<project-key>/`. `yawl -c` resumes the latest session in the working directory; `/resume` opens its session picker. `--session ID` resumes from any directory. Sessions restore the selected model and reasoning effort; `-m MODEL` overrides the model for one run.
+Sessions live under `~/.yawl/sessions/projects/<project-key>/`. `yawl -c` resumes the latest session in the working directory; `/resume` opens its session picker. `--session ID` resumes from any directory. Sessions restore the selected model and reasoning effort; `-m MODEL` overrides the model for one run. A session log is append-only: every change is an event that replay applies the same way the live session did. Unreadable entries, for example from a newer Yawl version, are skipped with a warning when the session opens, and an entry cut short by a crash is dropped.
 
-`/undo` restores files changed through `write_file`, `edit_file`, and `define_tool`, and removes the last turn. It does not track file changes made by shell commands or custom tools. Snapshots are limited to 32 MiB per file. If the agent moved Git `HEAD`, undo also soft-resets it to the pre-turn commit. `/diff` compares files touched by the file tools with their original session contents.
+`/undo` restores files changed through `write_file`, `edit_file`, and `define_tool`, and removes the last turn. It does not track file changes made by shell commands or custom tools. Snapshots are limited to 32 MiB per file. If the agent moved Git `HEAD`, undo also soft-resets it to the pre-turn commit. When a turn's snapshot is missing, for example after copying a session log without `~/.yawl/checkpoints`, undo still removes the turn and warns that files were not restored. A session that cannot finish recovering never blocks `/new` or `/resume`. `/diff` compares files touched by the file tools with their original session contents.
 
 Automatic compaction summarizes older conversation near the context limit, at 85% by default, while retaining recent exchanges. `/compact` requests it manually. The full transcript remains in the session log. `/usage` reports input, output, and prompt-cache usage.
 
@@ -228,7 +228,7 @@ Long reports are saved under `~/.yawl/artifacts/subagents/`, with a summary and 
 
 Use `shell` with `background: true` for servers and watchers so Yawl can track and stop them. Up to eight background commands can run per session; `/ps` opens their dashboard.
 
-Large command output is saved under `~/.yawl/artifacts/tool-output/`. The model receives an excerpt and a path for paged reading. These artifacts persist until manually removed. `edit_file` accepts files up to 16 MiB; use shell tools for larger files.
+Each command output stream keeps its first and last 32 KiB, so build and test summaries printed last are never lost; a marker shows how much was omitted in between. Large command output is saved under `~/.yawl/artifacts/tool-output/`. The model receives an excerpt and a path for paged reading. These artifacts persist until manually removed. `edit_file` accepts files up to 16 MiB; use shell tools for larger files.
 
 Shell and custom-tool results contain stdout, followed by any stderr under a `[stderr]` marker, even when the command succeeds. That way, compiler and linter warnings reach the model. Commands run without a terminal, so password and passphrase prompts from tools such as `ssh`, `sudo`, and `git` fail at once with their error instead of waiting for input; use keys, an agent, or `sudo -n`.
 
@@ -282,7 +282,7 @@ Yawl includes `~/.yawl/AGENTS.md` and `./AGENTS.md` in model instructions. Use t
 
 ## Development
 
-Yawl is one Cargo package with a library and binary, using blocking I/O. Agent, provider, configuration, tool, and TUI facades keep their implementations in child modules. See [AGENTS.md](AGENTS.md) for the module map and contribution rules.
+Yawl is one Cargo package using blocking I/O: a one-line binary over a library whose modules are all crate-private, so the compiler reports unused code. Agent, provider, configuration, tool, and TUI facades keep their implementations in child modules. See [AGENTS.md](AGENTS.md) for the module map and contribution rules.
 
 ```sh
 cargo fmt --all --check

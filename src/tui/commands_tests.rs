@@ -4,9 +4,10 @@ use super::*;
 
 #[test]
 fn new_and_clear_are_new_session_commands() {
-    assert!(is_new_session_command("new"));
-    assert!(is_new_session_command("clear"));
-    assert!(!is_new_session_command("compact"));
+    let command = |text: &str| super::commands::parse_command(text).and_then(|typed| typed.command);
+    assert_eq!(command("/new"), Some(Command::New));
+    assert_eq!(command("/clear"), Some(Command::New));
+    assert_eq!(command("/compact"), Some(Command::Compact));
 }
 
 #[test]
@@ -256,7 +257,7 @@ fn resume_picker_is_scoped_but_explicit_ids_search_other_projects() {
         .expect("test session should be created");
     let session_id = session.id.clone();
     session
-        .append_message(&crate::provider::Message::user("fix the bug"))
+        .append_message(crate::provider::Message::user("fix the bug"))
         .expect("message should append");
     // A mid-session switch is what the picker and resume must report.
     session
@@ -270,7 +271,7 @@ fn resume_picker_is_scoped_but_explicit_ids_search_other_projects() {
     )
     .expect("other project session should be written");
 
-    let mut agent = Agent::new(config, "claude".into(), session, Vec::new());
+    let mut agent = Agent::new(config, "claude".into(), session);
     let mut state = ViewState::from_agent(&agent);
 
     open_resume_picker(&agent, &mut state);
@@ -305,12 +306,12 @@ fn welcome_details_are_only_gathered_for_an_empty_transcript() {
     let mut used = crate::session::Session::create(&dirs.project, &cwd, "claude")
         .expect("used session should be created");
     let used_id = used.id.clone();
-    used.append_message(&crate::provider::Message::user("hello"))
+    used.append_message(crate::provider::Message::user("hello"))
         .expect("message should append");
     drop(used);
     let empty = crate::session::Session::create(&dirs.project, &cwd, "claude")
         .expect("empty session should be created");
-    let mut agent = Agent::new(config, "claude".into(), empty, Vec::new());
+    let mut agent = Agent::new(config, "claude".into(), empty);
 
     let mut state = ViewState::from_agent(&agent);
     assert_ne!(state.welcome, Default::default());
@@ -334,7 +335,7 @@ fn resume_picker_deletes_the_selected_session() {
     let dirs = config.session_dirs(&cwd);
     let mut keep = crate::session::Session::create(&dirs.project, &cwd, "claude")
         .expect("keep session should be created");
-    keep.append_message(&crate::provider::Message::user("keep me"))
+    keep.append_message(crate::provider::Message::user("keep me"))
         .expect("message should append");
     let keep_id = keep.id.clone();
     drop(keep);
@@ -342,13 +343,13 @@ fn resume_picker_deletes_the_selected_session() {
         .expect("remove session should be created");
     let remove_id = remove.id.clone();
     remove
-        .append_message(&crate::provider::Message::user("delete me"))
+        .append_message(crate::provider::Message::user("delete me"))
         .expect("message should append");
     drop(remove);
 
     let active = crate::session::Session::create(&dirs.project, &cwd, "claude")
         .expect("active session should be created");
-    let mut agent = Agent::new(config, "claude".into(), active, Vec::new());
+    let mut agent = Agent::new(config, "claude".into(), active);
     let mut state = ViewState::from_agent(&agent);
     let mut editor = Editor::default();
 
@@ -401,19 +402,19 @@ fn resume_picker_deletes_the_selected_session() {
 
 #[test]
 fn help_lists_undo_and_copy_commands() {
-    assert!(HELP.contains("/undo"));
-    assert!(HELP.contains("/copy"));
-    assert!(HELP.contains("/copy-all"));
-    assert!(HELP.contains("/usage"));
-    assert!(HELP.contains("/ps"));
-    assert!(HELP.contains("/git"));
-    assert!(HELP.contains("/reasoning"));
-    assert!(HELP.contains("/hotkeys"));
-    assert!(HELP.contains("/diff"));
-    assert!(HELP.contains("/init"));
-    assert!(HELP.contains("| Command | Description |"));
+    assert!(help().contains("/undo"));
+    assert!(help().contains("/copy"));
+    assert!(help().contains("/copy-all"));
+    assert!(help().contains("/usage"));
+    assert!(help().contains("/ps"));
+    assert!(help().contains("/git"));
+    assert!(help().contains("/reasoning"));
+    assert!(help().contains("/hotkeys"));
+    assert!(help().contains("/diff"));
+    assert!(help().contains("/init"));
+    assert!(help().contains("| Command | Description |"));
 
-    let rendered = crate::tui::markdown::render(HELP, 80);
+    let rendered = crate::tui::markdown::render(&help(), 80);
     assert!(
         rendered
             .iter()
@@ -623,7 +624,7 @@ fn reasoning_command_shows_model_levels_and_sets_them_directly() {
     let dirs = config.session_dirs(&cwd);
     let session = crate::session::Session::create(&dirs.project, &cwd, "openai-codex:gpt-5.4")
         .expect("session should be created");
-    let mut agent = Agent::new(config, "openai-codex:gpt-5.4".into(), session, Vec::new());
+    let mut agent = Agent::new(config, "openai-codex:gpt-5.4".into(), session);
     let mut state = ViewState::from_agent(&agent);
 
     reasoning(&mut agent, "", &mut state);
@@ -685,7 +686,7 @@ fn reasoning_status_only_shows_an_effort_supported_by_the_active_model() {
     let dirs = config.session_dirs(&cwd);
     let session = crate::session::Session::create(&dirs.project, &cwd, "claude")
         .expect("session should be created");
-    let mut agent = Agent::new(config, "claude".into(), session, Vec::new());
+    let mut agent = Agent::new(config, "claude".into(), session);
     let mut state = ViewState::from_agent(&agent);
 
     assert!(state.reasoning_effort.is_none());
@@ -722,7 +723,7 @@ fn reasoning_command_reports_models_without_levels() {
     let dirs = config.session_dirs(&cwd);
     let session = crate::session::Session::create(&dirs.project, &cwd, "claude")
         .expect("session should be created");
-    let mut agent = Agent::new(config, "claude".into(), session, Vec::new());
+    let mut agent = Agent::new(config, "claude".into(), session);
     let mut state = ViewState::from_agent(&agent);
 
     reasoning(&mut agent, "", &mut state);
@@ -776,7 +777,7 @@ fn format_copy_all_keeps_user_and_assistant_and_drops_tools_and_reasoning() {
         kind: crate::provider::ReasoningKind::Summary,
         content: "secret thoughts".into(),
     });
-    let summary = crate::compaction::summary_message("earlier work");
+    let summary = crate::provider::Message::summary("earlier work", Vec::new(), None);
     let messages = [
         summary,
         crate::provider::Message::user("please edit"),
@@ -800,7 +801,7 @@ fn format_copy_all_drops_a_user_turn_with_only_an_empty_assistant() {
         crate::provider::Message::assistant("answer".into(), vec![]),
         crate::provider::Message::user("failed turn"),
         crate::provider::Message::assistant(String::new(), vec![]),
-        crate::compaction::summary_message("earlier work"),
+        crate::provider::Message::summary("earlier work", Vec::new(), None),
     ];
     let text = format_copy_all(&messages, None);
     assert!(text.contains("User:\nkeep this"));
@@ -832,9 +833,9 @@ fn new_then_resume_does_not_reuse_submitted_image_numbers() {
         panic!("expected image submission");
     };
     session
-        .append_message(&crate::provider::Message::user(&input.text))
+        .append_message(crate::provider::Message::user(&input.text))
         .unwrap();
-    let mut agent = Agent::new(config, "claude".into(), session, Vec::new());
+    let mut agent = Agent::new(config, "claude".into(), session);
     let mut state = ViewState::from_agent(&agent);
 
     super::commands::new_session(&mut agent, &mut state);
@@ -882,7 +883,7 @@ fn model_selection_follows_up_with_only_the_models_supported_reasoning_levels() 
             let session =
                 crate::session::Session::create(&config.session_dirs(&cwd).project, &cwd, "test")
                     .unwrap();
-            let mut agent = Agent::new(config, "test".into(), session, Vec::new());
+            let mut agent = Agent::new(config, "test".into(), session);
             let mut state = ViewState::from_agent(&agent);
             let action = if save {
                 PickerAction::SaveModel("local:listed".into())
@@ -953,7 +954,7 @@ fn new_connection_session_activation_prompts_for_just_saved_reasoning_levels() {
             let session =
                 crate::session::Session::create(&config.session_dirs(&cwd).project, &cwd, "test")
                     .unwrap();
-            let mut agent = Agent::new(config, "test".into(), session, Vec::new());
+            let mut agent = Agent::new(config, "test".into(), session);
             let mut state = ViewState::from_agent(&agent);
             let plan = ConnectionPlan {
                 changes: vec![
@@ -1068,15 +1069,15 @@ fn agent_with_plan(root: &std::path::Path, ready: bool) -> Agent {
             .expect("test session should be created");
     let start = crate::provider::Message::user("add planning mode");
     session
-        .append_plan_start("add planning mode", &start)
+        .append_plan_start("add planning mode", start)
         .expect("plan start");
     if ready {
         let plan = crate::provider::Message::assistant("# Plan".into(), Vec::new());
         session
-            .append_plan_ready("# Plan", &plan)
+            .append_plan_ready("# Plan", plan)
             .expect("plan ready");
     }
-    Agent::new(config, "test".into(), session, Vec::new())
+    Agent::new(config, "test".into(), session)
 }
 
 fn last_notice(state: &ViewState) -> String {
@@ -1098,6 +1099,7 @@ fn revision_text_matches_only_the_revise_subcommand() {
     assert_eq!(revision_text("revise rename step 2"), Some("rename step 2"));
     assert_eq!(revision_text("revise"), Some(""));
     assert_eq!(revision_text("revise\n  tighten it "), Some("tighten it"));
+    assert_eq!(revision_text("Revise tighten it"), Some("tighten it"));
     assert_eq!(revision_text("revision of the docs"), None);
     assert_eq!(revision_text("implement"), None);
 }
@@ -1115,11 +1117,21 @@ fn plan_implement_and_revise_act_only_on_a_ready_plan() {
     ));
     assert_eq!(last_notice(&state), "No active plan.");
     assert!(matches!(
-        plan(&mut agent, "revise rename step 2", &mut state),
+        plan(&mut agent, "revise", &mut state),
         PlanAction::None
     ));
-    assert_eq!(last_notice(&state), "No active plan.");
+    assert_eq!(last_notice(&state), "Usage: /plan revise TEXT");
     assert!(agent.plan_state().is_none(), "no plan may be started");
+    // With no plan to revise, an objective may start with "revise".
+    assert!(matches!(
+        plan(&mut agent, "revise our CI caching", &mut state),
+        PlanAction::Start
+    ));
+    assert!(matches!(
+        agent.plan_state(),
+        Some(crate::session::PlanState::Draft { objective, .. })
+            if objective == "revise our CI caching"
+    ));
 
     let mut agent = agent_with_plan(&root.join("draft"), false);
     let mut state = ViewState::from_agent(&agent);
@@ -1146,7 +1158,7 @@ fn plan_implement_and_revise_act_only_on_a_ready_plan() {
     ));
     assert_eq!(last_notice(&state), "Usage: /plan revise TEXT");
     assert!(matches!(
-        plan(&mut agent, "implement", &mut state),
+        plan(&mut agent, "Implement", &mut state),
         PlanAction::Implement
     ));
     assert!(matches!(
@@ -1193,6 +1205,9 @@ fn plan_implement_and_revise_wait_for_a_busy_turn() {
     let mut state = ViewState::from_agent(&agent);
     super::commands::plan_while_busy("implement", &mut state);
     assert!(last_notice(&state).contains("/plan implement"));
+    super::commands::plan_while_busy("revise tighten it", &mut state);
+    assert!(last_notice(&state).contains("before changing the plan"));
+    state.active_plan = Some("# Plan".into());
     super::commands::plan_while_busy("revise tighten it", &mut state);
     assert!(last_notice(&state).contains("/plan revise TEXT"));
     super::commands::plan_while_busy("something new", &mut state);

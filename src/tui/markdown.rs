@@ -1023,15 +1023,7 @@ pub(super) fn split_chars(text: &str, width: usize) -> Vec<String> {
 }
 
 fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|character| {
-            if character == '\t' || !character.is_control() {
-                character
-            } else {
-                '�'
-            }
-        })
-        .collect()
+    crate::text::sanitize_line(text, crate::text::Tabs::Keep)
 }
 
 fn terminal_lines(text: &str) -> Vec<String> {
@@ -1057,7 +1049,7 @@ fn terminal_lines(text: &str) -> Vec<String> {
             '\r' => cursor = 0,
             '\u{8}' => cursor = cursor.saturating_sub(1),
             character => {
-                let character = if character == '\t' || !character.is_control() {
+                let character = if character == '\t' || !crate::text::is_unsafe(character) {
                     character
                 } else {
                     char::REPLACEMENT_CHARACTER

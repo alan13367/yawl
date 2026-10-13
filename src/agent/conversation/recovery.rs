@@ -1,4 +1,4 @@
-use super::{Conversation, ConversationKind, UndoReport};
+use super::{Conversation, UndoReport};
 use crate::error::Error;
 use crate::provider::Message;
 
@@ -11,12 +11,9 @@ impl Conversation {
     }
 
     fn flush_tool_results(&mut self) -> Result<(), Error> {
-        while let Some(result) = self.pending_tool_results.pop_front() {
-            if let Err(error) = self.persist_message(&result) {
-                self.pending_tool_results.push_front(result);
-                return Err(error);
-            }
-            self.messages.push(result);
+        while let Some(result) = self.pending_tool_results.front() {
+            self.session.append_message(result.clone())?;
+            self.pending_tool_results.pop_front();
         }
         Ok(())
     }
@@ -24,20 +21,7 @@ impl Conversation {
     pub(super) fn recover_history(&mut self) -> Result<(), Error> {
         self.flush_tool_results()?;
         self.recover_undo()?;
-        let previous_len = self.messages.len();
-        match &mut self.kind {
-            ConversationKind::Persistent(state) => {
-                state.session.repair_tool_results(&mut self.messages)?
-            }
-            ConversationKind::Child(_) => {
-                while let Some((index, results)) =
-                    crate::session::missing_tool_results(&self.messages)
-                {
-                    self.messages.splice(index..index, results);
-                }
-            }
-        }
-        if self.messages.len() != previous_len {
+        if self.session.repair_tool_results()? {
             self.context_tokens = 0;
             self.context_usage = None;
         }
@@ -45,10 +29,7 @@ impl Conversation {
     }
 
     pub(super) fn recover_undo(&mut self) -> Result<Option<UndoReport>, Error> {
-        let ConversationKind::Persistent(state) = &mut self.kind else {
-            return Ok(None);
-        };
-        let Some(undo) = state.session.pending_undo().cloned() else {
+        let Some(undo) = self.session.pending_undo().cloned() else {
             return Ok(None);
         };
         let restore = if undo.committed {
@@ -57,14 +38,12 @@ impl Conversation {
                 ..Default::default()
             }
         } else {
-            let restore = state.checkpoints.restore_retained(undo.checkpoint)?;
-            state.session.append_undo_event_with_plan(
-                undo.dropped,
-                undo.clear_goal,
-                undo.plan_state,
-            )?;
-            self.messages
-                .truncate(self.messages.len().saturating_sub(undo.dropped));
+            let restore = match &self.services.checkpoints {
+                Some(checkpoints) => checkpoints.restore_retained(undo.checkpoint)?,
+                None => crate::checkpoint::RestoreReport::default(),
+            };
+            self.session
+                .append_undo(undo.dropped, undo.clear_goal, undo.plan_state)?;
             self.context_tokens = 0;
             self.context_usage = None;
             self.latest_turn_result.clear();
@@ -72,8 +51,10 @@ impl Conversation {
             self.unfinished_mode = None;
             restore
         };
-        state.checkpoints.discard_restored(undo.checkpoint)?;
-        state.session.finish_undo()?;
+        if let Some(checkpoints) = &mut self.services.checkpoints {
+            checkpoints.discard_restored(undo.checkpoint)?;
+        }
+        self.session.finish_undo()?;
         Ok(Some(UndoReport {
             dropped: undo.dropped,
             restored_files: restore.restored,

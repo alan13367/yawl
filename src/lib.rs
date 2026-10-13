@@ -4,28 +4,35 @@
 //! model extends Yawl at runtime by writing executable tools; the harness
 //! never needs recompiling to gain capabilities.
 
-pub mod agent;
-pub(crate) mod background;
-pub(crate) mod cancellation;
-pub(crate) mod checkpoint;
-pub mod compaction;
-pub mod config;
-pub mod doctor;
-pub mod error;
-pub(crate) mod image;
-pub(crate) mod model;
-pub mod onboarding;
-pub mod prompt;
-pub mod provider;
-pub mod session;
-pub mod skills;
-pub(crate) mod subagent;
-pub(crate) mod terminal_mode;
+mod agent;
+mod app;
+mod background;
+mod cancellation;
+mod checkpoint;
+mod cli;
+mod compaction;
+mod config;
+mod doctor;
+mod error;
+mod image;
+mod model;
+mod onboarding;
+mod print_mode;
+mod project_trust;
+mod prompt;
+mod provider;
+mod session;
+mod skills;
+mod subagent;
+mod terminal_mode;
 #[cfg(test)]
 mod test_support;
-pub mod tools;
-pub mod trust;
-pub mod tui;
+mod text;
+mod tools;
+mod trust;
+mod tui;
+
+pub use app::main;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -34,11 +41,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// work, never the process.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-pub fn interrupted() -> bool {
+pub(crate) fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::Relaxed)
 }
 
-pub fn set_interrupted(value: bool) {
+pub(crate) fn set_interrupted(value: bool) {
     INTERRUPTED.store(value, Ordering::Relaxed);
 }
 
@@ -53,7 +60,7 @@ extern "C" fn handle_wake(_: libc::c_int) {}
 /// # Errors
 ///
 /// Returns the operating-system error if the signal handler cannot be set.
-pub fn install_interrupt_handler() -> std::io::Result<()> {
+pub(crate) fn install_interrupt_handler() -> std::io::Result<()> {
     // SAFETY: The zeroed sigaction is initialized before installation.
     // `handle_sigint` has the required C ABI and only performs an atomic
     // store. Leaving SA_RESTART unset lets Ctrl+C interrupt a blocking

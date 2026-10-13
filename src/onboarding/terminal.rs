@@ -176,3 +176,10 @@ fn read_line() -> Result<String, Error> {
     }
     Ok(line.trim().to_string())
 }
+
+/// Reads one byte of raw-mode terminal input; `None` at end of input.
+pub(super) fn read_byte() -> io::Result<Option<u8>> {
+    use std::io::Read;
+    let mut buffer = [0u8; 1];
+    Ok((io::stdin().read(&mut buffer)? == 1).then_some(buffer[0]))
+}

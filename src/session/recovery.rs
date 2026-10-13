@@ -15,46 +15,37 @@ pub(crate) struct PendingUndo {
 
 impl Session {
     pub(crate) fn pending_undo(&self) -> Option<&PendingUndo> {
-        self.pending_undo.as_deref()
+        self.state.pending_undo.as_deref()
     }
 
     pub(crate) fn begin_undo(&mut self, undo: PendingUndo) -> Result<(), Error> {
-        if self.pending_undo.is_some() {
+        if self.state.pending_undo.is_some() {
             return Err(Error::Protocol("another undo is unfinished".into()));
         }
-        self.append(&SessionEvent::UndoStarted { undo: undo.clone() })?;
-        self.pending_undo = Some(Box::new(undo));
-        Ok(())
+        self.record(SessionEvent::UndoStarted { undo })
     }
 
     pub(crate) fn finish_undo(&mut self) -> Result<(), Error> {
-        self.append(&SessionEvent::UndoFinished)?;
-        self.pending_undo = None;
-        Ok(())
+        self.record(SessionEvent::UndoFinished)
     }
 
     pub(crate) fn context(&self) -> Option<&ContextUsage> {
-        self.context.as_ref()
+        self.state.context.as_ref()
     }
 
     pub(crate) fn record_context(&mut self, context: ContextUsage) -> Result<(), Error> {
-        self.append(&SessionEvent::Context {
-            context: context.clone(),
-        })?;
-        self.context = Some(context);
-        Ok(())
+        self.record(SessionEvent::Context { context })
     }
 
-    pub(crate) fn repair_tool_results(&mut self, messages: &mut Vec<Message>) -> Result<(), Error> {
-        while let Some((index, results)) = missing_tool_results(messages) {
-            self.append(&SessionEvent::ToolResultsRecovered {
-                index,
-                results: results.clone(),
-            })?;
-            messages.splice(index..index, results);
-            self.context = None;
+    /// Adds an error result for every tool call left without one, so the
+    /// history is valid for the next request. Returns whether it changed.
+    pub(crate) fn repair_tool_results(&mut self) -> Result<bool, Error> {
+        let mut repaired = false;
+        while let Some((index, results)) = missing_tool_results(self.messages()) {
+            self.record(SessionEvent::ToolResultsRecovered { index, results })?;
+            repaired = true;
         }
-        Ok(())
+        Ok(repaired)
     }
 }
 

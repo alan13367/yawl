@@ -4,7 +4,6 @@ use super::truncate_visible;
 use super::{DiffKind, DiffLine, GitFile, GitSection, GitStatus, HistoryEntry, LoadedDiff};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 pub(super) const MAX_DIFF_LINES: usize = 2000;
 
@@ -83,9 +82,6 @@ pub(super) fn find_root(cwd: &Path) -> Result<PathBuf, FindRootError> {
     Ok(PathBuf::from(root))
 }
 
-/// Maximum interval between cancellation checks; completion wakes immediately.
-const GIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
-
 /// Runs `git -C root …` non-interactively and returns its stdout.
 pub(super) fn run_git(root: &Path, args: &[&str]) -> Result<String, String> {
     run_git_env(root, args, &[])
@@ -113,6 +109,8 @@ pub(super) fn run_git_env(
 }
 
 /// Captures at most `stdout_limit` bytes while continuing to drain the child.
+/// Cancellation kills the whole process group, including hooks holding the
+/// output pipes open, without changing the caller's cancellation flag.
 fn run_git_output(
     root: &Path,
     args: &[&str],
@@ -123,103 +121,47 @@ fn run_git_output(
         return Err("cancelled.".into());
     }
     let mut command = Command::new("git");
-    let mut child = crate::tools::exec::isolate_from_terminal(&mut command)
+    command
         .arg("-C")
         .arg(root)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat")
         .env("LC_ALL", "C")
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                "git is not installed".to_string()
+        .envs(env.iter().copied());
+    let result = crate::tools::exec::run(
+        command,
+        crate::tools::exec::RunOptions {
+            stdin: None,
+            timeout: None,
+            stdout: if stdout_limit == usize::MAX {
+                crate::tools::exec::Keep::All
             } else {
-                format!("could not run git: {error}")
-            }
-        })?;
-    // Drain stdout/stderr on reader threads while polling: a child that
-    // emits more than the pipe buffer (~64 KiB, e.g. `diff -U10000` of a
-    // large file) would otherwise block on write() forever while we block
-    // on try_wait().
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let pid = child.id() as libc::pid_t;
-    let (status, stdout_bytes, stderr_bytes) = std::thread::scope(|scope| {
-        let out_handle = scope.spawn(|| drain_pipe(stdout_pipe, stdout_limit));
-        let err_handle = scope.spawn(|| drain_pipe(stderr_pipe, usize::MAX));
-        // A blocking waiter reports completion immediately. The timeout only
-        // bounds cancellation checks, so fast Git commands do not pay a tick.
-        let (tx, rx) = std::sync::mpsc::channel();
-        scope.spawn(move || {
-            let _ = tx.send(child.wait());
-        });
-        let status = loop {
-            if crate::cancellation::interrupted() {
-                kill_git_group(pid);
-                return Err("cancelled.".to_string());
-            }
-            match rx.recv_timeout(GIT_POLL_INTERVAL) {
-                Ok(Ok(status)) => break status,
-                Ok(Err(error)) => {
-                    kill_git_group(pid);
-                    return Err(format!("could not wait for git: {error}"));
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    kill_git_group(pid);
-                    return Err("Git waiter stopped unexpectedly".into());
-                }
-            }
-        };
-        let stdout_bytes = out_handle.join().unwrap_or_default();
-        let stderr_bytes = err_handle.join().unwrap_or_default();
-        Ok::<_, String>((status, stdout_bytes, stderr_bytes))
-    })?;
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr_bytes);
-        let stdout = String::from_utf8_lossy(&stdout_bytes);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
+                crate::tools::exec::Keep::Head(stdout_limit)
+            },
+            stderr: crate::tools::exec::Keep::All,
+        },
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "git is not installed".to_string()
         } else {
-            stderr.trim()
+            format!("could not run git: {error}")
+        }
+    })?;
+    if result.interrupted {
+        return Err("cancelled.".into());
+    }
+    if result.status != Some(0) {
+        let detail = if result.stderr.trim().is_empty() {
+            result.stdout.trim()
+        } else {
+            result.stderr.trim()
         };
         let first = detail.lines().next().unwrap_or("git failed").trim();
         return Err(format!("git {} failed: {first}", args.join(" ")));
     }
-    Ok(String::from_utf8_lossy(&stdout_bytes).into_owned())
-}
-
-fn kill_git_group(pid: libc::pid_t) {
-    // SAFETY: the child was started in its own process group; a negative PID
-    // targets that group, including hooks that inherited the output pipes.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
-}
-
-/// Drains a piped child stream to completion. `None` (pipe already taken)
-/// yields empty output.
-pub(super) fn drain_pipe(pipe: Option<impl std::io::Read>, limit: usize) -> Vec<u8> {
-    let Some(mut pipe) = pipe else {
-        return Vec::new();
-    };
-    let mut buffered = Vec::new();
-    let mut chunk = [0u8; 8 * 1024];
-    loop {
-        match std::io::Read::read(&mut pipe, &mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(read) => {
-                let keep = read.min(limit.saturating_sub(buffered.len()));
-                buffered.extend_from_slice(&chunk[..keep]);
-            }
-        }
-    }
-    buffered
+    Ok(result.stdout)
 }
 
 fn parse_branch_header(header: &str, status: &mut GitStatus) {
@@ -955,7 +897,7 @@ mod tests {
             let _ = done_tx.send(output);
         });
         let output = done_rx
-            .recv_timeout(Duration::from_secs(15))
+            .recv_timeout(std::time::Duration::from_secs(15))
             .expect("large git diff must finish; pipe deadlock?")
             .map_err(crate::error::Error::Protocol)?;
         assert!(

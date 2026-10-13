@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use super::turn::TurnMode;
-use super::{Conversation, is_undoable_user_prompt, last_undoable_user_index};
+use super::TurnRequest;
+use super::{Conversation, last_undoable_user_index};
 use crate::agent::TurnEvent;
 use crate::compaction;
 use crate::config::{Config, ConfigChange};
@@ -121,6 +121,10 @@ impl Provider for RemoteCompactionProvider {
     }
 }
 
+fn prompt(text: &str) -> TurnRequest {
+    TurnRequest::Prompt(Some(text.to_string().into()))
+}
+
 struct TestAgent {
     root: PathBuf,
     sessions_dir: PathBuf,
@@ -147,7 +151,7 @@ impl TestAgent {
         Self {
             root,
             sessions_dir: dirs.project,
-            agent: Conversation::persistent(config, "test".into(), session, Vec::new(), cwd),
+            agent: Conversation::persistent(config, "test".into(), session, cwd),
         }
     }
 }
@@ -227,7 +231,7 @@ fn print_mode_pump_delivers_deferred_results_in_a_follow_up_turn() {
 
     assert!(pumped);
     assert!(!test.agent.subagent_manager().has_deferred());
-    let messages = &test.agent.messages;
+    let messages = test.agent.messages();
     assert_eq!(
         messages
             .iter()
@@ -290,7 +294,7 @@ fn mid_turn_reasoning_change_reaches_the_next_model_request() {
 
     assert!(
         test.agent
-            .run_turn_with(Some("run it".into()), &mut |_| {}, &mut resolve)
+            .run_with(prompt("run it"), &mut |_| {}, &mut resolve)
             .expect("scripted turn should complete")
     );
     assert_eq!(seen.borrow().as_slice(), &[None, Some("high".into())]);
@@ -315,20 +319,20 @@ fn conversation_transaction_persists_tool_loop_in_order() {
 
     let completed = test
         .agent
-        .run_turn_with(Some("run it".into()), &mut |_| {}, &mut resolve)
+        .run_with(prompt("run it"), &mut |_| {}, &mut resolve)
         .expect("scripted turn should complete");
 
     assert!(completed);
     assert_eq!(
         test.agent
-            .messages
+            .messages()
             .iter()
             .map(|message| message.role)
             .collect::<Vec<_>>(),
         [Role::User, Role::Assistant, Role::Tool, Role::Assistant]
     );
-    assert_eq!(test.agent.messages[2].content, "tool-output");
-    assert_eq!(test.agent.messages[3].content, "done");
+    assert_eq!(test.agent.messages()[2].content, "tool-output");
+    assert_eq!(test.agent.messages()[3].content, "done");
     assert_eq!(
         requests.borrow().as_slice(),
         [
@@ -336,8 +340,10 @@ fn conversation_transaction_persists_tool_loop_in_order() {
             vec![Role::User, Role::Assistant, Role::Tool]
         ]
     );
-    let (_, replayed) = Session::open(&test.sessions_dir, test.agent.session_id())
-        .expect("persisted session should replay");
+    let replayed = Session::open(&test.sessions_dir, test.agent.session_id())
+        .expect("persisted session should replay")
+        .messages()
+        .to_vec();
     assert_eq!(
         replayed
             .iter()
@@ -376,11 +382,10 @@ fn run_scripted_init_write(test: &mut TestAgent, content: &str) -> Rc<RefCell<Ve
 
     let completed = test
         .agent
-        .run_turn_input_with_mode(
-            Some("/init".to_string().into()),
+        .run_with(
+            TurnRequest::Init("/init".to_string().into()),
             &mut |_| {},
             &mut resolve,
-            TurnMode::Init,
         )
         .expect("init turn should complete");
     assert!(completed);
@@ -398,7 +403,7 @@ fn init_turn_keeps_literal_message_and_created_file_is_undoable() {
         std::fs::read_to_string(&agents).expect("read"),
         "# Agent guide\n"
     );
-    assert_eq!(test.agent.messages[0].content, "/init");
+    assert_eq!(test.agent.messages()[0].content, "/init");
     assert_eq!(systems.borrow().len(), 2);
     assert!(
         systems
@@ -406,14 +411,16 @@ fn init_turn_keeps_literal_message_and_created_file_is_undoable() {
             .iter()
             .all(|system| system.contains("<init_task>"))
     );
-    let (_, replayed) = Session::open(&test.sessions_dir, test.agent.session_id())
-        .expect("init session should replay");
+    let replayed = Session::open(&test.sessions_dir, test.agent.session_id())
+        .expect("init session should replay")
+        .messages()
+        .to_vec();
     assert_eq!(replayed[0].content, "/init");
 
     let report = test.agent.undo_last_turn().expect("undo init");
     assert!(report.restored_files);
     assert!(!agents.exists());
-    assert!(test.agent.messages.is_empty());
+    assert!(test.agent.messages().is_empty());
 
     let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
         text: "normal reply",
@@ -429,7 +436,7 @@ fn init_turn_keeps_literal_message_and_created_file_is_undoable() {
         Rc::clone(&normal_systems),
     );
     test.agent
-        .run_turn_with(Some("next".into()), &mut |_| {}, &mut resolve)
+        .run_with(prompt("next"), &mut |_| {}, &mut resolve)
         .expect("normal turn should complete");
     assert!(!normal_systems.borrow()[0].contains("<init_task>"));
 }
@@ -463,11 +470,11 @@ fn failed_provider_does_not_persist_partial_assistant() {
 
     let result = test
         .agent
-        .run_turn_with(Some("hello".into()), &mut |_| {}, &mut resolve);
+        .run_with(prompt("hello"), &mut |_| {}, &mut resolve);
 
     assert!(result.is_err());
-    assert_eq!(test.agent.messages.len(), 1);
-    assert_eq!(test.agent.messages[0].role, Role::User);
+    assert_eq!(test.agent.messages().len(), 1);
+    assert_eq!(test.agent.messages()[0].role, Role::User);
 }
 
 #[test]
@@ -487,13 +494,13 @@ fn a_failed_turn_continues_from_saved_history_without_a_new_prompt() {
     );
     let failed = test
         .agent
-        .run_turn_with(Some("hello".into()), &mut |_| {}, &mut resolve);
+        .run_with(prompt("hello"), &mut |_| {}, &mut resolve);
     assert!(failed.is_err());
     assert!(test.agent.can_continue());
 
     let resumed = test
         .agent
-        .run_continue_with(&mut |_| {}, &mut resolve)
+        .run_with(TurnRequest::Continue, &mut |_| {}, &mut resolve)
         .expect("continue should succeed");
 
     assert!(resumed);
@@ -502,7 +509,7 @@ fn a_failed_turn_continues_from_saved_history_without_a_new_prompt() {
         Some([Role::User].as_slice()),
         "continuing must resend the original prompt without a duplicate"
     );
-    let roles: Vec<Role> = test.agent.messages.iter().map(|m| m.role).collect();
+    let roles: Vec<Role> = test.agent.messages().iter().map(|m| m.role).collect();
     assert_eq!(roles, [Role::User, Role::Assistant]);
     assert!(
         !test.agent.can_continue(),
@@ -510,9 +517,10 @@ fn a_failed_turn_continues_from_saved_history_without_a_new_prompt() {
     );
     let error = test
         .agent
-        .run_continue_with(&mut |_| {}, &mut resolve)
+        .run_with(TurnRequest::Continue, &mut |_| {}, &mut resolve)
         .expect_err("nothing is left to continue");
-    assert!(matches!(error, Error::Config(_)));
+    assert!(matches!(error, Error::Invalid(_)));
+    assert_eq!(error.to_string(), "nothing to continue");
 }
 
 #[test]
@@ -520,7 +528,7 @@ fn a_session_left_mid_tool_call_can_continue_after_resume() {
     crate::set_interrupted(false);
     let mut test = TestAgent::new("continue-after-resume");
     let assistant = Message::assistant(String::new(), vec![call("call-1", "shell", "{}")]);
-    test.agent.messages = vec![Message::user("run it"), assistant];
+    *test.agent.session.messages_mut() = vec![Message::user("run it"), assistant];
 
     assert!(test.agent.can_continue());
     let steps = Rc::new(RefCell::new(VecDeque::from([text_step("done")])));
@@ -528,7 +536,7 @@ fn a_session_left_mid_tool_call_can_continue_after_resume() {
     let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
     assert!(
         test.agent
-            .run_continue_with(&mut |_| {}, &mut resolve)
+            .run_with(TurnRequest::Continue, &mut |_| {}, &mut resolve)
             .expect("continue")
     );
     assert_eq!(
@@ -552,7 +560,7 @@ fn provider_usage_saturates_instead_of_wrapping() {
 
     let completed = test
         .agent
-        .run_turn_with(Some("hello".into()), &mut |_| {}, &mut resolve)
+        .run_with(prompt("hello"), &mut |_| {}, &mut resolve)
         .expect("scripted turn should complete");
 
     assert!(completed);
@@ -578,18 +586,19 @@ fn compaction_persists_and_replays_provider_native_history() {
         .compact_now_with(&mut |_| {}, &mut resolve)
         .expect("remote compaction should succeed");
 
-    assert_eq!(test.agent.messages.len(), 11);
+    assert_eq!(test.agent.messages().len(), 11);
     assert_eq!(
-        test.agent.messages[0].provider_data[0]["type"],
+        test.agent.messages()[0].provider_data[0]["type"],
         "compaction"
     );
     assert_eq!(
-        test.agent.messages[0].provider_data_model.as_deref(),
+        test.agent.messages()[0].provider_data_model.as_deref(),
         Some("codex-test")
     );
     assert_eq!(test.agent.usage().requests, 2);
-    let (session, replayed) = Session::open(&test.sessions_dir, test.agent.session_id())
+    let session = Session::open(&test.sessions_dir, test.agent.session_id())
         .expect("compacted session should replay");
+    let replayed = session.messages().to_vec();
     assert_eq!(replayed[0].provider_data[0]["encrypted_content"], "opaque");
     assert_eq!(session.usage().requests, 2);
     assert_eq!(session.usage().cache_resets, 1);
@@ -606,7 +615,8 @@ fn failed_auto_compaction_warns_and_the_turn_continues() {
     // Enough history that auto-compaction has something to summarize.
     for index in 0..12 {
         test.agent
-            .messages
+            .session
+            .messages_mut()
             .push(Message::user(format!("history {index}")));
     }
     let steps = Rc::new(RefCell::new(VecDeque::from([
@@ -630,8 +640,8 @@ fn failed_auto_compaction_warns_and_the_turn_continues() {
 
     let completed = test
         .agent
-        .run_turn_with(
-            Some("hello".into()),
+        .run_with(
+            prompt("hello"),
             &mut |event| {
                 if let TurnEvent::Warning(text) = event {
                     warnings.push(text.to_string());
@@ -645,9 +655,9 @@ fn failed_auto_compaction_warns_and_the_turn_continues() {
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("Auto-compaction failed"));
     // The failed compaction left the conversation untouched.
-    assert_eq!(test.agent.messages.len(), 16);
-    assert_eq!(test.agent.messages[14].role, Role::Tool);
-    assert_eq!(test.agent.messages[15].content, "done");
+    assert_eq!(test.agent.messages().len(), 16);
+    assert_eq!(test.agent.messages()[14].role, Role::Tool);
+    assert_eq!(test.agent.messages()[15].content, "done");
 }
 
 #[test]
@@ -665,17 +675,23 @@ fn interrupted_tool_batch_keeps_one_result_per_call() {
         .expect("synthetic tool results should persist");
 
     assert!(aborted);
-    assert_eq!(test.agent.messages.len(), 2);
-    assert!(test.agent.messages.iter().all(|message| {
+    assert_eq!(test.agent.messages().len(), 2);
+    assert!(test.agent.messages().iter().all(|message| {
         message.role == Role::Tool && message.is_error && message.content == "[interrupted by user]"
     }));
-    assert_eq!(test.agent.messages[0].tool_call_id.as_deref(), Some("one"));
-    assert_eq!(test.agent.messages[1].tool_call_id.as_deref(), Some("two"));
+    assert_eq!(
+        test.agent.messages()[0].tool_call_id.as_deref(),
+        Some("one")
+    );
+    assert_eq!(
+        test.agent.messages()[1].tool_call_id.as_deref(),
+        Some("two")
+    );
 }
 
 #[test]
 fn last_undoable_user_skips_summaries_and_subagent_results() {
-    let summary = compaction::summary_message("old");
+    let summary = Message::summary("old", Vec::new(), None);
     let subagent = Message::subagent_results(vec![crate::provider::SubagentResult {
         id: "sa-1".into(),
         name: "scout".into(),
@@ -693,9 +709,9 @@ fn last_undoable_user_skips_summaries_and_subagent_results() {
         subagent,
     ];
     assert_eq!(last_undoable_user_index(&messages), Some(4));
-    assert!(is_undoable_user_prompt(&messages[0]));
-    assert!(!is_undoable_user_prompt(&messages[2]));
-    assert!(!is_undoable_user_prompt(&messages[6]));
+    assert!(messages[0].starts_user_turn());
+    assert!(!messages[2].starts_user_turn());
+    assert!(!messages[6].starts_user_turn());
 }
 
 #[test]
@@ -716,20 +732,18 @@ fn undo_keeps_working_after_compaction_during_a_goal() {
             .expect("goal progress should persist");
     }
 
-    let protected = last_undoable_user_index(&test.agent.messages);
-    let range = compaction::compaction_range(&test.agent.messages, protected);
-    let start = range.start;
-    let replaced = range.len();
+    let protected = last_undoable_user_index(test.agent.messages());
+    let range = compaction::compaction_range(test.agent.messages(), protected);
     test.agent
-        .persist_compaction("compacted goal progress", start, replaced, &[], None)
+        .session
+        .append_compaction("compacted goal progress", range, Vec::new(), None)
         .expect("compaction should persist");
-    compaction::apply_summary_range(&mut test.agent.messages, "compacted goal progress", range);
 
-    assert_eq!(last_undoable_user_index(&test.agent.messages), Some(2));
+    assert_eq!(last_undoable_user_index(test.agent.messages()), Some(2));
     let report = test.agent.undo_last_turn().expect("undo should succeed");
     assert!(report.dropped > 0);
-    assert_eq!(test.agent.messages.len(), 2);
-    assert_eq!(test.agent.messages[0].content, "earlier prompt");
+    assert_eq!(test.agent.messages().len(), 2);
+    assert_eq!(test.agent.messages()[0].content, "earlier prompt");
     assert_eq!(test.agent.active_goal(), None);
 }
 
@@ -739,13 +753,17 @@ fn undo_last_turn_drops_the_prompt_and_restores_files() {
     let file = test.root.join("cwd").join("note.txt");
     std::fs::write(&file, "before").expect("write");
     test.agent
-        .persistent_mut()
+        .services
         .checkpoints
+        .as_mut()
+        .unwrap()
         .snapshot()
         .expect("snapshot");
     test.agent
-        .persistent_mut()
+        .services
         .checkpoints
+        .as_mut()
+        .unwrap()
         .remember_path(&file)
         .expect("pre-image");
     test.agent
@@ -758,7 +776,7 @@ fn undo_last_turn_drops_the_prompt_and_restores_files() {
 
     let report = test.agent.undo_last_turn().expect("undo");
     assert_eq!(report.dropped, 2);
-    assert!(test.agent.messages.is_empty());
+    assert!(test.agent.messages().is_empty());
     assert_eq!(std::fs::read_to_string(&file).expect("read"), "before");
 }
 
@@ -782,14 +800,8 @@ fn undo_does_not_persist_intent_when_checkpoint_store_cannot_be_read() {
         .undo_last_turn()
         .expect_err("undo should report the unreadable store");
     assert!(error.to_string().contains("cannot load undo checkpoints"));
-    assert!(
-        test.agent
-            .persistent_state()
-            .session
-            .pending_undo()
-            .is_none()
-    );
-    assert_eq!(test.agent.messages[0].content, "keep this prompt");
+    assert!(test.agent.session.pending_undo().is_none());
+    assert_eq!(test.agent.messages()[0].content, "keep this prompt");
     assert!(checkpoint_dir.join("stack.json").is_dir());
 }
 
@@ -798,7 +810,7 @@ fn undo_without_a_user_turn_is_a_no_op() {
     let mut test = TestAgent::new("undo-empty");
     let report = test.agent.undo_last_turn().expect("undo");
     assert_eq!(report.dropped, 0);
-    assert!(test.agent.messages.is_empty());
+    assert!(test.agent.messages().is_empty());
 }
 
 fn scripted_resolve(
@@ -856,7 +868,7 @@ fn goal_mode_continues_on_text_only_then_finishes_with_goal_complete() {
 
     let completed = test
         .agent
-        .run_turn_input_with_mode(None, &mut |_| {}, &mut resolve, TurnMode::Goal)
+        .run_with(TurnRequest::Goal, &mut |_| {}, &mut resolve)
         .expect("goal turn should complete");
 
     assert!(completed);
@@ -864,14 +876,14 @@ fn goal_mode_continues_on_text_only_then_finishes_with_goal_complete() {
     assert_eq!(test.agent.latest_turn_result(), "shipped");
     assert!(
         test.agent
-            .messages
+            .messages()
             .iter()
             .any(|message| message.is_hidden_control()),
         "goal continuation should be recorded in history"
     );
     assert_eq!(
         test.agent
-            .messages
+            .messages()
             .last()
             .map(|message| message.content.as_str()),
         Some("shipped")
@@ -893,11 +905,7 @@ fn ordinary_turn_does_not_resume_a_paused_goal() {
 
     let completed = test
         .agent
-        .run_turn_with(
-            Some("a separate question".into()),
-            &mut |_| {},
-            &mut resolve,
-        )
+        .run_with(prompt("a separate question"), &mut |_| {}, &mut resolve)
         .expect("ordinary turn should complete");
 
     assert!(completed);
@@ -909,7 +917,7 @@ fn ordinary_turn_does_not_resume_a_paused_goal() {
     assert_eq!(requests.borrow().len(), 1);
     assert_eq!(
         test.agent
-            .messages
+            .messages()
             .iter()
             .filter(|message| message.control
                 == Some(crate::provider::MessageControl::GoalContinuation))
@@ -959,14 +967,14 @@ fn goal_mode_rejects_mixed_goal_complete_batches() {
 
     let completed = test
         .agent
-        .run_turn_input_with_mode(None, &mut |_| {}, &mut resolve, TurnMode::Goal)
+        .run_with(TurnRequest::Goal, &mut |_| {}, &mut resolve)
         .expect("goal turn should complete");
 
     assert!(completed);
     assert_eq!(test.agent.active_goal(), None);
     let first_batch_results = test
         .agent
-        .messages
+        .messages()
         .iter()
         .filter(|message| {
             message.role == Role::Tool
@@ -976,7 +984,7 @@ fn goal_mode_rejects_mixed_goal_complete_batches() {
         .collect::<Vec<_>>();
     assert_eq!(first_batch_results, ["goal-1", "shell-1"]);
     assert!(
-        test.agent.messages.iter().any(|message| {
+        test.agent.messages().iter().any(|message| {
             message.role == Role::Tool
                 && message.tool_name.as_deref() == Some(crate::tools::GOAL_COMPLETE_TOOL_NAME)
                 && message.is_error
@@ -1064,7 +1072,7 @@ fn planning_requires_one_to_three_questions_then_persists_the_completed_plan() {
 
     let completed = test
         .agent
-        .run_turn_input_with_mode(None, &mut |_| {}, &mut resolve, TurnMode::Plan)
+        .run_with(TurnRequest::Plan, &mut |_| {}, &mut resolve)
         .expect("planning should complete");
     assert!(
         responder.join().expect("question responder"),
@@ -1072,12 +1080,12 @@ fn planning_requires_one_to_three_questions_then_persists_the_completed_plan() {
     );
 
     assert!(completed);
-    assert!(test.agent.messages.iter().any(|message| {
+    assert!(test.agent.messages().iter().any(|message| {
         message.tool_call_id.as_deref() == Some("plan-early")
             && message.is_error
             && message.content == super::plan::PLAN_QUESTION_REQUIRED
     }));
-    assert!(test.agent.messages.iter().any(|message| {
+    assert!(test.agent.messages().iter().any(|message| {
         message.tool_call_id.as_deref() == Some("questions-invalid")
             && message.is_error
             && message.content.contains("between 1 and 3")
@@ -1092,11 +1100,10 @@ fn planning_requires_one_to_three_questions_then_persists_the_completed_plan() {
     let mut failed_resolve = scripted_resolve(failed_steps, Rc::new(RefCell::new(Vec::new())));
     assert!(
         test.agent
-            .run_turn_input_with_mode(
-                Some("implement it".to_string().into()),
+            .run_with(
+                TurnRequest::PlanImplement(Some("implement it".to_string().into())),
                 &mut |_| {},
-                &mut failed_resolve,
-                TurnMode::PlanImplement
+                &mut failed_resolve
             )
             .is_err()
     );
@@ -1130,7 +1137,7 @@ fn ready_plan_fixture(name: &str) -> TestAgent {
     let responder = answer_questions_without_countdown(test.agent.question_broker(), 1);
     assert!(
         test.agent
-            .run_turn_input_with_mode(None, &mut |_| {}, &mut resolve, TurnMode::Plan)
+            .run_with(TurnRequest::Plan, &mut |_| {}, &mut resolve)
             .expect("planning should complete")
     );
     responder.join().expect("question responder");
@@ -1152,11 +1159,10 @@ fn revision_completes_without_questions_and_has_its_own_continuation() {
 
     let completed = test
         .agent
-        .run_turn_input_with_mode(
-            Some("rename step 1".to_string().into()),
+        .run_with(
+            TurnRequest::PlanRevise("rename step 1".to_string().into()),
             &mut |_| {},
             &mut resolve,
-            TurnMode::PlanRevise,
         )
         .expect("revision should complete");
 
@@ -1167,7 +1173,7 @@ fn revision_completes_without_questions_and_has_its_own_continuation() {
     );
     let continuations = test
         .agent
-        .messages
+        .messages()
         .iter()
         .filter(|message| message.control == Some(MessageControl::PlanContinuation))
         .map(|message| message.content.as_str())
@@ -1176,7 +1182,7 @@ fn revision_completes_without_questions_and_has_its_own_continuation() {
     assert!(
         !test
             .agent
-            .messages
+            .messages()
             .iter()
             .any(|message| message.is_error && message.tool_call_id.as_deref() == Some("plan-2"))
     );
@@ -1187,14 +1193,13 @@ fn plan_revision_requires_a_ready_plan() {
     let mut test = TestAgent::new("plan-revise-needs-plan");
     let steps = Rc::new(RefCell::new(VecDeque::new()));
     let mut resolve = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
-    let result = test.agent.run_turn_input_with_mode(
-        Some("rename step 1".to_string().into()),
+    let result = test.agent.run_with(
+        TurnRequest::PlanRevise("rename step 1".to_string().into()),
         &mut |_| {},
         &mut resolve,
-        TurnMode::PlanRevise,
     );
-    assert!(matches!(result, Err(Error::Config(_))));
-    assert!(test.agent.messages.is_empty());
+    assert!(matches!(result, Err(Error::Invalid(_))));
+    assert!(test.agent.messages().is_empty());
 }
 
 #[test]
@@ -1217,11 +1222,10 @@ fn revision_questions_are_optional_and_wait_for_the_user() {
 
     assert!(
         test.agent
-            .run_turn_input_with_mode(
-                Some("use another approach".to_string().into()),
+            .run_with(
+                TurnRequest::PlanRevise("use another approach".to_string().into()),
                 &mut |_| {},
-                &mut resolve,
-                TurnMode::PlanRevise,
+                &mut resolve
             )
             .expect("revision should complete")
     );
@@ -1291,7 +1295,7 @@ fn unrelated_follow_up_replies_normally_and_leaves_the_plan_active() {
 
     let completed = test
         .agent
-        .run_turn_input_with_mode(None, &mut |_| {}, &mut resolve, TurnMode::Plan)
+        .run_with(TurnRequest::Plan, &mut |_| {}, &mut resolve)
         .expect("planning should complete");
     responder.join().expect("question responder");
 
@@ -1307,11 +1311,10 @@ fn unrelated_follow_up_replies_normally_and_leaves_the_plan_active() {
 
     let completed = test
         .agent
-        .run_turn_input_with_mode(
-            Some("what is this plan about?".to_string().into()),
+        .run_with(
+            TurnRequest::PlanFollowUp("what is this plan about?".to_string().into()),
             &mut |_| {},
             &mut reply_resolve,
-            TurnMode::PlanFollowUp,
         )
         .expect("unrelated follow-up should complete");
 
@@ -1323,7 +1326,7 @@ fn unrelated_follow_up_replies_normally_and_leaves_the_plan_active() {
     assert_eq!(test.agent.active_plan(), Some("# Plan\n\n1. Build it."));
     assert_eq!(
         test.agent
-            .messages
+            .messages()
             .last()
             .map(|message| message.content.as_str()),
         Some("This plan adds a planning mode before implementation starts."),
@@ -1379,7 +1382,7 @@ fn resumed_plan_remembers_that_requirements_were_answered() {
 
     assert!(
         test.agent
-            .run_turn_input_with_mode(None, &mut |_| {}, &mut first_resolve, TurnMode::Plan)
+            .run_with(TurnRequest::Plan, &mut |_| {}, &mut first_resolve)
             .is_err()
     );
     responder.join().expect("question responder");
@@ -1400,7 +1403,7 @@ fn resumed_plan_remembers_that_requirements_were_answered() {
     let mut resumed_resolve = scripted_resolve(resumed_steps, Rc::new(RefCell::new(Vec::new())));
     assert!(
         test.agent
-            .run_turn_input_with_mode(None, &mut |_| {}, &mut resumed_resolve, TurnMode::Plan)
+            .run_with(TurnRequest::Plan, &mut |_| {}, &mut resumed_resolve)
             .expect("resumed plan should complete without another question batch")
     );
     assert_eq!(test.agent.active_plan(), Some("# Plan\n\n1. Build it."));
@@ -1414,11 +1417,9 @@ fn unrelated_plan_follow_up_transitions_to_the_full_tool_registry() {
         .expect("start plan");
     let ready = Message::assistant("# Plan".into(), vec![]);
     test.agent
-        .persistent_mut()
         .session
-        .append_plan_ready("# Plan", &ready)
+        .append_plan_ready("# Plan", ready)
         .expect("ready plan");
-    test.agent.messages.push(ready);
     let output_path = test.root.join("unrelated.txt");
     let steps = Rc::new(RefCell::new(VecDeque::from([
         step(
@@ -1447,11 +1448,10 @@ fn unrelated_plan_follow_up_transitions_to_the_full_tool_registry() {
 
     assert!(
         test.agent
-            .run_turn_input_with_mode(
-                Some("write an unrelated file".to_string().into()),
+            .run_with(
+                TurnRequest::PlanFollowUp("write an unrelated file".to_string().into()),
                 &mut |_| {},
-                &mut resolve,
-                TurnMode::PlanFollowUp
+                &mut resolve
             )
             .expect("unrelated request should run normally")
     );
@@ -1471,11 +1471,9 @@ fn plan_implementation_receives_deferred_subagent_results() {
         .expect("start plan");
     let ready = Message::assistant("# Plan".into(), vec![]);
     test.agent
-        .persistent_mut()
         .session
-        .append_plan_ready("# Plan", &ready)
+        .append_plan_ready("# Plan", ready)
         .expect("ready plan");
-    test.agent.messages.push(ready);
     test.agent.subagent_manager().push_test_deferred(
         1,
         "worker",
@@ -1497,15 +1495,14 @@ fn plan_implementation_receives_deferred_subagent_results() {
 
     assert!(
         test.agent
-            .run_turn_input_with_mode(
-                Some("implement it".to_string().into()),
+            .run_with(
+                TurnRequest::PlanImplement(Some("implement it".to_string().into())),
                 &mut |_| {},
-                &mut resolve,
-                TurnMode::PlanImplement
+                &mut resolve
             )
             .expect("implementation should complete")
     );
-    assert!(test.agent.messages.iter().any(|message| {
+    assert!(test.agent.messages().iter().any(|message| {
         message
             .subagent_results
             .iter()
@@ -1538,8 +1535,8 @@ fn steering_skips_pending_tools_and_injects_the_steer_message() {
 
     let completed = test
         .agent
-        .run_turn_with(
-            Some("start".into()),
+        .run_with(
+            prompt("start"),
             &mut |event| {
                 if matches!(event, TurnEvent::SteerAccepted { .. }) {
                     steer_accepted = true;
@@ -1551,7 +1548,7 @@ fn steering_skips_pending_tools_and_injects_the_steer_message() {
 
     assert!(completed);
     assert!(
-        test.agent.messages.iter().any(|message| {
+        test.agent.messages().iter().any(|message| {
             message.role == Role::Tool
                 && message.content == "[skipped because the user steered]"
                 && message.is_error
@@ -1560,7 +1557,7 @@ fn steering_skips_pending_tools_and_injects_the_steer_message() {
     );
     assert!(
         test.agent
-            .messages
+            .messages()
             .iter()
             .any(|message| message.is_steering() && message.content == "stop and summarize"),
         "accepted steer should be recorded as a steering user message"
@@ -1569,12 +1566,11 @@ fn steering_skips_pending_tools_and_injects_the_steer_message() {
 }
 
 fn reopen_test_agent(test: &mut TestAgent) {
-    let (session, messages) = Session::open(&test.sessions_dir, test.agent.session_id()).unwrap();
+    let session = Session::open(&test.sessions_dir, test.agent.session_id()).unwrap();
     test.agent = Conversation::persistent(
         test.agent.config.clone(),
         "test".into(),
         session,
-        messages,
         test.root.join("cwd"),
     );
 }
@@ -1599,23 +1595,22 @@ fn undo_retries_the_same_checkpoint_after_history_write_fails() {
         let mut test = TestAgent::new("undo-write-failure");
         let path = two_checkpoint_turns(&mut test);
         // No files change unless the intent was saved successfully.
-        test.agent.persistent_mut().session.fail_append_after(0);
+        test.agent.session.fail_append_after(0);
         assert!(test.agent.undo_last_turn().is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second edit");
-        assert!(
-            test.agent
-                .persistent_state()
-                .session
-                .pending_undo()
-                .is_none()
-        );
+        assert!(test.agent.session.pending_undo().is_none());
         // The intent persists, files restore, then the history append fails.
-        test.agent.persistent_mut().session.fail_append_after(1);
+        test.agent.session.fail_append_after(1);
         assert!(test.agent.undo_last_turn().is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first edit");
-        assert_eq!(test.agent.messages.len(), 2);
+        assert_eq!(test.agent.messages().len(), 2);
         assert_eq!(
-            test.agent.persistent_state().checkpoints.last_index(),
+            test.agent
+                .services
+                .checkpoints
+                .as_ref()
+                .unwrap()
+                .last_index(),
             Some(1)
         );
         if reopen {
@@ -1623,9 +1618,14 @@ fn undo_retries_the_same_checkpoint_after_history_write_fails() {
         }
         assert_eq!(test.agent.undo_last_turn().unwrap().dropped, 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first edit");
-        assert_eq!(test.agent.messages.len(), 1);
+        assert_eq!(test.agent.messages().len(), 1);
         assert_eq!(
-            test.agent.persistent_state().checkpoints.last_index(),
+            test.agent
+                .services
+                .checkpoints
+                .as_ref()
+                .unwrap()
+                .last_index(),
             Some(0)
         );
         test.agent.undo_last_turn().unwrap();
@@ -1638,22 +1638,16 @@ fn undo_recovery_after_cleanup_does_not_restore_an_older_turn() {
     let mut test = TestAgent::new("undo-finish-failure");
     let path = two_checkpoint_turns(&mut test);
     // Intent and history commit; the checkpoint is removed, but finishing fails.
-    test.agent.persistent_mut().session.fail_append_after(2);
+    test.agent.session.fail_append_after(2);
     assert!(test.agent.undo_last_turn().is_err());
-    assert_eq!(test.agent.messages.len(), 1);
+    assert_eq!(test.agent.messages().len(), 1);
     reopen_test_agent(&mut test);
     let report = test.agent.undo_last_turn().unwrap();
     assert_eq!(report.dropped, 1);
     assert!(report.restored_files);
     assert_eq!(std::fs::read_to_string(path).unwrap(), "first edit");
-    assert_eq!(test.agent.messages.len(), 1);
-    assert!(
-        test.agent
-            .persistent_state()
-            .session
-            .pending_undo()
-            .is_none()
-    );
+    assert_eq!(test.agent.messages().len(), 1);
+    assert!(test.agent.session.pending_undo().is_none());
 }
 
 #[test]
@@ -1669,13 +1663,18 @@ fn undo_recovery_after_checkpoint_cleanup_failure_is_idempotent() {
         .join("stack.json.tmp");
     std::fs::create_dir(&temporary).unwrap();
     assert!(test.agent.undo_last_turn().is_err());
-    assert_eq!(test.agent.messages.len(), 1);
+    assert_eq!(test.agent.messages().len(), 1);
     std::fs::remove_dir(&temporary).unwrap();
     reopen_test_agent(&mut test);
     test.agent.undo_last_turn().unwrap();
     assert_eq!(std::fs::read_to_string(path).unwrap(), "first edit");
     assert_eq!(
-        test.agent.persistent_state().checkpoints.last_index(),
+        test.agent
+            .services
+            .checkpoints
+            .as_ref()
+            .unwrap()
+            .last_index(),
         Some(0)
     );
 }
@@ -1700,7 +1699,7 @@ fn failed_tool_result_is_saved_on_retry_without_rerunning_tools() {
         .append_input_message(Message::assistant("".into(), calls.clone()))
         .unwrap();
     let registry = test.agent.scan_tools();
-    test.agent.persistent_mut().session.fail_append_after(0);
+    test.agent.session.fail_append_after(0);
     assert!(
         test.agent
             .run_tools_while(&registry, &calls, &mut |_| {}, || false)
@@ -1713,11 +1712,11 @@ fn failed_tool_result_is_saved_on_retry_without_rerunning_tools() {
     std::fs::write(&path, "external change").unwrap();
     test.agent.recover_history().unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "external change");
-    assert_eq!(test.agent.messages[1].content, actual_output);
-    assert!(test.agent.messages[2].content.contains("not executed"));
+    assert_eq!(test.agent.messages()[1].content, actual_output);
+    assert!(test.agent.messages()[2].content.contains("not executed"));
     reopen_test_agent(&mut test);
-    assert_eq!(test.agent.messages.len(), 3);
-    assert_eq!(test.agent.messages[1].content, actual_output);
+    assert_eq!(test.agent.messages().len(), 3);
+    assert_eq!(test.agent.messages()[1].content, actual_output);
 }
 
 #[test]
@@ -1744,16 +1743,20 @@ fn resume_repairs_missing_results_without_executing_uncertain_calls() {
         .append_input_message(Message::user("continue"))
         .unwrap();
     reopen_test_agent(&mut test);
-    assert_eq!(test.agent.messages.len(), 4);
-    assert_eq!(test.agent.messages[1].content, "known output");
+    assert_eq!(test.agent.messages().len(), 4);
+    assert_eq!(test.agent.messages()[1].content, "known output");
     assert_eq!(
-        test.agent.messages[2].tool_call_id.as_deref(),
+        test.agent.messages()[2].tool_call_id.as_deref(),
         Some("unknown")
     );
-    assert!(test.agent.messages[2].content.contains("may have executed"));
-    assert_eq!(test.agent.messages[3].content, "continue");
+    assert!(
+        test.agent.messages()[2]
+            .content
+            .contains("may have executed")
+    );
+    assert_eq!(test.agent.messages()[3].content, "continue");
     reopen_test_agent(&mut test);
-    assert_eq!(test.agent.messages.len(), 4);
+    assert_eq!(test.agent.messages().len(), 4);
 }
 
 #[test]
@@ -1797,7 +1800,7 @@ fn connect_default_model_is_recorded_in_the_session() {
     assert_eq!(test.agent.config().model.as_deref(), Some("openai:gpt-4.1"));
 
     // The switch must be in the log so resuming continues with this model.
-    let (session, _) = Session::open(&test.sessions_dir, test.agent.session_id()).unwrap();
+    let session = Session::open(&test.sessions_dir, test.agent.session_id()).unwrap();
     assert_eq!(session.model(), "openai:gpt-4.1");
 }
 
@@ -1812,7 +1815,8 @@ fn switched_models_are_recorded_and_adopted_on_resume() {
 
     // The switch is in the log, so a replayed session reports it.
     let id = test.agent.session_id().to_string();
-    let (session, messages) = Session::open(&test.sessions_dir, &id).unwrap();
+    let session = Session::open(&test.sessions_dir, &id).unwrap();
+    let messages = session.messages().to_vec();
     assert_eq!(session.model(), "other-model");
     assert_eq!(messages.len(), 1);
     drop(session);
@@ -1832,7 +1836,6 @@ fn switched_models_are_recorded_and_adopted_on_resume() {
         test.agent.config.clone(),
         "test".into(),
         Session::create(&dirs.project, &cwd, "test").unwrap(),
-        Vec::new(),
         cwd.clone(),
     );
     resumed.load_session(&id).unwrap();
@@ -1841,14 +1844,13 @@ fn switched_models_are_recorded_and_adopted_on_resume() {
 }
 
 fn resume_with_reasoning(test: &TestAgent, id: &str, saved_default: Option<&str>) -> Conversation {
-    let (session, messages) = Session::open(&test.sessions_dir, id).unwrap();
+    let session = Session::open(&test.sessions_dir, id).unwrap();
     let mut config = test.agent.config().clone();
     config.reasoning_effort = saved_default.map(str::to_string);
     Conversation::persistent(
         config,
         test.agent.model().to_string(),
         session,
-        messages,
         test.root.join("cwd"),
     )
 }
@@ -1924,7 +1926,7 @@ fn config_reload_keeps_a_session_reasoning_choice_until_the_default_is_saved() {
     );
 
     let id = test.agent.session_id().to_string();
-    let (session, _) = Session::open(&test.sessions_dir, &id).unwrap();
+    let session = Session::open(&test.sessions_dir, &id).unwrap();
     assert_eq!(session.recorded_reasoning(), None);
     let resumed = resume_with_reasoning(&test, &id, Some("xhigh"));
     assert_eq!(
@@ -1983,8 +1985,8 @@ fn context_limit_gets_at_most_one_compaction_retry() {
         let requests = Rc::new(RefCell::new(Vec::new()));
         let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
         let mut compactions = 0;
-        let result = test.agent.run_turn_with(
-            Some("continue".into()),
+        let result = test.agent.run_with(
+            prompt("continue"),
             &mut |event| {
                 if matches!(event, TurnEvent::Compacted { .. }) {
                     compactions += 1;
@@ -2015,8 +2017,8 @@ fn malformed_tool_calls_retry_with_a_transient_corrective_note() {
         let requests = Rc::new(RefCell::new(Vec::new()));
         let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
         let mut warnings = 0;
-        let result = test.agent.run_turn_with(
-            Some("continue".into()),
+        let result = test.agent.run_with(
+            prompt("continue"),
             &mut |event| {
                 if matches!(event, TurnEvent::Warning(_)) {
                     warnings += 1;
@@ -2066,7 +2068,7 @@ fn legacy_resumed_history_is_compacted_before_the_first_request() {
     let mut resolve = scripted_resolve(steps, Rc::clone(&requests));
     assert!(
         test.agent
-            .run_turn_with(Some("continue".into()), &mut |_| {}, &mut resolve)
+            .run_with(prompt("continue"), &mut |_| {}, &mut resolve)
             .unwrap()
     );
     assert_eq!(
@@ -2110,7 +2112,7 @@ fn fresh_tool_output_triggers_compaction_even_when_reported_usage_was_low() {
     let mut resolve = scripted_resolve(steps, Rc::clone(&requests));
     assert!(
         test.agent
-            .run_turn_with(Some("read the file".into()), &mut |_| {}, &mut resolve)
+            .run_with(prompt("read the file"), &mut |_| {}, &mut resolve)
             .unwrap()
     );
     assert_eq!(
@@ -2148,7 +2150,7 @@ fn deferred_delivery_is_restored_after_a_partial_append_failure() {
     let steps = Rc::new(RefCell::new(VecDeque::from([text_step("summary")])));
     let requests = Rc::new(RefCell::new(Vec::new()));
     let mut resolve = scripted_resolve(steps, Rc::clone(&requests));
-    test.agent.persistent_mut().session.fail_append_after(0);
+    test.agent.session.fail_append_after(0);
     assert!(
         test.agent
             .run_deferred_subagent_results_with(&mut |_| {}, &mut resolve)
@@ -2164,8 +2166,8 @@ fn deferred_delivery_is_restored_after_a_partial_append_failure() {
     );
     assert!(!test.agent.subagent_manager().has_deferred());
     reopen_test_agent(&mut test);
-    assert_eq!(test.agent.messages.len(), 2);
-    assert_eq!(test.agent.messages[0].subagent_results.len(), 1);
+    assert_eq!(test.agent.messages().len(), 2);
+    assert_eq!(test.agent.messages()[0].subagent_results.len(), 1);
 }
 
 /// System prompt, advertised tool names, and messages of each request.
@@ -2226,16 +2228,10 @@ fn ready_handoff_fixture(name: &str) -> TestAgent {
         .start_plan("Keep the public API stable".to_string().into())
         .unwrap();
     let investigation = Message::assistant("large investigation output ".repeat(4000), vec![]);
-    test.agent.persist_message(&investigation).unwrap();
-    test.agent.messages.push(investigation);
+    test.agent.session.append_message(investigation).unwrap();
     let plan = "# Unique implementation plan\n\nUpdate parsing and run checks.";
     let ready = Message::assistant(plan.into(), vec![]);
-    test.agent
-        .persistent_mut()
-        .session
-        .append_plan_ready(plan, &ready)
-        .unwrap();
-    test.agent.messages.push(ready);
+    test.agent.session.append_plan_ready(plan, ready).unwrap();
     test
 }
 
@@ -2245,7 +2241,7 @@ fn plan_handoff_reduces_requests_for_picker_and_classified_follow_up() -> Result
         let mut test = ready_handoff_fixture("handoff-requests");
         let before = test
             .agent
-            .messages
+            .messages()
             .iter()
             .map(super::context::message_tokens)
             .sum::<u64>();
@@ -2260,19 +2256,14 @@ fn plan_handoff_reduces_requests_for_picker_and_classified_follow_up() -> Result
             ))
         };
         if classify {
-            test.agent.run_turn_input_with_mode(
-                Some("Implement, preserving compatibility".to_string().into()),
+            test.agent.run_with(
+                TurnRequest::PlanFollowUp("Implement, preserving compatibility".to_string().into()),
                 &mut |_| {},
                 &mut resolve,
-                TurnMode::PlanFollowUp,
             )?;
         } else {
-            test.agent.run_turn_input_with_mode(
-                None,
-                &mut |_| {},
-                &mut resolve,
-                TurnMode::PlanImplement,
-            )?;
+            test.agent
+                .run_with(TurnRequest::PlanImplement(None), &mut |_| {}, &mut resolve)?;
         }
         let requests = captures.borrow();
         // No summarizer request: acceptance goes straight to implementation.
@@ -2331,18 +2322,12 @@ fn plan_handoff_reduces_requests_for_picker_and_classified_follow_up() -> Result
         // Undo implementation retains the compact handoff and its ready plan.
         test.agent.undo_last_turn()?;
         assert!(test.agent.active_plan().is_some());
-        assert!(test.agent.persistent_state().session.plan_has_handoff(1));
+        assert!(test.agent.session.plan_has_handoff(1));
         let id = test.agent.session_id().to_string();
-        let (session, messages) = Session::open(&test.sessions_dir, &id)?;
-        *test.agent.persistent_mut().session = session;
-        test.agent.messages = messages;
+        test.agent.session = Session::open(&test.sessions_dir, &id)?;
         captures.borrow_mut().clear();
-        test.agent.run_turn_input_with_mode(
-            None,
-            &mut |_| {},
-            &mut resolve,
-            TurnMode::PlanImplement,
-        )?;
+        test.agent
+            .run_with(TurnRequest::PlanImplement(None), &mut |_| {}, &mut resolve)?;
         assert_eq!(captures.borrow().len(), 1);
         let requests = captures.borrow();
         let (_, _, resumed) = requests.last().unwrap();
@@ -2368,8 +2353,7 @@ fn plan_handoff_keeps_earlier_conversation_and_carries_requirements() -> Result<
     test.agent
         .append_input_message(Message::user("Earlier unrelated discussion"))?;
     let reply = Message::assistant("Earlier reply".into(), vec![]);
-    test.agent.persist_message(&reply)?;
-    test.agent.messages.push(reply);
+    test.agent.session.append_message(reply)?;
     test.agent
         .start_plan("Add a cache\nwith a TTL".to_string().into())?;
     let questions = serde_json::json!({"questions": [
@@ -2404,16 +2388,11 @@ fn plan_handoff_keeps_earlier_conversation_and_carries_requirements() -> Result<
         Message::assistant("large investigation output".into(), vec![]),
     ];
     for message in planning {
-        test.agent.persist_message(&message)?;
-        test.agent.messages.push(message);
+        test.agent.session.append_message(message)?;
     }
     let plan = "# Cache plan\n\nAdd the cache.";
     let ready = Message::assistant(plan.into(), vec![]);
-    test.agent
-        .persistent_mut()
-        .session
-        .append_plan_ready(plan, &ready)?;
-    test.agent.messages.push(ready);
+    test.agent.session.append_plan_ready(plan, ready)?;
     test.agent.append_input_message(
         Message::user("Implement the active plan now.")
             .with_control(MessageControl::PlanImplementationStart),
@@ -2427,12 +2406,12 @@ fn plan_handoff_keeps_earlier_conversation_and_carries_requirements() -> Result<
     })?;
     // Objective, question batch, answers, steer, investigation, and plan.
     assert_eq!(handoffs, [6]);
-    let messages = &test.agent.messages;
+    let messages = test.agent.messages();
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[0].content, "Earlier unrelated discussion");
     assert_eq!(messages[1].content, "Earlier reply");
     assert!(messages[2].is_plan_handoff());
-    assert!(!compaction::is_summary_message(&messages[2]));
+    assert!(!messages[2].is_summary());
     let handoff = &messages[2].content;
     for expected in [
         "replaced by its completed plan",
@@ -2451,10 +2430,10 @@ fn plan_handoff_keeps_earlier_conversation_and_carries_requirements() -> Result<
     assert_eq!(last_undoable_user_index(messages), Some(3));
 
     let id = test.agent.session_id().to_string();
-    let (_, replayed) = Session::open(&test.sessions_dir, &id)?;
+    let replayed = Session::open(&test.sessions_dir, &id)?.messages().to_vec();
     assert_eq!(
         serde_json::to_value(&replayed)?,
-        serde_json::to_value(&test.agent.messages)?,
+        serde_json::to_value(test.agent.messages())?,
         "replay rebuilds the same handoff"
     );
     Ok(())
@@ -2476,15 +2455,14 @@ fn plan_turns_announce_phase_changes() -> Result<(), Error> {
         ))
     };
     let mut phases = Vec::new();
-    test.agent.run_turn_input_with_mode(
-        Some("Implement it".to_string().into()),
+    test.agent.run_with(
+        TurnRequest::PlanFollowUp("Implement it".to_string().into()),
         &mut |event| {
             if let TurnEvent::PlanPhase(phase) = event {
                 phases.push(phase);
             }
         },
         &mut resolve,
-        TurnMode::PlanFollowUp,
     )?;
     assert_eq!(
         phases,
@@ -2509,15 +2487,14 @@ fn plan_implementation_stops_idle_replies_and_blocked_keeps_the_plan() -> Result
     };
     let mut warnings = Vec::new();
     // The provider only ever replies with text.
-    assert!(test.agent.run_turn_input_with_mode(
-        None,
+    assert!(test.agent.run_with(
+        TurnRequest::PlanImplement(None),
         &mut |event| {
             if let TurnEvent::Warning(text) = event {
                 warnings.push(text);
             }
         },
-        &mut resolve,
-        TurnMode::PlanImplement,
+        &mut resolve
     )?);
     assert_eq!(requests.borrow().len(), 3);
     assert!(
@@ -2537,14 +2514,13 @@ fn plan_implementation_stops_idle_replies_and_blocked_keeps_the_plan() -> Result
     steps.borrow_mut().push_back(finish(
         r#"{"result":"Need the API key","status":"blocked"}"#,
     ));
-    test.agent.run_turn_input_with_mode(
-        Some("Keep going".to_string().into()),
+    test.agent.run_with(
+        TurnRequest::PlanImplement(Some("Keep going".to_string().into())),
         &mut |_| {},
         &mut resolve,
-        TurnMode::PlanImplement,
     )?;
     assert!(test.agent.active_plan().is_some(), "blocked keeps the plan");
-    let last = test.agent.messages.last().expect("blocked reply");
+    let last = test.agent.messages().last().expect("blocked reply");
     assert_eq!(last.content, "Need the API key");
     assert!(last.tool_calls.is_empty());
 
@@ -2559,11 +2535,10 @@ fn plan_implementation_stops_idle_replies_and_blocked_keeps_the_plan() -> Result
         }),
         finish(r#"{"result":"Done."}"#),
     ]);
-    test.agent.run_turn_input_with_mode(
-        Some("Here is the key".to_string().into()),
+    test.agent.run_with(
+        TurnRequest::PlanFollowUp("Here is the key".to_string().into()),
         &mut |_| {},
         &mut resolve,
-        TurnMode::PlanFollowUp,
     )?;
     let follow_up_note = requests.borrow()[0]
         .2
@@ -2591,11 +2566,10 @@ fn follow_up_before_implementation_uses_the_plain_classifier_note() -> Result<()
             "test".into(),
         ))
     };
-    test.agent.run_turn_input_with_mode(
-        Some("What does step two mean?".to_string().into()),
+    test.agent.run_with(
+        TurnRequest::PlanFollowUp("What does step two mean?".to_string().into()),
         &mut |_| {},
         &mut resolve,
-        TurnMode::PlanFollowUp,
     )?;
     let note = requests.borrow()[0]
         .2
@@ -2614,15 +2588,15 @@ fn failed_plan_handoff_preserves_history_and_retries() -> Result<(), Error> {
     let mut test = ready_handoff_fixture("handoff-failure");
     test.agent
         .append_input_message(Message::user("Implement with care"))?;
-    let before = serde_json::to_value(&test.agent.messages)?;
-    test.agent.persistent_mut().session.fail_append_after(0);
+    let before = serde_json::to_value(test.agent.messages())?;
+    test.agent.session.fail_append_after(0);
     assert!(test.agent.prepare_plan_handoff(&mut |_| {}).is_err());
-    assert_eq!(serde_json::to_value(&test.agent.messages)?, before);
-    assert!(!test.agent.persistent_state().session.plan_has_handoff(1));
+    assert_eq!(serde_json::to_value(test.agent.messages())?, before);
+    assert!(!test.agent.session.plan_has_handoff(1));
     assert!(test.agent.active_plan().is_some());
     test.agent.prepare_plan_handoff(&mut |_| {})?;
-    assert_eq!(test.agent.messages.len(), 2);
-    assert!(test.agent.persistent_state().session.plan_has_handoff(1));
+    assert_eq!(test.agent.messages().len(), 2);
+    assert!(test.agent.session.plan_has_handoff(1));
     Ok(())
 }
 
@@ -2632,24 +2606,18 @@ fn plan_handoff_survives_compaction_and_new_revision_gets_a_new_handoff() -> Res
     test.agent
         .append_input_message(Message::user("Implement"))?;
     test.agent.prepare_plan_handoff(&mut |_| {})?;
-    test.agent.persist_compaction(
+    test.agent.session.append_compaction(
         "Implementation progress; consult saved plan.",
-        0,
-        1,
-        &[],
+        0..1,
+        Vec::new(),
         None,
     )?;
-    compaction::apply_summary(
-        &mut test.agent.messages,
-        "Implementation progress; consult saved plan.",
-        1,
-    );
     let path = test.agent.plan_file_reference()?.unwrap();
     std::fs::remove_file(&path)?;
-    let compacted = serde_json::to_value(&test.agent.messages)?;
+    let compacted = serde_json::to_value(test.agent.messages())?;
     test.agent.prepare_plan_handoff(&mut |_| {})?;
     assert_eq!(
-        serde_json::to_value(&test.agent.messages)?,
+        serde_json::to_value(test.agent.messages())?,
         compacted,
         "an existing handoff must not replace later history"
     );
@@ -2661,21 +2629,17 @@ fn plan_handoff_survives_compaction_and_new_revision_gets_a_new_handoff() -> Res
 
     let plan = "# Revised implementation plan";
     let ready = Message::assistant(plan.into(), vec![]);
-    test.agent
-        .persistent_mut()
-        .session
-        .append_plan_ready(plan, &ready)?;
-    test.agent.messages.push(ready);
+    test.agent.session.append_plan_ready(plan, ready)?;
     test.agent
         .append_input_message(Message::user("Implement the revised plan"))?;
     test.agent.prepare_plan_handoff(&mut |_| {})?;
-    assert!(test.agent.messages[0].content.contains(plan));
+    assert!(test.agent.messages()[0].content.contains(plan));
     assert!(
-        !test.agent.messages[0]
+        !test.agent.messages()[0]
             .content
             .contains("# Unique implementation plan")
     );
-    assert!(test.agent.persistent_state().session.plan_has_handoff(2));
+    assert!(test.agent.session.plan_has_handoff(2));
     assert_ne!(test.agent.plan_file_reference()?.unwrap(), path);
     Ok(())
 }
@@ -2711,10 +2675,7 @@ impl Provider for PhaseProvider {
 fn plan_phases_keep_the_prompt_prefix_and_gate_tools_in_history_notes() -> Result<(), Error> {
     let mut test = TestAgent::new("plan-phase-prefix");
     test.agent.start_plan("Add a parser".to_string().into())?;
-    test.agent
-        .persistent_mut()
-        .session
-        .append_plan_questions_asked()?;
+    test.agent.session.append_plan_questions_asked()?;
     let blocked = test.root.join("blocked.txt");
     let call = |id: &str, name: &str, arguments: String| {
         Some(ToolCall {
@@ -2752,32 +2713,28 @@ fn plan_phases_keep_the_prompt_prefix_and_gate_tools_in_history_notes() -> Resul
         ))
     };
 
-    assert!(test.agent.run_turn_input_with_mode(
-        None,
-        &mut |_| {},
-        &mut resolve,
-        TurnMode::Plan
-    )?);
+    assert!(
+        test.agent
+            .run_with(TurnRequest::Plan, &mut |_| {}, &mut resolve)?
+    );
     assert!(!blocked.exists(), "planning must not run write_file");
     let rejected = test
         .agent
-        .messages
+        .messages()
         .iter()
         .find(|m| m.tool_call_id.as_deref() == Some("write"))
         .expect("write result");
     assert!(rejected.is_error);
     assert!(rejected.content.contains("unavailable while planning"));
 
-    assert!(test.agent.run_turn_input_with_mode(
-        None,
-        &mut |_| {},
-        &mut resolve,
-        TurnMode::PlanImplement
-    )?);
+    assert!(
+        test.agent
+            .run_with(TurnRequest::PlanImplement(None), &mut |_| {}, &mut resolve)?
+    );
     assert_eq!(test.agent.active_plan(), None);
     assert!(
         test.agent
-            .run_turn_with(Some("thanks".into()), &mut |_| {}, &mut resolve)?
+            .run_with(prompt("thanks"), &mut |_| {}, &mut resolve)?
     );
 
     let requests = captures.borrow();
@@ -2808,10 +2765,10 @@ fn plan_phases_keep_the_prompt_prefix_and_gate_tools_in_history_notes() -> Resul
     // Phase notes are hidden and never become undo points.
     assert!(
         test.agent
-            .messages
+            .messages()
             .iter()
             .filter(|m| m.control == Some(MessageControl::PlanPhase))
-            .all(|m| m.is_hidden_control() && !is_undoable_user_prompt(m))
+            .all(|m| m.is_hidden_control() && !m.starts_user_turn())
     );
     Ok(())
 }
@@ -2855,19 +2812,15 @@ fn defined_tools_work_on_the_next_step_reach_the_prompt_and_undo_cleanly() {
     };
 
     test.agent
-        .run_turn_with(
-            Some("make me a greeting tool".into()),
-            &mut sink,
-            &mut resolve,
-        )
+        .run_with(prompt("make me a greeting tool"), &mut sink, &mut resolve)
         .expect("defining turn should complete");
     test.agent
-        .run_turn_with(Some("thanks".into()), &mut sink, &mut resolve)
+        .run_with(prompt("thanks"), &mut sink, &mut resolve)
         .expect("follow-up turn should complete");
 
     let results = test
         .agent
-        .messages
+        .messages()
         .iter()
         .filter(|message| message.role == Role::Tool)
         .map(|message| (message.is_error, message.content.clone()))
@@ -2890,4 +2843,91 @@ fn defined_tools_work_on_the_next_step_reach_the_prompt_and_undo_cleanly() {
     let report = test.agent.undo_last_turn().expect("undo definition");
     assert!(report.restored_files);
     assert!(!manifest.exists(), "undo should remove the defined tool");
+}
+
+#[test]
+fn undo_after_late_subagent_results_restores_the_ready_plan() {
+    let mut test = ready_plan_fixture("undo-late-subagent-results");
+    test.agent.checkpoint_snapshot().unwrap().unwrap();
+    test.agent
+        .append_input_message(
+            Message::user("Implement the active plan now.")
+                .with_control(MessageControl::PlanImplementationStart),
+        )
+        .unwrap();
+    // Implementation finishes while a background subagent still runs; its
+    // result arrives afterwards.
+    test.agent
+        .session
+        .append_plan_implemented(Message::assistant("implemented".into(), vec![]))
+        .unwrap();
+    test.agent
+        .append_input_message(Message::subagent_results(vec![
+            crate::provider::SubagentResult {
+                id: "sa-1".into(),
+                name: "explorer".into(),
+                status: "completed".into(),
+                run_number: 1,
+                content: "found it".into(),
+            },
+        ]))
+        .unwrap();
+
+    let report = test.agent.undo_last_turn().unwrap();
+    assert_eq!(report.dropped, 3);
+    assert!(
+        matches!(
+            test.agent.plan_state(),
+            Some(crate::session::PlanState::Ready { .. })
+        ),
+        "undo lost the ready plan: {:?}",
+        test.agent.plan_state()
+    );
+}
+
+/// An undo left pending (crash between its two log writes) whose snapshots
+/// are gone must neither block leaving the session nor wedge it.
+#[test]
+fn pending_undo_with_missing_checkpoints_degrades_to_a_warning() {
+    let mut test = TestAgent::new("undo-missing-checkpoints");
+    let path = two_checkpoint_turns(&mut test);
+    test.agent.session.fail_append_after(1);
+    assert!(test.agent.undo_last_turn().is_err());
+    let home = test.agent.config.home_dir.clone();
+    std::fs::remove_dir_all(home.join("checkpoints")).unwrap();
+    reopen_test_agent(&mut test);
+
+    let report = test.agent.undo_last_turn().unwrap();
+    assert_eq!(report.dropped, 1);
+    assert!(!report.restored_files);
+    assert!(report.warning.unwrap().contains("missing"));
+    // The interrupted attempt already restored the file before its history
+    // write failed.
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "first edit");
+    assert_eq!(test.agent.messages().len(), 1);
+    assert!(test.agent.session.pending_undo().is_none());
+}
+
+#[test]
+fn a_session_that_cannot_recover_does_not_block_a_new_one() {
+    let mut test = TestAgent::new("undo-blocked-reset");
+    two_checkpoint_turns(&mut test);
+    test.agent.session.fail_append_after(1);
+    assert!(test.agent.undo_last_turn().is_err());
+    // A corrupt checkpoint store keeps the old session from recovering.
+    let store = test
+        .agent
+        .config
+        .home_dir
+        .join("checkpoints")
+        .join(test.agent.session_id());
+    std::fs::write(store.join("stack.json"), "{not json").unwrap();
+    reopen_test_agent(&mut test);
+    assert!(test.agent.undo_last_turn().is_err());
+
+    test.agent
+        .reset()
+        .expect("/new must not depend on the old session");
+    assert!(test.agent.messages().is_empty());
+    assert!(test.agent.session.pending_undo().is_none());
 }

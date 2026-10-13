@@ -9,7 +9,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -232,11 +232,24 @@ impl Checkpoints {
     }
 
     /// Restore without consuming the checkpoint until session history commits.
+    ///
+    /// A snapshot that is gone, for example because the session log was
+    /// copied without `~/.yawl/checkpoints` or the store was cleaned up, only
+    /// becomes a warning: the history can still be undone.
     pub(crate) fn restore_retained(&self, index: Option<usize>) -> Result<RestoreReport, Error> {
         self.ensure_loaded()?;
         let Some(index) = index else {
             return Ok(RestoreReport::default());
         };
+        if index >= self.stack.len() {
+            return Ok(RestoreReport {
+                restored: false,
+                reset_head: false,
+                warning: Some(
+                    "the undo snapshot for this turn is missing, so files were not restored".into(),
+                ),
+            });
+        }
         if self.last_index() != Some(index) {
             return Err(Error::Protocol(
                 "undo checkpoint is missing or out of order".into(),
@@ -306,7 +319,7 @@ impl Checkpoints {
         if self.stack.len() == index + 1 {
             persist_stack(&self.dir, &self.stack[..index])?;
             self.stack.truncate(index);
-        } else if self.stack.len() != index {
+        } else if self.stack.len() > index + 1 {
             return Err(Error::Protocol(
                 "undo checkpoint cleanup is out of order".into(),
             ));
@@ -369,9 +382,9 @@ fn persist_stack(dir: &Path, stack: &[TurnRecord]) -> Result<(), Error> {
 fn git_available() -> bool {
     Command::new("git")
         .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }
@@ -477,25 +490,46 @@ fn git_command(work_tree: &Path) -> Command {
     command
 }
 
+/// Bounds every `/undo` Git call, so a stuck repository cannot hold a turn
+/// or an undo forever.
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn run_git(cmd: &mut Command) -> Result<String, Error> {
-    let output = cmd.stdin(Stdio::null()).output().map_err(|error| {
+    let command = std::mem::replace(cmd, Command::new("git"));
+    let result = crate::tools::exec::run(
+        command,
+        crate::tools::exec::RunOptions {
+            stdin: None,
+            timeout: Some(GIT_TIMEOUT),
+            stdout: crate::tools::exec::Keep::All,
+            stderr: crate::tools::exec::Keep::All,
+        },
+    )
+    .map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             Error::Config("git is not installed".into())
         } else {
             Error::Io(error)
         }
     })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
+    if result.interrupted {
+        return Err(Error::Interrupted);
+    }
+    if result.timed_out {
+        return Err(Error::Protocol(format!(
+            "git timed out after {}s",
+            GIT_TIMEOUT.as_secs()
+        )));
+    }
+    if result.status != Some(0) {
+        let detail = if result.stderr.trim().is_empty() {
+            result.stdout.trim()
         } else {
-            stderr.trim()
+            result.stderr.trim()
         };
         return Err(Error::Protocol(format!("git failed: {detail}")));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(result.stdout)
 }
 
 #[cfg(test)]

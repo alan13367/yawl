@@ -384,8 +384,10 @@ impl SubagentSnapshot {
                 self.current_activity = "sending".into();
             }
             TurnEvent::Warning(text) => self.error = bounded(&text, MAX_ERROR_BYTES),
-            // Children never run plan mode.
-            TurnEvent::PlanHandoff { .. } | TurnEvent::PlanPhase(_) => {}
+            // Children never run plan mode or wait for subagents of their own.
+            TurnEvent::PlanHandoff { .. }
+            | TurnEvent::PlanPhase(_)
+            | TurnEvent::WaitingForSubagents { .. } => {}
             TurnEvent::Usage {
                 context_tokens,
                 context_window,
@@ -505,7 +507,7 @@ pub(crate) fn sanitize_preview(text: &str, limit: usize) -> String {
             }
             continue;
         }
-        if character.is_control() {
+        if crate::text::is_unsafe(character) {
             if !output.ends_with(' ') {
                 output.push(' ');
             }

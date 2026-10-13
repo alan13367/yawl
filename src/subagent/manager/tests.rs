@@ -235,6 +235,7 @@ fn large_reports_are_bounded_in_deliveries_and_readable_after_shutdown() {
             "read_file",
             &serde_json::json!({"path": path, "offset": offset, "limit": 1024}).to_string(),
             "resumed",
+            false,
         );
         assert!(!outcome.is_error, "{}", outcome.content);
         let (header, content) = outcome

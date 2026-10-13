@@ -239,7 +239,7 @@ fn count_label(count: usize, noun: &str) -> String {
 
 fn printable(text: &str) -> String {
     text.chars()
-        .filter(|character| !character.is_control())
+        .filter(|character| !crate::text::is_unsafe(*character))
         .collect()
 }
 

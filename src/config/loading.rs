@@ -348,16 +348,6 @@ fn default_local_providers() -> HashMap<String, ProviderConfig> {
     providers
 }
 
-/// Valid reasoning efforts. `default` and `off` omit the
-/// request field and let the service choose its default behavior.
-pub fn normalize_reasoning_effort(value: &str) -> Option<&str> {
-    match value {
-        level if super::REASONING_EFFORTS.contains(&level) => Some(value),
-        "default" | "off" => None,
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -446,7 +436,6 @@ mod tests {
         for effort in super::super::REASONING_EFFORTS {
             cfg.apply(serde_json::from_value(json!({"reasoning_effort": effort}))?)?;
             assert_eq!(cfg.reasoning_effort.as_deref(), Some(*effort));
-            assert_eq!(normalize_reasoning_effort(effort), Some(*effort));
         }
         cfg.apply(serde_json::from_value(json!({"reasoning_effort": "high"}))?)?;
         assert_eq!(cfg.reasoning_effort.as_deref(), Some("high"));

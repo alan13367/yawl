@@ -81,8 +81,8 @@ impl SubagentManager {
                 return;
             }
             let run_model = conversation.model().to_string();
-            let result = conversation.run_turn_preserving_cancellation(
-                Some(work.message.clone()),
+            let result = conversation.run(
+                crate::agent::TurnRequest::Prompt(Some(work.message.clone().into())),
                 &mut |event| {
                     let mut state = self.lock();
                     apply_turn_event(&mut state, id, event);

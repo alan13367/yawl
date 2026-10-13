@@ -105,7 +105,7 @@ pub(in crate::tui) fn settings(agent: &mut Agent, argument: &str, state: &mut Vi
     let change = match key {
         "reload" => {
             if parts.next().is_some() {
-                Err(Error::Config("usage: /settings reload".into()))
+                Err(Error::Invalid("usage: /settings reload".into()))
             } else {
                 Ok(ConfigChange::Reload)
             }
@@ -228,7 +228,7 @@ pub(in crate::tui) fn settings(agent: &mut Agent, argument: &str, state: &mut Vi
             let path = parts.next();
             if !matches!(action, Some("add" | "remove")) || path.is_none() || parts.next().is_some()
             {
-                Err(Error::Config(
+                Err(Error::Invalid(
                     "usage: /settings skills add|remove DIRECTORY".into(),
                 ))
             } else {
@@ -266,7 +266,7 @@ pub(in crate::tui) fn settings(agent: &mut Agent, argument: &str, state: &mut Vi
             let url = parts.next();
             let api_key = parts.next();
             if name.is_none() || url.is_none() || parts.next().is_some() {
-                Err(Error::Config(
+                Err(Error::Invalid(
                     "usage: /settings provider NAME BASE_URL [API_KEY|-]".into(),
                 ))
             } else {
@@ -277,7 +277,7 @@ pub(in crate::tui) fn settings(agent: &mut Agent, argument: &str, state: &mut Vi
                 })
             }
         }
-        _ => Err(Error::Config(format!(
+        _ => Err(Error::Invalid(format!(
             "unknown setting '{key}'; run /settings to list settings"
         ))),
     };
@@ -549,9 +549,9 @@ pub(super) fn one_value<'a>(
 ) -> Result<&'a str, Error> {
     let value = parts
         .next()
-        .ok_or_else(|| Error::Config(usage.to_string()))?;
+        .ok_or_else(|| Error::Invalid(usage.to_string()))?;
     if parts.next().is_some() {
-        return Err(Error::Config(usage.to_string()));
+        return Err(Error::Invalid(usage.to_string()));
     }
     Ok(value)
 }

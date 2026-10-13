@@ -60,6 +60,10 @@ pub enum TurnEvent<'a> {
     PlanPhase(Option<PlanPhase>),
     /// Non-fatal problem the user should know about; the turn continues.
     Warning(String),
+    /// Print mode is waiting for `active` background subagents to finish.
+    WaitingForSubagents {
+        active: usize,
+    },
     Usage {
         context_tokens: u64,
         context_window: u64,
