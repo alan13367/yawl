@@ -40,7 +40,10 @@ pub(super) fn command_completions(agent: &Agent) -> Vec<Completion> {
         ("/resume", "List or resume sessions"),
         ("/unqueue", "Cancel queued messages"),
         ("/goal", "Start, resume, or cancel a persistent goal"),
-        ("/plan", "Start, resume, or cancel a planning workflow"),
+        (
+            "/plan",
+            "Start, revise, implement, resume, or cancel a plan",
+        ),
         ("/help", "Show help"),
         ("/hotkeys", "List every keyboard shortcut"),
         ("/diff", "Show files changed this session"),

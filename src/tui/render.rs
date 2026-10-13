@@ -39,6 +39,7 @@ pub(super) use super::status_bar::format_token_count;
 
 use std::sync::Arc;
 
+use crate::agent::PlanPhase;
 use crate::config::UiColor;
 use crate::provider::ImageContent;
 
@@ -436,10 +437,15 @@ pub(super) fn build_frame_with_images(
         Some("Your input")
     } else if plan_handoff {
         Some("Plan ready")
-    } else if state.turn_started.is_some() && !state.goal_running && state.plan_draft {
-        Some("Planning")
-    } else if state.turn_started.is_some() && !state.goal_running && state.active_plan.is_some() {
-        Some("Plan turn")
+    } else if state.turn_started.is_some()
+        && let Some(phase) = state.plan_phase
+    {
+        Some(match phase {
+            PlanPhase::Planning => "Planning",
+            PlanPhase::FollowUp => "Plan follow-up",
+            PlanPhase::Revising => "Revising plan",
+            PlanPhase::Implementing => "Implementing plan",
+        })
     } else {
         None
     };

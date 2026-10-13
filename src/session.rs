@@ -738,14 +738,16 @@ fn replay(path: &Path) -> Result<ReplayedSession, Error> {
                 }
                 let start = start.min(messages.len());
                 let end = start.saturating_add(replaced).min(messages.len());
-                drop(messages.splice(
-                    start..end,
-                    std::iter::once(crate::compaction::summary_message_with_provider_data(
+                let replacement = if plan_revision.is_some() {
+                    crate::compaction::plan_handoff_message(&summary)
+                } else {
+                    crate::compaction::summary_message_with_provider_data(
                         &summary,
                         provider_data,
                         provider_data_model,
-                    )),
-                ));
+                    )
+                };
+                drop(messages.splice(start..end, std::iter::once(replacement)));
                 context = None;
                 usage.record_cache_reset();
             }

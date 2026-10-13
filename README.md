@@ -69,7 +69,7 @@ With the transcript focused, arrows select blocks, `h`/`l` fold or unfold, `Ente
 
 Long pastes appear as compact markers but reach the model in full. Each prompt accepts up to five clipboard images in PNG, JPEG, GIF, or WebP format, up to 5 MB each. Linux clipboard images require `wl-paste` or `xclip`.
 
-Canceling a response pauses queued messages and pending steering. Use `/unqueue` to edit the queue and `Enter` to resume. When a request fails, press `Enter` on an empty prompt to continue the turn from its saved history; `/continue` does the same after a failure or a cancel, keeping goal and plan modes. Model questions appear in the composer; their countdown accepts recommended answers unless you intervene. Disable completion and question bells with `/settings bell off`.
+Canceling a response pauses queued messages and pending steering. Use `/unqueue` to edit the queue and `Enter` to resume. When a request fails, press `Enter` on an empty prompt to continue the turn from its saved history; `/continue` does the same after a failure or a cancel, keeping goal and plan modes. Model questions appear in the composer; outside planning, their countdown accepts recommended answers unless you press a key or scroll. Planning and plan-revision questions have no countdown and wait for your answer. Disable completion and question bells with `/settings bell off`.
 
 ### Slash commands
 
@@ -96,7 +96,7 @@ Canceling a response pauses queued messages and pending steering. Use `/unqueue`
 | `/resume [ID\|NUMBER]` | Open the session picker or resume directly; `d` deletes a session |
 | `/unqueue [NUMBER\|all]` | Edit, remove, or clear queued messages |
 | `/goal [TEXT]` | Start, resume, cancel, or show a persistent goal |
-| `/plan [TEXT]` | Start, resume, cancel, or show the planning workflow |
+| `/plan [TEXT\|revise TEXT\|implement]` | Start, revise, implement, resume, cancel, or show the planning workflow |
 | `/help` | Show terminal controls and commands |
 | `/hotkeys` | Show every keyboard shortcut, grouped by area |
 | `/quit` | Exit and print the resumable `yawl --session ID` command |
@@ -105,7 +105,7 @@ The Git dashboard supports keyboard and mouse navigation. Click a file or commit
 
 ### Goals and plans
 
-`/goal TEXT` keeps the agent working until it marks the goal complete. `/plan TEXT` starts a read-only workflow that asks questions and saves a Markdown plan. You can revise the plan or choose Implement. Implementation starts from the saved plan alone, without an extra summarization request; the original conversation stays in the session log. Plan phases keep the same system prompt and tool list and add their instructions as hidden messages, so local servers can reuse their prompt cache; planning still rejects any tool that is not read-only.
+`/goal TEXT` keeps the agent working until it marks the goal complete. `/plan TEXT` starts a read-only workflow that asks one to three questions (more only while material choices remain) and saves a Markdown plan. Once the plan is ready, a typed prompt is classified as a revision, an implementation request, or an unrelated message; `/plan revise TEXT` revises the plan directly and `/plan implement` implements it, with no classification step. Revisions ask questions only when the change leaves material choices open. `/plan TEXT` with a ready plan replaces it with a new plan, and `/undo` restores the ready one. `revise` and `implement` are reserved first words, so start a plan about them with different wording. When implementation starts, the planning conversation, from `/plan` up to the implementation prompt, is replaced in the model's context by the saved plan, the objective, and your answers and prompts from planning, without an extra summarization request. Conversation from before `/plan` stays in context, and the full history stays in the session log. If implementation needs something only you can provide, or the model replies three times in a row without finishing a plan step, the turn stops and the plan stays active. A reply that answers or continues the work resumes implementation, and `/plan implement` resumes it directly. Plan phases keep the same system prompt and tool list and add their instructions as hidden messages, so local servers can reuse their prompt cache; planning still rejects any tool that is not read-only.
 
 ### Remote control
 

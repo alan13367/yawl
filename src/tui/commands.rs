@@ -19,7 +19,8 @@ pub(super) use diff::show_diff;
 #[cfg(test)]
 pub(super) use diff::show_diff_files;
 pub(super) use modes::{
-    GoalAction, PlanAction, goal, goal_while_busy, init, plan, plan_handoff_picker, plan_while_busy,
+    GoalAction, PlanAction, goal, goal_while_busy, init, plan, plan_handoff_picker,
+    plan_while_busy, revision_text,
 };
 #[cfg(test)]
 pub(super) use queue::open_queue_picker;
@@ -71,7 +72,7 @@ Commands
 | `/skills` | List discovered skills (run `/skill:NAME`) |
 | --- | --- |
 | `/goal [TEXT]` | Start, resume, cancel, or show goal |
-| `/plan [TEXT]` | Start, resume, cancel, or show plan workflow |
+| `/plan [TEXT]` | Start, revise, implement, resume, cancel, or show plan |
 | `/unqueue [N]` | Cancel or manage queued messages |
 | `/subagents` | Open the subagent dashboard |
 | `/git` | Open the git dashboard (offers repo setup outside a repo) |

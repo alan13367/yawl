@@ -1053,3 +1053,149 @@ fn tools_listing_separates_custom_tools_and_explains_skipped_manifests() {
     assert!(text.contains("broken.json: invalid manifest"));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// An agent whose session already holds a plan: a ready one, or a draft.
+fn agent_with_plan(root: &std::path::Path, ready: bool) -> Agent {
+    let config = crate::config::Config {
+        model: Some("test".into()),
+        home_dir: root.join("home/.yawl"),
+        project_dir: root.join("project/.yawl"),
+        ..crate::config::Config::test_default()
+    };
+    let cwd = root.join("project");
+    let mut session =
+        crate::session::Session::create(&config.session_dirs(&cwd).project, &cwd, "test")
+            .expect("test session should be created");
+    let start = crate::provider::Message::user("add planning mode");
+    session
+        .append_plan_start("add planning mode", &start)
+        .expect("plan start");
+    if ready {
+        let plan = crate::provider::Message::assistant("# Plan".into(), Vec::new());
+        session
+            .append_plan_ready("# Plan", &plan)
+            .expect("plan ready");
+    }
+    Agent::new(config, "test".into(), session, Vec::new())
+}
+
+fn last_notice(state: &ViewState) -> String {
+    state
+        .transcript
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            Entry::Notice(text) => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn revision_text_matches_only_the_revise_subcommand() {
+    use super::commands::revision_text;
+    assert_eq!(revision_text("revise rename step 2"), Some("rename step 2"));
+    assert_eq!(revision_text("revise"), Some(""));
+    assert_eq!(revision_text("revise\n  tighten it "), Some("tighten it"));
+    assert_eq!(revision_text("revision of the docs"), None);
+    assert_eq!(revision_text("implement"), None);
+}
+
+#[test]
+fn plan_implement_and_revise_act_only_on_a_ready_plan() {
+    use super::commands::{PlanAction, plan};
+    let root = crate::test_support::unique_temp_dir("tui-plan-subcommands");
+
+    let mut agent = super::test_support::agent_in(&root.join("none"));
+    let mut state = ViewState::from_agent(&agent);
+    assert!(matches!(
+        plan(&mut agent, "implement", &mut state),
+        PlanAction::None
+    ));
+    assert_eq!(last_notice(&state), "No active plan.");
+    assert!(matches!(
+        plan(&mut agent, "revise rename step 2", &mut state),
+        PlanAction::None
+    ));
+    assert_eq!(last_notice(&state), "No active plan.");
+    assert!(agent.plan_state().is_none(), "no plan may be started");
+
+    let mut agent = agent_with_plan(&root.join("draft"), false);
+    let mut state = ViewState::from_agent(&agent);
+    assert!(matches!(
+        plan(&mut agent, "implement", &mut state),
+        PlanAction::None
+    ));
+    assert!(last_notice(&state).contains("/plan resume"));
+    assert!(matches!(
+        plan(&mut agent, "revise rename step 2", &mut state),
+        PlanAction::None
+    ));
+    assert!(last_notice(&state).contains("/plan resume"));
+    assert!(matches!(
+        agent.plan_state(),
+        Some(crate::session::PlanState::Draft { objective, .. }) if objective == "add planning mode"
+    ));
+
+    let mut agent = agent_with_plan(&root.join("ready"), true);
+    let mut state = ViewState::from_agent(&agent);
+    assert!(matches!(
+        plan(&mut agent, "revise", &mut state),
+        PlanAction::None
+    ));
+    assert_eq!(last_notice(&state), "Usage: /plan revise TEXT");
+    assert!(matches!(
+        plan(&mut agent, "implement", &mut state),
+        PlanAction::Implement
+    ));
+    assert!(matches!(
+        plan(&mut agent, "revise rename step 2", &mut state),
+        PlanAction::Revise(text) if text == "rename step 2"
+    ));
+    assert_eq!(agent.active_plan(), Some("# Plan"), "the plan stays ready");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn starting_a_plan_over_a_ready_one_says_undo_restores_it() {
+    use super::commands::{PlanAction, plan};
+    let root = crate::test_support::unique_temp_dir("tui-plan-replace");
+    let mut agent = agent_with_plan(&root, true);
+    let mut state = ViewState::from_agent(&agent);
+
+    assert!(matches!(
+        plan(&mut agent, "build something else", &mut state),
+        PlanAction::Start
+    ));
+    assert!(last_notice(&state).contains("/undo restores"));
+    assert!(agent.active_plan().is_none());
+
+    agent.undo_last_turn().expect("undo");
+    assert_eq!(agent.active_plan(), Some("# Plan"));
+
+    let mut agent = super::test_support::agent_in(&root.join("fresh"));
+    let mut state = ViewState::from_agent(&agent);
+    assert!(matches!(
+        plan(&mut agent, "build something", &mut state),
+        PlanAction::Start
+    ));
+    assert!(!last_notice(&state).contains("/undo"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn plan_implement_and_revise_wait_for_a_busy_turn() {
+    let root = crate::test_support::unique_temp_dir("tui-plan-busy");
+    let agent = super::test_support::agent_in(&root);
+    let mut state = ViewState::from_agent(&agent);
+    super::commands::plan_while_busy("implement", &mut state);
+    assert!(last_notice(&state).contains("/plan implement"));
+    super::commands::plan_while_busy("revise tighten it", &mut state);
+    assert!(last_notice(&state).contains("/plan revise TEXT"));
+    super::commands::plan_while_busy("something new", &mut state);
+    assert!(last_notice(&state).contains("before changing the plan"));
+    let _ = std::fs::remove_dir_all(&root);
+}

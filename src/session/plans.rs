@@ -62,16 +62,18 @@ impl Session {
         self.plan_handoffs.contains(&revision)
     }
 
+    /// Records that `range` of the history was replaced by the handoff for
+    /// plan `revision`. Replay rebuilds it as a handoff, not a summary.
     pub(crate) fn append_plan_handoff(
         &mut self,
         revision: usize,
-        summary: &str,
-        replaced: usize,
+        handoff: &str,
+        range: std::ops::Range<usize>,
     ) -> Result<(), Error> {
         self.append(&SessionEvent::Compaction {
-            summary: summary.to_string(),
-            start: 0,
-            replaced,
+            summary: handoff.to_string(),
+            start: range.start,
+            replaced: range.len(),
             provider_data: Vec::new(),
             provider_data_model: None,
             plan_revision: Some(revision),
@@ -129,7 +131,7 @@ mod tests {
         let first_path = session.ensure_plan_file()?.unwrap();
         assert!(first_path.is_absolute());
         assert_eq!(fs::read_to_string(&first_path)?, first);
-        session.append_plan_handoff(1, "summary and first plan", 1)?;
+        session.append_plan_handoff(1, "summary and first plan", 0..1)?;
         session.append_plan_ready("# Second", &Message::assistant("# Second".into(), vec![]))?;
         let second_path = session.ensure_plan_file()?.unwrap();
         assert_ne!(first_path, second_path);
@@ -181,7 +183,7 @@ mod tests {
         let id = session.id.clone();
         session.append_plan_ready("# Plan", &Message::assistant("# Plan".into(), vec![]))?;
         session.fail_append_after(0);
-        assert!(session.append_plan_handoff(1, "handoff", 1).is_err());
+        assert!(session.append_plan_handoff(1, "handoff", 0..1).is_err());
         assert!(!session.plan_has_handoff(1));
         drop(session);
         let (session, messages) = Session::open(&fixture.0, &id)?;

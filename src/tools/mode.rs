@@ -56,10 +56,13 @@ pub(super) fn plan_action_entry() -> ToolEntry {
 pub(super) fn plan_implemented_entry() -> ToolEntry {
     ToolEntry::new(ToolSpec {
             name: PLAN_IMPLEMENTED_TOOL_NAME.into(),
-            description: "Finish implementation of the active plan with the final user-facing result. This must be the only tool call in its step.".into(),
+            description: "Finish implementation of the active plan with the final user-facing result. Use status blocked only when the user must act before the work can continue; the plan then stays active. This must be the only tool call in its step.".into(),
             input_schema: json!({
                 "type": "object",
-                "properties": {"result": {"type": "string"}},
+                "properties": {
+                    "result": {"type": "string"},
+                    "status": {"type": "string", "enum": ["completed", "blocked"]}
+                },
                 "required": ["result"]
             }),
         }, ToolImpl::PlanImplemented,

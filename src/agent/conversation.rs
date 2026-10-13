@@ -61,6 +61,7 @@ pub(crate) fn is_undoable_user_prompt(message: &Message) -> bool {
     message.role == crate::provider::Role::User
         && message.subagent_results.is_empty()
         && !compaction::is_summary_message(message)
+        && !message.is_plan_handoff()
         && (!message.is_hidden_control() || message.is_plan_implementation_start())
         && !message.is_steering()
 }
@@ -326,7 +327,7 @@ impl Conversation {
             return Err(Error::Config("plan objective is empty".into()));
         }
         let warning = self.checkpoint_warning();
-        let message = Message::user_input(input);
+        let message = Message::user_input(input).with_control(MessageControl::PlanStart);
         self.persistent_mut()
             .session
             .append_plan_start(&objective, &message)?;

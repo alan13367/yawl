@@ -1,5 +1,15 @@
 use crate::provider::{ImageContent, ReasoningKind, StreamNotice, TokenUsage, UsageSummary};
 
+/// Plan workflow phase of the running turn, so the UI can label it. A
+/// follow-up turn moves to revision or implementation mid-turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanPhase {
+    Planning,
+    FollowUp,
+    Revising,
+    Implementing,
+}
+
 /// Progress events surfaced to the UI (print mode or TUI) during a turn.
 pub enum TurnEvent<'a> {
     TextDelta(&'a str),
@@ -40,6 +50,14 @@ pub enum TurnEvent<'a> {
     Compacted {
         replaced: usize,
     },
+    /// Implementation started from the saved plan; `replaced` planning
+    /// messages left the model's context.
+    PlanHandoff {
+        path: &'a str,
+        replaced: usize,
+    },
+    /// The turn entered a plan phase, or left plan mode (`None`).
+    PlanPhase(Option<PlanPhase>),
     /// Non-fatal problem the user should know about; the turn continues.
     Warning(String),
     Usage {

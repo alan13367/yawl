@@ -6,16 +6,32 @@ use crate::provider::{
 };
 use crate::tools::Registry;
 
-use super::plan::{self, FollowUpAction};
+use super::plan::{self, FollowUpAction, ImplementationStatus};
 use super::{Conversation, ConversationKind, last_undoable_user_index};
 use super::{context, goal};
-use crate::agent::events::{TurnEvent, forward};
+use crate::agent::events::{PlanPhase, TurnEvent, forward};
 
 /// Corrective retries after the server rejects an unparseable tool call.
 const MALFORMED_TOOL_CALL_RETRIES: u32 = 2;
 const MALFORMED_TOOL_CALL_NOTE: &str = "[yawl] Your previous response contained a tool call \
 the server could not parse, so it was discarded and nothing ran. Continue the task: \
 re-issue the call with a valid tool name and JSON arguments, or answer in plain text.";
+
+/// Consecutive text-only replies a plan phase accepts before stopping the
+/// turn, so a model that is blocked or ignores the finishing tool cannot
+/// loop on continuation prompts forever.
+const MAX_IDLE_PLAN_REPLIES: u32 = 3;
+
+fn idle_plan_stop_notice(mode: TurnMode) -> String {
+    let next = match mode {
+        TurnMode::Plan => "/plan resume continues planning; /plan cancel clears it.",
+        TurnMode::PlanRevise => "The plan is unchanged. Reply to keep revising, or /plan cancel.",
+        _ => "The plan stays active. Reply or run /plan implement to continue, or /plan cancel.",
+    };
+    format!(
+        "Stopped after {MAX_IDLE_PLAN_REPLIES} replies in a row that did not finish this plan step. {next}"
+    )
+}
 
 /// Weaker models often invent tool names, so the retry note names the
 /// tools that actually exist.
@@ -49,10 +65,13 @@ pub(super) enum TurnMode {
     PlanImplement,
 }
 
+/// `implementation_started` is true once the ready plan was handed off to
+/// implementation, so a follow-up can resume work that stopped early.
 fn plan_prompt<'a>(
     state: Option<&'a crate::session::PlanState>,
     path: Option<&'a str>,
     mode: TurnMode,
+    implementation_started: bool,
 ) -> Option<crate::prompt::PlanPrompt<'a>> {
     use crate::prompt::PlanPrompt;
     use crate::session::PlanState;
@@ -62,6 +81,9 @@ fn plan_prompt<'a>(
         }
         (_, Some(PlanState::Draft { objective, .. })) => Some(PlanPrompt::Paused(objective)),
         (TurnMode::PlanRevise, Some(PlanState::Ready { .. })) => path.map(PlanPrompt::Revise),
+        (TurnMode::PlanFollowUp, Some(PlanState::Ready { .. })) if implementation_started => {
+            path.map(PlanPrompt::ImplementationFollowUp)
+        }
         (TurnMode::PlanFollowUp, Some(PlanState::Ready { .. })) => path.map(PlanPrompt::FollowUp),
         (TurnMode::PlanImplement, Some(PlanState::Ready { .. })) => path.map(PlanPrompt::Implement),
         (_, Some(PlanState::Ready { .. })) => path.map(PlanPrompt::Active),
@@ -69,9 +91,20 @@ fn plan_prompt<'a>(
     }
 }
 
+fn plan_phase(mode: TurnMode) -> Option<PlanPhase> {
+    match mode {
+        TurnMode::Plan => Some(PlanPhase::Planning),
+        TurnMode::PlanFollowUp => Some(PlanPhase::FollowUp),
+        TurnMode::PlanRevise => Some(PlanPhase::Revising),
+        TurnMode::PlanImplement => Some(PlanPhase::Implementing),
+        TurnMode::Normal | TurnMode::Init | TurnMode::Goal => None,
+    }
+}
+
 fn plan_continuation(mode: TurnMode) -> Option<&'static str> {
     match mode {
-        TurnMode::Plan | TurnMode::PlanRevise => Some(plan::PLAN_CONTINUATION),
+        TurnMode::Plan => Some(plan::PLAN_CONTINUATION),
+        TurnMode::PlanRevise => Some(plan::PLAN_REVISE_CONTINUATION),
         TurnMode::PlanImplement => Some(plan::PLAN_IMPLEMENT_CONTINUATION),
         // Follow-up turns end on a text reply so the model can answer
         // requests unrelated to the plan without being forced to classify.
@@ -183,6 +216,16 @@ impl Conversation {
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<bool, Error> {
         self.run_mode_preserving_cancellation(Some(input), TurnMode::PlanFollowUp, sink)
+    }
+
+    /// Revises the ready plan from `input` without asking the model to
+    /// classify the request first.
+    pub(crate) fn run_plan_revision_preserving_cancellation(
+        &mut self,
+        input: TurnInput,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.run_mode_preserving_cancellation(Some(input), TurnMode::PlanRevise, sink)
     }
 
     pub(crate) fn run_plan_implementation_preserving_cancellation(
@@ -426,7 +469,9 @@ impl Conversation {
             {
                 return Err(Error::Config("no draft plan to resume".into()));
             }
-            TurnMode::PlanFollowUp | TurnMode::PlanImplement if self.active_plan().is_none() => {
+            TurnMode::PlanFollowUp | TurnMode::PlanRevise | TurnMode::PlanImplement
+                if self.active_plan().is_none() =>
+            {
                 return Err(Error::Config("no completed plan is active".into()));
             }
             _ => {}
@@ -467,12 +512,21 @@ impl Conversation {
                 .plan_state()
                 .is_some_and(crate::session::PlanState::questions_asked);
 
+        // Front ends start every turn without a plan phase label.
+        let mut announced_phase = None;
+        let mut idle_plan_replies = 0;
+
         // Uncapped: the loop ends when the model stops calling tools, or
         // when a goal completes through goal_complete.
         loop {
             self.unfinished_mode = Some(mode);
             if crate::cancellation::interrupted() {
                 return Ok(false);
+            }
+            let phase = plan_phase(mode);
+            if phase != announced_phase {
+                announced_phase = phase;
+                sink(TurnEvent::PlanPhase(phase));
             }
             if matches!(mode, TurnMode::Goal | TurnMode::PlanImplement) {
                 self.drain_deferred_subagent_results_into_history()?;
@@ -499,6 +553,9 @@ impl Conversation {
             if mode == TurnMode::PlanImplement {
                 self.prepare_plan_handoff(sink)?;
             }
+            // Planning decisions wait for the user; other modes auto-answer.
+            self.questions
+                .set_countdown(!matches!(mode, TurnMode::Plan | TurnMode::PlanRevise));
             let plan_path = self.plan_file_reference()?;
 
             // Rescan every iteration so a tool the model just wrote is
@@ -521,8 +578,19 @@ impl Conversation {
             let overhead = context::prompt_tokens(&system, registry.tool_tokens());
             self.maybe_compact(overhead, sink, resolve_provider)?;
             if let ConversationKind::Persistent(state) = &self.kind {
-                let note = plan_prompt(state.session.active_plan(), plan_path.as_deref(), mode)
-                    .map(crate::prompt::plan_phase_note);
+                let active_plan = state.session.active_plan();
+                let implementation_started = matches!(
+                    active_plan,
+                    Some(crate::session::PlanState::Ready { revision, .. })
+                        if state.session.plan_has_handoff(*revision)
+                );
+                let note = plan_prompt(
+                    active_plan,
+                    plan_path.as_deref(),
+                    mode,
+                    implementation_started,
+                )
+                .map(crate::prompt::plan_phase_note);
                 self.sync_plan_phase_note(note)?;
             }
 
@@ -596,6 +664,9 @@ impl Conversation {
             });
 
             self.latest_turn_result.clone_from(&out.text);
+            if !out.tool_calls.is_empty() {
+                idle_plan_replies = 0;
+            }
             let mut assistant = Message::assistant(out.text, out.tool_calls.clone());
             assistant.reasoning = out.reasoning;
             assistant.provider_data = out.provider_data;
@@ -629,17 +700,16 @@ impl Conversation {
                         .first()
                         .map_or("{}", |call| call.arguments.as_str()),
                 );
-                let valid_batch = out.tool_calls.len() == 1
-                    && (!matches!(mode, TurnMode::Plan | TurnMode::PlanRevise)
-                        || question_validation == Ok(3));
-                if !valid_batch {
-                    let error = if out.tool_calls.len() != 1 {
-                        "request_user_input must be the only tool call in its model step"
-                    } else if let Err(error) = &question_validation {
-                        error
-                    } else {
-                        "planning and revision require exactly three questions per request_user_input call"
-                    };
+                if out.tool_calls.len() != 1 {
+                    self.reject_tool_calls(
+                        &out.tool_calls,
+                        "request_user_input must be the only tool call in its model step",
+                    )?;
+                    continue;
+                }
+                if let Err(error) = &question_validation
+                    && matches!(mode, TurnMode::Plan | TurnMode::PlanRevise)
+                {
                     self.reject_tool_calls(&out.tool_calls, error)?;
                     continue;
                 }
@@ -647,13 +717,12 @@ impl Conversation {
                 if aborted {
                     return Ok(false);
                 }
-                if matches!(mode, TurnMode::Plan | TurnMode::PlanRevise) {
+                // Only drafting requires questions; revisions ask optionally.
+                if mode == TurnMode::Plan {
                     asked_plan_questions = true;
-                    if mode == TurnMode::Plan {
-                        self.persistent_mut()
-                            .session
-                            .append_plan_questions_asked()?;
-                    }
+                    self.persistent_mut()
+                        .session
+                        .append_plan_questions_asked()?;
                 }
                 continue;
             }
@@ -675,7 +744,7 @@ impl Conversation {
                 let call = &out.tool_calls[0];
                 match mode {
                     TurnMode::Plan | TurnMode::PlanRevise if plan::is_plan_complete(call) => {
-                        if !asked_plan_questions {
+                        if mode == TurnMode::Plan && !asked_plan_questions {
                             self.persist_assistant(assistant, sink)?;
                             self.reject_tool_calls(&out.tool_calls, plan::PLAN_QUESTION_REQUIRED)?;
                             continue;
@@ -704,7 +773,6 @@ impl Conversation {
                                     FollowUpAction::Implement => TurnMode::PlanImplement,
                                     FollowUpAction::Unrelated => TurnMode::Normal,
                                 };
-                                asked_plan_questions = false;
                             }
                             Err(error) => {
                                 self.persist_assistant(assistant, sink)?;
@@ -715,8 +783,12 @@ impl Conversation {
                     }
                     TurnMode::PlanImplement if plan::is_plan_implemented(call) => {
                         match plan::parse_implemented(&call.arguments) {
-                            Ok(result) => {
+                            Ok((result, ImplementationStatus::Completed)) => {
                                 self.finish_plan_implemented(assistant, result, sink)?;
+                                return Ok(true);
+                            }
+                            Ok((result, ImplementationStatus::Blocked)) => {
+                                self.finish_plan_blocked(assistant, result, sink)?;
                                 return Ok(true);
                             }
                             Err(error) => {
@@ -782,6 +854,11 @@ impl Conversation {
                     continue;
                 }
                 if let Some(continuation) = plan_continuation(mode) {
+                    idle_plan_replies += 1;
+                    if idle_plan_replies >= MAX_IDLE_PLAN_REPLIES {
+                        sink(TurnEvent::Warning(idle_plan_stop_notice(mode)));
+                        return Ok(true);
+                    }
                     self.append_plan_continuation(continuation)?;
                     continue;
                 }
@@ -1097,6 +1174,32 @@ impl Conversation {
         self.messages.push(assistant);
         self.latest_turn_result.clone_from(&result);
         sink(TurnEvent::AssistantDone);
+        Ok(())
+    }
+
+    /// Ends an implementation turn the model cannot finish without the
+    /// user. The plan stays active, so a reply continues implementing.
+    fn finish_plan_blocked(
+        &mut self,
+        mut assistant: Message,
+        result: String,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<(), Error> {
+        if assistant.content.is_empty() {
+            sink(TurnEvent::TextDelta(&result));
+        } else if assistant.content != result {
+            sink(TurnEvent::AssistantReplace(&result));
+        }
+        assistant.content.clone_from(&result);
+        assistant.tool_calls.clear();
+        self.persist_message(&assistant)?;
+        self.messages.push(assistant);
+        self.latest_turn_result.clone_from(&result);
+        sink(TurnEvent::AssistantDone);
+        sink(TurnEvent::Warning(
+            "Implementation is blocked and needs your input. The plan stays active: reply or run /plan implement to continue, or /plan cancel."
+                .into(),
+        ));
         Ok(())
     }
 

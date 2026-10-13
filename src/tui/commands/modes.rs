@@ -25,6 +25,16 @@ pub(in crate::tui) enum PlanAction {
     None,
     Start,
     Resume,
+    Implement,
+    /// Revise the ready plan with this (paste-expanded) request.
+    Revise(String),
+}
+
+/// The request after a `/plan revise` subcommand, trimmed. `None` when
+/// `argument` is not that subcommand.
+pub(in crate::tui) fn revision_text(argument: &str) -> Option<&str> {
+    let rest = argument.strip_prefix("revise")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 
 pub(in crate::tui) fn plan(agent: &mut Agent, argument: &str, state: &mut ViewState) -> PlanAction {
@@ -49,7 +59,7 @@ pub(in crate::tui) fn plan(agent: &mut Agent, argument: &str, state: &mut ViewSt
             Some(crate::session::PlanState::Draft { .. }) => PlanAction::Resume,
             Some(crate::session::PlanState::Ready { .. }) => {
                 state.notice(
-                    "The plan is already complete. Enter a prompt to revise or implement it.",
+                    "The plan is already complete. Run /plan revise TEXT or /plan implement.",
                 );
                 PlanAction::None
             }
@@ -58,20 +68,58 @@ pub(in crate::tui) fn plan(agent: &mut Agent, argument: &str, state: &mut ViewSt
                 PlanAction::None
             }
         },
-        objective => match agent.start_plan(objective.to_string().into()) {
-            Ok(warning) => {
-                state.active_plan = None;
-                state.plan_draft = true;
-                if let Some(warning) = warning {
-                    state.notice(warning);
-                }
-                PlanAction::Start
+        "implement" => match agent.plan_state() {
+            Some(crate::session::PlanState::Ready { .. }) => PlanAction::Implement,
+            Some(crate::session::PlanState::Draft { .. }) => {
+                state.notice(
+                    "The plan is still a draft. Finish it, or run /plan resume to continue it.",
+                );
+                PlanAction::None
             }
-            Err(error) => {
-                state.notice(format!("Could not start the plan: {error}"));
+            None => {
+                state.notice("No active plan.");
                 PlanAction::None
             }
         },
+        argument if let Some(revision) = revision_text(argument) => match agent.plan_state() {
+            _ if revision.is_empty() => {
+                state.notice("Usage: /plan revise TEXT");
+                PlanAction::None
+            }
+            Some(crate::session::PlanState::Ready { .. }) => PlanAction::Revise(revision.into()),
+            Some(crate::session::PlanState::Draft { .. }) => {
+                state.notice(
+                    "The plan is still a draft. Finish it, or run /plan resume to continue it.",
+                );
+                PlanAction::None
+            }
+            None => {
+                state.notice("No active plan.");
+                PlanAction::None
+            }
+        },
+        objective => {
+            let replaced = agent.active_plan().is_some();
+            match agent.start_plan(objective.to_string().into()) {
+                Ok(warning) => {
+                    state.active_plan = None;
+                    state.plan_draft = true;
+                    if let Some(warning) = warning {
+                        state.notice(warning);
+                    }
+                    if replaced {
+                        state.notice(
+                            "Started a new plan in place of the ready one. /undo restores it.",
+                        );
+                    }
+                    PlanAction::Start
+                }
+                Err(error) => {
+                    state.notice(format!("Could not start the plan: {error}"));
+                    PlanAction::None
+                }
+            }
+        }
     }
 }
 
@@ -81,7 +129,7 @@ fn notice_plan_status(agent: &Agent, state: &mut ViewState) {
             "Draft plan for:\n{objective}\n\n/plan resume continues it. /plan cancel clears it."
         )),
         Some(crate::session::PlanState::Ready { plan, .. }) => state.notice(format!(
-            "Active plan:\n\n{plan}\n\nEnter a prompt to revise or implement it. /plan cancel clears it."
+            "Active plan:\n\n{plan}\n\nEnter a prompt, or run /plan revise TEXT or /plan implement. /plan cancel clears it."
         )),
         None => state.notice("No active plan. Start one with /plan TEXT."),
     }
@@ -181,6 +229,12 @@ pub(in crate::tui) fn plan_while_busy(argument: &str, state: &mut ViewState) {
             } else {
                 state.notice("No active plan.");
             }
+        }
+        "implement" => {
+            state.notice("Wait for the current turn to settle, then run /plan implement.")
+        }
+        argument if revision_text(argument).is_some() => {
+            state.notice("Wait for the current turn to settle, then run /plan revise TEXT.");
         }
         _ => state.notice("Wait for the current turn to settle before changing the plan."),
     }

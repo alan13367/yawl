@@ -14,6 +14,9 @@ pub(crate) enum PlanPrompt<'a> {
     Paused(&'a str),
     Revise(&'a str),
     FollowUp(&'a str),
+    /// A follow-up after implementation started but did not finish, such
+    /// as when it stopped to wait for the user.
+    ImplementationFollowUp(&'a str),
     Implement(&'a str),
 }
 
@@ -119,7 +122,10 @@ pub(crate) fn plan_phase_note(plan: PlanPrompt<'_>) -> String {
     let saved_plan = !matches!(plan, PlanPrompt::Draft(_) | PlanPrompt::Paused(_));
     let restricted = matches!(
         plan,
-        PlanPrompt::Draft(_) | PlanPrompt::Revise(_) | PlanPrompt::FollowUp(_)
+        PlanPrompt::Draft(_)
+            | PlanPrompt::Revise(_)
+            | PlanPrompt::FollowUp(_)
+            | PlanPrompt::ImplementationFollowUp(_)
     );
     let (phase, content, instructions) = match plan {
         PlanPrompt::Active(plan) => (
@@ -130,7 +136,7 @@ pub(crate) fn plan_phase_note(plan: PlanPrompt<'_>) -> String {
         PlanPrompt::Draft(objective) => (
             "planning",
             objective,
-            "Inspect with the read-only tools. Before plan_complete, call request_user_input at least once with exactly three meaningful questions; ask more batches only while material choices remain. plan_complete takes a self-contained Markdown implementation plan, since implementation starts from the plan alone without this conversation, with agreed requirements, constraints, implementation decisions, relevant code locations, and acceptance checks. A text reply does not finish planning.",
+            "Inspect with the read-only tools. Before plan_complete, call request_user_input at least once with one to three meaningful questions; ask more batches only while material choices remain. plan_complete takes a self-contained Markdown implementation plan, since implementation starts from the plan alone without this conversation, with agreed requirements, constraints, implementation decisions, relevant code locations, and acceptance checks. A text reply does not finish planning.",
         ),
         PlanPrompt::Paused(objective) => (
             "paused",
@@ -140,17 +146,22 @@ pub(crate) fn plan_phase_note(plan: PlanPrompt<'_>) -> String {
         PlanPrompt::Revise(plan) => (
             "revision",
             plan,
-            "Revise this plan per the user's latest request; inspect with the read-only tools. Before plan_complete, call request_user_input at least once with exactly three meaningful questions. plan_complete takes the self-contained revised Markdown plan, since implementation starts from the plan alone without this conversation, with agreed requirements, constraints, implementation decisions, relevant code locations, and acceptance checks. A text reply does not finish revision.",
+            "Revise this plan per the user's latest request; inspect with the read-only tools. Call request_user_input with one to three meaningful questions only when the requested change leaves material choices open; otherwise call plan_complete directly. plan_complete takes the self-contained revised Markdown plan, since implementation starts from the plan alone without this conversation, with agreed requirements, constraints, implementation decisions, relevant code locations, and acceptance checks. A text reply does not finish revision.",
         ),
         PlanPrompt::FollowUp(plan) => (
             "follow_up",
             plan,
             "First call plan_action: revise or implement when the user's latest request asks to change or implement this plan, otherwise unrelated to continue it as a normal turn with the full tool set. Judge intent, not keywords.",
         ),
+        PlanPrompt::ImplementationFollowUp(plan) => (
+            "follow_up",
+            plan,
+            "Implementation of this plan already started and stopped before it finished, for example to wait for the user. First call plan_action: implement when the user's latest request continues that work, such as answering what it needed, supplying a missing value, or asking to go on; revise when it asks to change the plan; otherwise unrelated to continue it as a normal turn with the full tool set. Judge intent, not keywords.",
+        ),
         PlanPrompt::Implement(plan) => (
             "implementation",
             plan,
-            "Implement this plan and keep it active through errors or interruptions. Only after it fully succeeds, call plan_implemented with the final user-facing result; a text reply does not finish implementation.",
+            "Implement this plan and keep it active through errors or interruptions. Only after it fully succeeds, call plan_implemented with the final user-facing result. If only the user can unblock the work, such as a missing credential or a decision the plan does not cover, call plan_implemented with status blocked and say what you need; the plan stays active. A text reply does not finish implementation.",
         ),
     };
     let mut prompt = String::from(
@@ -436,7 +447,7 @@ mod tests {
     fn planning_note_carries_active_state_and_plan_requirements() {
         let note = plan_phase_note(PlanPrompt::Draft("clarify the feature"));
         assert!(note.contains("clarify the feature"));
-        assert!(note.contains("exactly three meaningful questions"));
+        assert!(note.contains("one to three meaningful questions"));
         assert!(note.contains("self-contained Markdown implementation plan"));
         assert!(note.contains("starts from the plan alone"));
         assert!(note.contains("acceptance checks"));
@@ -455,6 +466,16 @@ mod tests {
         assert!(note.contains("Planning is read-only"));
         let implement = plan_phase_note(PlanPrompt::Implement("/session/plans/1.md"));
         assert!(!implement.contains("Planning is read-only"));
+    }
+
+    #[test]
+    fn follow_up_after_started_implementation_routes_replies_to_implement() {
+        let note = plan_phase_note(PlanPrompt::ImplementationFollowUp("/session/plans/1.md"));
+        assert!(note.contains("already started and stopped before it finished"));
+        assert!(note.contains("First call plan_action: implement"));
+        assert!(note.contains("answering what it needed"));
+        assert!(note.contains("otherwise unrelated"));
+        assert!(note.contains("Planning is read-only"));
     }
 
     #[test]

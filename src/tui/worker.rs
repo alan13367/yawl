@@ -36,6 +36,7 @@ pub(super) enum TurnKind {
     Goal,
     Plan,
     PlanFollowUp,
+    PlanRevise,
     PlanImplement,
     Continue,
 }
@@ -65,6 +66,10 @@ pub(super) fn turn_interactive<R: Read>(
             TurnKind::Plan => agent.run_plan_preserving_cancellation(sink),
             TurnKind::PlanFollowUp => agent.run_plan_follow_up_preserving_cancellation(
                 input.ok_or_else(|| Error::Protocol("plan follow-up input is missing".into()))?,
+                sink,
+            ),
+            TurnKind::PlanRevise => agent.run_plan_revision_preserving_cancellation(
+                input.ok_or_else(|| Error::Protocol("plan revision input is missing".into()))?,
                 sink,
             ),
             TurnKind::PlanImplement => {
@@ -297,11 +302,22 @@ pub(super) fn pump_events<R: Read, T>(
                         needs_draw |= advance_ticks(state);
                         needs_draw |= sync_question(terminal, state, &worker.questions);
                     }
-                    Event::MouseScroll(amount) => scroll(state, amount),
+                    Event::MouseScroll(amount) => {
+                        mark_question_present(state.question.as_ref(), &worker.questions);
+                        scroll(state, amount);
+                    }
                     Event::Mouse(mouse) => {
+                        // Scroll-bar drags and jump-button clicks scroll the
+                        // transcript; bare pointer motion proves nothing.
+                        if mouse.kind != super::events::MouseKind::Move {
+                            mark_question_present(state.question.as_ref(), &worker.questions);
+                        }
                         needs_draw |= handle_mouse_selection(terminal, state, mouse)?;
                     }
-                    Event::Paste(text) => paste_question_answer(state, &text),
+                    Event::Paste(text) => {
+                        mark_question_present(state.question.as_ref(), &worker.questions);
+                        paste_question_answer(state, &text);
+                    }
                     Event::FocusGained | Event::FocusLost => {}
                 }
                 break;
@@ -513,6 +529,8 @@ fn handle_question_key(
     broker: &crate::tools::QuestionBroker,
     key: Key,
 ) {
+    // Any key, including editing the custom answer, means the user is here.
+    let _ = broker.mark_present(active.snapshot.request_id);
     if let super::state::QuestionInput::Custom(editor) = &mut active.input {
         if key == Key::Escape {
             active.input = super::state::QuestionInput::Choices;
@@ -526,7 +544,6 @@ fn handle_question_key(
 
     let model_option_count = active.snapshot.question.options.len();
     let option_count = model_option_count.saturating_add(1);
-    let previous_selection = active.selected;
     match key {
         Key::Up | Key::Char('k') => {
             active.selected = active.selected.saturating_sub(1);
@@ -549,7 +566,13 @@ fn handle_question_key(
         }
         _ => {}
     }
-    if active.selected != previous_selection {
+}
+
+fn mark_question_present(
+    question: Option<&super::state::ActiveQuestion>,
+    broker: &crate::tools::QuestionBroker,
+) {
+    if let Some(active) = question {
         let _ = broker.mark_present(active.snapshot.request_id);
     }
 }
@@ -1158,9 +1181,14 @@ mod question_tests {
         assert_eq!(active.selected, 2);
     }
 
-    #[test]
-    fn changing_the_selected_option_marks_the_user_present() {
-        let broker = crate::tools::QuestionBroker::default();
+    /// Starts a pending question with a running countdown and returns the
+    /// asker handle plus the view of it the TUI would hold.
+    fn pending_question(
+        broker: &crate::tools::QuestionBroker,
+    ) -> (
+        std::thread::JoinHandle<Result<String, String>>,
+        super::super::state::ActiveQuestion,
+    ) {
         broker.enable();
         broker.begin_turn();
         let asker = broker.clone();
@@ -1169,21 +1197,68 @@ mod question_tests {
         while broker.snapshot().is_none() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let mut active =
+        let active =
             super::super::state::ActiveQuestion::new(broker.snapshot().expect("active question"));
-
-        handle_question_key(&mut active, &broker, Key::Down);
-        assert_eq!(active.selected, 1);
         assert!(
             broker
                 .snapshot()
-                .expect("question should remain pending")
+                .expect("question pending")
                 .remaining
-                .is_none()
+                .is_some()
         );
+        (handle, active)
+    }
 
+    fn finish_pending(
+        broker: &crate::tools::QuestionBroker,
+        handle: std::thread::JoinHandle<Result<String, String>>,
+    ) {
         broker.cancel_pending();
         assert!(handle.join().expect("asker thread").is_err());
+    }
+
+    #[test]
+    fn any_question_key_marks_the_user_present() {
+        // Down changes the selection; a digit for the current row, an
+        // unbound key, and Escape in the custom editor do not.
+        for key in [Key::Down, Key::Char('1'), Key::Char('x'), Key::Tab] {
+            let broker = crate::tools::QuestionBroker::default();
+            let (handle, mut active) = pending_question(&broker);
+            handle_question_key(&mut active, &broker, key);
+            assert!(
+                broker
+                    .snapshot()
+                    .expect("question should remain pending")
+                    .remaining
+                    .is_none(),
+                "{key:?} should disable the countdown"
+            );
+            finish_pending(&broker, handle);
+        }
+
+        let broker = crate::tools::QuestionBroker::default();
+        let (handle, mut active) = pending_question(&broker);
+        active.input = super::super::state::QuestionInput::Custom(Box::default());
+        handle_question_key(&mut active, &broker, Key::Escape);
+        assert!(!active.is_custom());
+        assert!(broker.snapshot().expect("pending").remaining.is_none());
+        finish_pending(&broker, handle);
+
+        let broker = crate::tools::QuestionBroker::default();
+        let (handle, mut active) = pending_question(&broker);
+        active.input = super::super::state::QuestionInput::Custom(Box::default());
+        handle_question_key(&mut active, &broker, Key::Char('a'));
+        assert!(broker.snapshot().expect("pending").remaining.is_none());
+        finish_pending(&broker, handle);
+    }
+
+    #[test]
+    fn scrolling_or_pasting_while_a_question_is_pending_marks_the_user_present() {
+        let broker = crate::tools::QuestionBroker::default();
+        let (handle, active) = pending_question(&broker);
+        mark_question_present(Some(&active), &broker);
+        assert!(broker.snapshot().expect("pending").remaining.is_none());
+        finish_pending(&broker, handle);
     }
 }
 

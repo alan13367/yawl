@@ -52,7 +52,8 @@ use crate::error::Error;
 use self::commands::{
     GoalAction, HELP, HOTKEYS, PlanAction, activate_picker_action, copy_all_messages,
     copy_last_reply, goal, is_new_session_command, notice_undo, open_resume_picker, plan,
-    plan_handoff_picker, reasoning, resume, settings, show_diff, show_skills, unqueue,
+    plan_handoff_picker, reasoning, resume, revision_text, settings, show_diff, show_skills,
+    unqueue,
 };
 use self::completion::handle_completion_key;
 use self::events::{Event, EventReader, Key, event_requests_redraw};
@@ -565,6 +566,29 @@ fn handle_submission<R: Read>(
                             events,
                         )?;
                     }
+                    PlanAction::Implement => {
+                        run_agent_turn(
+                            agent,
+                            None,
+                            TurnDispatch::PlanImplement(None),
+                            state,
+                            editor,
+                            terminal,
+                            events,
+                        )?;
+                    }
+                    PlanAction::Revise(revision) => {
+                        let displayed = revision_text(&displayed).unwrap_or(&revision);
+                        run_agent_turn(
+                            agent,
+                            Some(displayed.to_string()),
+                            TurnDispatch::PlanRevise(revision.into()),
+                            state,
+                            editor,
+                            terminal,
+                            events,
+                        )?;
+                    }
                 }
             }
             "undo" => match agent.undo_last_turn() {
@@ -630,6 +654,7 @@ enum TurnDispatch {
     Goal,
     Plan,
     PlanFollowUp(crate::provider::TurnInput),
+    PlanRevise(crate::provider::TurnInput),
     PlanImplement(Option<crate::provider::TurnInput>),
     Continue,
 }
@@ -670,6 +695,7 @@ fn run_agent_turn<R: Read>(
         TurnDispatch::Goal => TurnKind::Goal,
         TurnDispatch::Plan => TurnKind::Plan,
         TurnDispatch::PlanFollowUp(_) => TurnKind::PlanFollowUp,
+        TurnDispatch::PlanRevise(_) => TurnKind::PlanRevise,
         TurnDispatch::PlanImplement(_) => TurnKind::PlanImplement,
         TurnDispatch::Continue => TurnKind::Continue,
     };
@@ -692,7 +718,7 @@ fn run_agent_turn<R: Read>(
         TurnDispatch::Init(input) => Some(input),
         TurnDispatch::Goal => None,
         TurnDispatch::Plan => None,
-        TurnDispatch::PlanFollowUp(input) => Some(input),
+        TurnDispatch::PlanFollowUp(input) | TurnDispatch::PlanRevise(input) => Some(input),
         TurnDispatch::PlanImplement(input) => input,
         TurnDispatch::Continue => None,
     };

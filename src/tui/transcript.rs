@@ -99,6 +99,11 @@ impl Transcript {
         for message in messages {
             match message.role {
                 Role::User if message.is_hidden_control() => {}
+                // The planning conversation is gone from history; show what
+                // replaced it.
+                Role::User if message.is_plan_handoff() => {
+                    entries.push(Entry::Notice(message.content.clone()));
+                }
                 Role::User if message.is_steering() => {
                     entries.push(Entry::Steer(message.content.clone()));
                 }
@@ -686,6 +691,21 @@ impl Entry {
 mod tests {
     use super::*;
     use crate::provider::{Reasoning, SubagentResult, ToolCall};
+
+    #[test]
+    fn plan_handoff_replays_as_a_notice_without_the_summary_marker() {
+        let handoff = crate::compaction::plan_handoff_message(
+            "Implementation handoff: the planning conversation was replaced.\n\nPlan:\n\n# Plan",
+        );
+        let transcript = Transcript::from_messages(&[handoff]);
+        match transcript.entries() {
+            [Entry::Notice(text)] => {
+                assert!(text.starts_with("Implementation handoff"));
+                assert!(!text.contains("[conversation summary]"));
+            }
+            _ => panic!("expected one handoff notice"),
+        }
+    }
 
     #[test]
     fn hiding_a_notice_empties_it_in_place() {

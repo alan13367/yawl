@@ -986,15 +986,9 @@ fn goal_mode_rejects_mixed_goal_complete_batches() {
     );
 }
 
-#[test]
-fn planning_requires_three_questions_then_persists_the_completed_plan() {
-    let mut test = TestAgent::new("plan-complete");
-    test.agent.enable_interactive_questions();
-    test.agent
-        .start_plan("add planning mode".to_string().into())
-        .expect("start plan");
-    let question_arguments = serde_json::json!({
-        "questions": (1..=3).map(|index| serde_json::json!({
+fn plan_question_batch(count: usize) -> String {
+    serde_json::json!({
+        "questions": (1..=count).map(|index| serde_json::json!({
             "id": format!("q{index}"),
             "question": format!("Choice {index}?"),
             "options": [
@@ -1004,37 +998,21 @@ fn planning_requires_three_questions_then_persists_the_completed_plan() {
             "recommended": 0
         })).collect::<Vec<_>>()
     })
-    .to_string();
-    let steps = Rc::new(RefCell::new(VecDeque::from([
-        step("", vec![ToolCall {
-                id: "questions-invalid".into(),
-                name: crate::tools::USER_INPUT_TOOL_NAME.into(),
-                arguments: serde_json::json!({
-                    "questions": [
-                        {"id":"one","question":"One?","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}],"recommended":0},
-                        {"id":"two","question":"Two?","options":[{"label":"A","description":"a"},{"label":"B","description":"b"}],"recommended":0}
-                    ]
-                })
-                .to_string(),
-            }]),
-        step("", vec![ToolCall {
-                id: "questions-1".into(),
-                name: crate::tools::USER_INPUT_TOOL_NAME.into(),
-                arguments: question_arguments,
-            }]),
-        step("", vec![ToolCall {
-                id: "plan-1".into(),
-                name: crate::tools::PLAN_COMPLETE_TOOL_NAME.into(),
-                arguments: r##"{"plan":"# Plan\n\n1. Build it."}"##.into(),
-            }]),
-    ])));
-    let requests = Rc::new(RefCell::new(Vec::new()));
-    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
-    let broker = test.agent.question_broker();
-    let responder = std::thread::spawn(move || {
+    .to_string()
+}
+
+/// Answers `count` questions with their recommendations and reports whether
+/// every one of them was shown without an auto-answer countdown.
+fn answer_questions_without_countdown(
+    broker: crate::tools::QuestionBroker,
+    count: usize,
+) -> std::thread::JoinHandle<bool> {
+    std::thread::spawn(move || {
         let mut answered = 0;
-        while answered < 3 {
+        let mut waited = true;
+        while answered < count {
             if let Some(snapshot) = broker.snapshot() {
+                waited &= snapshot.remaining.is_none();
                 broker
                     .answer(snapshot.request_id, snapshot.question.recommended)
                     .expect("answer question");
@@ -1043,19 +1021,66 @@ fn planning_requires_three_questions_then_persists_the_completed_plan() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
-    });
+        waited
+    })
+}
+
+fn tool_step(id: &str, name: &str, arguments: impl Into<String>) -> ProviderStep {
+    step(
+        "",
+        vec![ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        }],
+    )
+}
+
+#[test]
+fn planning_requires_one_to_three_questions_then_persists_the_completed_plan() {
+    let mut test = TestAgent::new("plan-complete");
+    test.agent.enable_interactive_questions();
+    test.agent
+        .start_plan("add planning mode".to_string().into())
+        .expect("start plan");
+    let plan = r##"{"plan":"# Plan\n\n1. Build it."}"##;
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        tool_step("plan-early", crate::tools::PLAN_COMPLETE_TOOL_NAME, plan),
+        tool_step(
+            "questions-invalid",
+            crate::tools::USER_INPUT_TOOL_NAME,
+            plan_question_batch(4),
+        ),
+        tool_step(
+            "questions-1",
+            crate::tools::USER_INPUT_TOOL_NAME,
+            plan_question_batch(1),
+        ),
+        tool_step("plan-1", crate::tools::PLAN_COMPLETE_TOOL_NAME, plan),
+    ])));
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
+    let responder = answer_questions_without_countdown(test.agent.question_broker(), 1);
 
     let completed = test
         .agent
         .run_turn_input_with_mode(None, &mut |_| {}, &mut resolve, TurnMode::Plan)
         .expect("planning should complete");
-    responder.join().expect("question responder");
+    assert!(
+        responder.join().expect("question responder"),
+        "planning questions must not count down"
+    );
 
     assert!(completed);
     assert!(test.agent.messages.iter().any(|message| {
+        message.tool_call_id.as_deref() == Some("plan-early")
+            && message.is_error
+            && message.content == super::plan::PLAN_QUESTION_REQUIRED
+    }));
+    assert!(test.agent.messages.iter().any(|message| {
         message.tool_call_id.as_deref() == Some("questions-invalid")
             && message.is_error
-            && message.content.contains("exactly three")
+            && message.content.contains("between 1 and 3")
     }));
     assert_eq!(test.agent.active_plan(), Some("# Plan\n\n1. Build it."));
     assert!(matches!(
@@ -1079,6 +1104,134 @@ fn planning_requires_three_questions_then_persists_the_completed_plan() {
         test.agent.active_plan(),
         Some("# Plan\n\n1. Build it."),
         "implementation errors must retain the active plan"
+    );
+}
+
+/// A plan completed through one answered question, ready for revision.
+fn ready_plan_fixture(name: &str) -> TestAgent {
+    let mut test = TestAgent::new(name);
+    test.agent.enable_interactive_questions();
+    test.agent
+        .start_plan("add planning mode".to_string().into())
+        .expect("start plan");
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        tool_step(
+            "questions-1",
+            crate::tools::USER_INPUT_TOOL_NAME,
+            plan_question_batch(1),
+        ),
+        tool_step(
+            "plan-1",
+            crate::tools::PLAN_COMPLETE_TOOL_NAME,
+            r##"{"plan":"# Plan\n\n1. Build it."}"##,
+        ),
+    ])));
+    let mut resolve = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
+    let responder = answer_questions_without_countdown(test.agent.question_broker(), 1);
+    assert!(
+        test.agent
+            .run_turn_input_with_mode(None, &mut |_| {}, &mut resolve, TurnMode::Plan)
+            .expect("planning should complete")
+    );
+    responder.join().expect("question responder");
+    test
+}
+
+#[test]
+fn revision_completes_without_questions_and_has_its_own_continuation() {
+    let mut test = ready_plan_fixture("plan-revise-no-questions");
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        text_step("I will rename the step."),
+        tool_step(
+            "plan-2",
+            crate::tools::PLAN_COMPLETE_TOOL_NAME,
+            r##"{"plan":"# Plan\n\n1. Build it well."}"##,
+        ),
+    ])));
+    let mut resolve = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
+
+    let completed = test
+        .agent
+        .run_turn_input_with_mode(
+            Some("rename step 1".to_string().into()),
+            &mut |_| {},
+            &mut resolve,
+            TurnMode::PlanRevise,
+        )
+        .expect("revision should complete");
+
+    assert!(completed);
+    assert_eq!(
+        test.agent.active_plan(),
+        Some("# Plan\n\n1. Build it well.")
+    );
+    let continuations = test
+        .agent
+        .messages
+        .iter()
+        .filter(|message| message.control == Some(MessageControl::PlanContinuation))
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(continuations, [super::plan::PLAN_REVISE_CONTINUATION]);
+    assert!(
+        !test
+            .agent
+            .messages
+            .iter()
+            .any(|message| message.is_error && message.tool_call_id.as_deref() == Some("plan-2"))
+    );
+}
+
+#[test]
+fn plan_revision_requires_a_ready_plan() {
+    let mut test = TestAgent::new("plan-revise-needs-plan");
+    let steps = Rc::new(RefCell::new(VecDeque::new()));
+    let mut resolve = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
+    let result = test.agent.run_turn_input_with_mode(
+        Some("rename step 1".to_string().into()),
+        &mut |_| {},
+        &mut resolve,
+        TurnMode::PlanRevise,
+    );
+    assert!(matches!(result, Err(Error::Config(_))));
+    assert!(test.agent.messages.is_empty());
+}
+
+#[test]
+fn revision_questions_are_optional_and_wait_for_the_user() {
+    let mut test = ready_plan_fixture("plan-revise-questions");
+    let steps = Rc::new(RefCell::new(VecDeque::from([
+        tool_step(
+            "questions-2",
+            crate::tools::USER_INPUT_TOOL_NAME,
+            plan_question_batch(2),
+        ),
+        tool_step(
+            "plan-2",
+            crate::tools::PLAN_COMPLETE_TOOL_NAME,
+            r##"{"plan":"# Plan\n\n1. Build it differently."}"##,
+        ),
+    ])));
+    let mut resolve = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
+    let responder = answer_questions_without_countdown(test.agent.question_broker(), 2);
+
+    assert!(
+        test.agent
+            .run_turn_input_with_mode(
+                Some("use another approach".to_string().into()),
+                &mut |_| {},
+                &mut resolve,
+                TurnMode::PlanRevise,
+            )
+            .expect("revision should complete")
+    );
+    assert!(
+        responder.join().expect("question responder"),
+        "revision questions must not count down"
+    );
+    assert_eq!(
+        test.agent.active_plan(),
+        Some("# Plan\n\n1. Build it differently.")
     );
 }
 
@@ -2206,6 +2359,253 @@ fn plan_handoff_reduces_requests_for_picker_and_classified_follow_up() -> Result
             "original history remains on disk"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn plan_handoff_keeps_earlier_conversation_and_carries_requirements() -> Result<(), Error> {
+    let mut test = TestAgent::new("handoff-scope");
+    test.agent
+        .append_input_message(Message::user("Earlier unrelated discussion"))?;
+    let reply = Message::assistant("Earlier reply".into(), vec![]);
+    test.agent.persist_message(&reply)?;
+    test.agent.messages.push(reply);
+    test.agent
+        .start_plan("Add a cache\nwith a TTL".to_string().into())?;
+    let questions = serde_json::json!({"questions": [
+        {"id": "store", "question": "Which store?", "recommended": 0, "options": [
+            {"label": "Redis", "description": "shared"},
+            {"label": "Memory", "description": "local"}]},
+        {"id": "ttl", "question": "Which TTL?", "recommended": 0, "options": [
+            {"label": "60s", "description": "short"},
+            {"label": "1h", "description": "long"}]}
+    ]});
+    let ask = Message::assistant(
+        String::new(),
+        vec![ToolCall {
+            id: "ask".into(),
+            name: crate::tools::USER_INPUT_TOOL_NAME.into(),
+            arguments: questions.to_string(),
+        }],
+    );
+    let answers = serde_json::json!({"timed_out": false, "answers": [
+        {"id": "store", "option_index": null, "label": "Other", "answer": "Redis cluster", "source": "user"},
+        {"id": "ttl", "option_index": 0, "label": "60s", "answer": "60s", "source": "timeout"}
+    ]});
+    let planning = [
+        ask,
+        Message::tool_result(
+            "ask",
+            crate::tools::USER_INPUT_TOOL_NAME,
+            answers.to_string(),
+            false,
+        ),
+        Message::user("Also log cache misses").with_control(MessageControl::Steering),
+        Message::assistant("large investigation output".into(), vec![]),
+    ];
+    for message in planning {
+        test.agent.persist_message(&message)?;
+        test.agent.messages.push(message);
+    }
+    let plan = "# Cache plan\n\nAdd the cache.";
+    let ready = Message::assistant(plan.into(), vec![]);
+    test.agent
+        .persistent_mut()
+        .session
+        .append_plan_ready(plan, &ready)?;
+    test.agent.messages.push(ready);
+    test.agent.append_input_message(
+        Message::user("Implement the active plan now.")
+            .with_control(MessageControl::PlanImplementationStart),
+    )?;
+
+    let mut handoffs = Vec::new();
+    test.agent.prepare_plan_handoff(&mut |event| match event {
+        TurnEvent::PlanHandoff { replaced, .. } => handoffs.push(replaced),
+        TurnEvent::Compacted { .. } => panic!("a plan handoff is not a compaction"),
+        _ => {}
+    })?;
+    // Objective, question batch, answers, steer, investigation, and plan.
+    assert_eq!(handoffs, [6]);
+    let messages = &test.agent.messages;
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[0].content, "Earlier unrelated discussion");
+    assert_eq!(messages[1].content, "Earlier reply");
+    assert!(messages[2].is_plan_handoff());
+    assert!(!compaction::is_summary_message(&messages[2]));
+    let handoff = &messages[2].content;
+    for expected in [
+        "replaced by its completed plan",
+        "Objective:\n> Add a cache\n> with a TTL",
+        "- Q: Which store?\n  A: Redis cluster\n",
+        "- Q: Which TTL?\n  A: 60s (recommended default; the user did not answer)",
+        "- User: Also log cache misses",
+        "Plan:\n\n# Cache plan",
+    ] {
+        assert!(
+            handoff.contains(expected),
+            "missing {expected:?} in {handoff}"
+        );
+    }
+    assert!(!handoff.contains("large investigation output"));
+    assert_eq!(last_undoable_user_index(messages), Some(3));
+
+    let id = test.agent.session_id().to_string();
+    let (_, replayed) = Session::open(&test.sessions_dir, &id)?;
+    assert_eq!(
+        serde_json::to_value(&replayed)?,
+        serde_json::to_value(&test.agent.messages)?,
+        "replay rebuilds the same handoff"
+    );
+    Ok(())
+}
+
+#[test]
+fn plan_turns_announce_phase_changes() -> Result<(), Error> {
+    use crate::agent::PlanPhase;
+
+    let mut test = ready_handoff_fixture("handoff-phases");
+    let captures = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = |_: &str, _: &Config| -> Result<(Box<dyn Provider>, String), Error> {
+        Ok((
+            Box::new(HandoffProvider {
+                requests: captures.clone(),
+                classify: true,
+            }),
+            "test".into(),
+        ))
+    };
+    let mut phases = Vec::new();
+    test.agent.run_turn_input_with_mode(
+        Some("Implement it".to_string().into()),
+        &mut |event| {
+            if let TurnEvent::PlanPhase(phase) = event {
+                phases.push(phase);
+            }
+        },
+        &mut resolve,
+        TurnMode::PlanFollowUp,
+    )?;
+    assert_eq!(
+        phases,
+        [Some(PlanPhase::FollowUp), Some(PlanPhase::Implementing)]
+    );
+    Ok(())
+}
+
+#[test]
+fn plan_implementation_stops_idle_replies_and_blocked_keeps_the_plan() -> Result<(), Error> {
+    let mut test = ready_handoff_fixture("implement-idle");
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let steps = Rc::new(RefCell::new(VecDeque::new()));
+    let mut resolve = |_: &str, _: &Config| -> Result<(Box<dyn Provider>, String), Error> {
+        Ok((
+            Box::new(PhaseProvider {
+                requests: requests.clone(),
+                steps: steps.clone(),
+            }),
+            "test".into(),
+        ))
+    };
+    let mut warnings = Vec::new();
+    // The provider only ever replies with text.
+    assert!(test.agent.run_turn_input_with_mode(
+        None,
+        &mut |event| {
+            if let TurnEvent::Warning(text) = event {
+                warnings.push(text);
+            }
+        },
+        &mut resolve,
+        TurnMode::PlanImplement,
+    )?);
+    assert_eq!(requests.borrow().len(), 3);
+    assert!(
+        warnings
+            .iter()
+            .any(|text| text.contains("plan stays active"))
+    );
+    assert!(test.agent.active_plan().is_some());
+
+    let finish = |arguments: &str| {
+        Some(ToolCall {
+            id: "finish".into(),
+            name: crate::tools::PLAN_IMPLEMENTED_TOOL_NAME.into(),
+            arguments: arguments.into(),
+        })
+    };
+    steps.borrow_mut().push_back(finish(
+        r#"{"result":"Need the API key","status":"blocked"}"#,
+    ));
+    test.agent.run_turn_input_with_mode(
+        Some("Keep going".to_string().into()),
+        &mut |_| {},
+        &mut resolve,
+        TurnMode::PlanImplement,
+    )?;
+    assert!(test.agent.active_plan().is_some(), "blocked keeps the plan");
+    let last = test.agent.messages.last().expect("blocked reply");
+    assert_eq!(last.content, "Need the API key");
+    assert!(last.tool_calls.is_empty());
+
+    // A reply to the blocked turn arrives as an ordinary follow-up; its note
+    // says implementation already started, so the answer resumes it.
+    requests.borrow_mut().clear();
+    steps.borrow_mut().extend([
+        Some(ToolCall {
+            id: "classify".into(),
+            name: crate::tools::PLAN_ACTION_TOOL_NAME.into(),
+            arguments: r#"{"action":"implement"}"#.into(),
+        }),
+        finish(r#"{"result":"Done."}"#),
+    ]);
+    test.agent.run_turn_input_with_mode(
+        Some("Here is the key".to_string().into()),
+        &mut |_| {},
+        &mut resolve,
+        TurnMode::PlanFollowUp,
+    )?;
+    let follow_up_note = requests.borrow()[0]
+        .2
+        .iter()
+        .rev()
+        .find(|message| message.control == Some(MessageControl::PlanPhase))
+        .map(|message| message.content.clone())
+        .expect("follow-up phase note");
+    assert!(follow_up_note.contains("already started and stopped before it finished"));
+    assert!(test.agent.active_plan().is_none());
+    Ok(())
+}
+
+#[test]
+fn follow_up_before_implementation_uses_the_plain_classifier_note() -> Result<(), Error> {
+    let mut test = ready_handoff_fixture("follow-up-before-implementation");
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let steps = Rc::new(RefCell::new(VecDeque::new()));
+    let mut resolve = |_: &str, _: &Config| -> Result<(Box<dyn Provider>, String), Error> {
+        Ok((
+            Box::new(PhaseProvider {
+                requests: requests.clone(),
+                steps: steps.clone(),
+            }),
+            "test".into(),
+        ))
+    };
+    test.agent.run_turn_input_with_mode(
+        Some("What does step two mean?".to_string().into()),
+        &mut |_| {},
+        &mut resolve,
+        TurnMode::PlanFollowUp,
+    )?;
+    let note = requests.borrow()[0]
+        .2
+        .iter()
+        .rev()
+        .find(|message| message.control == Some(MessageControl::PlanPhase))
+        .map(|message| message.content.clone())
+        .expect("follow-up phase note");
+    assert!(note.contains("phase=\"follow_up\""));
+    assert!(!note.contains("already started"));
     Ok(())
 }
 

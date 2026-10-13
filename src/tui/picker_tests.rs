@@ -108,6 +108,50 @@ fn narrow_picker_lists_labels_and_wraps_the_selected_description() {
 }
 
 #[test]
+fn picker_aligns_descriptions_in_one_column() {
+    let item = |label: &str, description: &str| PickerItem {
+        label: label.into(),
+        description: description.into(),
+        action: PickerAction::SwitchModel(description.into()),
+    };
+    let long_label = "Qwythos-9B-Claude-Mythos-5-1M-MLX-oQ8-mtp-with-extra-suffix";
+    let picker = Picker {
+        title: "Choose model".into(),
+        hint: "Enter select".into(),
+        selected: 0,
+        items: vec![
+            item("glm-5.3", "Qwen:glm-5.3"),
+            item("deepseek-v4.1-flash", "Qwen:deepseek-v4.1-flash"),
+            item(long_label, "omlx:qwythos"),
+        ],
+        editing: None,
+        parent: None,
+    };
+    let rendered = render_picker(&picker, &Editor::default(), "\x1b[7m", "", 80, 12).0;
+    let text = rendered
+        .iter()
+        .map(|line| markdown::strip_ansi(line))
+        .collect::<Vec<_>>();
+    let column = |needle: &str| {
+        let line = text
+            .iter()
+            .find(|line| line.contains(needle))
+            .expect("row is rendered");
+        markdown::visible_width(&line[..line.find(needle).unwrap()])
+    };
+    let first = column("Qwen:glm-5.3");
+    assert_eq!(column("Qwen:deepseek-v4.1-flash"), first);
+    assert_eq!(column("omlx:qwythos"), first);
+    assert!(text.iter().any(|line| line.contains("…   omlx:qwythos")));
+    assert!(!text.join("\n").contains(long_label));
+    assert!(
+        rendered
+            .iter()
+            .all(|line| markdown::visible_width(line) == 80)
+    );
+}
+
+#[test]
 fn picker_uses_available_width_and_accent_colored_outline() {
     let model = "omlx:mtplx-qwen38-27b-optimized-speed-with-a-long-model-name";
     let picker = Picker {

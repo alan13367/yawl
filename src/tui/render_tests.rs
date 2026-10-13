@@ -1982,20 +1982,38 @@ fn ready_plan_actions_replace_the_composer_without_covering_the_plan() {
 }
 
 #[test]
-fn planning_turn_labels_the_composer_border() {
+fn plan_phases_label_the_composer_border() {
+    use crate::agent::PlanPhase;
+
     let mut state = empty_session_state();
-    state.plan_draft = true;
     state.turn_started = Some(std::time::Instant::now());
+    let label = |state: &mut ViewState| {
+        let (frame, _) = build_frame(state, &Editor::default(), 40, 10);
+        markdown::strip_ansi(&frame.join("\n"))
+    };
+    for (phase, expected) in [
+        (PlanPhase::Planning, "Planning"),
+        (PlanPhase::FollowUp, "Plan follow-up"),
+        (PlanPhase::Revising, "Revising plan"),
+        (PlanPhase::Implementing, "Implementing plan"),
+    ] {
+        state.plan_phase = Some(phase);
+        assert!(label(&mut state).contains(expected), "{expected}");
+    }
 
-    let (planning_frame, _) = build_frame(&mut state, &Editor::default(), 40, 10);
-    let planning = markdown::strip_ansi(&planning_frame.join("\n"));
-    assert!(planning.contains("Planning"));
-
-    state.plan_draft = false;
+    // A normal turn beside a paused draft or a ready plan has no plan label.
+    state.plan_phase = None;
+    state.plan_draft = true;
     state.active_plan = Some("ready".into());
-    let (follow_up_frame, _) = build_frame(&mut state, &Editor::default(), 40, 10);
-    let follow_up = markdown::strip_ansi(&follow_up_frame.join("\n"));
-    assert!(follow_up.contains("Plan turn"));
+    let normal = label(&mut state);
+    for stale in [
+        "Planning",
+        "Plan follow-up",
+        "Revising plan",
+        "Implementing plan",
+    ] {
+        assert!(!normal.contains(stale), "{stale}");
+    }
 }
 
 fn empty_session_state() -> ViewState {

@@ -81,6 +81,12 @@ pub struct ToolCall {
 #[serde(rename_all = "snake_case")]
 pub enum MessageControl {
     GoalStart,
+    /// The visible prompt that started a plan, so the implementation handoff
+    /// replaces only the planning conversation.
+    PlanStart,
+    /// The completed plan, objective, and user answers that replace the
+    /// planning conversation when implementation starts.
+    PlanHandoff,
     GoalContinuation,
     PlanContinuation,
     PlanImplementationStart,
@@ -316,6 +322,14 @@ impl Message {
 
     pub fn is_goal_start(&self) -> bool {
         matches!(self.control, Some(MessageControl::GoalStart))
+    }
+
+    pub fn is_plan_start(&self) -> bool {
+        matches!(self.control, Some(MessageControl::PlanStart))
+    }
+
+    pub fn is_plan_handoff(&self) -> bool {
+        matches!(self.control, Some(MessageControl::PlanHandoff))
     }
 
     pub fn is_plan_implementation_start(&self) -> bool {

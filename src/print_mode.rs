@@ -128,6 +128,10 @@ impl PrintSink {
             TurnEvent::SteerAccepted { .. } => {}
             TurnEvent::Compacting => eprintln!("compacting conversation..."),
             TurnEvent::Compacted { replaced } => eprintln!("compacted {replaced} messages"),
+            TurnEvent::PlanHandoff { path, .. } => {
+                eprintln!("implementing from saved plan {}", sanitize_terminal(path))
+            }
+            TurnEvent::PlanPhase(_) => {}
             TurnEvent::Warning(text) => eprintln!("{text}"),
             TurnEvent::ToolPreparing { .. }
             | TurnEvent::ToolStart { .. }

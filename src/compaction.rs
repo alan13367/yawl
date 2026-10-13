@@ -8,7 +8,9 @@ use std::fmt::Write as _;
 use std::ops::Range;
 
 use crate::error::Error;
-use crate::provider::{Message, Provider, Request, Role, StreamNotice, TokenUsage, stream_turn};
+use crate::provider::{
+    Message, MessageControl, Provider, Request, Role, StreamNotice, TokenUsage, stream_turn,
+};
 
 /// Maximum ordinary tail length before applying the estimated token budget.
 pub const KEEP_TAIL: usize = 10;
@@ -31,6 +33,13 @@ pub(crate) fn summary_message_with_provider_data(
     message.provider_data = provider_data;
     message.provider_data_model = provider_data_model;
     message
+}
+
+/// The implementation handoff that replaces a planning conversation.
+/// Providers see ordinary user content; it is not a summary, so the UI
+/// renders it as a handoff and `/undo` never treats it as a prompt.
+pub(crate) fn plan_handoff_message(handoff: &str) -> Message {
+    Message::user(handoff).with_control(MessageControl::PlanHandoff)
 }
 
 pub(crate) fn is_summary_message(message: &Message) -> bool {

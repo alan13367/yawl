@@ -13,6 +13,9 @@ const COMPACT_PICKER_COLUMNS: usize = 60;
 /// Separator plus two wrapped description lines.
 const COMPACT_DETAIL_ROWS: usize = 3;
 
+/// Gap between the label column and the description column.
+const COLUMN_GAP: usize = 3;
+
 /// Draws the picker panel centered in `height` rows. Returns the lines and,
 /// while a field is focused, the cursor's row and column within them.
 pub(in crate::tui) fn render_picker(
@@ -122,23 +125,33 @@ fn render_items(
             item.description.clone()
         }
     };
+    // Descriptions start in one column sized by the widest label in the
+    // whole list, so scrolling never shifts it. Labels longer than the cap
+    // are shortened rather than pushing their description out of line.
+    let label_column = picker
+        .items
+        .iter()
+        .map(|item| markdown::visible_width(&item.label))
+        .max()
+        .unwrap_or(0)
+        .min(inner.saturating_sub(3) / 2);
     for (index, item) in picker.items[start..end].iter().enumerate() {
         let absolute = start + index;
-        let marker = if absolute == picker.selected {
-            "›"
-        } else {
-            " "
-        };
+        let selected = absolute == picker.selected;
+        let marker = if selected { "›" } else { " " };
         let text = if compact {
             format!(" {marker} {}", item.label)
         } else {
-            format!(
-                " {marker} {}  ·  {}",
-                item.label,
-                description_of(absolute, item)
-            )
+            let label = fit_label(&item.label, label_column);
+            let description = description_of(absolute, item);
+            let gap = " ".repeat(COLUMN_GAP);
+            if selected {
+                format!(" {marker} {label}{gap}{description}")
+            } else {
+                format!(" {marker} {label}{gap}\x1b[2m{description}\x1b[0m")
+            }
         };
-        if absolute == picker.selected {
+        if selected {
             panel.push(boxed(&super::render::selected_row(
                 &markdown::fit_width(&text, inner),
                 selection,
@@ -161,4 +174,17 @@ fn render_items(
             panel.push(boxed(&format!(" \x1b[2m{line}\x1b[0m")));
         }
     }
+}
+
+/// Pads `label` to exactly `width` columns, ending an over-long label with
+/// an ellipsis.
+fn fit_label(label: &str, width: usize) -> String {
+    if markdown::visible_width(label) <= width {
+        return markdown::fit_width(label, width);
+    }
+    let mut shortened = markdown::fit_width(label, width.saturating_sub(1))
+        .trim_end()
+        .to_string();
+    shortened.push('…');
+    markdown::fit_width(&shortened, width)
 }

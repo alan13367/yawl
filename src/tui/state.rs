@@ -153,6 +153,8 @@ pub(super) struct ViewState {
     pub(super) goal_running: bool,
     pub(super) active_plan: Option<String>,
     pub(super) plan_draft: bool,
+    /// Plan phase of the running turn, which labels the composer.
+    pub(super) plan_phase: Option<crate::agent::PlanPhase>,
     pub(super) pending_plan_implementation: bool,
     pub(super) question: Option<ActiveQuestion>,
     pub(super) pending_actions: std::collections::VecDeque<PickerAction>,
@@ -229,6 +231,7 @@ impl ViewState {
             goal_running: false,
             active_plan: None,
             plan_draft: false,
+            plan_phase: None,
             pending_plan_implementation: false,
             question: None,
             pending_actions: std::collections::VecDeque::new(),
@@ -301,6 +304,7 @@ impl ViewState {
                 agent.plan_state(),
                 Some(crate::session::PlanState::Draft { .. })
             ),
+            plan_phase: None,
             pending_plan_implementation: false,
             question: None,
             pending_actions: std::collections::VecDeque::new(),
@@ -414,6 +418,7 @@ impl ViewState {
     pub(super) fn begin_turn(&mut self, activity: &str) {
         self.activity = activity.into();
         self.turn_started = Some(std::time::Instant::now());
+        self.plan_phase = None;
         self.transcript.mark_progress();
     }
 
@@ -507,6 +512,14 @@ impl ViewState {
                 self.transcript
                     .notice(format!("Compacted {replaced} older messages."));
             }
+            Update::PlanHandoff { path, replaced } => {
+                self.activity.clear();
+                let messages = if replaced == 1 { "message" } else { "messages" };
+                self.transcript.notice(format!(
+                    "Implementing the plan. The planning conversation ({replaced} {messages}) left the model's context, which now starts from the saved plan; the session log keeps it.\n\nPlan: `{path}`"
+                ));
+            }
+            Update::PlanPhase(phase) => self.plan_phase = phase,
             Update::Warning(text) => {
                 self.activity.clear();
                 self.transcript.notice(text);
@@ -541,6 +554,11 @@ pub(super) enum Update {
     Compacted {
         replaced: usize,
     },
+    PlanHandoff {
+        path: String,
+        replaced: usize,
+    },
+    PlanPhase(Option<crate::agent::PlanPhase>),
     Warning(String),
     SteerAccepted {
         text: String,
@@ -601,6 +619,11 @@ impl Update {
             }),
             TurnEvent::Compacting => Self::Compacting,
             TurnEvent::Compacted { replaced } => Self::Compacted { replaced },
+            TurnEvent::PlanHandoff { path, replaced } => Self::PlanHandoff {
+                path: path.to_string(),
+                replaced,
+            },
+            TurnEvent::PlanPhase(phase) => Self::PlanPhase(phase),
             TurnEvent::Warning(text) => Self::Warning(text),
             TurnEvent::Usage {
                 context_tokens,

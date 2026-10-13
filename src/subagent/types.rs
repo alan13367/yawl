@@ -384,6 +384,8 @@ impl SubagentSnapshot {
                 self.current_activity = "sending".into();
             }
             TurnEvent::Warning(text) => self.error = bounded(&text, MAX_ERROR_BYTES),
+            // Children never run plan mode.
+            TurnEvent::PlanHandoff { .. } | TurnEvent::PlanPhase(_) => {}
             TurnEvent::Usage {
                 context_tokens,
                 context_window,

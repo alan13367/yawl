@@ -132,6 +132,8 @@ impl AfkTimer {
 #[derive(Default)]
 struct State {
     enabled: bool,
+    /// Planning questions wait for the user instead of auto-answering.
+    no_countdown: bool,
     next_id: u64,
     timed_out_this_turn: bool,
     pending: Option<Pending>,
@@ -172,6 +174,12 @@ impl QuestionBroker {
 
     pub(crate) fn is_enabled(&self) -> bool {
         self.lock().enabled
+    }
+
+    /// Chooses whether later questions arm the auto-answer countdown.
+    /// Pending questions keep the timer they were asked with.
+    pub(crate) fn set_countdown(&self, enabled: bool) {
+        self.lock().no_countdown = !enabled;
     }
 
     pub(crate) fn begin_turn(&self) {
@@ -219,7 +227,11 @@ impl QuestionBroker {
             questions,
             current: 0,
             answers: Vec::new(),
-            afk_timer: AfkTimer::armed(timeout, Duration::ZERO),
+            afk_timer: if state.no_countdown {
+                AfkTimer::Disabled
+            } else {
+                AfkTimer::armed(timeout, Duration::ZERO)
+            },
             timeout,
             follow_up_grace,
         });
@@ -336,13 +348,16 @@ impl QuestionBroker {
         mut state: MutexGuard<'_, State>,
         request_id: u64,
     ) -> Result<(), String> {
+        let no_countdown = state.no_countdown;
         let pending = state
             .pending
             .as_mut()
             .ok_or_else(|| "there is no pending user question".to_string())?;
         pending.current = pending.current.saturating_add(1);
         if pending.current < pending.questions.len() {
-            pending.afk_timer = AfkTimer::armed(pending.timeout, pending.follow_up_grace);
+            if !no_countdown {
+                pending.afk_timer = AfkTimer::armed(pending.timeout, pending.follow_up_grace);
+            }
             self.shared.changed.notify_all();
             return Ok(());
         }
@@ -613,6 +628,48 @@ mod tests {
 
         broker.cancel_pending();
         assert!(handle.join().expect("asker thread").is_err());
+    }
+
+    #[test]
+    fn questions_without_a_countdown_wait_for_an_answer() {
+        let broker = QuestionBroker::default();
+        broker.enable();
+        broker.begin_turn();
+        broker.set_countdown(false);
+        let asker = broker.clone();
+        let handle = std::thread::spawn(move || {
+            asker.ask_with_timeout(questions(), Duration::from_millis(5))
+        });
+        while broker.snapshot().is_none() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(40));
+        let first = broker.snapshot().expect("question must not time out");
+        assert!(first.remaining.is_none());
+        broker
+            .answer(first.request_id, first.question.recommended)
+            .expect("first answer");
+        std::thread::sleep(Duration::from_millis(40));
+        let second = broker
+            .snapshot()
+            .expect("follow-up question must not time out");
+        assert!(second.remaining.is_none());
+        broker.answer(second.request_id, 0).expect("second answer");
+        let third = broker.snapshot().expect("third question");
+        broker.answer(third.request_id, 0).expect("third answer");
+        let result = handle
+            .join()
+            .expect("asker thread")
+            .expect("completed answers");
+        let value: Value = serde_json::from_str(&result).expect("result json");
+        assert_eq!(value["timed_out"], false);
+
+        broker.set_countdown(true);
+        let result = broker
+            .ask_with_timeout(questions(), Duration::from_millis(1))
+            .expect("countdown resumes for later questions");
+        let value: Value = serde_json::from_str(&result).expect("result json");
+        assert_eq!(value["timed_out"], true);
     }
 
     #[test]

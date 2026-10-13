@@ -16,7 +16,7 @@ use crate::tools::Registry;
 
 pub use conversation::UndoReport;
 pub(crate) use conversation::{Conversation, RunLimits, SteerInbox};
-pub use events::TurnEvent;
+pub use events::{PlanPhase, TurnEvent};
 
 /// A persistent user-facing conversation.
 pub struct Agent {
@@ -251,6 +251,15 @@ impl Agent {
     ) -> Result<bool, Error> {
         self.conversation
             .run_plan_follow_up_preserving_cancellation(input, sink)
+    }
+
+    pub(crate) fn run_plan_revision_preserving_cancellation(
+        &mut self,
+        input: TurnInput,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<bool, Error> {
+        self.conversation
+            .run_plan_revision_preserving_cancellation(input, sink)
     }
 
     pub(crate) fn run_plan_implementation_preserving_cancellation(
