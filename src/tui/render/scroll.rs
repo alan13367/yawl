@@ -1,11 +1,11 @@
-//! The transcript scroll bar and the "Scroll to bottom" pill shown while the
+//! The transcript scroll rail and the "Scroll to bottom" pill shown while the
 //! view is scrolled up.
 
 use crate::config::UiColor;
 
 use super::super::state::{JumpButton, ScrollGeometry, scroll_bar_position, scroll_bar_span};
 use super::super::{ViewState, markdown, theme};
-use super::picker_is_plan_handoff;
+use super::foreground_color;
 
 const JUMP_LABEL: &str = " ↓ Scroll to bottom ";
 
@@ -93,20 +93,33 @@ pub(in crate::tui) fn render_jump_button(
     state.follow.button = Some(button);
 }
 
-/// Thumb shading as a fraction of the accent color.
-const SCROLL_THUMB_INTENSITY: f32 = 0.65;
+/// Rail glyphs, both centered in the cell so the thumb rides on the track.
+const SCROLL_TRACK: &str = "│";
+const SCROLL_THUMB: &str = "┃";
 
-fn shaded_background(color: UiColor, intensity: f32) -> String {
-    let channel = |value: u8| (f32::from(value) * intensity).round() as u8;
+/// How far the hovered thumb's halo fades the accent toward the background,
+/// in percent.
+const THUMB_HALO_FADE: u8 = 70;
+
+/// Background behind a hovered or dragged thumb: a faint accent halo that
+/// widens the line to the whole rail cell.
+fn thumb_halo(accent: UiColor) -> String {
+    let accent = theme::ink(accent);
+    let target = if theme::is_light() { 255 } else { 0 };
     format!(
         "\x1b[48;2;{};{};{}m",
-        channel(color.red),
-        channel(color.green),
-        channel(color.blue)
+        mix_channel(accent.red, target, THUMB_HALO_FADE),
+        mix_channel(accent.green, target, THUMB_HALO_FADE),
+        mix_channel(accent.blue, target, THUMB_HALO_FADE)
     )
 }
 
-pub(in crate::tui) fn apply_scroll_bar(
+/// Appends the scroll rail to transcript rows drawn one cell narrower than
+/// `columns`. While the transcript can scroll, the rail is a thin track with
+/// the thumb over it, widened by a halo while the pointer rests on the rail
+/// or drags it. Otherwise the cell stays blank, so the text keeps its width
+/// when the bar auto-hides or the transcript starts to overflow.
+pub(in crate::tui) fn append_scroll_rail(
     region: &mut [String],
     state: &mut ViewState,
     total_lines: usize,
@@ -114,17 +127,12 @@ pub(in crate::tui) fn apply_scroll_bar(
     columns: usize,
 ) {
     let height = region.len();
-    if !state.show_scroll_bar
-        || state
-            .picker
-            .as_ref()
-            .is_some_and(|picker| !picker_is_plan_handoff(picker))
-        || max_scroll == 0
-        || height == 0
-        || total_lines <= height
-        || columns == 0
-    {
+    if !state.show_scroll_bar || height == 0 || max_scroll == 0 || total_lines <= height {
         state.scroll_geometry = None;
+        state.scroll_bar_hovered = false;
+        for line in region {
+            line.push_str("\x1b[0m ");
+        }
         return;
     }
     let (thumb_length, travel) = scroll_bar_span(height, total_lines);
@@ -136,11 +144,25 @@ pub(in crate::tui) fn apply_scroll_bar(
         thumb_length,
     });
     let start = scroll_bar_position(travel, max_scroll, state.scroll_offset);
-    let thumb = shaded_background(state.accent_color, SCROLL_THUMB_INTENSITY);
+    let track = format!(
+        "\x1b[0m{}{SCROLL_TRACK}\x1b[0m",
+        theme::palette().scroll_track
+    );
+    let halo = if state.scroll_bar_hovered || state.scroll_bar_drag.is_some() {
+        thumb_halo(state.accent_color)
+    } else {
+        String::new()
+    };
+    let thumb = format!(
+        "\x1b[0m{halo}{}{SCROLL_THUMB}\x1b[0m",
+        foreground_color(state.accent_color)
+    );
     for (row, line) in region.iter_mut().enumerate() {
-        debug_assert_eq!(markdown::visible_width(line), columns);
-        if row >= start && row < start + thumb_length {
-            *line = markdown::overlay_last_cell_background(line, &thumb);
-        }
+        debug_assert_eq!(markdown::visible_width(line) + 1, columns);
+        line.push_str(if (start..start + thumb_length).contains(&row) {
+            &thumb
+        } else {
+            &track
+        });
     }
 }

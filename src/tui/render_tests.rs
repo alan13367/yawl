@@ -789,7 +789,7 @@ fn quiet_thinking_is_not_reported_as_a_stall() {
         let (frame, _) = build_frame(state, &editor, 60, 12);
         frame
             .iter()
-            .map(|line| markdown::strip_ansi(line))
+            .map(|line| without_rail(line))
             .find(|line| line.contains("Thinking"))
             .expect("thinking tag on screen")
     };
@@ -910,29 +910,37 @@ fn overflow_state() -> ViewState {
     }
 }
 
+/// Plain text of a transcript row without its final rail cell.
+fn without_rail(line: &str) -> String {
+    let mut plain = markdown::strip_ansi(line);
+    plain.pop();
+    plain
+}
+
+const RAIL_TRACK: &str = "\x1b[0m\x1b[38;2;72;74;84m│\x1b[0m";
+const RAIL_THUMB: &str = "\x1b[0m\x1b[38;2;238;238;238m┃\x1b[0m";
+
 #[test]
-fn scroll_bar_draws_only_a_larger_thumb_over_the_transcript() {
+fn scroll_rail_draws_a_minimum_size_thumb_over_a_thin_track() {
     let mut state = overflow_state();
     let editor = Editor::default();
     let columns = 40;
     let (frame, _) = build_frame(&mut state, &editor, columns, 12);
     let transcript_rows = &frame[..8];
 
-    let track = "\x1b[48;2;90;90;90m";
-    let thumb = "\x1b[48;2;155;155;155m";
     for line in transcript_rows {
         assert_eq!(markdown::visible_width(line), columns);
+        assert!(
+            line.ends_with(RAIL_TRACK) || line.ends_with(RAIL_THUMB),
+            "{line:?}"
+        );
     }
-    assert!(!frame.join("\n").contains(track));
-    assert!(
-        transcript_rows[7].contains(thumb),
-        "{:?}",
-        transcript_rows[7]
-    );
+    assert!(transcript_rows[7].ends_with(RAIL_THUMB));
+    assert!(transcript_rows[0].ends_with(RAIL_TRACK));
     assert_eq!(
         transcript_rows
             .iter()
-            .filter(|line| line.contains(thumb))
+            .filter(|line| line.ends_with(RAIL_THUMB))
             .count(),
         3,
         "the thumb should stay easy to grab even for long transcripts"
@@ -940,7 +948,7 @@ fn scroll_bar_draws_only_a_larger_thumb_over_the_transcript() {
 }
 
 #[test]
-fn scroll_bar_overlays_reasoning_without_replacing_its_text() {
+fn scroll_rail_sits_beside_reasoning_without_covering_its_text() {
     let mut state = overflow_state();
     state.apply(Update::Transcript(TranscriptEvent::ReasoningDelta {
         kind: ReasoningKind::Full,
@@ -956,24 +964,25 @@ fn scroll_bar_overlays_reasoning_without_replacing_its_text() {
     let editor = Editor::default();
 
     let (with_thumb, _) = build_frame(&mut state, &editor, 40, 12);
-    state.scroll_bar_enabled = false;
     state.show_scroll_bar = false;
     let (without_thumb, _) = build_frame(&mut state, &editor, 40, 12);
 
     let plain = |frame: &[String]| {
         frame[..8]
             .iter()
-            .map(|line| markdown::strip_ansi(line))
+            .map(|line| without_rail(line))
             .collect::<Vec<_>>()
     };
     assert_eq!(plain(&with_thumb), plain(&without_thumb));
-    assert!(with_thumb[..8].iter().any(|line| {
-        line.contains("\x1b[2;3;38;2;148;148;158m") && line.contains("\x1b[48;2;155;155;155m")
-    }));
+    assert!(
+        with_thumb[..8].iter().any(|line| {
+            line.contains("\x1b[2;3;38;2;148;148;158m") && line.ends_with(RAIL_THUMB)
+        })
+    );
 }
 
 #[test]
-fn scroll_bar_thumb_overlays_tool_panels_without_replacing_their_content() {
+fn scroll_rail_keeps_tool_panel_backgrounds_out_of_its_column() {
     let mut state = overflow_state();
     state.apply(Update::Transcript(TranscriptEvent::ToolStart {
         name: "shell".into(),
@@ -989,35 +998,77 @@ fn scroll_bar_thumb_overlays_tool_panels_without_replacing_their_content() {
     let editor = Editor::default();
 
     let (with_thumb, _) = build_frame(&mut state, &editor, 40, 12);
-    state.scroll_bar_enabled = false;
     state.show_scroll_bar = false;
     let (without_thumb, _) = build_frame(&mut state, &editor, 40, 12);
 
-    let plain = |frame: &[String]| markdown::strip_ansi(&frame[..8].join("\n"));
+    let plain = |frame: &[String]| {
+        frame[..8]
+            .iter()
+            .map(|line| without_rail(line))
+            .collect::<Vec<_>>()
+    };
     assert_eq!(plain(&with_thumb), plain(&without_thumb));
     assert!(
-        with_thumb[..8].iter().any(|line| {
-            line.contains("\x1b[48;2;42;50;41m") && line.contains("\x1b[48;2;155;155;155m")
-        }),
-        "thumb should overlay the tool panel: {:?}",
+        with_thumb[..8]
+            .iter()
+            .any(|line| { line.contains("\x1b[48;2;42;50;41m") && line.ends_with(RAIL_THUMB) }),
+        "the thumb should sit beside the tool panel: {:?}",
         &with_thumb[..8]
     );
+    assert!(
+        without_thumb[..8]
+            .iter()
+            .all(|line| line.ends_with("\x1b[0m ")),
+        "a hidden bar leaves a blank, unstyled rail"
+    );
+}
+
+#[test]
+fn hovering_or_dragging_the_rail_widens_the_thumb_with_a_halo() {
+    let mut state = overflow_state();
+    let editor = Editor::default();
+    let halo = "\x1b[0m\x1b[48;2;71;71;71m\x1b[38;2;238;238;238m┃\x1b[0m";
+
+    state.scroll_bar_hovered = true;
+    let (hovered, _) = build_frame(&mut state, &editor, 40, 12);
+    assert!(hovered[7].ends_with(halo), "{:?}", hovered[7]);
+    assert!(hovered[0].ends_with(RAIL_TRACK), "only the thumb widens");
+
+    state.scroll_bar_hovered = false;
+    state.scroll_bar_drag = Some(0);
+    let (dragged, _) = build_frame(&mut state, &editor, 40, 12);
+    assert!(
+        dragged[7].ends_with(halo),
+        "a drag keeps the halo off the rail"
+    );
+
+    state.scroll_bar_drag = None;
+    let (resting, _) = build_frame(&mut state, &editor, 40, 12);
+    assert!(resting[7].ends_with(RAIL_THUMB));
+}
+
+#[test]
+fn hiding_the_scroll_bar_drops_its_hover() {
+    let mut state = overflow_state();
+    state.scroll_bar_hovered = true;
+    state.show_scroll_bar = false;
+    build_frame(&mut state, &Editor::default(), 40, 12);
+    assert!(!state.scroll_bar_hovered);
 }
 
 #[test]
 fn scroll_bar_thumb_tracks_the_viewport_position() {
     let mut state = overflow_state();
     let editor = Editor::default();
-    let thumb = "\x1b[48;2;155;155;155m";
     let (frame_bottom, _) = build_frame(&mut state, &editor, 40, 12);
 
     // At the bottom the top transcript row has no thumb.
-    assert!(!frame_bottom[0].contains(thumb));
+    assert!(frame_bottom[0].ends_with(RAIL_TRACK));
 
     // Scrolling to the top moves the thumb to the first transcript row.
     state.scroll_offset = usize::MAX;
     let (frame_top, _) = build_frame(&mut state, &editor, 40, 12);
-    assert!(frame_top[0].contains(thumb));
+    assert!(frame_top[0].ends_with(RAIL_THUMB));
 }
 
 #[test]
@@ -1058,7 +1109,7 @@ fn search_hit_scrolls_to_the_start_of_the_block() {
 }
 
 #[test]
-fn scroll_bar_overlay_preserves_the_last_column() {
+fn scroll_rail_wraps_text_before_the_last_column() {
     let mut state = overflow_state();
     let content = format!("{}Z{}", "a".repeat(39), "b".repeat(400));
     state.transcript =
@@ -1067,9 +1118,13 @@ fn scroll_bar_overlay_preserves_the_last_column() {
     let editor = Editor::default();
 
     let (frame, _) = build_frame(&mut state, &editor, 40, 12);
-    let visible = markdown::strip_ansi(&frame[..8].join("\n"));
+    let rows = frame[..8]
+        .iter()
+        .map(|line| without_rail(line))
+        .collect::<Vec<_>>();
 
-    assert!(visible.contains('Z'), "{visible:?}");
+    assert_eq!(rows[0], "a".repeat(39));
+    assert!(rows[1].starts_with('Z'), "{rows:?}");
 }
 
 #[test]
@@ -1122,13 +1177,12 @@ fn scroll_bar_setting_hides_the_bar_and_preserves_content() {
     let editor = Editor::default();
     let (frame, _) = build_frame(&mut state, &editor, 40, 12);
 
-    assert!(!frame.join("\n").contains("\x1b[48;2;"));
     assert!(state.scroll_geometry.is_none());
-    assert!(
-        frame[..8]
-            .iter()
-            .all(|line| markdown::visible_width(line) == 40)
-    );
+    assert!(frame[..8].iter().all(|line| {
+        markdown::visible_width(line) == 40
+            && !line.ends_with(RAIL_TRACK)
+            && !line.ends_with(RAIL_THUMB)
+    }));
 }
 
 #[test]
@@ -1179,8 +1233,14 @@ fn scroll_bar_is_absent_when_content_fits_the_transcript() {
     let editor = Editor::default();
     let (frame, _) = build_frame(&mut state, &editor, 40, 12);
 
-    assert!(!frame.join("\n").contains("\x1b[48;2;"));
     assert!(state.scroll_geometry.is_none());
+    assert!(
+        frame[..8]
+            .iter()
+            .all(|line| line.ends_with("\x1b[0m ") && markdown::visible_width(line) == 40),
+        "the rail stays reserved but blank: {:?}",
+        &frame[..8]
+    );
 }
 
 #[test]
@@ -1226,7 +1286,7 @@ fn scroll_bar_does_not_overlay_an_open_picker() {
     let editor = Editor::default();
     let (frame, _) = build_frame(&mut state, &editor, 40, 12);
 
-    assert!(!frame[..8].iter().any(|line| line.contains("\x1b[48;2;")));
+    assert!(!frame[..8].iter().any(|line| line.contains('┃')));
     assert!(state.scroll_geometry.is_none());
     assert!(
         frame
@@ -2418,7 +2478,7 @@ fn clicking_the_thinking_tag_toggles_but_the_traces_stay_inert() {
 fn transcript_rows(frame: &[String], rows: usize) -> Vec<String> {
     frame[..rows]
         .iter()
-        .map(|line| markdown::strip_ansi(line))
+        .map(|line| without_rail(line))
         .collect()
 }
 
@@ -2474,7 +2534,8 @@ fn jump_button_appears_when_scrolled_up_and_returns_to_the_bottom() {
             .iter()
             .all(|line| !markdown::strip_ansi(line).contains(['┌', '└']))
     );
-    let centered = (40 - (button.right - button.left)) / 2;
+    // Centered over the transcript, which leaves the last column to the rail.
+    let centered = (39 - (button.right - button.left)) / 2;
     assert_eq!(button.left, centered);
 
     let press = |kind| crate::tui::events::MouseEvent {

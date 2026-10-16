@@ -47,6 +47,8 @@ pub(super) struct Palette {
     pub(super) marker: &'static str,
     /// Rules, table borders, and quoted text.
     pub(super) muted: &'static str,
+    /// The thin line the transcript scroll thumb rides on.
+    pub(super) scroll_track: &'static str,
     /// Syntax colors, tuned for `code_background`.
     pub(super) keyword: &'static str,
     pub(super) string: &'static str,
@@ -90,6 +92,7 @@ const DARK: Palette = Palette {
     heading_minor: "\x1b[1;38;2;180;205;250m",
     marker: "\x1b[38;2;116;199;213m",
     muted: "\x1b[38;2;140;146;160m",
+    scroll_track: "\x1b[38;2;72;74;84m",
     keyword: "\x1b[1;38;2;198;160;246m",
     string: "\x1b[38;2;166;209;137m",
     number: "\x1b[38;2;239;159;118m",
@@ -128,6 +131,7 @@ const LIGHT: Palette = Palette {
     heading_minor: "\x1b[1;38;2;52;100;170m",
     marker: "\x1b[38;2;0;118;140m",
     muted: "\x1b[38;2;96;102;116m",
+    scroll_track: "\x1b[38;2;204;206;214m",
     keyword: "\x1b[1;38;2;124;58;196m",
     string: "\x1b[38;2;44;114;28m",
     number: "\x1b[38;2;170;80;14m",

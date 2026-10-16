@@ -22,7 +22,7 @@ use super::picker::{
 };
 use super::state::{
     COPY_TOAST_TICKS, ViewState, clear_jump_pointer, handle_jump_button_mouse,
-    handle_scroll_bar_mouse, handle_tool_click, pointer_over_jump_button,
+    handle_scroll_bar_mouse, handle_tool_click, hover_scroll_bar, pointer_over_jump_button,
 };
 use super::terminal::Terminal;
 
@@ -124,21 +124,28 @@ pub(super) fn paste_question_answer(state: &mut ViewState, text: &str) {
     editor.paste(text);
 }
 
-/// Returns whether the scroll-to-bottom pill's hover state changed. Pointer
-/// motion does not otherwise redraw.
+/// Hover state of the transcript controls: the scroll-to-bottom pill and the
+/// scroll rail.
+fn hovered_controls(state: &ViewState) -> (bool, bool) {
+    (pointer_over_jump_button(state), state.scroll_bar_hovered)
+}
+
+/// Returns whether the hover state of the scroll-to-bottom pill or the scroll
+/// rail changed. Pointer motion does not otherwise redraw.
 pub(super) fn handle_mouse_selection(
     terminal: &mut Terminal,
     state: &mut ViewState,
     event: MouseEvent,
 ) -> Result<bool, Error> {
-    let was_hovered = pointer_over_jump_button(state);
+    let was_hovered = hovered_controls(state);
+    hover_scroll_bar(state, event);
     if handle_jump_button_mouse(state, event) {
         state.tool_click_press = None;
-        return Ok(pointer_over_jump_button(state) != was_hovered);
+        return Ok(hovered_controls(state) != was_hovered);
     }
     if handle_scroll_bar_mouse(state, event) {
         state.tool_click_press = None;
-        return Ok(pointer_over_jump_button(state) != was_hovered);
+        return Ok(hovered_controls(state) != was_hovered);
     }
     match event.kind {
         MouseKind::Press => {
@@ -153,14 +160,14 @@ pub(super) fn handle_mouse_selection(
             if copied && !clicked {
                 state.copy_toast_ticks = COPY_TOAST_TICKS;
             }
-            return Ok(pointer_over_jump_button(state) != was_hovered);
+            return Ok(hovered_controls(state) != was_hovered);
         }
         MouseKind::Drag | MouseKind::Move => {}
     }
     if terminal.handle_mouse(event)? {
         state.copy_toast_ticks = COPY_TOAST_TICKS;
     }
-    Ok(pointer_over_jump_button(state) != was_hovered)
+    Ok(hovered_controls(state) != was_hovered)
 }
 
 /// Applies focus changes, which no view handles, and returns the next other
@@ -180,6 +187,7 @@ pub(super) fn apply_focus_events<R: Read>(
                 terminal.set_focused(false);
                 needs_draw |= super::git::clear_hover(state);
                 needs_draw |= clear_jump_pointer(state);
+                needs_draw |= std::mem::take(&mut state.scroll_bar_hovered);
             }
             other => return Ok((Some(other), needs_draw)),
         }

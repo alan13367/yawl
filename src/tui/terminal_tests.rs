@@ -13,12 +13,34 @@ fn screen_selection_extracts_styled_text_in_either_direction() {
             "\x1b[31mhello world\x1b[0m   ".into(),
             "second line   ".into(),
         ],
+        rail_rows: 0,
     };
 
     assert_eq!(selected_text(&selection), "world\nsecond");
     let highlighted = highlighted_selection(&selection);
     assert_eq!(markdown::strip_ansi(&highlighted[0]), "hello world   ");
     assert!(highlighted[0].contains("\x1b[7m"));
+}
+
+#[test]
+fn screen_selection_leaves_the_scroll_rail_out() {
+    let selection = TextSelection {
+        anchor: ScreenPoint { row: 0, column: 0 },
+        current: ScreenPoint { row: 2, column: 9 },
+        frame: vec![
+            "first row\x1b[0m\x1b[38;2;1;2;3m│\x1b[0m".into(),
+            "second ro\x1b[0m\x1b[38;2;1;2;3m┃\x1b[0m".into(),
+            "│ input  │".into(),
+        ],
+        rail_rows: 2,
+    };
+
+    assert_eq!(
+        selected_text(&selection),
+        "first row\nsecond ro\n│ input  │"
+    );
+    let highlighted = highlighted_selection(&selection);
+    assert!(highlighted[0].ends_with("\x1b[27m\x1b[0m\x1b[38;2;1;2;3m│\x1b[0m"));
 }
 
 /// Models the row-addressing and autowrap commands emitted by write_frame_rows.
@@ -112,6 +134,36 @@ fn scrolling_rows_cannot_overwrite_an_unchanged_composer_corner() {
         );
         assert!(screen.autowrap, "restore autowrap after row output");
     }
+}
+
+#[test]
+fn unchanged_frames_write_no_rows() {
+    use super::terminal::write_frame_rows;
+
+    let frame = (1..=5).map(|row| format!("row {row}")).collect::<Vec<_>>();
+    let mut output = Vec::new();
+    assert!(!write_frame_rows(&mut output, &frame, &frame, false).unwrap());
+    assert!(output.is_empty(), "{output:?}");
+}
+
+#[test]
+fn a_changed_row_also_repaints_its_neighbors() {
+    use super::terminal::write_frame_rows;
+
+    // A glyph that overhangs its cell would otherwise leave residue in the
+    // unchanged rows beside it, such as a hidden scroll rail above the
+    // composer corner.
+    let frame = (1..=5).map(|row| format!("row {row}")).collect::<Vec<_>>();
+    let mut changed = frame.clone();
+    changed[3] = "rail hidden".into();
+    let mut output = Vec::new();
+    assert!(write_frame_rows(&mut output, &changed, &frame, false).unwrap());
+    let written = String::from_utf8(output).unwrap();
+
+    assert!(written.contains("\x1b[4;1H\x1b[2Krail hidden"));
+    assert!(written.contains("\x1b[3;1H\x1b[2Krow 3"));
+    assert!(written.contains("\x1b[5;1H\x1b[2Krow 5"));
+    assert!(!written.contains("row 1") && !written.contains("row 2"));
 }
 
 #[test]

@@ -88,6 +88,13 @@ pub(super) struct ScrollGeometry {
     pub(super) thumb_length: usize,
 }
 
+impl ScrollGeometry {
+    /// Whether a screen cell lies on the rail, the last transcript column.
+    pub(super) fn contains(&self, row: usize, column: usize) -> bool {
+        column + 1 == self.columns && row < self.rows
+    }
+}
+
 /// Committed colors captured when an accent or selection color picker opens.
 /// The picker previews its highlighted row by overriding these for the whole
 /// interface, and Escape restores the captured values.
@@ -128,6 +135,9 @@ pub(super) struct ViewState {
     /// Keeps a scrolled-up viewport still while output streams in below it.
     pub(super) follow: FollowState,
     pub(super) scroll_bar_drag: Option<usize>,
+    /// The pointer rests on the scroll rail, so the thumb draws wider. Only
+    /// tracked while the bar is drawn; focus loss clears it.
+    pub(super) scroll_bar_hovered: bool,
     /// Maps each transcript screen row (0..transcript height) to its owning
     /// transcript entry, captured each frame for click-to-expand hit-testing.
     /// `None` rows are padding, separators, or non-transcript content.
@@ -213,6 +223,7 @@ impl ViewState {
             scroll_geometry: None,
             follow: Default::default(),
             scroll_bar_drag: None,
+            scroll_bar_hovered: false,
             transcript_row_entries: Vec::new(),
             tool_click_press: None,
             copy_toast_ticks: 0,
@@ -283,6 +294,7 @@ impl ViewState {
             scroll_geometry: None,
             follow: Default::default(),
             scroll_bar_drag: None,
+            scroll_bar_hovered: false,
             transcript_row_entries: Vec::new(),
             tool_click_press: None,
             copy_toast_ticks: 0,
@@ -692,10 +704,15 @@ pub(super) fn advance_ticks(state: &mut ViewState) -> bool {
         changed = true;
     }
     if state.scroll_bar_enabled && state.scroll_bar_auto_hide && state.scroll_bar_drag.is_none() {
-        state.scroll_bar_idle_ticks = state.scroll_bar_idle_ticks.saturating_add(1);
-        if state.show_scroll_bar && state.scroll_bar_idle_ticks >= SCROLL_BAR_AUTO_HIDE_TICKS {
-            state.show_scroll_bar = false;
-            changed = true;
+        if state.scroll_bar_hovered {
+            // A pointer resting on the rail keeps the bar it is about to grab.
+            state.scroll_bar_idle_ticks = 0;
+        } else {
+            state.scroll_bar_idle_ticks = state.scroll_bar_idle_ticks.saturating_add(1);
+            if state.show_scroll_bar && state.scroll_bar_idle_ticks >= SCROLL_BAR_AUTO_HIDE_TICKS {
+                state.show_scroll_bar = false;
+                changed = true;
+            }
         }
     }
     super::subagents::refresh(state);
@@ -791,6 +808,13 @@ pub(super) fn handle_jump_button_mouse(state: &mut ViewState, event: MouseEvent)
     }
 }
 
+/// Records whether the pointer in a mouse report rests on the scroll rail.
+pub(super) fn hover_scroll_bar(state: &mut ViewState, event: MouseEvent) {
+    state.scroll_bar_hovered = state
+        .scroll_geometry
+        .is_some_and(|geometry| geometry.contains(event.row, event.column));
+}
+
 /// Handles presses and drags on the transcript scroll bar. Returns true when
 /// the event belongs to the bar so text selection leaves it alone.
 pub(super) fn handle_scroll_bar_mouse(state: &mut ViewState, event: MouseEvent) -> bool {
@@ -800,7 +824,7 @@ pub(super) fn handle_scroll_bar_mouse(state: &mut ViewState, event: MouseEvent) 
             let Some(geometry) = state.scroll_geometry else {
                 return false;
             };
-            if event.column + 1 != geometry.columns || event.row >= geometry.rows {
+            if !geometry.contains(event.row, event.column) {
                 state.scroll_bar_drag = None;
                 return false;
             }

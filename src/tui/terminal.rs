@@ -20,6 +20,10 @@ pub(super) struct Terminal {
     focused: bool,
     last_frame: Vec<String>,
     last_base_frame: Vec<String>,
+    /// Leading rows of `last_base_frame` that end in the scroll rail.
+    last_rail_rows: usize,
+    /// Cursor control written with `last_frame`.
+    last_cursor: String,
     last_images: Vec<DisplayedImage>,
     last_size: (u16, u16),
     selection: Option<TextSelection>,
@@ -171,6 +175,19 @@ pub(super) struct TextSelection {
     pub(super) anchor: ScreenPoint,
     pub(super) current: ScreenPoint,
     pub(super) frame: Vec<String>,
+    /// Leading rows of `frame` whose last cell is the scroll rail.
+    pub(super) rail_rows: usize,
+}
+
+impl TextSelection {
+    /// Cells of `row` that a selection may cover, leaving out the rail.
+    fn selectable_cells(&self, row: usize, cells: usize) -> usize {
+        if row < self.rail_rows {
+            cells.saturating_sub(1)
+        } else {
+            cells
+        }
+    }
 }
 
 impl Terminal {
@@ -187,6 +204,8 @@ impl Terminal {
             focused: true,
             last_frame: Vec::new(),
             last_base_frame: Vec::new(),
+            last_rail_rows: 0,
+            last_cursor: String::new(),
             last_images: Vec::new(),
             last_size: (0, 0),
             selection: None,
@@ -337,6 +356,7 @@ impl Terminal {
                     anchor: point,
                     current: point,
                     frame: self.last_base_frame.clone(),
+                    rail_rows: self.last_rail_rows,
                 });
                 Ok(false)
             }
@@ -388,6 +408,7 @@ impl Terminal {
         let cursor = rendered.cursor;
         let images = rendered.images;
         self.last_base_frame.clone_from(&base_frame);
+        self.last_rail_rows = rendered.rail_rows;
         let frame = self
             .selection
             .as_ref()
@@ -403,22 +424,34 @@ impl Terminal {
             || self.last_frame.len() != frame.len()
             || images_changed
             || image_rows_changed;
+        let mut rows_output = Vec::new();
+        let rows_written = write_frame_rows(&mut rows_output, &frame, &self.last_frame, force)?;
+        let cursor = cursor_control(cursor, self.selection.is_some());
+        // An unchanged frame writes nothing, not even the cursor, so events
+        // that change nothing, such as wheel ticks past the top, leave the
+        // screen alone instead of hiding and re-showing the cursor each time.
         let mut output = Vec::new();
-        output.extend_from_slice(b"\x1b[?25l");
-        if force {
-            if image_protocol == ImageProtocol::Kitty && !self.last_images.is_empty() {
-                output.extend_from_slice(b"\x1b_Ga=d,d=A,q=2;\x1b\\");
+        if rows_written {
+            output.extend_from_slice(b"\x1b[?25l");
+            if force {
+                if image_protocol == ImageProtocol::Kitty && !self.last_images.is_empty() {
+                    output.extend_from_slice(b"\x1b_Ga=d,d=A,q=2;\x1b\\");
+                }
+                output.extend_from_slice(b"\x1b[2J");
             }
-            output.extend_from_slice(b"\x1b[2J");
+            output.append(&mut rows_output);
+            if force {
+                write_inline_images(&mut output, image_protocol, &images)?;
+            }
         }
-        write_frame_rows(&mut output, &frame, &self.last_frame, force)?;
-        if force {
-            write_inline_images(&mut output, image_protocol, &images)?;
+        if rows_written || cursor != self.last_cursor {
+            output.extend_from_slice(cursor.as_bytes());
         }
-        output.extend_from_slice(cursor_control(cursor, self.selection.is_some()).as_bytes());
         if to_remote {
-            self.remote
-                .send_frame(String::from_utf8_lossy(&output).into_owned());
+            if !output.is_empty() {
+                self.remote
+                    .send_frame(String::from_utf8_lossy(&output).into_owned());
+            }
             self.draw_lock_screen(&remote)?;
         } else {
             self.stdout.write_all(&output)?;
@@ -427,19 +460,22 @@ impl Terminal {
                 && state.process_view.is_none();
             // Any-event tracking reports motion without a held button. The
             // Git dashboard uses it for row hover; the scroll-to-bottom pill
-            // uses it while that pill is on screen. Clicks and drags stay on
-            // button-event tracking the rest of the time.
+            // and the scroll rail use it while they are on screen. Clicks and
+            // drags stay on button-event tracking the rest of the time.
             let jump_visible = state.follow.button.is_some();
+            let rail_visible = state.scroll_geometry.is_some();
             self.mouse_mode.update(
                 &mut self.stdout,
-                git_visible || jump_visible,
+                git_visible || jump_visible || rail_visible,
                 self.focused
                     && (super::git::pointer_over_control(state)
-                        || super::state::pointer_over_jump_button(state)),
+                        || super::state::pointer_over_jump_button(state)
+                        || state.scroll_bar_hovered),
             )?;
             self.stdout.flush()?;
         }
         self.last_frame = frame;
+        self.last_cursor = cursor;
         self.last_images = displayed_images;
         self.last_size = (columns, rows);
         Ok(())
@@ -541,25 +577,47 @@ fn write_kitty_image(
     Ok(())
 }
 
+/// Writes the rows of `frame` that differ from `previous`, or every row when
+/// `force` is set, plus the rows directly above and below each changed row.
+/// Returns whether any row was written; an unchanged frame writes nothing.
+///
+/// Glyphs such as box-drawing lines can paint slightly past their cell, and
+/// terminals such as Terminal.app repaint only the rows that were written.
+/// Without the neighbors, a changed row's old glyph could leave a stray pixel
+/// in an unchanged row beside it, as the scroll rail did above the composer
+/// corner when it auto-hid.
 pub(super) fn write_frame_rows(
     output: &mut impl Write,
     frame: &[String],
     previous: &[String],
     force: bool,
-) -> io::Result<()> {
+) -> io::Result<bool> {
+    let changed = frame
+        .iter()
+        .enumerate()
+        .map(|(index, line)| force || previous.get(index) != Some(line))
+        .collect::<Vec<_>>();
+    if !changed.contains(&true) {
+        return Ok(false);
+    }
+    let dirty = |index: usize| {
+        changed[index]
+            || index.checked_sub(1).is_some_and(|above| changed[above])
+            || changed.get(index + 1).copied().unwrap_or(false)
+    };
     // Every row is explicitly positioned. A terminal may measure Unicode
     // differently from us; never let an overlong row wrap into an unchanged
     // row below it, where incremental drawing would leave the damage behind.
     output.write_all(b"\x1b[?7l")?;
     let result = frame.iter().enumerate().try_for_each(|(index, line)| {
-        if force || previous.get(index) != Some(line) {
+        if dirty(index) {
             write!(output, "\x1b[{};1H\x1b[2K{line}", index + 1)?;
         }
         Ok(())
     });
     // Attempt restoration even if a row write failed.
     let restore = output.write_all(b"\x1b[?7h");
-    result.and(restore)
+    result.and(restore).map(|()| true)
 }
 
 pub(super) fn cursor_control(cursor: (usize, usize), selecting: bool) -> String {
@@ -611,9 +669,9 @@ pub(super) fn selected_text(selection: &TextSelection) -> String {
         .iter()
         .enumerate()
         .map(|(offset, line)| {
-            let plain = markdown::strip_ansi(line);
-            let line_length = plain.chars().count();
             let row = start.row + offset;
+            let plain = markdown::strip_ansi(line);
+            let line_length = selection.selectable_cells(row, plain.chars().count());
             let from = if row == start.row { start.column } else { 0 };
             let through = if row == end.row {
                 end.column.saturating_add(1)
@@ -651,7 +709,7 @@ pub(super) fn highlighted_selection(selection: &TextSelection) -> Vec<String> {
         .take(end.row + 1)
         .skip(start.row)
     {
-        let width = markdown::visible_width(line);
+        let width = selection.selectable_cells(row, markdown::visible_width(line));
         let from = if row == start.row { start.column } else { 0 };
         let through = if row == end.row {
             end.column.saturating_add(1)

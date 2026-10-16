@@ -3,8 +3,8 @@
 use super::events::{MouseEvent, MouseKind};
 use super::state::{
     SCROLL_BAR_AUTO_HIDE_TICKS, ScrollGeometry, Update, ViewState, advance_ticks,
-    handle_scroll_bar_mouse, handle_tool_click, scroll, scroll_bar_span, toggle_tool_entry,
-    toggle_tool_expansion,
+    handle_scroll_bar_mouse, handle_tool_click, hover_scroll_bar, scroll, scroll_bar_span,
+    toggle_tool_entry, toggle_tool_expansion,
 };
 use super::transcript::{Entry, Transcript, TranscriptEvent};
 use crate::provider::{Message, ReasoningKind, ToolCall};
@@ -34,6 +34,21 @@ fn state_with(geometry: Option<ScrollGeometry>) -> ViewState {
         scroll_geometry: geometry,
         ..ViewState::test_default()
     }
+}
+
+#[test]
+fn pointer_hovers_the_scroll_bar_anywhere_on_its_rail() {
+    let mut state = state_with(Some(geometry()));
+    hover_scroll_bar(&mut state, mouse(MouseKind::Move, 39, 0));
+    assert!(state.scroll_bar_hovered, "the track scrolls on click too");
+    hover_scroll_bar(&mut state, mouse(MouseKind::Move, 38, 0));
+    assert!(!state.scroll_bar_hovered);
+    hover_scroll_bar(&mut state, mouse(MouseKind::Move, 39, 8));
+    assert!(!state.scroll_bar_hovered, "the composer is below the rail");
+
+    let mut hidden = state_with(None);
+    hover_scroll_bar(&mut hidden, mouse(MouseKind::Move, 39, 0));
+    assert!(!hidden.scroll_bar_hovered);
 }
 
 #[test]
@@ -136,6 +151,25 @@ fn scrolling_resets_the_auto_hide_timer_and_reveals_the_bar() {
     assert_eq!(state.scroll_bar_idle_ticks, 0);
 
     for _ in 0..SCROLL_BAR_AUTO_HIDE_TICKS - 1 {
+        advance_ticks(&mut state);
+    }
+    assert!(state.show_scroll_bar);
+    advance_ticks(&mut state);
+    assert!(!state.show_scroll_bar);
+}
+
+#[test]
+fn hovering_the_rail_keeps_an_auto_hiding_bar_visible() {
+    let mut state = auto_hidden_state(Some(geometry()));
+    hover_scroll_bar(&mut state, mouse(MouseKind::Move, 39, 2));
+    for _ in 0..SCROLL_BAR_AUTO_HIDE_TICKS * 2 {
+        advance_ticks(&mut state);
+    }
+    assert!(state.show_scroll_bar);
+
+    // Leaving the rail starts a fresh idle window.
+    hover_scroll_bar(&mut state, mouse(MouseKind::Move, 10, 2));
+    for _ in 1..SCROLL_BAR_AUTO_HIDE_TICKS {
         advance_ticks(&mut state);
     }
     assert!(state.show_scroll_bar);

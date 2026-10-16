@@ -26,7 +26,7 @@ pub(super) use entries::{entry_default_expanded, render_user_panel};
 #[cfg(test)]
 pub(super) use entries::{render_entries, render_expanded, render_queued_panel};
 pub(super) use reasoning::{render_reasoning, render_thinking_tag};
-use scroll::{apply_scroll_bar, render_jump_button};
+use scroll::{append_scroll_rail, render_jump_button};
 use transcript::subagent_labels;
 #[cfg(test)]
 pub(super) use transcript::{MODEL_STREAM_STALL, render_loading_state};
@@ -90,6 +90,9 @@ pub(super) struct RenderedFrame {
     pub(super) lines: Vec<String>,
     pub(super) cursor: (usize, usize),
     pub(super) images: Vec<FrameImage>,
+    /// Leading rows whose last cell is the scroll rail, which text
+    /// selection leaves out.
+    pub(super) rail_rows: usize,
 }
 
 /// Foreground escape for an interface color, darkened on light
@@ -149,18 +152,21 @@ pub(super) fn render_copy_toast(frame: &mut [String], columns: usize, accent: Ui
     }
 }
 
-fn frame_without_jump_button(
+fn frame_without_transcript_controls(
     state: &mut ViewState,
     lines: Vec<String>,
     cursor: (usize, usize),
 ) -> RenderedFrame {
     state.follow.button = None;
     state.follow.pointer = None;
+    state.scroll_geometry = None;
+    state.scroll_bar_hovered = false;
     state.transcript_row_entries.clear();
     RenderedFrame {
         lines,
         cursor,
         images: Vec::new(),
+        rail_rows: 0,
     }
 }
 
@@ -181,26 +187,26 @@ pub(super) fn build_frame_with_images(
     rows: usize,
     image_support: ImageSupport,
 ) -> RenderedFrame {
-    // Only the transcript view draws the jump button; every other view must
-    // not leave a stale hit area or pointer cell behind. Motion tracking is
-    // off on those screens, so a saved cell would highlight the wrong place
-    // when the transcript returns.
+    // Only the transcript view draws the jump button and the scroll rail;
+    // every other view must not leave a stale hit area or pointer cell
+    // behind. Motion tracking is off on those screens, so a saved cell would
+    // highlight the wrong place when the transcript returns.
     state.follow.button = None;
     if state.git_init.is_some() {
         let (lines, cursor) = super::git::render_init(state, editor, columns, rows);
-        return frame_without_jump_button(state, lines, cursor);
+        return frame_without_transcript_controls(state, lines, cursor);
     }
     if state.process_view.is_some() {
         let (lines, cursor) = super::processes::render(state, columns, rows);
-        return frame_without_jump_button(state, lines, cursor);
+        return frame_without_transcript_controls(state, lines, cursor);
     }
     if state.git_view.is_some() {
         let (lines, cursor) = super::git::render(state, editor, columns, rows);
-        return frame_without_jump_button(state, lines, cursor);
+        return frame_without_transcript_controls(state, lines, cursor);
     }
     if state.subagent_view.is_some() {
         let (lines, cursor) = super::subagents::render(state, editor, columns, rows);
-        return frame_without_jump_button(state, lines, cursor);
+        return frame_without_transcript_controls(state, lines, cursor);
     }
     let columns = columns.max(20);
     let rows = rows.max(8);
@@ -209,13 +215,14 @@ pub(super) fn build_frame_with_images(
         // A viewer that closed itself falls through to a transcript frame and
         // owns the jump button that frame just recorded.
         if state.transcript.viewer_open() {
-            return frame_without_jump_button(state, lines, cursor);
+            return frame_without_transcript_controls(state, lines, cursor);
         }
         state.transcript_row_entries.clear();
         return RenderedFrame {
             lines,
             cursor,
             images: Vec::new(),
+            rail_rows: 0,
         };
     }
     let inner_width = columns.saturating_sub(2);
@@ -342,8 +349,12 @@ pub(super) fn build_frame_with_images(
     let transcript_height = rows.saturating_sub(
         input_height + menu_height + search_height + activity_height + status_height,
     );
-    let transcript = render_transcript_window(state, columns, transcript_height, image_support);
-    let transcript_width = columns;
+    // The scroll bar owns the last column whenever it is enabled, even while
+    // hidden, so text never reflows under it or as it appears.
+    let rail = usize::from(state.scroll_bar_enabled);
+    let transcript_width = columns - rail;
+    let transcript =
+        render_transcript_window(state, transcript_width, transcript_height, image_support);
     let visible = &transcript.lines;
 
     let mut region = Vec::with_capacity(transcript_height);
@@ -374,7 +385,7 @@ pub(super) fn build_frame_with_images(
         region.extend(render_welcome(
             state.accent_color,
             &state.welcome,
-            transcript_width,
+            columns,
             transcript_height,
             state.spinner_tick,
         ));
@@ -407,20 +418,27 @@ pub(super) fn build_frame_with_images(
         }));
     }
     if showing_transcript && state.scroll_offset > 0 {
-        render_jump_button(&mut region, state, columns);
+        render_jump_button(&mut region, state, transcript_width);
     } else {
         // The pill is the only transcript control that needs motion reports.
         // Drop the cell while it is hidden so the next appearance starts
         // unhovered until the pointer moves again.
         state.follow.pointer = None;
     }
-    apply_scroll_bar(
-        &mut region,
-        state,
-        transcript.total_lines,
-        transcript.max_scroll,
-        columns,
-    );
+    let rail_rows = if showing_transcript && rail > 0 {
+        append_scroll_rail(
+            &mut region,
+            state,
+            transcript.total_lines,
+            transcript.max_scroll,
+            columns,
+        );
+        region.len()
+    } else {
+        state.scroll_geometry = None;
+        state.scroll_bar_hovered = false;
+        0
+    };
     let mut frame = region;
     if let Some(query) = state.transcript.search_query() {
         let position = state.transcript.search_position().map_or_else(
@@ -509,6 +527,7 @@ pub(super) fn build_frame_with_images(
         lines: frame,
         cursor: (cursor_row, cursor_col),
         images,
+        rail_rows,
     }
 }
 
