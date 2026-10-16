@@ -50,7 +50,7 @@ fn build_messages(messages: &[super::Message], supports_images: bool) -> Vec<Val
                 if supports_images {
                     content.extend(m.images.iter().map(image_block));
                 }
-                content.push(json!({"type": "text", "text": m.content}));
+                content.push(json!({"type": "text", "text": m.request_text()}));
                 out.push(json!({"role": "user", "content": content}));
             }
             Role::Assistant => {

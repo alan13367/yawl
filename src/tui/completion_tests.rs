@@ -139,6 +139,22 @@ fn enter_inserts_a_mention_tag_without_submitting() {
 }
 
 #[test]
+fn mention_of_a_duplicated_file_name_uses_the_relative_path() {
+    let mut state = mention_state(&["web/index.html", "docs/index.html", "src/main.rs"]);
+    let mut editor = Editor::default();
+    editor.paste("compare @index");
+
+    assert!(handle_completion_key(&mut state, &mut editor, Key::Enter));
+    editor.paste("with @main");
+    assert!(handle_completion_key(&mut state, &mut editor, Key::Enter));
+    assert_eq!(editor.text(), "compare @web/index.html with @main.rs ");
+    assert_eq!(
+        editor.expand_submission(&editor.text()),
+        "compare @web/index.html with @src/main.rs "
+    );
+}
+
+#[test]
 fn mention_menu_navigates_and_tab_completes() {
     let mut state = mention_state(&["a.rs", "b.rs"]);
     let mut editor = Editor::default();

@@ -391,12 +391,15 @@ impl Conversation {
             if let Some(done) = self.begin_step(&mut progress, sink)? {
                 return Ok(done);
             }
+            // Steers wait for the next request, so tool calls the model
+            // already made run first instead of wasting their output.
+            self.inject_pending_steers(sink)?;
             let step = self.prepare_step(progress.mode, sink, resolve_provider)?;
             let Some(out) = self.request_step(&step, sink, resolve_provider)? else {
                 return Ok(false);
             };
             let (assistant, calls) = self.record_step(out, &step, &mut progress, sink)?;
-            let kind = step::classify(progress.mode, &calls, self.steers.has_pending());
+            let kind = step::classify(progress.mode, &calls);
             match self.handle_step(kind, assistant, &calls, &step, &mut progress, sink)? {
                 Flow::Continue => {}
                 Flow::Finish(done) => return Ok(done),
@@ -729,7 +732,6 @@ impl Conversation {
         goal_complete_error: Option<&str>,
     ) -> Result<bool, Error> {
         let mut aborted = false;
-        let mut skip_remaining = false;
         for (index, call) in calls.iter().enumerate() {
             let result = if aborted {
                 Message::tool_result(
@@ -738,9 +740,6 @@ impl Conversation {
                     "[interrupted by user]".to_string(),
                     true,
                 )
-            } else if skip_remaining {
-                Message::tool_result(&call.id, &call.name, goal::STEER_SKIPPED.to_string(), true)
-                    .with_control(MessageControl::ToolSkipped)
             } else if goal_complete_error.is_some() && goal::is_goal_complete(call) {
                 Message::tool_result(
                     &call.id,
@@ -783,8 +782,6 @@ impl Conversation {
                 });
                 if interrupted() {
                     aborted = true;
-                } else if self.steers.has_pending() {
-                    skip_remaining = true;
                 }
                 Message::tool_result_with_images(
                     &call.id,

@@ -36,10 +36,6 @@ impl SteerInbox {
             .take()
     }
 
-    pub(crate) fn has_pending(&self) -> bool {
-        !self.lock().is_empty()
-    }
-
     pub(crate) fn drain(&self) -> Vec<TurnInput> {
         self.lock().drain(..).collect()
     }

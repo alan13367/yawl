@@ -2,6 +2,7 @@
 //! chrome-free fenced-code highlighting (code renders as background-shaded
 //! highlighted lines so terminal drag-select copies clean commands).
 
+use super::input::highlighted_token_end;
 use super::{highlight, theme};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -18,6 +19,16 @@ const MAX_INDENT: usize = 12;
 const MAX_AUTOLINK_CHARS: usize = 2048;
 
 pub fn render(markdown: &str, width: usize) -> Vec<String> {
+    render_with(markdown, width, None)
+}
+
+/// Renders a user prompt: Markdown plus `@` file mentions and `/skill:`
+/// invocations in `token_style`, matching the composer.
+pub(super) fn render_prompt(markdown: &str, width: usize, token_style: &str) -> Vec<String> {
+    render_with(markdown, width, Some(token_style))
+}
+
+fn render_with(markdown: &str, width: usize, tokens: Option<&str>) -> Vec<String> {
     let palette = theme::palette();
     let (marker_style, muted) = (palette.marker, palette.muted);
     let width = width.max(8);
@@ -54,7 +65,7 @@ pub fn render(markdown: &str, width: usize) -> Vec<String> {
                 rows.push(parse_cells(source[index]));
                 index += 1;
             }
-            render_table(&rows, width, &mut output);
+            render_table(&rows, width, tokens, &mut output);
             list_content = None;
             continue;
         }
@@ -68,7 +79,10 @@ pub fn render(markdown: &str, width: usize) -> Vec<String> {
                 2 => palette.heading_minor,
                 _ => HEADING,
             };
-            let styled = format!("{style}{}{RESET}", render_inline_styled(content, style));
+            let styled = format!(
+                "{style}{}{RESET}",
+                render_inline_styled(content, style, tokens)
+            );
             push_wrapped("", "", &styled, width, &mut output);
             list_content = None;
         } else if is_rule(trimmed) {
@@ -77,7 +91,10 @@ pub fn render(markdown: &str, width: usize) -> Vec<String> {
         } else if let Some((depth, content)) = blockquote(trimmed) {
             let bars = format!("{marker_style}{}{RESET}", "│ ".repeat(depth));
             let blank = " ".repeat(depth * 2);
-            let styled = format!("{muted}{}{RESET}", render_inline_styled(content, muted));
+            let styled = format!(
+                "{muted}{}{RESET}",
+                render_inline_styled(content, muted, tokens)
+            );
             push_wrapped(&bars, &blank, &styled, width, &mut output);
         } else if let Some((marker, content)) = list_item(trimmed, indent) {
             let pad = " ".repeat(indent);
@@ -87,15 +104,21 @@ pub fn render(markdown: &str, width: usize) -> Vec<String> {
             push_wrapped(
                 &prefix,
                 &continuation,
-                &render_inline(content),
+                &render_inline(content, tokens),
                 width,
                 &mut output,
             );
         } else if let Some(column) = list_content.filter(|_| indent > 0) {
             let pad = " ".repeat(column);
-            push_wrapped(&pad, &pad, &render_inline(trimmed), width, &mut output);
+            push_wrapped(
+                &pad,
+                &pad,
+                &render_inline(trimmed, tokens),
+                width,
+                &mut output,
+            );
         } else {
-            push_wrapped("", "", &render_inline(trimmed), width, &mut output);
+            push_wrapped("", "", &render_inline(trimmed, tokens), width, &mut output);
             list_content = None;
         }
         index += 1;
@@ -259,17 +282,17 @@ fn render_code_line(language: &str, line: &str, width: usize, output: &mut Vec<S
     }
 }
 
-fn render_inline(text: &str) -> String {
-    render_inline_styled(text, "")
+fn render_inline(text: &str, tokens: Option<&str>) -> String {
+    render_inline_styled(text, "", tokens)
 }
 
 /// Renders inline markdown inside a block whose own style is `base`. Each
 /// span ends with a reset followed by `base`, so a bold word or code span in
 /// a heading or quote returns to the surrounding style instead of plain text.
-fn render_inline_styled(text: &str, base: &str) -> String {
+fn render_inline_styled(text: &str, base: &str, tokens: Option<&str>) -> String {
     let chars: Vec<char> = sanitize(text).chars().collect();
     let mut output = String::new();
-    render_spans(&chars, base, &mut output);
+    render_spans(&chars, base, tokens, &mut output);
     output
 }
 
@@ -284,7 +307,9 @@ const EMPHASIS: [(&str, &str); 7] = [
     ("_", ITALIC),
 ];
 
-fn render_spans(chars: &[char], base: &str, output: &mut String) {
+/// `tokens`, when set, styles `@` file mentions and `/skill:` invocations
+/// and prints them verbatim, so emphasis markers in a path stay literal.
+fn render_spans(chars: &[char], base: &str, tokens: Option<&str>, output: &mut String) {
     let code = code_spans(chars);
     let closers = EMPHASIS.map(|(marker, _)| emphasis_closers(chars, marker, &code));
     let mut labels = DelimiterSearch::default();
@@ -303,6 +328,17 @@ fn render_spans(chars: &[char], base: &str, output: &mut String) {
             index = span.end;
             continue;
         }
+        if let Some(style) = tokens
+            && let Some(end) = highlighted_token_end(chars, index)
+        {
+            let end = code.get(code_index).map_or(end, |span| end.min(span.start));
+            output.push_str(style);
+            output.extend(&chars[index..end]);
+            output.push_str(RESET);
+            output.push_str(base);
+            index = end;
+            continue;
+        }
         let character = chars[index];
         if character == '\\'
             && let Some(next) = chars.get(index + 1).filter(|c| c.is_ascii_punctuation())
@@ -319,7 +355,7 @@ fn render_spans(chars: &[char], base: &str, output: &mut String) {
             {
                 let underlined = format!("{base}{UNDERLINE}");
                 output.push_str(UNDERLINE);
-                render_spans(&chars[index + 1..close_label], &underlined, output);
+                render_spans(&chars[index + 1..close_label], &underlined, tokens, output);
                 output.push_str(RESET);
                 output.push_str(base);
                 output.push_str(" \x1b[2m(");
@@ -365,7 +401,7 @@ fn render_spans(chars: &[char], base: &str, output: &mut String) {
             };
             let nested = format!("{base}{style}");
             output.push_str(style);
-            render_spans(&chars[index + length..close], &nested, output);
+            render_spans(&chars[index + length..close], &nested, tokens, output);
             output.push_str(RESET);
             output.push_str(base);
             index = close + length;
@@ -576,14 +612,25 @@ fn is_row_separator(row: &[String]) -> bool {
         })
 }
 
-fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
+fn render_table(
+    rows: &[Vec<String>],
+    width: usize,
+    tokens: Option<&str>,
+    output: &mut Vec<String>,
+) {
     let muted = theme::palette().muted;
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     // Borders plus one space of padding on each side of every cell.
     let available = width.saturating_sub(columns + 1 + columns * 2);
     if columns == 0 || available < columns {
         for row in rows {
-            push_wrapped("", "", &render_inline(&row.join(" | ")), width, output);
+            push_wrapped(
+                "",
+                "",
+                &render_inline(&row.join(" | "), tokens),
+                width,
+                output,
+            );
         }
         return;
     }
@@ -593,7 +640,7 @@ fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
             continue;
         }
         for (column, cell) in row.iter().enumerate() {
-            widths[column] = widths[column].max(visible_width(&render_inline(cell)));
+            widths[column] = widths[column].max(visible_width(&render_inline(cell, tokens)));
         }
     }
     while widths.iter().sum::<usize>() > available {
@@ -621,9 +668,9 @@ fn render_table(rows: &[Vec<String>], width: usize, output: &mut Vec<String>) {
             .map(|(column, cell_width)| {
                 let cell = row.get(column).map_or("", String::as_str);
                 let rendered = if row_index == 0 {
-                    format!("{BOLD}{}{RESET}", render_inline_styled(cell, BOLD))
+                    format!("{BOLD}{}{RESET}", render_inline_styled(cell, BOLD, tokens))
                 } else {
-                    render_inline(cell)
+                    render_inline(cell, tokens)
                 };
                 wrap_ansi(&rendered, cell_width)
             })
@@ -1146,14 +1193,14 @@ mod tests {
             "[".repeat(40_000),
             format!("{}](unfinished", "[".repeat(20_000)),
         ] {
-            assert_eq!(render_inline(&text), text);
+            assert_eq!(render_inline(&text, None), text);
         }
         assert_eq!(
-            render_inline("[broken] then [ok](url)"),
+            render_inline("[broken] then [ok](url)", None),
             "[broken] then \x1b[4mok\x1b[0m \x1b[2m(url)\x1b[0m"
         );
         assert_eq!(
-            render_inline("[[label](url)"),
+            render_inline("[[label](url)", None),
             "\x1b[4m[label\x1b[0m \x1b[2m(url)\x1b[0m"
         );
     }
@@ -1477,15 +1524,27 @@ mod tests {
             "a ** b ** c",
             "foo__bar__baz",
         ] {
-            assert_eq!(render_inline(literal), literal, "{literal}");
+            assert_eq!(render_inline(literal, None), literal, "{literal}");
         }
-        assert_eq!(render_inline("*soft*"), format!("{ITALIC}soft{RESET}"));
-        assert_eq!(render_inline("_soft_"), format!("{ITALIC}soft{RESET}"));
-        assert_eq!(render_inline("***both***"), format!("\x1b[1;3mboth{RESET}"));
-        assert_eq!(render_inline("~~gone~~"), format!("{STRIKE}gone{RESET}"));
-        assert_eq!(render_inline(r"\*literal\*"), "*literal*");
         assert_eq!(
-            render_inline("**bold `code` end**"),
+            render_inline("*soft*", None),
+            format!("{ITALIC}soft{RESET}")
+        );
+        assert_eq!(
+            render_inline("_soft_", None),
+            format!("{ITALIC}soft{RESET}")
+        );
+        assert_eq!(
+            render_inline("***both***", None),
+            format!("\x1b[1;3mboth{RESET}")
+        );
+        assert_eq!(
+            render_inline("~~gone~~", None),
+            format!("{STRIKE}gone{RESET}")
+        );
+        assert_eq!(render_inline(r"\*literal\*", None), "*literal*");
+        assert_eq!(
+            render_inline("**bold `code` end**", None),
             format!(
                 "{BOLD}bold {}code{RESET}{BOLD} end{RESET}",
                 palette().inline_code
@@ -1496,17 +1555,17 @@ mod tests {
     #[test]
     fn code_spans_pair_matching_runs_and_shield_their_contents() {
         assert_eq!(
-            render_inline("``a ` b``"),
+            render_inline("``a ` b``", None),
             format!("{}a ` b{RESET}", palette().inline_code)
         );
         assert_eq!(
-            render_inline("*see `a*b` here*"),
+            render_inline("*see `a*b` here*", None),
             format!(
                 "{ITALIC}see {}a*b{RESET}{ITALIC} here{RESET}",
                 palette().inline_code
             )
         );
-        assert_eq!(render_inline("unpaired ` tick"), "unpaired ` tick");
+        assert_eq!(render_inline("unpaired ` tick", None), "unpaired ` tick");
     }
 
     #[test]
@@ -1579,6 +1638,42 @@ mod tests {
             }
         }
         assert_eq!(strip_ansi(&lines[1]).trim(), "Target");
+    }
+
+    #[test]
+    fn prompt_mentions_and_skills_are_colored_verbatim() {
+        let style = "\x1b[38;2;1;2;3m";
+        let lines = render_prompt(
+            "/skill:design fix @src/my_file_name.rs and **@a.rs** not me@b.c `@code`",
+            80,
+            style,
+        );
+        assert_eq!(
+            lines,
+            [format!(
+                "{style}/skill:design{RESET} fix {style}@src/my_file_name.rs{RESET} and \
+                 {BOLD}{style}@a.rs{RESET}{BOLD}{RESET} not me@b.c {}@code{RESET}",
+                palette().inline_code
+            )]
+        );
+        assert_eq!(
+            render("see @src/my_file_name.rs", 80),
+            ["see @src/my_file_name.rs"]
+        );
+    }
+
+    #[test]
+    fn panel_mentions_keep_the_panel_background() {
+        let lines = super::super::render::render_user_panel("open @index.html now", 40);
+        assert!(lines[1].contains(palette().mention), "{:?}", lines[1]);
+        for (index, _) in lines[1].match_indices(RESET) {
+            let after = &lines[1][index + RESET.len()..];
+            assert!(
+                after.is_empty() || after.starts_with(palette().user_background),
+                "{:?}",
+                lines[1]
+            );
+        }
     }
 
     #[test]

@@ -54,6 +54,8 @@ pub(crate) enum ConfigChange {
         name: String,
         model: String,
         reasoning_efforts: Vec<String>,
+        /// The served context limit to record. `None` keeps any saved value.
+        context_window: Option<u64>,
     },
     RemoveProviderModel {
         name: String,
@@ -192,8 +194,14 @@ impl ConfigChange {
                 name,
                 model,
                 reasoning_efforts,
+                context_window,
             } => {
                 validate_provider_name(name)?;
+                if *context_window == Some(0) {
+                    return Err(Error::Config(
+                        "provider model context window must be a positive integer".into(),
+                    ));
+                }
                 if reasoning_efforts
                     .iter()
                     .any(|effort| !super::REASONING_EFFORTS.contains(&effort.as_str()))
@@ -351,6 +359,7 @@ impl ConfigChange {
                 name,
                 model,
                 reasoning_efforts,
+                context_window,
             } => {
                 let provider = provider_object(root, name)?;
                 let models = provider
@@ -370,8 +379,16 @@ impl ConfigChange {
                     })?;
                     entry.remove("reasoningEfforts");
                     entry.insert("reasoning_efforts".into(), json!(reasoning_efforts));
+                    if let Some(window) = context_window {
+                        entry.remove("contextWindow");
+                        entry.insert("context_window".into(), json!(window));
+                    }
                 } else {
-                    models.push(json!({"id": model, "reasoning_efforts": reasoning_efforts}));
+                    let mut entry = json!({"id": model, "reasoning_efforts": reasoning_efforts});
+                    if let Some(window) = context_window {
+                        entry["context_window"] = json!(window);
+                    }
+                    models.push(entry);
                 }
                 Ok(())
             }
@@ -455,9 +472,12 @@ impl ConfigChange {
                 name,
                 model,
                 reasoning_efforts,
+                context_window,
             } => config.providers.get(name).is_some_and(|provider| {
                 provider.models.iter().any(|entry| {
-                    entry.id == *model && entry.reasoning_efforts == *reasoning_efforts
+                    entry.id == *model
+                        && entry.reasoning_efforts == *reasoning_efforts
+                        && (context_window.is_none() || entry.context_window == *context_window)
                 })
             }),
             Self::RemoveProviderModel { name, model } => !config
@@ -667,6 +687,7 @@ mod tests {
             name: "local".into(),
             model: "m".into(),
             reasoning_efforts: vec!["high".into(), "ultra".into()],
+            context_window: None,
         };
         let outcome = config.change_global(change.clone()).unwrap();
         assert_eq!(outcome.effect, ConfigChangeEffect::Applied);
@@ -709,10 +730,61 @@ mod tests {
                 .change_global(ConfigChange::ProviderModel {
                     name: "local".into(),
                     model: "m".into(),
-                    reasoning_efforts: vec!["typo".into()]
+                    reasoning_efforts: vec!["typo".into()],
+                    context_window: None,
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn provider_model_records_a_discovered_context_window() {
+        let dirs = TestDirs::new("model-context-window");
+        fs::create_dir_all(&dirs.home).unwrap();
+        fs::write(
+            dirs.home.join("config.json"),
+            json!({
+                "providers": {"local": {"base_url": "http://localhost/v1", "models": [
+                    {"id": "old", "contextWindow": 131072},
+                    {"id": "kept", "contextWindow": 32768}
+                ]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let config = dirs.config();
+        let change = |model: &str, context_window| ConfigChange::ProviderModel {
+            name: "local".into(),
+            model: model.into(),
+            reasoning_efforts: Vec::new(),
+            context_window,
+        };
+        let outcome = config
+            .change_global_batch(vec![
+                change("old", Some(65_536)),
+                change("kept", None),
+                change("new", Some(262_144)),
+            ])
+            .unwrap();
+        assert!(
+            outcome
+                .effects
+                .iter()
+                .all(|effect| *effect == ConfigChangeEffect::Applied)
+        );
+        let window = |model: &str| crate::model::context_window(&outcome.config, model);
+        assert_eq!(window("local:old"), 65_536);
+        assert_eq!(window("local:kept"), 32_768);
+        assert_eq!(window("local:new"), 262_144);
+
+        let saved: Value =
+            serde_json::from_str(&fs::read_to_string(dirs.home.join("config.json")).unwrap())
+                .unwrap();
+        let models = &saved["providers"]["local"]["models"];
+        assert!(models[0].get("contextWindow").is_none());
+        assert_eq!(models[0]["context_window"], 65_536);
+        assert_eq!(models[1]["contextWindow"], 32_768);
+        assert!(config.change_global(change("zero", Some(0))).is_err());
     }
 
     #[test]

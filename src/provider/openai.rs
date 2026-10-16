@@ -81,11 +81,11 @@ fn build_messages(
         match m.role {
             Role::User => {
                 if supports_images && !m.images.is_empty() {
-                    let mut content = vec![json!({"type": "text", "text": m.content})];
+                    let mut content = vec![json!({"type": "text", "text": m.request_text()})];
                     content.extend(m.images.iter().map(openai_image_block));
                     out.push(json!({"role": "user", "content": content}));
                 } else {
-                    out.push(json!({"role": "user", "content": m.content}));
+                    out.push(json!({"role": "user", "content": m.request_text()}));
                 }
             }
             Role::Assistant => {

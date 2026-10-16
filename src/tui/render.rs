@@ -46,7 +46,7 @@ use crate::provider::ImageContent;
 use super::completion::{
     COMPLETION_MENU_ROWS, completion_window, menu_rows, sync_completion_filter,
 };
-use super::input::Editor;
+use super::input::{Editor, LayoutStyles};
 use super::picker::{picker_is_plan_handoff, render_picker};
 use super::{ViewState, markdown, theme};
 
@@ -220,9 +220,13 @@ pub(super) fn build_frame_with_images(
     }
     let inner_width = columns.saturating_sub(2);
     let plan_handoff = state.picker.as_ref().is_some_and(picker_is_plan_handoff);
+    let image_style = foreground_color(reasoning::thinking_color(state.accent_color));
     let layout = editor.styled_layout(
         inner_width,
-        &foreground_color(reasoning::thinking_color(state.accent_color)),
+        LayoutStyles {
+            image: &image_style,
+            token: theme::palette().mention,
+        },
     );
     let background_count = state.background_processes.active_count();
     state.background_active_count = background_count;

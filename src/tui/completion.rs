@@ -181,7 +181,9 @@ fn handle_mention_key(state: &mut ViewState, editor: &mut Editor, query: &str, k
     }
     match key {
         Key::Tab | Key::Enter => {
-            editor.complete_mention(&matches[state.completion_index]);
+            let path = matches[state.completion_index].clone();
+            let shares_name = state.file_index.shares_name(&path);
+            editor.complete_mention(&path, shares_name);
             state.completion_index = 0;
             sync_completion_filter(state, editor);
             true

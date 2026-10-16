@@ -67,9 +67,11 @@ Scrolling up while a response streams keeps the view where it is, and new output
 
 With the transcript focused, arrows select blocks, `h`/`l` fold or unfold, `Enter` opens a viewer, and `y` copies. Click tool cards or thinking tags to expand them. Reasoning is collapsed by default; `hide_reasoning` removes it entirely.
 
+Picking a file from the `@` menu inserts a tag showing its file name, or its relative path when another project file has the same name. The model receives the path relative to the working directory. File tags and `/skill:` invocations are highlighted in the composer and in sent prompts.
+
 Long pastes appear as compact markers but reach the model in full. Each prompt accepts up to five clipboard images in PNG, JPEG, GIF, or WebP format, up to 5 MB each. Linux clipboard images require `wl-paste` or `xclip`.
 
-Canceling a response pauses queued messages and pending steering. Use `/unqueue` to edit the queue and `Enter` to resume. When a request fails, press `Enter` on an empty prompt to continue the turn from its saved history; `/continue` does the same after a failure or a cancel, keeping goal and plan modes. Model questions appear in the composer; outside planning, their countdown accepts recommended answers unless you press a key or scroll. Planning and plan-revision questions have no countdown and wait for your answer. Disable completion and question bells with `/settings bell off`.
+A steer reaches the model with its next request, marked as an adjustment to the request in progress so the final reply still covers the whole request. Tool calls the model has already written, such as a large file, still run first, so cancel instead when they must not run. A steer that arrives as the turn finishes is sent as the next message. Canceling a response pauses queued messages and pending steering. Use `/unqueue` to edit the queue and `Enter` to resume. When a request fails, press `Enter` on an empty prompt to continue the turn from its saved history; `/continue` does the same after a failure or a cancel, keeping goal and plan modes. Model questions appear in the composer; outside planning, their countdown accepts recommended answers unless you press a key or scroll. Planning and plan-revision questions have no countdown and wait for your answer. Disable completion and question bells with `/settings bell off`.
 
 ### Slash commands
 
@@ -171,7 +173,7 @@ Use `/connect` for guided setup or add an OpenAI-compatible endpoint under `prov
 }
 ```
 
-`apiKey` accepts `$ENV_VAR` and `${ENV_VAR}` references; omit it for keyless servers. The optional `models` array supplies model capabilities and picker entries. Unlisted model IDs work but remain text-only. In `/model`, `d` or `Delete` removes a configured entry after confirmation.
+`apiKey` accepts `$ENV_VAR` and `${ENV_VAR}` references; omit it for keyless servers. The optional `models` array supplies model capabilities and picker entries. When the models endpoint reports a served context length (`max_model_len`, as oMLX and vLLM do), `/connect` saves it as the model's `context_window`. Unlisted model IDs work but remain text-only. In `/model`, `d` or `Delete` removes a configured entry after confirmation.
 
 Declare the reasoning levels your endpoint accepts in `reasoning_efforts`, or select them during setup. An empty list disables explicit reasoning for that model. Model selection offers supported levels and a provider-default option, including when you save a new connection for the current session.
 

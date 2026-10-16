@@ -38,6 +38,17 @@ impl FileIndex {
         &self.cached_matches
     }
 
+    /// Whether another indexed file has the same file name as `path`, so a
+    /// bare-name tag would be ambiguous.
+    pub(super) fn shares_name(&self, path: &str) -> bool {
+        let name = file_name(path);
+        self.entries.as_ref().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry != path && file_name(entry) == name)
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn with_entries(entries: Vec<String>) -> Self {
         Self {
@@ -45,6 +56,10 @@ impl FileIndex {
             ..Self::default()
         }
     }
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 pub(super) fn scan(root: &Path) -> Vec<String> {
@@ -128,7 +143,7 @@ fn walk(root: &Path) -> Vec<String> {
 /// Match quality, ordered best-first. File-name hits outrank path hits so
 /// typing a name surfaces the file before every directory that contains it.
 fn score(path: &str, query: &str) -> Option<u8> {
-    let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    let name = file_name(path).to_lowercase();
     if name.starts_with(query) {
         return Some(0);
     }

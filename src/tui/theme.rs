@@ -34,6 +34,9 @@ pub(super) struct Palette {
     pub(super) tool_removed: &'static str,
     pub(super) tool_error: &'static str,
     pub(super) inline_code: &'static str,
+    /// `@` file mentions and `/skill:` invocations in the composer and in
+    /// user prompts.
+    pub(super) mention: &'static str,
     /// Warm gray behind fenced code, distinct from the user panel and the
     /// tool cards. Background escapes never survive `strip_ansi`, so
     /// drag-select copies stay clean.
@@ -81,6 +84,7 @@ const DARK: Palette = Palette {
     tool_removed: "\x1b[38;5;203m",
     tool_error: "\x1b[38;5;210m",
     inline_code: "\x1b[38;2;155;188;198m",
+    mention: "\x1b[38;2;170;160;255m",
     code_background: "\x1b[48;2;36;34;30m",
     heading_major: "\x1b[1;38;2;137;180;250m",
     heading_minor: "\x1b[1;38;2;180;205;250m",
@@ -118,6 +122,7 @@ const LIGHT: Palette = Palette {
     tool_removed: "\x1b[38;2;184;36;36m",
     tool_error: "\x1b[38;2;168;32;32m",
     inline_code: "\x1b[38;2;16;104;128m",
+    mention: "\x1b[38;2;92;60;196m",
     code_background: "\x1b[48;2;243;240;233m",
     heading_major: "\x1b[1;38;2;28;84;188m",
     heading_minor: "\x1b[1;38;2;52;100;170m",
@@ -330,6 +335,8 @@ mod tests {
         let text = |escape| rgb(escape, "38");
         let pairs = [
             (LIGHT.user_text, background(LIGHT.user_background), 4.5),
+            (LIGHT.mention, background(LIGHT.user_background), 4.5),
+            (LIGHT.mention, white, 4.5),
             (LIGHT.inline_code, white, 4.5),
             (LIGHT.heading_major, white, 4.5),
             (LIGHT.heading_minor, white, 4.5),

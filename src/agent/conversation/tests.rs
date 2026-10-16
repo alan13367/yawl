@@ -1512,57 +1512,102 @@ fn plan_implementation_receives_deferred_subagent_results() {
 }
 
 #[test]
-fn steering_skips_pending_tools_and_injects_the_steer_message() {
+fn steering_mid_response_runs_its_tool_calls_before_the_steer() {
     let mut test = TestAgent::new("steer-tools");
-    test.agent.steer_inbox().push(crate::provider::TurnInput {
-        text: "stop and summarize".into(),
-        images: Vec::new(),
-    });
+    let output_path = test.root.join("cwd/large.txt");
     let steps = Rc::new(RefCell::new(VecDeque::from([
         step(
-            "working",
-            vec![call(
-                "shell-1",
-                "shell",
-                r#"{"command":"printf tool-output"}"#,
-            )],
+            "writing",
+            vec![
+                call(
+                    "write-1",
+                    "write_file",
+                    &serde_json::json!({ "path": output_path, "content": "large file" })
+                        .to_string(),
+                ),
+                call("shell-1", "shell", r#"{"command":"printf tool-output"}"#),
+            ],
         ),
-        step("summary", Vec::new()),
+        step("adjusted", Vec::new()),
     ])));
     let requests = Rc::new(RefCell::new(Vec::new()));
     let mut resolve = scripted_resolve(Rc::clone(&steps), Rc::clone(&requests));
+    let steers = test.agent.steer_inbox();
     let mut steer_accepted = false;
 
     let completed = test
         .agent
         .run_with(
             prompt("start"),
-            &mut |event| {
-                if matches!(event, TurnEvent::SteerAccepted { .. }) {
-                    steer_accepted = true;
-                }
+            &mut |event| match event {
+                TurnEvent::TextDelta("writing") => steers.push(crate::provider::TurnInput {
+                    text: "use tabs instead".into(),
+                    images: Vec::new(),
+                }),
+                TurnEvent::SteerAccepted { .. } => steer_accepted = true,
+                _ => {}
             },
             &mut resolve,
         )
         .expect("steered turn should complete");
 
     assert!(completed);
-    assert!(
-        test.agent.messages().iter().any(|message| {
-            message.role == Role::Tool
-                && message.content == "[skipped because the user steered]"
-                && message.is_error
-        }),
-        "pending tools should be skipped once steering is accepted"
+    assert_eq!(
+        std::fs::read_to_string(&output_path).expect("the streamed write should run"),
+        "large file"
     );
-    assert!(
-        test.agent
-            .messages()
-            .iter()
-            .any(|message| message.is_steering() && message.content == "stop and summarize"),
-        "accepted steer should be recorded as a steering user message"
-    );
+    let messages = test.agent.messages();
+    assert!(!messages.iter().any(Message::is_skipped_tool));
+    let shell = messages
+        .iter()
+        .position(|message| message.role == Role::Tool && message.content.contains("tool-output"))
+        .expect("the second call should run although the steer was pending");
+    let steer = messages
+        .iter()
+        .position(|message| message.is_steering() && message.content == "use tabs instead")
+        .expect("accepted steer should be recorded as a steering user message");
+    assert!(steer > shell, "the steer follows the tool results");
+    assert_eq!(requests.borrow().len(), 2);
+    assert_eq!(requests.borrow()[1].last(), Some(&Role::User));
     assert!(steer_accepted, "steer acceptance should surface to the UI");
+}
+
+#[test]
+fn steering_while_the_goal_completes_hands_the_steer_back_for_the_next_turn() {
+    let mut test = TestAgent::new("steer-goal-complete");
+    test.agent
+        .start_goal("ship the feature".to_string().into())
+        .expect("start goal");
+    let steps = Rc::new(RefCell::new(VecDeque::from([step(
+        "done",
+        vec![call(
+            "goal-1",
+            crate::tools::GOAL_COMPLETE_TOOL_NAME,
+            r#"{"result":"shipped"}"#,
+        )],
+    )])));
+    let mut resolve = scripted_resolve(steps, Rc::new(RefCell::new(Vec::new())));
+    let steers = test.agent.steer_inbox();
+
+    let completed = test
+        .agent
+        .run_with(
+            TurnRequest::Goal,
+            &mut |event| {
+                if matches!(event, TurnEvent::TextDelta(_)) {
+                    steers.push("also update the docs".to_string().into());
+                }
+            },
+            &mut resolve,
+        )
+        .expect("goal turn should complete");
+
+    assert!(completed);
+    assert_eq!(test.agent.active_goal(), None);
+    assert_eq!(test.agent.latest_turn_result(), "shipped");
+    let leftover = test.agent.take_unaccepted_steers();
+    assert_eq!(leftover.len(), 1);
+    assert_eq!(leftover[0].text, "also update the docs");
 }
 
 fn reopen_test_agent(test: &mut TestAgent) {

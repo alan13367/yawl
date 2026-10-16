@@ -21,9 +21,6 @@ pub(super) const MAX_IDLE_PLAN_REPLIES: u32 = 3;
 /// What a model response asks for, in the order the turn handles it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StepKind {
-    /// The user steered while the model answered: record the response,
-    /// skip its tool calls, and take the steer.
-    Steered,
     /// `request_user_input` asks the user questions.
     Questions,
     /// A private planning tool finishes or routes a plan phase.
@@ -36,10 +33,8 @@ pub(super) enum StepKind {
     Tools,
 }
 
-pub(super) fn classify(mode: TurnMode, calls: &[ToolCall], steered: bool) -> StepKind {
-    if steered {
-        StepKind::Steered
-    } else if calls.iter().any(plan::is_user_input) {
+pub(super) fn classify(mode: TurnMode, calls: &[ToolCall]) -> StepKind {
+    if calls.iter().any(plan::is_user_input) {
         StepKind::Questions
     } else if calls.iter().any(|call| {
         plan::is_plan_complete(call)
@@ -74,36 +69,12 @@ impl Conversation {
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<Flow, Error> {
         match kind {
-            StepKind::Steered => self.on_steered(assistant, calls, progress.mode, sink),
             StepKind::Questions => self.on_questions(assistant, calls, step, progress, sink),
             StepKind::PlanTool => self.on_plan_tool(assistant, calls, step, progress, sink),
             StepKind::GoalComplete => self.on_goal_complete(assistant, calls, step, sink),
             StepKind::Reply => self.on_reply(assistant, progress, sink),
             StepKind::Tools => self.on_tools(assistant, calls, step, sink),
         }
-    }
-
-    fn on_steered(
-        &mut self,
-        assistant: Message,
-        calls: &[ToolCall],
-        mode: TurnMode,
-        sink: &mut dyn FnMut(TurnEvent<'_>),
-    ) -> Result<Flow, Error> {
-        self.persist_assistant(assistant, sink)?;
-        self.skip_tool_calls(calls, goal::STEER_SKIPPED)?;
-        if self.inject_pending_steers(sink)? || !calls.is_empty() {
-            return Ok(Flow::Continue);
-        }
-        if mode == TurnMode::Goal {
-            self.append_goal_continuation()?;
-            return Ok(Flow::Continue);
-        }
-        if let Some(continuation) = plan_continuation(mode) {
-            self.append_plan_continuation(continuation)?;
-            return Ok(Flow::Continue);
-        }
-        Ok(Flow::Finish(true))
     }
 
     fn on_questions(
@@ -238,7 +209,6 @@ impl Conversation {
         )? {
             return Ok(Flow::Finish(false));
         }
-        self.inject_pending_steers(sink)?;
         Ok(Flow::Continue)
     }
 
@@ -280,7 +250,6 @@ impl Conversation {
         if self.run_tools(&step.registry, calls, sink)? {
             return Ok(Flow::Finish(false));
         }
-        self.inject_pending_steers(sink)?;
         Ok(Flow::Continue)
     }
 
@@ -291,15 +260,6 @@ impl Conversation {
     ) -> Result<(), Error> {
         self.session.append_message(assistant)?;
         sink(TurnEvent::AssistantDone);
-        Ok(())
-    }
-
-    fn skip_tool_calls(&mut self, calls: &[ToolCall], reason: &str) -> Result<(), Error> {
-        for call in calls {
-            let result = Message::tool_result(&call.id, &call.name, reason.to_string(), true)
-                .with_control(MessageControl::ToolSkipped);
-            self.session.append_message(result)?;
-        }
         Ok(())
     }
 
@@ -441,33 +401,24 @@ mod tests {
         let plan_complete = call(crate::tools::PLAN_COMPLETE_TOOL_NAME);
         let goal_complete = call(crate::tools::GOAL_COMPLETE_TOOL_NAME);
         let shell = call("shell");
-        // A pending steer wins over everything the response asked for.
         assert_eq!(
-            classify(TurnMode::Plan, std::slice::from_ref(&questions), true),
-            StepKind::Steered
-        );
-        assert_eq!(
-            classify(TurnMode::Plan, &[shell.clone(), questions], false),
+            classify(TurnMode::Plan, &[shell.clone(), questions]),
             StepKind::Questions
         );
         assert_eq!(
-            classify(TurnMode::Normal, &[plan_complete], false),
+            classify(TurnMode::Normal, &[plan_complete]),
             StepKind::PlanTool
         );
         assert_eq!(
-            classify(
-                TurnMode::Goal,
-                &[shell.clone(), goal_complete.clone()],
-                false
-            ),
+            classify(TurnMode::Goal, &[shell.clone(), goal_complete.clone()]),
             StepKind::GoalComplete
         );
         // Outside goal mode, goal_complete is an ordinary (unknown) tool.
         assert_eq!(
-            classify(TurnMode::Normal, &[goal_complete], false),
+            classify(TurnMode::Normal, &[goal_complete]),
             StepKind::Tools
         );
-        assert_eq!(classify(TurnMode::Normal, &[], false), StepKind::Reply);
-        assert_eq!(classify(TurnMode::Normal, &[shell], false), StepKind::Tools);
+        assert_eq!(classify(TurnMode::Normal, &[]), StepKind::Reply);
+        assert_eq!(classify(TurnMode::Normal, &[shell]), StepKind::Tools);
     }
 }

@@ -6,7 +6,8 @@ use crate::cancellation::CancellationToken;
 use crate::config::Config;
 use crate::error::Error;
 use crate::onboarding::provider::{
-    self, ConnectionActivation, ConnectionPlan, CredentialChoice, ProviderDefinition, ProviderId,
+    self, ConnectionActivation, ConnectionPlan, CredentialChoice, DiscoveredModel,
+    ProviderDefinition, ProviderId,
 };
 use crate::provider::codex::{CodexLoginStatus, DeviceLoginPrompt};
 
@@ -44,7 +45,7 @@ pub(super) struct ConnectFlow {
     endpoint: String,
     credential: CredentialChoice,
     model: String,
-    models: Vec<String>,
+    models: Vec<DiscoveredModel>,
     reasoning_efforts: Vec<String>,
     job: Option<ConnectJob>,
     root_parent: Option<PickerAction>,
@@ -52,7 +53,7 @@ pub(super) struct ConnectFlow {
 
 enum ConnectJob {
     Discovery {
-        receiver: Receiver<Result<Vec<String>, Error>>,
+        receiver: Receiver<Result<Vec<DiscoveredModel>, Error>>,
         cancellation: CancellationToken,
     },
     Login {
@@ -485,7 +486,10 @@ fn start_codex_discovery(flow: &mut ConnectFlow, state: &mut ViewState) {
         "Fetching models for this account",
         move || {
             let models = crate::provider::codex::refresh_catalog(&config)?;
-            Ok(models.into_iter().map(|model| model.slug).collect())
+            Ok(models
+                .into_iter()
+                .map(|model| DiscoveredModel::named(model.slug))
+                .collect())
         },
     );
 }
@@ -497,7 +501,7 @@ fn spawn_discovery(
     state: &mut ViewState,
     title: &str,
     description: &str,
-    discover: impl FnOnce() -> Result<Vec<String>, Error> + Send + 'static,
+    discover: impl FnOnce() -> Result<Vec<DiscoveredModel>, Error> + Send + 'static,
 ) {
     let cancellation = CancellationToken::default();
     let worker_cancellation = cancellation.clone();
@@ -610,7 +614,7 @@ pub(super) fn poll(state: &mut ViewState) -> bool {
     };
     enum PollEvent {
         None,
-        Models(Vec<String>),
+        Models(Vec<DiscoveredModel>),
         DiscoveryFailure(&'static str),
         LoginPrompt(DeviceLoginPrompt),
         LoginDone,
@@ -648,7 +652,7 @@ pub(super) fn poll(state: &mut ViewState) -> bool {
             let cached = if flow.provider == Some(ProviderId::Codex) {
                 crate::provider::codex::cached_models(&flow.config)
                     .into_iter()
-                    .map(|model| model.slug)
+                    .map(|model| DiscoveredModel::named(model.slug))
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
@@ -680,13 +684,13 @@ pub(super) fn poll(state: &mut ViewState) -> bool {
     changed
 }
 
-fn show_models(flow: &mut ConnectFlow, models: Vec<String>, state: &mut ViewState) {
+fn show_models(flow: &mut ConnectFlow, models: Vec<DiscoveredModel>, state: &mut ViewState) {
     flow.step = ConnectStep::Models;
     flow.models = models.clone();
     state.picker = Some(models_picker(flow, &models));
 }
 
-fn models_picker(flow: &ConnectFlow, models: &[String]) -> Picker {
+fn models_picker(flow: &ConnectFlow, models: &[DiscoveredModel]) -> Picker {
     let codex = if flow.provider == Some(ProviderId::Codex) {
         crate::provider::codex::cached_models(&flow.config)
     } else {
@@ -694,7 +698,7 @@ fn models_picker(flow: &ConnectFlow, models: &[String]) -> Picker {
     };
     let mut items = models
         .iter()
-        .cloned()
+        .map(|model| model.id.clone())
         .map(|model| PickerItem {
             label: codex
                 .iter()
@@ -891,6 +895,11 @@ fn build_plan(
                     .filter(|effort| flow.reasoning_efforts.iter().any(|value| value == *effort))
                     .map(|effort| (*effort).to_string())
                     .collect(),
+                context_window: flow
+                    .models
+                    .iter()
+                    .find(|model| model.id == flow.model)
+                    .and_then(|model| model.context_window),
             });
         }
         if let Some(change) = provider::credential_change(provider, &flow.credential) {
@@ -947,7 +956,16 @@ mod tests {
             endpoint: "http://127.0.0.1:9000/v1".into(),
             credential: CredentialChoice::None,
             model: "chosen-model".into(),
-            models: vec!["chosen-model".into()],
+            models: vec![
+                DiscoveredModel {
+                    id: "chosen-model".into(),
+                    context_window: Some(65_536),
+                },
+                DiscoveredModel {
+                    id: "other-model".into(),
+                    context_window: Some(131_072),
+                },
+            ],
             reasoning_efforts: vec!["low".into(), "ultra".into()],
             job: None,
             root_parent: None,
@@ -973,6 +991,10 @@ mod tests {
         assert_eq!(
             saved.providers["local-api"].models[0].reasoning_efforts,
             ["low", "ultra"]
+        );
+        assert_eq!(
+            crate::model::context_window(&saved, "local-api:chosen-model"),
+            65_536
         );
 
         let saved_again = saved.change_global_batch(plan.changes_for_save())?.config;

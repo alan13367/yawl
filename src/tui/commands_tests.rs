@@ -967,6 +967,7 @@ fn new_connection_session_activation_prompts_for_just_saved_reasoning_levels() {
                         name: "local".into(),
                         model: "new-model".into(),
                         reasoning_efforts: levels.clone(),
+                        context_window: None,
                     },
                 ],
                 model: "local:new-model".into(),

@@ -1,11 +1,9 @@
-//! Goal-mode helpers: completion parsing, continuation text, and skip labels.
+//! Goal-mode helpers: completion parsing and continuation text.
 
 use crate::provider::ToolCall;
 use crate::tools::GOAL_COMPLETE_TOOL_NAME;
 
 pub(super) const GOAL_CONTINUATION: &str = "Continue working on the active goal. Do not stop until you call goal_complete with the final user-facing result.";
-
-pub(super) const STEER_SKIPPED: &str = "[skipped because the user steered]";
 
 pub(super) fn parse_goal_complete_result(arguments: &str) -> Result<String, String> {
     super::plan::parse_non_empty(arguments, "result", GOAL_COMPLETE_TOOL_NAME)

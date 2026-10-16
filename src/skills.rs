@@ -191,7 +191,7 @@ pub fn has_project_sources(config: &Config) -> bool {
 
 pub fn expand(skill: &Skill, arguments: &str) -> String {
     let mut prompt = format!(
-        "Apply the following skill instructions. Resolve relative paths from {}.\n\n<skill name=\"{}\">\n{}\n</skill>",
+        "Apply the following skill instructions. Resolve relative paths in them from {}; paths in the user request are relative to the working directory.\n\n<skill name=\"{}\">\n{}\n</skill>",
         skill.directory.display(),
         skill.name,
         skill.instructions.trim()

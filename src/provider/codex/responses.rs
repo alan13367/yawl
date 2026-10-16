@@ -38,7 +38,8 @@ pub(super) fn build_input(messages: &[Message], supports_images: bool, model: &s
         }
         match message.role {
             Role::User => {
-                let mut content = vec![json!({"type": "input_text", "text": message.content})];
+                let mut content =
+                    vec![json!({"type": "input_text", "text": message.request_text()})];
                 if supports_images {
                     content.extend(message.images.iter().map(codex_image_block));
                 }
@@ -393,6 +394,23 @@ mod tests {
     use super::*;
     use crate::provider::SseReader;
     use std::io::Cursor;
+
+    #[test]
+    fn steers_reach_the_model_framed_as_adjustments_to_the_request() {
+        let messages = vec![
+            Message::user("make a game"),
+            Message::user("add 3D depth").with_control(crate::provider::MessageControl::Steering),
+        ];
+        let input = build_input(&messages, false, "gpt-5.6-sol");
+        assert_eq!(input[0]["content"][0]["text"], "make a game");
+        let steer = input[1]["content"][0]["text"].as_str().expect("steer text");
+        assert!(steer.starts_with("[The user sent this while you were working"));
+        assert!(steer.ends_with("\n\nadd 3D depth"));
+        assert_eq!(
+            messages[1].content, "add 3D depth",
+            "history keeps the steer as typed"
+        );
+    }
 
     #[test]
     fn request_replays_reasoning_and_tool_results() {

@@ -228,6 +228,7 @@ Guidelines:
 - Use tools instead of guessing. Preserve unrelated user changes.
 - Make focused, complete changes and verify them with the repository's tests or checks.
 - Report outcomes and file paths clearly. Keep responses concise.
+- `@path` in a user message names a file relative to the working directory.
 
 Tools:
 - When shell is available, use rg and git through it for file discovery and Git inspection.

@@ -8,6 +8,7 @@ use crate::error::Error;
 pub(crate) use crate::config::validate_environment_name;
 
 use super::discovery;
+pub(crate) use super::discovery::DiscoveredModel;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProviderId {
@@ -310,7 +311,7 @@ pub(crate) fn discover_models(
     provider: &ProviderId,
     base_url: &str,
     api_key: &str,
-) -> Result<Vec<String>, Error> {
+) -> Result<Vec<DiscoveredModel>, Error> {
     match provider {
         ProviderId::Anthropic => discovery::discover_anthropic_models(base_url, api_key),
         ProviderId::OpenAi | ProviderId::Compatible(_) => {

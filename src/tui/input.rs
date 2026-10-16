@@ -130,6 +130,51 @@ struct BufferLayout {
     positions: Vec<CursorPosition>,
 }
 
+/// Escape sequences for the composer's highlighted spans.
+#[derive(Clone, Copy)]
+pub(super) struct LayoutStyles<'a> {
+    pub(super) image: &'a str,
+    pub(super) token: &'a str,
+}
+
+/// End of the `@` file mention or `/skill:` invocation starting at `index`,
+/// if one does. Both start a whitespace-delimited token and need at least
+/// one character after the prefix. The composer and user prompt panels
+/// share this rule so a tag looks the same before and after submission.
+pub(super) fn highlighted_token_end(chars: &[char], index: usize) -> Option<usize> {
+    if index > 0 && !chars[index - 1].is_whitespace() {
+        return None;
+    }
+    let rest = chars.get(index..)?;
+    let prefix = if rest.first() == Some(&'@') {
+        1
+    } else if rest.starts_with(&['/', 's', 'k', 'i', 'l', 'l', ':']) {
+        7
+    } else {
+        return None;
+    };
+    let length = rest
+        .iter()
+        .position(|character| character.is_whitespace())
+        .unwrap_or(rest.len());
+    (length > prefix).then_some(index + length)
+}
+
+/// Every highlighted token in `buffer`, as sorted `(start, end)` spans.
+fn highlighted_spans(buffer: &[char]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < buffer.len() {
+        if let Some(end) = highlighted_token_end(buffer, index) {
+            spans.push((index, end));
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+    spans
+}
+
 /// Single-line text editing shared by the Git commit box, the Git init URL
 /// field, and picker text fields: insertion, deletion, and word/line motions
 /// over char indices. Newlines are dropped so pastes stay on one line.
@@ -346,12 +391,18 @@ impl Editor {
     }
 
     /// Replaces the mention token under the cursor with a short display tag
-    /// for `path` and records the tag for expansion on submit.
-    pub fn complete_mention(&mut self, path: &str) {
+    /// for `path` and records the tag for expansion on submit. The tag is the
+    /// file name, or the whole relative path when another project file
+    /// `shares_name`.
+    pub fn complete_mention(&mut self, path: &str, shares_name: bool) {
         let Some((start, end)) = self.mention_token_range() else {
             return;
         };
-        let display = self.unique_mention_display(path);
+        let display = if shares_name {
+            path.to_string()
+        } else {
+            self.unique_mention_display(path)
+        };
         let replacement: Vec<char> = format!("@{display}").chars().collect();
         let length = replacement.len();
         self.replace_range(start, end, replacement);
@@ -508,8 +559,10 @@ impl Editor {
         self.layout_with_buffer(width, &self.buffer, &self.image_spans(), None)
     }
 
-    pub(super) fn styled_layout(&self, width: usize, image_style: &str) -> InputLayout {
-        self.layout_with_buffer(width, &self.buffer, &self.image_spans(), Some(image_style))
+    /// Layout with image markers in `styles.image` and `@` mentions and
+    /// `/skill:` invocations in `styles.token`.
+    pub(super) fn styled_layout(&self, width: usize, styles: LayoutStyles<'_>) -> InputLayout {
+        self.layout_with_buffer(width, &self.buffer, &self.image_spans(), Some(styles))
     }
 
     fn layout_with_buffer(
@@ -517,11 +570,11 @@ impl Editor {
         width: usize,
         buffer: &[char],
         image_spans: &[(usize, usize)],
-        image_style: Option<&str>,
+        styles: Option<LayoutStyles<'_>>,
     ) -> InputLayout {
         let width = width.max(3);
         self.layout_width.set(width);
-        let layout = buffer_layout(buffer, width, image_spans, image_style);
+        let layout = buffer_layout(buffer, width, image_spans, styles);
         let cursor = layout.positions[self.cursor];
         InputLayout {
             lines: layout.lines,
@@ -888,10 +941,9 @@ fn should_wrap_word(
     column > 2 && word_width <= width.saturating_sub(2) && column.saturating_add(word_width) > width
 }
 
-fn next_buffer_line(lines: &mut Vec<String>, line: &mut String, styled: &mut bool) {
-    if *styled {
+fn next_buffer_line(lines: &mut Vec<String>, line: &mut String, styled: &mut Option<&str>) {
+    if styled.take().is_some() {
         line.push_str("\x1b[0m");
-        *styled = false;
     }
     lines.push(std::mem::replace(line, String::from("  ")));
 }
@@ -900,14 +952,19 @@ fn buffer_layout(
     buffer: &[char],
     width: usize,
     image_spans: &[(usize, usize)],
-    image_style: Option<&str>,
+    styles: Option<LayoutStyles<'_>>,
 ) -> BufferLayout {
     let mut lines = Vec::new();
     let mut positions = Vec::with_capacity(buffer.len().saturating_add(1));
     let mut line = String::from("> ");
     let mut column = 2usize;
-    let mut styled = false;
+    let mut styled: Option<&str> = None;
     let widths = display_widths(buffer);
+    let token_spans = if styles.is_some() {
+        highlighted_spans(buffer)
+    } else {
+        Vec::new()
+    };
 
     for (index, character) in buffer.iter().copied().enumerate() {
         if character == '\n' {
@@ -955,14 +1012,26 @@ fn buffer_layout(
             row: lines.len(),
             column,
         });
-        let should_style = marker.is_some() && image_style.is_some();
-        if should_style != styled {
-            if let Some(style) = image_style.filter(|_| should_style) {
-                line.push_str(style);
+        let style = styles.and_then(|styles| {
+            if marker.is_some() {
+                Some(styles.image)
+            } else if token_spans
+                .iter()
+                .any(|(start, end)| *start <= index && index < *end)
+            {
+                Some(styles.token)
             } else {
+                None
+            }
+        });
+        if style != styled {
+            if styled.is_some() {
                 line.push_str("\x1b[0m");
             }
-            styled = should_style;
+            if let Some(style) = style {
+                line.push_str(style);
+            }
+            styled = style;
         }
         line.push(displayed);
         column = column.saturating_add(character_width);
@@ -971,7 +1040,7 @@ fn buffer_layout(
         row: lines.len(),
         column,
     });
-    if styled {
+    if styled.is_some() {
         line.push_str("\x1b[0m");
     }
     lines.push(line);
@@ -1223,6 +1292,38 @@ mod tests {
         let _ = std::fs::remove_file(second_path);
     }
 
+    const TOKEN_STYLE: &str = "\x1b[38;2;1;2;3m";
+
+    fn styles(image: &str) -> LayoutStyles<'_> {
+        LayoutStyles {
+            image,
+            token: TOKEN_STYLE,
+        }
+    }
+
+    #[test]
+    fn mentions_and_skill_invocations_are_colored_in_the_composer() {
+        let mut editor = Editor::default();
+        editor.paste("/skill:design fix @ren");
+        editor.complete_mention("src/tui/render.rs", false);
+        editor.paste("and me@example.com @ ok");
+        assert_eq!(
+            editor.styled_layout(80, styles("")).lines,
+            [format!(
+                "> {TOKEN_STYLE}/skill:design\x1b[0m fix {TOKEN_STYLE}@render.rs\x1b[0m and me@example.com @ ok"
+            )]
+        );
+    }
+
+    #[test]
+    fn wrapped_mention_keeps_its_color_on_each_line() {
+        let mut editor = Editor::default();
+        editor.paste("@abcdefghijklmnop");
+        let lines = editor.styled_layout(10, styles("")).lines;
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| line.contains(TOKEN_STYLE)));
+    }
+
     #[test]
     fn staged_image_marker_wraps_as_one_colored_token() {
         let (image, path) = staged_image(1, "layout");
@@ -1231,7 +1332,7 @@ mod tests {
         editor.insert_image(image);
         editor.paste(" x");
         let style = "\x1b[38;2;180;200;220m";
-        let layout = editor.styled_layout(16, style);
+        let layout = editor.styled_layout(16, styles(style));
         assert_eq!(layout.lines[0], "> hello ");
         assert_eq!(layout.lines[1], format!("  {style}[Image #1]\x1b[0m x"));
         assert_eq!((layout.cursor_row, layout.cursor_col), (1, 14));
@@ -1262,7 +1363,7 @@ mod tests {
         let mut editor = Editor::default();
         editor.insert_image(image);
         let style = "\x1b[38;2;180;200;220m";
-        let layout = editor.styled_layout(5, style);
+        let layout = editor.styled_layout(5, styles(style));
         assert!(layout.lines.len() > 1);
         let text = layout
             .lines
@@ -1284,7 +1385,9 @@ mod tests {
         let mut editor = Editor::default();
         editor.paste("[Image #1]");
         assert_eq!(
-            editor.styled_layout(40, "\x1b[38;2;180;200;220m").lines,
+            editor
+                .styled_layout(40, styles("\x1b[38;2;180;200;220m"))
+                .lines,
             ["> [Image #1]"]
         );
         editor.handle_key(Key::Left);
@@ -1619,11 +1722,11 @@ mod tests {
     fn completed_mentions_expand_to_relative_paths_on_submit() {
         let mut editor = Editor::default();
         editor.paste("compare @ren");
-        editor.complete_mention("src/tui/render.rs");
+        editor.complete_mention("src/tui/render.rs", false);
         assert_eq!(editor.text(), "compare @render.rs ");
 
         editor.paste("with @ren");
-        editor.complete_mention("src/other/render.rs");
+        editor.complete_mention("src/other/render.rs", false);
         assert_eq!(editor.text(), "compare @render.rs with @other/render.rs ");
         assert_eq!(
             editor.expand_submission(&editor.text()),
@@ -1632,10 +1735,22 @@ mod tests {
     }
 
     #[test]
+    fn mention_of_a_shared_file_name_shows_its_relative_path() {
+        let mut editor = Editor::default();
+        editor.paste("open @index");
+        editor.complete_mention("web/index.html", true);
+        assert_eq!(editor.text(), "open @web/index.html ");
+        assert_eq!(
+            editor.expand_submission(&editor.text()),
+            "open @web/index.html "
+        );
+    }
+
+    #[test]
     fn unrecorded_at_tokens_pass_through_unchanged() {
         let mut editor = Editor::default();
         editor.paste("ping @ren");
-        editor.complete_mention("src/tui/render.rs");
+        editor.complete_mention("src/tui/render.rs", false);
         assert_eq!(
             editor.expand_submission("see @render.rs and @unknown and me@example.com"),
             "see @src/tui/render.rs and @unknown and me@example.com"
@@ -1646,7 +1761,7 @@ mod tests {
     fn mention_expansion_requires_a_full_token_match() {
         let mut editor = Editor::default();
         editor.paste("@ren");
-        editor.complete_mention("src/tui/render.rs");
+        editor.complete_mention("src/tui/render.rs", false);
         assert_eq!(
             editor.expand_submission("@render.rs.bak stays"),
             "@render.rs.bak stays"

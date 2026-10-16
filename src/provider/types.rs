@@ -8,6 +8,10 @@ use crate::error::Error;
 
 const OPENAI_PROMPT_CACHE_KEY_MAX_CHARS: usize = 64;
 
+/// Sent ahead of a steer so the model amends the request in progress
+/// instead of treating the steer as a new one and reporting only on it.
+const STEERING_NOTE: &str = "[The user sent this while you were working on the request above. Treat it as an adjustment to that request, not a replacement, unless it says so. Your final reply should still cover the whole request, not only this message.]";
+
 pub(super) fn clamp_openai_prompt_cache_key(key: Option<&str>) -> Option<Cow<'_, str>> {
     key.map(|key| {
         key.char_indices()
@@ -325,6 +329,16 @@ impl Message {
 
     pub fn is_steering(&self) -> bool {
         matches!(self.control, Some(MessageControl::Steering))
+    }
+
+    /// User text as providers send it. Sessions and the transcript keep the
+    /// steer as typed; only requests carry [`STEERING_NOTE`].
+    pub(super) fn request_text(&self) -> Cow<'_, str> {
+        if self.is_steering() {
+            Cow::Owned(format!("{STEERING_NOTE}\n\n{}", self.content))
+        } else {
+            Cow::Borrowed(&self.content)
+        }
     }
 
     pub fn is_goal_start(&self) -> bool {

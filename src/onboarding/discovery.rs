@@ -6,17 +6,39 @@ use crate::error::Error;
 
 const MAX_DISCOVERED_MODELS: usize = 30;
 
-pub(super) fn discover_models(base_url: &str, api_key: &str) -> Result<Vec<String>, Error> {
+/// A model listed by a provider's models endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiscoveredModel {
+    pub(crate) id: String,
+    /// The served context limit, when the server reports one. oMLX and vLLM
+    /// add a non-standard `max_model_len` to each OpenAI-style entry.
+    pub(crate) context_window: Option<u64>,
+}
+
+impl DiscoveredModel {
+    /// A model with no reported metadata.
+    pub(crate) fn named(id: String) -> Self {
+        Self {
+            id,
+            context_window: None,
+        }
+    }
+}
+
+pub(super) fn discover_models(
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<DiscoveredModel>, Error> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    fetch_model_ids(&url, AuthStyle::Bearer(api_key))
+    fetch_models(&url, AuthStyle::Bearer(api_key))
 }
 
 pub(super) fn discover_anthropic_models(
     base_url: &str,
     api_key: &str,
-) -> Result<Vec<String>, Error> {
+) -> Result<Vec<DiscoveredModel>, Error> {
     let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
-    fetch_model_ids(&url, AuthStyle::Anthropic(api_key))
+    fetch_models(&url, AuthStyle::Anthropic(api_key))
 }
 
 /// How the models request authenticates.
@@ -27,7 +49,7 @@ enum AuthStyle<'a> {
     Anthropic(&'a str),
 }
 
-fn fetch_model_ids(url: &str, style: AuthStyle<'_>) -> Result<Vec<String>, Error> {
+fn fetch_models(url: &str, style: AuthStyle<'_>) -> Result<Vec<DiscoveredModel>, Error> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(5)))
@@ -53,19 +75,24 @@ fn fetch_model_ids(url: &str, style: AuthStyle<'_>) -> Result<Vec<String>, Error
     if status != 200 {
         return Err(Error::Http { status, body });
     }
-    parse_model_ids(&body)
+    parse_models(&body)
 }
 
-fn parse_model_ids(payload: &str) -> Result<Vec<String>, Error> {
+fn parse_models(payload: &str) -> Result<Vec<DiscoveredModel>, Error> {
     let payload: Value = serde_json::from_str(payload)?;
     let mut models = payload["data"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|model| model["id"].as_str().map(str::to_string))
+        .filter_map(|model| {
+            Some(DiscoveredModel {
+                id: model["id"].as_str()?.to_string(),
+                context_window: model["max_model_len"].as_u64().filter(|window| *window > 0),
+            })
+        })
         .collect::<Vec<_>>();
-    models.sort();
-    models.dedup();
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.dedup_by(|left, right| left.id == right.id);
     models.truncate(MAX_DISCOVERED_MODELS);
     Ok(models)
 }
@@ -81,11 +108,36 @@ mod tests {
         data.push(serde_json::json!({"id": "zeta"}));
         let payload = serde_json::json!({"data": data}).to_string();
 
-        let models = parse_model_ids(&payload)?;
+        let models = parse_models(&payload)?;
 
         assert_eq!(models.len(), MAX_DISCOVERED_MODELS);
-        assert_eq!(models.first().map(String::as_str), Some("m00"));
-        assert_eq!(models.last().map(String::as_str), Some("m29"));
+        assert_eq!(models.first().map(|model| model.id.as_str()), Some("m00"));
+        assert_eq!(models.last().map(|model| model.id.as_str()), Some("m29"));
+        Ok(())
+    }
+
+    #[test]
+    fn served_context_length_is_read_when_reported() -> Result<(), Error> {
+        let payload = serde_json::json!({"data": [
+            {"id": "omlx-model", "object": "model", "owned_by": "omlx", "max_model_len": 65536},
+            {"id": "plain-model", "object": "model"},
+            {"id": "zero-model", "max_model_len": 0},
+            {"id": "text-model", "max_model_len": "big"}
+        ]})
+        .to_string();
+
+        let models = parse_models(&payload)?;
+
+        let window = |id: &str| {
+            models
+                .iter()
+                .find(|model| model.id == id)
+                .and_then(|model| model.context_window)
+        };
+        assert_eq!(window("omlx-model"), Some(65_536));
+        assert_eq!(window("plain-model"), None);
+        assert_eq!(window("zero-model"), None);
+        assert_eq!(window("text-model"), None);
         Ok(())
     }
 }

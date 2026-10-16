@@ -8,7 +8,7 @@ use crate::provider::codex::{CodexLoginStatus, credential_status};
 
 use super::SetupOutcome;
 use super::field::Field;
-use super::provider::{self, ProviderId};
+use super::provider::{self, DiscoveredModel, ProviderId};
 use super::select::{self, Choice};
 use super::terminal::{self, Authentication};
 
@@ -375,7 +375,7 @@ fn configure_builtin(
         };
         models
     };
-    let Some(model) = choose_model(models)? else {
+    let Some(model) = choose_model(models.into_iter().map(|model| model.id).collect())? else {
         return Ok(None);
     };
     let default_model = format!("{}:{model}", spec.name);
@@ -483,9 +483,13 @@ fn configure_entry_with(
         models
     };
 
-    let Some(model) = choose_model(models)? else {
+    let Some(model) = choose_model(models.iter().map(|model| model.id.clone()).collect())? else {
         return Ok(None);
     };
+    let context_window = models
+        .iter()
+        .find(|entry| entry.id == model)
+        .and_then(|entry| entry.context_window);
     let default_model = format!("{name}:{model}");
     let supported = crate::model::saved_reasoning_efforts(config, &default_model);
     let efforts = crate::config::REASONING_EFFORTS;
@@ -522,6 +526,7 @@ fn configure_entry_with(
             name: name.to_string(),
             model,
             reasoning_efforts,
+            context_window,
         },
     ];
     Ok(Some(SetupPlan {
@@ -532,8 +537,8 @@ fn configure_entry_with(
 }
 
 fn discover_with_recovery(
-    mut discover: impl FnMut() -> Result<Vec<String>, Error>,
-) -> Result<Option<Vec<String>>, Error> {
+    mut discover: impl FnMut() -> Result<Vec<DiscoveredModel>, Error>,
+) -> Result<Option<Vec<DiscoveredModel>>, Error> {
     loop {
         match discover() {
             Ok(models) if !models.is_empty() => {

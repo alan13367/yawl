@@ -285,7 +285,7 @@ pub(in crate::tui) fn render_user_panel(content: &str, width: usize) -> Vec<Stri
     let mut lines = Vec::new();
     lines.push(blank.clone());
     lines.extend(
-        markdown::render(content, content_width)
+        markdown::render_prompt(content, content_width, palette.mention)
             .into_iter()
             .map(|line| {
                 let fitted =
