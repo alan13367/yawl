@@ -825,6 +825,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "ureq",
+ "windows-sys",
 ]
 
 [[package]]
