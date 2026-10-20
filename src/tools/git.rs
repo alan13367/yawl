@@ -46,9 +46,16 @@ fn inspect_at(args: &Value, cwd: &Path) -> ToolOutcome {
         Some(Value::String(path))
             if !path.is_empty()
                 && !Path::new(path).is_absolute()
-                && !Path::new(path)
-                    .components()
-                    .any(|part| matches!(part, std::path::Component::ParentDir)) =>
+                && !Path::new(path).components().any(|part| {
+                    // On Windows `\dir` and `C:dir` are not absolute but still
+                    // leave the working directory.
+                    matches!(
+                        part,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                }) =>
         {
             Some(path)
         }
@@ -134,6 +141,9 @@ fn inspect_at(args: &Value, cwd: &Path) -> ToolOutcome {
     }
 }
 
+/// The file that always reads as empty.
+const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
 fn inspection_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(cwd);
@@ -145,7 +155,7 @@ fn inspection_command(cwd: &Path) -> Command {
     }
     command
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .args([
@@ -280,6 +290,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn disables_repository_command_hooks() {
         let temp = TestDir::new();

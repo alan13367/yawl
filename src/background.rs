@@ -1,20 +1,33 @@
 //! Session-bound background shell process management.
+//!
+//! The mechanics of signalling a process tree differ by platform: `unix` and
+//! `windows` each provide a `Group` that spawns the shell, reports whether
+//! any of its processes are alive, and stops them.
 
 use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(unix)]
+use unix::Group;
+#[cfg(windows)]
+use windows::Group;
 
 const MAX_ACTIVE: usize = 8;
 const MAX_TRACKED: usize = 64;
 const MAX_LOG_BYTES: usize = 256 * 1024;
 const MAX_READ_BYTES: usize = 48 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
-const STOP_GRACE: Duration = Duration::from_secs(2);
 const READER_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -270,16 +283,20 @@ impl BackgroundProcessManager {
             let _ = worker.join();
         }
 
-        let mut command = Command::new("sh");
-        crate::tools::exec::isolate_from_terminal(&mut command)
-            .arg("-c")
-            .arg(&spec.command)
+        let mut command = match crate::tools::exec::shell_command(&spec.command, None) {
+            Ok(command) => command,
+            Err(error) => {
+                self.remove_failed_start(&id);
+                return Err(format!("failed to spawn background shell: {error}"));
+            }
+        };
+        command
             .current_dir(&spec.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = match command.spawn() {
-            Ok(child) => child,
+        let (mut child, group) = match Group::spawn(&mut command) {
+            Ok(spawned) => spawned,
             Err(error) => {
                 self.remove_failed_start(&id);
                 return Err(format!("failed to spawn background shell: {error}"));
@@ -287,33 +304,39 @@ impl BackgroundProcessManager {
         };
         let pid = child.id();
         let Some(stdout) = child.stdout.take() else {
-            terminate_now(&mut child);
+            group.kill(&mut child);
             self.remove_failed_start(&id);
             return Err("background shell stdout was not piped".into());
         };
         let Some(stderr) = child.stderr.take() else {
-            terminate_now(&mut child);
+            group.kill(&mut child);
             self.remove_failed_start(&id);
             return Err("background shell stderr was not piped".into());
         };
-        if let Err(error) = crate::tools::exec::set_nonblocking(&stdout) {
-            terminate_now(&mut child);
-            self.remove_failed_start(&id);
-            return Err(format!(
-                "failed to configure background shell stdout: {error}"
-            ));
-        }
-        if let Err(error) = crate::tools::exec::set_nonblocking(&stderr) {
-            terminate_now(&mut child);
-            self.remove_failed_start(&id);
-            return Err(format!(
-                "failed to configure background shell stderr: {error}"
-            ));
-        }
+        let stdout = match crate::tools::exec::nonblocking(stdout) {
+            Ok(stdout) => stdout,
+            Err(error) => {
+                group.kill(&mut child);
+                self.remove_failed_start(&id);
+                return Err(format!(
+                    "failed to configure background shell stdout: {error}"
+                ));
+            }
+        };
+        let stderr = match crate::tools::exec::nonblocking(stderr) {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                group.kill(&mut child);
+                self.remove_failed_start(&id);
+                return Err(format!(
+                    "failed to configure background shell stderr: {error}"
+                ));
+            }
+        };
         {
             let mut state = self.lock_state();
             let Some(entry) = find_entry_mut(&mut state, id.as_str()) else {
-                terminate_now(&mut child);
+                group.kill(&mut child);
                 return Err("background process entry disappeared during startup".into());
             };
             entry.pid = Some(pid);
@@ -353,6 +376,7 @@ impl BackgroundProcessManager {
             monitor.run_process(
                 monitor_id,
                 child,
+                group,
                 stop,
                 timeout,
                 OutputWorkers {
@@ -538,12 +562,12 @@ impl BackgroundProcessManager {
         &self,
         id: BackgroundId,
         mut child: Child,
+        group: Group,
         stop: Arc<AtomicBool>,
         timeout: Option<Duration>,
         output: OutputWorkers,
     ) {
         let started = Instant::now();
-        let process_group = child.id();
         let mut leader_status = None;
         let final_status = loop {
             if leader_status.is_none() {
@@ -551,12 +575,12 @@ impl BackgroundProcessManager {
                     Ok(Some(status)) => leader_status = Some(status),
                     Ok(None) => {}
                     Err(error) => {
-                        terminate_now(&mut child);
+                        group.kill(&mut child);
                         break BackgroundStatus::Failed(error.to_string());
                     }
                 }
             }
-            if !process_group_alive(process_group)
+            if !group.alive()
                 && let Some(status) = leader_status.take()
             {
                 break status
@@ -565,12 +589,12 @@ impl BackgroundProcessManager {
             }
             if stop.load(Ordering::Acquire) {
                 self.mark_stopping(&id);
-                terminate_gracefully(&mut child, process_group);
+                group.stop(&mut child);
                 break BackgroundStatus::Stopped;
             }
             if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
                 self.mark_stopping(&id);
-                terminate_gracefully(&mut child, process_group);
+                group.stop(&mut child);
                 break BackgroundStatus::TimedOut;
             }
             std::thread::sleep(Duration::from_millis(30));
@@ -740,56 +764,8 @@ fn take_decoded_utf8(bytes: &mut Vec<u8>, end_of_stream: bool) -> String {
     text
 }
 
-fn terminate_gracefully(child: &mut Child, process_group: u32) {
-    signal_group(process_group, libc::SIGTERM);
-    let deadline = Instant::now().checked_add(STOP_GRACE);
-    loop {
-        let _ = child.try_wait();
-        if !process_group_alive(process_group) {
-            let _ = child.wait();
-            return;
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(30));
-    }
-    signal_group(process_group, libc::SIGKILL);
-    let _ = child.wait();
-}
-
-fn terminate_now(child: &mut Child) {
-    signal_group(child.id(), libc::SIGKILL);
-    let _ = child.wait();
-}
-
-fn signal_group(process_group: u32, signal: libc::c_int) {
-    if let Ok(process_group) = i32::try_from(process_group) {
-        // SAFETY: The child was created as the leader of its own process
-        // group. A negative PID addresses that group, and `kill` does not
-        // impose Rust memory-safety requirements.
-        unsafe {
-            libc::kill(-process_group, signal);
-        }
-    }
-}
-
-fn process_group_alive(process_group: u32) -> bool {
-    let Ok(process_group) = i32::try_from(process_group) else {
-        return false;
-    };
-    // SAFETY: Signal zero performs existence and permission checks only. The
-    // negative PID addresses the process group created for this command.
-    let result = unsafe { libc::kill(-process_group, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-    use std::os::unix::net::UnixStream;
-    use std::sync::mpsc;
-
     use super::*;
 
     fn spec(command: &str) -> StartSpec {
@@ -968,10 +944,15 @@ mod tests {
         assert!(pending.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn stream_reader_can_stop_while_a_writer_keeps_the_pipe_open() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+
         let (reader, mut writer) = UnixStream::pair().expect("create stream pair");
-        crate::tools::exec::set_nonblocking(&reader).expect("set reader nonblocking");
+        let reader = crate::tools::exec::nonblocking(reader).expect("set reader nonblocking");
         writer.write_all(b"partial").expect("write stream content");
         let done = Arc::new(AtomicBool::new(false));
         let reader_done = done.clone();

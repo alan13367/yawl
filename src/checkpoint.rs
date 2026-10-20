@@ -406,12 +406,27 @@ fn restore_overlay(dir: &Path, overlay: &Overlay) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn absolute(path: &Path, cwd: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
     }
+}
+
+/// Overlays are matched by their recorded path string, so one file must
+/// always produce one spelling. Rejoining the components gives `\`
+/// separators and drops `.` parts, so `C:/repo/a.rs` and `C:\repo\a.rs`
+/// are the same overlay and `/undo` never restores a stale pre-image last.
+#[cfg(windows)]
+fn absolute(path: &Path, cwd: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    joined.components().collect()
 }
 
 fn read_user_head(work_tree: &Path) -> UserHead {

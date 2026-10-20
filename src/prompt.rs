@@ -206,6 +206,9 @@ The user ran `/init`. Create or update `./AGENTS.md` as concise working guidance
     );
 }
 
+/// Tells the model what the shell is on Windows, where it is not `sh`.
+const WINDOWS_SHELL_NOTE: &str = "- On Windows, shell runs Git Bash (`bash -c`). Reach Windows paths as `/c/...` or `C:/...`, and call native Windows programs on PATH (git, cargo, python, ...) directly.\n";
+
 fn build_system_prompt_from(
     cwd: Option<&Path>,
     global_dir: &Path,
@@ -234,6 +237,9 @@ Tools:
 - When shell is available, use rg and git through it for file discovery and Git inspection.
 "#
     );
+    if cfg!(windows) {
+        prompt.push_str(WINDOWS_SHELL_NOTE);
+    }
     if let Some(custom_tools) = options.custom_tools {
         prompt.push_str(
             "- Personalize Yawl with define_tool. When the user wants a repeatable command, or you have run a multi-step workflow they will need again, save it as a tool; it persists across sessions.\n",
@@ -393,6 +399,22 @@ mod tests {
             "the base prompt should stay compact; got {} bytes",
             prompt.len()
         );
+    }
+
+    #[test]
+    fn only_windows_prompts_describe_git_bash() {
+        let dirs = TestDirs::new();
+        let prompt = build_system_prompt_from(
+            Some(&dirs.0),
+            &dirs.0.join("global"),
+            PromptOptions::default(),
+            None,
+            &[],
+            None,
+        );
+        assert_eq!(prompt.contains(WINDOWS_SHELL_NOTE), cfg!(windows));
+        assert!(WINDOWS_SHELL_NOTE.contains("Git Bash"));
+        assert!(WINDOWS_SHELL_NOTE.ends_with('\n'));
     }
 
     #[test]

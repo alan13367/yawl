@@ -2,7 +2,7 @@
 //!
 //! A custom tool is `<name>.json` in `~/.yawl/tools/` (global) or
 //! `./.yawl/tools/` (project). The manifest declares typed parameters and a
-//! `sh -c` command whose `{{param}}` placeholders expand to shell-quoted
+//! shell command (`sh -c`, or bash on Windows) whose `{{param}}` placeholders expand to shell-quoted
 //! values; the complete JSON arguments also arrive on stdin. Discovery only
 //! parses JSON, so nothing runs until the model calls a tool. Project tools
 //! load once the project is trusted, except manifests this process saved.
@@ -13,7 +13,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -234,17 +233,17 @@ impl CustomTool {
         };
         let command = self.expand(&values);
         let input = Value::Object(values).to_string();
-        let mut process = Command::new("sh");
-        process
-            .arg("-c")
-            .arg(&command)
-            .env("YAWL_SESSION_ID", session_id);
+        let mut process = match super::exec::shell_command(&command, None) {
+            Ok(process) => process,
+            Err(error) => return ToolOutcome::error(format!("failed to start {name}: {error}")),
+        };
+        process.env("YAWL_SESSION_ID", session_id);
         // Absolute, so commands that change directory can still reach
         // helper scripts next to the manifest.
         if let Some(directory) = self.path.parent() {
             let directory =
                 std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
-            process.env("YAWL_TOOL_DIR", directory);
+            process.env("YAWL_TOOL_DIR", super::exec::shell_path(&directory));
         }
         match super::exec::run_with_timeout(process, Some(input.as_bytes()), self.timeout) {
             Ok(result) => {
@@ -827,11 +826,31 @@ pub(super) fn scan_dir(
     (entries, warnings)
 }
 
+/// Whether `path` is a file the scan should check for the removed
+/// `--describe` protocol: one with an execute bit.
+#[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+/// Windows has no execute bit, so a file counts when its extension names a
+/// program or script type that the shell would run.
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file() && has_executable_extension(path)
+}
+
+#[cfg(any(windows, test))]
+fn has_executable_extension(path: &Path) -> bool {
+    const EXTENSIONS: &[&str] = &["exe", "com", "bat", "cmd", "ps1", "sh"];
+    path.extension().is_some_and(|extension| {
+        EXTENSIONS
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+    })
 }
 
 /// Whether `./.yawl/tools/` holds manifests, which makes the project's
@@ -857,7 +876,7 @@ pub(super) fn define_entry() -> ToolEntry {
                 "properties": {
                     "name": {"type": "string", "description": "Tool name: 1-64 ASCII letters, digits, '_' or '-'; snake_case reads best"},
                     "description": {"type": "string", "description": "What the tool does and when to use it; this is all you will see in later sessions"},
-                    "command": {"type": "string", "description": "Script for `sh -c` in the working directory. {{param}} expands to that argument already shell-quoted, so never wrap it in quotes. Arguments also arrive as a JSON object on stdin; $YAWL_TOOL_DIR is the manifest's directory. Exit nonzero on failure."},
+                    "command": {"type": "string", "description": format!("Script for `{}` in the working directory. {{{{param}}}} expands to that argument already shell-quoted, so never wrap it in quotes. Arguments also arrive as a JSON object on stdin; $YAWL_TOOL_DIR is the manifest's directory. Exit nonzero on failure.", super::exec::SHELL_INVOCATION)},
                     "params": {
                         "type": "object",
                         "description": "Parameters by name. Each is required unless it sets required=false, a default, or a flag.",
@@ -1389,6 +1408,7 @@ mod tests {
         assert_eq!(outcome.content, "{{.State.Status}} {{ }}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn scans_reuse_unchanged_manifests_and_explain_broken_files() {
         let root = TempRoot::new("scan");
@@ -1622,5 +1642,22 @@ mod tests {
             refused.content
         );
         assert!(!root.0.join("project/tools/mine.json").exists());
+    }
+
+    #[test]
+    fn windows_programs_are_recognized_by_extension() {
+        for name in [
+            "tool.exe",
+            "TOOL.CMD",
+            "run.bat",
+            "x.ps1",
+            "helper.sh",
+            "a.com",
+        ] {
+            assert!(has_executable_extension(Path::new(name)), "{name}");
+        }
+        for name in ["tool.json", "notes.txt", "tool", "tool.exe.json"] {
+            assert!(!has_executable_extension(Path::new(name)), "{name}");
+        }
     }
 }

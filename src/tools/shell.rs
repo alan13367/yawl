@@ -1,4 +1,5 @@
-//! Foreground `sh -c` execution and background process tools.
+//! Foreground shell execution (`sh -c`, or bash on Windows) and background
+//! process tools.
 //!
 //! The registry owns discovery and dispatch; this module owns the shell
 //! schemas and their execution against [`BackgroundProcessManager`].
@@ -10,6 +11,7 @@ use serde_json::{Value, json};
 use crate::background::{BackgroundProcessManager, OutputRead, StartSpec};
 use crate::provider::ToolSpec;
 
+use super::exec::SHELL_INVOCATION;
 use super::{ToolEntry, ToolImpl, ToolOutcome, str_arg};
 
 const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -29,14 +31,18 @@ pub(super) fn entry(background: bool) -> ToolEntry {
             "maxLength": 80,
             "description": "Optional /ps label"
         });
-        "Run `sh -c` in the working directory. Use background=true for dev servers, watchers, and long commands, then shell_output, shell_list, or shell_stop. Do not detach with & or nohup; use the tracked background mode. Bound readiness checks with timeouts."
+        format!(
+            "Run `{SHELL_INVOCATION}` in the working directory. Use background=true for dev servers, watchers, and long commands, then shell_output, shell_list, or shell_stop. Do not detach with & or nohup; use the tracked background mode. Bound readiness checks with timeouts."
+        )
     } else {
-        "Run foreground `sh -c` in the working directory; return stdout or the failure."
+        format!(
+            "Run foreground `{SHELL_INVOCATION}` in the working directory; return stdout or the failure."
+        )
     };
     ToolEntry::new(
         ToolSpec {
             name: "shell".into(),
-            description: description.into(),
+            description,
             input_schema: json!({
                 "type": "object",
                 "properties": properties,
@@ -69,7 +75,11 @@ pub(super) fn background_entries() -> Vec<ToolEntry> {
             }, ToolImpl::ShellOutput),
         ToolEntry::new(ToolSpec {
                 name: "shell_stop".into(),
-                description: "Gracefully stop a background process group; settled commands return status.".into(),
+                description: if cfg!(windows) {
+                    "Stop a background process tree; settled commands return status."
+                } else {
+                    "Gracefully stop a background process group; settled commands return status."
+                }.into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {"id": {"type": "string", "description": "bg-N ID"}},
@@ -143,11 +153,10 @@ pub(super) fn execute_with_path(
         None => SHELL_DEFAULT_TIMEOUT_SECS,
     };
     let timeout = Duration::from_secs(timeout_secs);
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c").arg(command);
-    if let Some(path) = path {
-        cmd.env("PATH", path);
-    }
+    let cmd = match super::exec::shell_command(command, path) {
+        Ok(cmd) => cmd,
+        Err(e) => return ToolOutcome::error(format!("failed to spawn shell: {e}")),
+    };
     match super::exec::run_with_timeout(cmd, None, timeout) {
         Ok(result) => {
             let (content, is_error) = super::exec::render_result(&result, timeout);
