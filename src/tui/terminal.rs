@@ -768,6 +768,7 @@ pub(super) fn highlight_cells(line: &str, from: usize, through: usize) -> String
     output
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) fn copy_command(program: &str, arguments: &[&str], text: &str) -> bool {
     let Ok(mut child) = std::process::Command::new(program)
         .args(arguments)

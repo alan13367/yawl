@@ -619,7 +619,10 @@ mod tests {
         assert!(error.to_string().contains("cannot replace"), "{error}");
         assert_eq!(std::fs::read_to_string(&file)?, "old");
 
+        // Windows has no world-writable bits; this only clears the
+        // read-only attribute so the test directory can be removed.
         let mut permissions = std::fs::metadata(&file)?.permissions();
+        #[expect(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         std::fs::set_permissions(&file, permissions)
     }
