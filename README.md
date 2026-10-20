@@ -7,11 +7,11 @@
   <p>
     <a href="https://github.com/alan13367/yawl/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-7aa2f7?style=flat-square" alt="MIT license"></a>
     <img src="https://img.shields.io/badge/Rust-1.99%2B-orange?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.99 or newer">
-    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-8fbcbb?style=flat-square" alt="macOS and Linux">
+    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-8fbcbb?style=flat-square" alt="macOS, Linux, and Windows">
   </p>
 </div>
 
-Yawl is a terminal AI agent for macOS and Linux. Use the full-screen interface for interactive work or pipe input into print mode. It supports persistent sessions, custom providers, and custom tools the agent builds for you and keeps across sessions.
+Yawl is a terminal AI agent for macOS, Linux, and Windows. Use the full-screen interface for interactive work or pipe input into print mode. It supports persistent sessions, custom providers, and custom tools the agent builds for you and keeps across sessions.
 
 <table>
   <tr>
@@ -31,6 +31,8 @@ cargo install --path .
 ```
 
 Run `yawl` to choose a provider and model. Use `yawl --setup` to reopen setup or `yawl --doctor` to check and repair configuration.
+
+On Windows, Yawl needs Windows 10 version 1809 or later and runs in Windows Terminal or the standard console; the mintty window that Git Bash opens is not supported. Shell commands and custom tools run in the bash that comes with [Git for Windows](https://git-scm.com/download/win), so install it first. Yawl finds it through `git.exe` on `PATH` or the standard install folders; set `YAWL_GIT_BASH` to the full path of `bash.exe` to choose another. Paths written as `~/.yawl` below mean `%USERPROFILE%\.yawl`.
 
 ## Usage
 
@@ -69,7 +71,7 @@ With the transcript focused, arrows select blocks, `h`/`l` fold or unfold, `Ente
 
 Picking a file from the `@` menu inserts a tag showing its file name, or its relative path when another project file has the same name. The model receives the path relative to the working directory. File tags and `/skill:` invocations are highlighted in the composer and in sent prompts.
 
-Long pastes appear as compact markers but reach the model in full. Each prompt accepts up to five clipboard images in PNG, JPEG, GIF, or WebP format, up to 5 MB each. Linux clipboard images require `wl-paste` or `xclip`.
+Long pastes appear as compact markers but reach the model in full. Each prompt accepts up to five clipboard images in PNG, JPEG, GIF, or WebP format, up to 5 MB each. Linux clipboard images require `wl-paste` or `xclip`; Windows reads them through PowerShell.
 
 A steer reaches the model with its next request, marked as an adjustment to the request in progress so the final reply still covers the whole request. Tool calls the model has already written, such as a large file, still run first, so cancel instead when they must not run. A steer that arrives as the turn finishes is sent as the next message. Canceling a response pauses queued messages and pending steering. Use `/unqueue` to edit the queue and `Enter` to resume. When a request fails, press `Enter` on an empty prompt to continue the turn from its saved history; `/continue` does the same after a failure or a cancel, keeping goal and plan modes. Model questions appear in the composer; outside planning, their countdown accepts recommended answers unless you press a key or scroll. Planning and plan-revision questions have no countdown and wait for your answer. Disable completion and question bells with `/settings bell off`.
 
@@ -111,7 +113,7 @@ The Git dashboard supports keyboard and mouse navigation. Click a file or commit
 
 ### Remote control
 
-`/remote` lets another device in your [Tailscale](https://tailscale.com) network control the current session from a browser. Yawl listens only on this machine's Tailscale address, port 7474 by default. Each session has its own server, so other sessions running `/remote` take the next free port, from 7475 to 7483, and then any free port. It looks for the address on Tailscale's tunnel interface (`utun*` on macOS, `tailscale*` on Linux), not just any address in the shared 100.64.0.0/10 range. It shows the address, a six-digit pairing code, and a QR code, and copies the link to the clipboard. This notice is removed once a device connects or remote control stops.
+`/remote` lets another device in your [Tailscale](https://tailscale.com) network control the current session from a browser. Yawl listens only on this machine's Tailscale address, port 7474 by default. Each session has its own server, so other sessions running `/remote` take the next free port, from 7475 to 7483, and then any free port. It looks for the address on Tailscale's tunnel interface (`utun*` on macOS, `tailscale*` on Linux, the adapter named Tailscale on Windows), not just any address in the shared 100.64.0.0/10 range. It shows the address, a six-digit pairing code, and a QR code, and copies the link to the clipboard. This notice is removed once a device connects or remote control stops.
 - **Scan the QR code:** the phone opens the page and pairs automatically. The link carries the code in its `#fragment`, which browsers never send to the server.
 - **Use the clipboard:** with Universal Clipboard, paste the link on an iPhone.
 - **Type it:** open the address on the other device and enter the code.
@@ -145,7 +147,7 @@ Yawl reads `~/.yawl/config.json` and then `./.yawl/config.json`; project setting
 }
 ```
 
-Built-in providers use `anthropic:`, `openai:`, and `openai-codex:` prefixes. Anthropic and OpenAI read `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`, which take precedence over saved keys. Saved configuration uses file mode `0600`.
+Built-in providers use `anthropic:`, `openai:`, and `openai-codex:` prefixes. Anthropic and OpenAI read `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`, which take precedence over saved keys. Saved configuration uses file mode `0600`; on Windows it relies on the private permissions of your user profile.
 
 For Codex, run `yawl --login openai-codex` to sign in with your ChatGPT subscription. Yawl discovers your account's models and caches their capabilities for offline lookup.
 
@@ -228,11 +230,11 @@ Long reports are saved under `~/.yawl/artifacts/subagents/`, with a summary and 
 | `read_skill` | Load a skill's instructions |
 | `list_files`, `search_files`, `git_inspect` | File discovery and Git inspection for restricted children |
 
-Use `shell` with `background: true` for servers and watchers so Yawl can track and stop them. Up to eight background commands can run per session; `/ps` opens their dashboard.
+Use `shell` with `background: true` for servers and watchers so Yawl can track and stop them. Up to eight background commands can run per session; `/ps` opens their dashboard. `shell_stop` asks a command to exit and kills it after two seconds; Windows has no such request, so there it ends the whole process tree at once.
 
 Each command output stream keeps its first and last 32 KiB, so build and test summaries printed last are never lost; a marker shows how much was omitted in between. Large command output is saved under `~/.yawl/artifacts/tool-output/`. The model receives an excerpt and a path for paged reading. These artifacts persist until manually removed. `edit_file` accepts files up to 16 MiB; use shell tools for larger files.
 
-Shell and custom-tool results contain stdout, followed by any stderr under a `[stderr]` marker, even when the command succeeds. That way, compiler and linter warnings reach the model. Commands run without a terminal, so password and passphrase prompts from tools such as `ssh`, `sudo`, and `git` fail at once with their error instead of waiting for input; use keys, an agent, or `sudo -n`.
+Shell and custom-tool results contain stdout, followed by any stderr under a `[stderr]` marker, even when the command succeeds. That way, compiler and linter warnings reach the model. Commands run without a terminal, so password and passphrase prompts from tools such as `ssh`, `sudo`, and `git` fail at once with their error instead of waiting for input; use keys, an agent, or `sudo -n`. On Windows, commands get a hidden console instead. Git prompts and Git Credential Manager dialogs are turned off, but other programs that prompt, such as `ssh` asking for a password, wait until the command times out. A Windows command line holds at most 32,767 characters, so write longer scripts to a file first.
 
 ### Custom tools
 
@@ -252,7 +254,7 @@ Each tool is one JSON manifest named after the tool. Global tools live in `~/.ya
 }
 ```
 
-- `command` runs with `sh -c` in the working directory, with a 120-second default timeout.
+- `command` runs with `sh -c` (Git for Windows' `bash -c` on Windows) in the working directory, with a 120-second default timeout.
 - `{{name}}` expands to that argument, already shell-quoted, so spaces and quotes in values stay intact. Don't wrap a placeholder in quotes; the manifest is rejected if you do.
 - A missing optional argument expands to nothing. An array expands to one word per item.
 - A boolean with a `flag` expands to the flag text when true and to nothing when false.
