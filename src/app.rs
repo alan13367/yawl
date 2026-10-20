@@ -25,6 +25,7 @@ pub fn main() {
 }
 
 fn run() -> Result<i32, Box<dyn std::error::Error>> {
+    crate::terminal_mode::enable_escape_output();
     let cli = parse_args(std::env::args().skip(1)).map_err(|message| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

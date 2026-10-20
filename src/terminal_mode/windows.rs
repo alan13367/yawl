@@ -15,8 +15,8 @@ use windows_sys::Win32::System::Console::{
     ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT, FlushConsoleInputBuffer, GetConsoleCP,
     GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents,
-    GetStdHandle, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_HANDLE, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP,
+    GetStdHandle, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_ERROR_HANDLE, STD_HANDLE,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP,
 };
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
@@ -183,6 +183,22 @@ impl Drop for RawMode {
                 SetConsoleOutputCP(self.output_code_page);
             }
             FlushConsoleInputBuffer(self.stdin);
+        }
+    }
+}
+
+/// Turns on VT processing for stdout and stderr when they are consoles. Best
+/// effort: a redirected stream or an old console simply keeps its mode.
+pub(super) fn enable_escape_output() {
+    for which in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let Ok(handle) = std_handle(which) else {
+            continue;
+        };
+        if let Ok(mode) = console_mode(handle) {
+            let _ = set_console_mode(
+                handle,
+                mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+            );
         }
     }
 }

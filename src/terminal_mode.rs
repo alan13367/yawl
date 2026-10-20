@@ -22,6 +22,15 @@ pub(crate) fn window_size() -> Option<(u16, u16)> {
     return windows::window_size();
 }
 
+/// Lets stdout and stderr interpret ANSI escapes outside raw mode, for
+/// colored reports and prompts. Unix terminals always do; a Windows console
+/// does only once asked, and the setting is left on, as other console
+/// programs leave it.
+pub(crate) fn enable_escape_output() {
+    #[cfg(windows)]
+    windows::enable_escape_output();
+}
+
 /// Width of the terminal on stdout, or 80 when it cannot be read.
 pub(crate) fn terminal_columns() -> usize {
     match window_size() {

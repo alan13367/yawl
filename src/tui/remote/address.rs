@@ -39,8 +39,26 @@ pub(super) fn tailscale_ipv4() -> io::Result<Option<Ipv4Addr>> {
 fn is_tailscale_interface(interface: &InterfaceAddress) -> bool {
     interface.up
         && is_tunnel_name(&interface.name)
-        && interface.netmask == Some(Ipv4Addr::BROADCAST)
+        && is_tunnel_netmask(interface.netmask)
         && is_tailscale_range(interface.address)
+}
+
+#[cfg(unix)]
+fn is_tunnel_netmask(netmask: Option<Ipv4Addr>) -> bool {
+    netmask == Some(Ipv4Addr::BROADCAST)
+}
+
+/// The adapter name already identifies the tunnel on Windows, and how wide a
+/// prefix Tailscale assigns there is not documented, so any prefix inside the
+/// 100.64.0.0/10 range is accepted.
+#[cfg(windows)]
+fn is_tunnel_netmask(netmask: Option<Ipv4Addr>) -> bool {
+    is_windows_tunnel_netmask(netmask)
+}
+
+#[cfg(any(windows, test))]
+fn is_windows_tunnel_netmask(netmask: Option<Ipv4Addr>) -> bool {
+    netmask.is_some_and(|netmask| u32::from(netmask).leading_ones() >= 10)
 }
 
 #[cfg(unix)]
@@ -175,6 +193,14 @@ mod tests {
         assert_eq!(prefix_netmask(10), Ipv4Addr::new(255, 192, 0, 0));
         assert_eq!(prefix_netmask(0), Ipv4Addr::UNSPECIFIED);
         assert_eq!(prefix_netmask(200), Ipv4Addr::BROADCAST);
+    }
+
+    #[test]
+    fn windows_accepts_any_prefix_within_the_tailscale_range() {
+        assert!(is_windows_tunnel_netmask(Some(prefix_netmask(32))));
+        assert!(is_windows_tunnel_netmask(Some(prefix_netmask(10))));
+        assert!(!is_windows_tunnel_netmask(Some(prefix_netmask(8))));
+        assert!(!is_windows_tunnel_netmask(None));
     }
 
     #[cfg(unix)]

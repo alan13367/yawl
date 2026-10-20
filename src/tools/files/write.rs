@@ -271,10 +271,9 @@ fn replace_through_temporary(
 
 /// Windows has no owner, group, or mode to copy. The replacement inherits the
 /// directory's ACL and loses the original's explicit ACL, hidden and system
-/// attributes, and alternate data streams. The read-only attribute is the one
-/// piece of `Permissions` there, and it is copied. Replacing a read-only file,
-/// or one that another program holds open without sharing deletes, fails with
-/// an error that says so.
+/// attributes, and alternate data streams. Replacing a read-only file, or one
+/// that another program holds open without sharing deletes, fails with an
+/// error that says so.
 #[cfg(windows)]
 fn replace_through_temporary(
     temporary: &Path,
@@ -282,6 +281,14 @@ fn replace_through_temporary(
     original: Option<&fs::Metadata>,
     contents: &[u8],
 ) -> std::io::Result<bool> {
+    // Refused before the temporary file exists: a read-only copy of it could
+    // not be deleted again once the rename fails.
+    if original.is_some_and(|original| original.permissions().readonly()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("cannot replace {}: the file is read-only", target.display()),
+        ));
+    }
     let Ok(mut file) = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -291,12 +298,7 @@ fn replace_through_temporary(
     };
     let written = (|| {
         std::io::Write::write_all(&mut file, contents)?;
-        file.sync_all()?;
-        // After the contents, because a read-only file cannot be written.
-        if let Some(original) = original {
-            file.set_permissions(original.permissions())?;
-        }
-        Ok(())
+        file.sync_all()
     })();
     // Close the handle before the rename.
     drop(file);
@@ -618,6 +620,11 @@ mod tests {
         let error = write_atomically(&file, b"new").unwrap_err();
         assert!(error.to_string().contains("cannot replace"), "{error}");
         assert_eq!(std::fs::read_to_string(&file)?, "old");
+        let leftovers = std::fs::read_dir(&dir.0)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
 
         // Windows has no world-writable bits; this only clears the
         // read-only attribute so the test directory can be removed.

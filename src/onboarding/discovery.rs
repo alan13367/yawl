@@ -50,11 +50,12 @@ enum AuthStyle<'a> {
 }
 
 fn fetch_models(url: &str, style: AuthStyle<'_>) -> Result<Vec<DiscoveredModel>, Error> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(5)))
-        .build()
-        .into();
+    let agent = crate::provider::cancellable_agent(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build(),
+    );
     let mut request = agent.get(url).header("accept", "application/json");
     request = match style {
         AuthStyle::Bearer(key) if !key.is_empty() => {

@@ -73,6 +73,19 @@ pub(crate) fn valid_tool_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && !names_device(name)
+}
+
+/// Tool names become `<name>.json` manifest files, and Windows opens names
+/// such as `con` or `com1` as devices wherever they appear.
+#[cfg(windows)]
+fn names_device(name: &str) -> bool {
+    crate::paths::is_reserved_device_name(name)
+}
+
+#[cfg(unix)]
+fn names_device(_name: &str) -> bool {
+    false
 }
 
 /// Formats a finished process: stdout, then stderr under a `[stderr]`
