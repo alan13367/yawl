@@ -7,6 +7,10 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::error::Error;
 
 mod interruptible;
+#[cfg(any(windows, test))]
+mod ready;
+#[cfg(test)]
+mod scenarios;
 
 pub(crate) use interruptible::cancellable_agent;
 
