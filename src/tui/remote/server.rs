@@ -3,7 +3,10 @@
 
 use std::io::{self, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, RawFd};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -23,7 +26,7 @@ const COOKIE: &str = "yawl_remote";
 const CLIENT_HEADER: &str = "x-yawl-client";
 const MAX_CONNECTIONS: usize = 32;
 /// How often waiting threads recheck whether their session is still current.
-const POLL_MILLIS: libc::c_int = 100;
+const POLL_MILLIS: i32 = 100;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long an idle kept-alive connection waits for its next request.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -83,7 +86,7 @@ impl Server {
         while self.hub.is_current(self.generation) {
             // Wait for a connection without sleeping through it, so new
             // connections are accepted at once.
-            if !wait_readable(listener.as_raw_fd()) {
+            if !wait_readable(&listener) {
                 continue;
             }
             if let Ok((stream, peer)) = listener.accept() {
@@ -154,7 +157,7 @@ impl Server {
     fn wait_for_request(&self, stream: &TcpStream) -> bool {
         let started = Instant::now();
         while self.hub.is_current(self.generation) {
-            if wait_readable(stream.as_raw_fd()) {
+            if wait_readable(stream) {
                 return true;
             }
             if started.elapsed() >= IDLE_TIMEOUT {
@@ -311,15 +314,33 @@ impl Server {
 
 /// Waits up to [`POLL_MILLIS`] for a pending connection or request. A closed
 /// peer also counts as readable, so the next read sees the end of stream.
-fn wait_readable(fd: RawFd) -> bool {
+#[cfg(unix)]
+fn wait_readable(socket: &impl AsRawFd) -> bool {
     let mut descriptor = libc::pollfd {
-        fd,
+        fd: socket.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
     // SAFETY: `descriptor` is one initialized pollfd for a descriptor the
     // caller keeps open for the duration of the call.
     unsafe { libc::poll(&mut descriptor, 1, POLL_MILLIS) > 0 }
+}
+
+/// `WSAPoll` reports a closed or reset peer through `POLLHUP`/`POLLERR`, which
+/// it returns without being asked for, so those count as readable too.
+#[cfg(windows)]
+fn wait_readable(socket: &impl AsRawSocket) -> bool {
+    use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, WSAPOLLFD, WSAPoll};
+
+    let mut descriptor = WSAPOLLFD {
+        fd: socket.as_raw_socket() as usize,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    // SAFETY: `descriptor` is one initialized WSAPOLLFD for a socket the
+    // caller keeps open for the duration of the call. Winsock is initialized
+    // because std did so when this socket was created.
+    unsafe { WSAPoll(&mut descriptor, 1, POLL_MILLIS) > 0 }
 }
 
 /// Accepts IP literals, single-label MagicDNS names, and `*.ts.net` names.

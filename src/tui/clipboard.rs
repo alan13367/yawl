@@ -2,12 +2,23 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::process::Command;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
+/// Starting PowerShell and loading Windows Forms takes noticeably longer
+/// than the macOS and Linux helpers.
+#[cfg(any(windows, test))]
+const POWERSHELL_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StagedImage {
@@ -59,15 +70,14 @@ impl ClipboardStore {
 
     fn ensure_process_dir(&mut self) -> io::Result<&Path> {
         if self.process_dir.is_none() {
-            let root = PathBuf::from("/tmp/yawl-clipboard");
+            let root = staging_root();
             ensure_private_directory(&root)?;
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
             let directory = root.join(format!("{}-{stamp}", std::process::id()));
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700).create(&directory)?;
+            create_private_directory(&directory)?;
             self.process_dir = Some(directory);
         }
         self.process_dir
@@ -84,6 +94,33 @@ impl Drop for ClipboardStore {
     }
 }
 
+/// Where per-process staging directories live.
+#[cfg(unix)]
+fn staging_root() -> PathBuf {
+    PathBuf::from("/tmp/yawl-clipboard")
+}
+
+/// The per-user temporary directory (`%LOCALAPPDATA%\Temp`) is private to the
+/// user by its default ACL, unlike a shared `/tmp`.
+#[cfg(windows)]
+fn staging_root() -> PathBuf {
+    std::env::temp_dir().join("yawl-clipboard")
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
+}
+
+/// New directories inherit the private ACL of the user's temporary directory,
+/// so no mode is set.
+#[cfg(windows)]
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
+}
+
+#[cfg(unix)]
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
     // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
     let effective_uid = unsafe { libc::geteuid() };
@@ -104,20 +141,40 @@ fn ensure_private_directory(path: &Path) -> io::Result<()> {
             }
             Ok(())
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700).create(path)
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_private_directory(path),
         Err(error) => Err(error),
     }
 }
 
+/// The staging root sits in the user's private temporary directory, which no
+/// other user can write to, so there is no owner or mode to verify; only a
+/// reparse point or plain file squatting on the name is refused.
+#[cfg(windows)]
+fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a plain directory", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_private_directory(path),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
 fn create_private_file(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)
+}
+
+/// The file inherits the private ACL of its staging directory.
+#[cfg(windows)]
+fn create_private_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 fn validate_staged(path: &Path) -> Result<&'static str, String> {
@@ -135,6 +192,7 @@ fn validate_staged(path: &Path) -> Result<&'static str, String> {
         .ok_or_else(|| "clipboard image must be PNG, JPEG, GIF, or WebP".into())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn wait_for_child(child: &mut Child, deadline: Instant) -> Result<ExitStatus, String> {
     loop {
         match child.try_wait() {
@@ -239,9 +297,97 @@ fn platform_read(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Variable the script reads the target path from, so the path never passes
+/// through string interpolation into code.
+#[cfg(any(windows, test))]
+const POWERSHELL_PATH_VARIABLE: &str = "YAWL_CLIPBOARD_IMAGE_PATH";
+
+/// Saves the clipboard bitmap as PNG. Exits 0 on success, 2 when the clipboard
+/// holds no image, and 1 with a message on stderr for anything else.
+#[cfg(any(windows, test))]
+const POWERSHELL_SCRIPT: &str = concat!(
+    "$ErrorActionPreference = 'Stop'; ",
+    "try { ",
+    "Add-Type -AssemblyName System.Windows.Forms, System.Drawing; ",
+    "$image = [System.Windows.Forms.Clipboard]::GetImage(); ",
+    "if ($null -eq $image) { exit 2 }; ",
+    "try { $image.Save($env:YAWL_CLIPBOARD_IMAGE_PATH, [System.Drawing.Imaging.ImageFormat]::Png) } ",
+    "finally { $image.Dispose() } ",
+    "} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }",
+);
+
+#[cfg(windows)]
+fn platform_read(path: &Path) -> Result<(), String> {
+    use crate::tools::exec::{Keep, RunOptions, run};
+
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-STA",
+            "-Command",
+            POWERSHELL_SCRIPT,
+        ])
+        .env(POWERSHELL_PATH_VARIABLE, path);
+    let result = run(
+        command,
+        RunOptions {
+            stdin: None,
+            timeout: Some(POWERSHELL_TIMEOUT),
+            stdout: Keep::Head(1024),
+            stderr: Keep::Head(2048),
+        },
+    );
+    match result {
+        Ok(result) => powershell_outcome(
+            result.status,
+            result.timed_out,
+            result.interrupted,
+            &result.stderr,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err("image paste on Windows requires powershell.exe".into())
+        }
+        Err(error) => Err(format!("cannot run powershell.exe: {error}")),
+    }
+}
+
+/// Maps how the PowerShell helper ended to the paste result.
+#[cfg(any(windows, test))]
+fn powershell_outcome(
+    status: Option<i32>,
+    timed_out: bool,
+    interrupted: bool,
+    stderr: &str,
+) -> Result<(), String> {
+    if interrupted {
+        return Err("clipboard image paste was interrupted".into());
+    }
+    if timed_out {
+        return Err("clipboard image paste timed out".into());
+    }
+    match status {
+        Some(0) => Ok(()),
+        Some(2) => Err("clipboard does not contain a supported image".into()),
+        status => {
+            let message = stderr
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(|line| crate::text::sanitize_line(line, crate::text::Tabs::Space));
+            Err(match (message, status) {
+                (Some(message), _) => format!("cannot read clipboard image: {message}"),
+                (None, Some(code)) => format!("clipboard helper exited with status {code}"),
+                (None, None) => "clipboard helper ended without a status".into(),
+            })
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn platform_read(_: &Path) -> Result<(), String> {
-    Err("clipboard image paste is supported only on macOS and Linux".into())
+    Err("clipboard image paste is supported only on macOS, Linux, and Windows".into())
 }
 
 #[cfg(test)]
@@ -262,6 +408,7 @@ mod tests {
         assert_eq!(image.marker(), "[Image #3]");
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_directory_has_owner_only_permissions() -> io::Result<()> {
         let path = temp_path("private");
@@ -285,6 +432,43 @@ mod tests {
         drop(store);
         assert!(!path.exists());
         Ok(())
+    }
+
+    #[test]
+    fn powershell_results_map_to_paste_errors() {
+        assert_eq!(powershell_outcome(Some(0), false, false, ""), Ok(()));
+        assert_eq!(
+            powershell_outcome(Some(2), false, false, ""),
+            Err("clipboard does not contain a supported image".into())
+        );
+        assert_eq!(
+            powershell_outcome(Some(1), false, false, "\n  Out of memory \x1b[2J\n"),
+            Err("cannot read clipboard image: Out of memory \u{fffd}[2J".into())
+        );
+        assert_eq!(
+            powershell_outcome(Some(7), false, false, ""),
+            Err("clipboard helper exited with status 7".into())
+        );
+        assert_eq!(
+            powershell_outcome(None, false, false, ""),
+            Err("clipboard helper ended without a status".into())
+        );
+        assert!(
+            powershell_outcome(None, true, false, "")
+                .is_err_and(|error| error.contains("timed out"))
+        );
+        assert!(
+            powershell_outcome(Some(0), false, true, "")
+                .is_err_and(|error| error.contains("interrupted"))
+        );
+    }
+
+    #[test]
+    fn powershell_script_reads_its_path_from_the_environment() {
+        assert!(POWERSHELL_SCRIPT.contains(&format!("$env:{POWERSHELL_PATH_VARIABLE}")));
+        // No double quotes, so the argument needs no escaping on a command line.
+        assert!(!POWERSHELL_SCRIPT.contains('"'));
+        assert!(POWERSHELL_TIMEOUT >= Duration::from_secs(5));
     }
 
     #[test]

@@ -171,15 +171,50 @@ pub(super) fn prompt_with_default(label: &str, default: &str) -> Result<String, 
 
 fn read_line() -> Result<String, Error> {
     let mut line = String::new();
-    if io::stdin().read_line(&mut line)? == 0 {
+    let read = match crate::terminal_mode::read_line(&mut line) {
+        Ok(read) => read,
+        Err(error) if error.kind() == io::ErrorKind::Interrupted && crate::interrupted() => {
+            return Err(Error::Interrupted);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if read == 0 {
         return Err(Error::Config("onboarding canceled".into()));
     }
     Ok(line.trim().to_string())
 }
 
-/// Reads one byte of raw-mode terminal input; `None` at end of input.
+/// Reads one byte of raw-mode terminal input. `None` means nothing arrived
+/// within the raw-mode read timeout, not end of input.
+#[cfg(unix)]
 pub(super) fn read_byte() -> io::Result<Option<u8>> {
     use std::io::Read;
     let mut buffer = [0u8; 1];
     Ok((io::stdin().read(&mut buffer)? == 1).then_some(buffer[0]))
+}
+
+/// Reads one byte of raw-mode terminal input from the console key records,
+/// which `io::stdin()` cannot give as bytes with a timeout. `None` means
+/// nothing arrived within the timeout. Where Unix reports Ctrl+C as an
+/// interrupted read, this reports it as soon as a timeout finds the
+/// interrupt flag set, which is within 100 ms.
+#[cfg(windows)]
+pub(super) fn read_byte() -> io::Result<Option<u8>> {
+    use std::cell::RefCell;
+    use std::io::Read;
+
+    thread_local! {
+        // Keeps queued bytes between calls, such as the tail of a multi-byte
+        // character.
+        static INPUT: RefCell<crate::terminal_mode::ConsoleInput> =
+            RefCell::new(crate::terminal_mode::ConsoleInput::stdin());
+    }
+    let mut buffer = [0u8; 1];
+    if INPUT.with_borrow_mut(|input| input.read(&mut buffer))? == 1 {
+        return Ok(Some(buffer[0]));
+    }
+    if crate::interrupted() {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    Ok(None)
 }

@@ -7,12 +7,22 @@ mod http;
 mod hub;
 mod qr;
 mod server;
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
 
 use std::cell::RefCell;
 use std::io::{self, Read};
 use std::net::{IpAddr, SocketAddr};
-use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
+
+#[cfg(unix)]
+use self::unix as platform;
+#[cfg(windows)]
+use self::windows as platform;
+
+pub(super) use self::platform::TerminalInput;
 
 use self::hub::{Hub, Outgoing};
 
@@ -70,11 +80,15 @@ impl Remote {
     /// polls both the terminal and remote input, so remote keystrokes are
     /// handled immediately rather than after the raw-mode read timeout.
     ///
-    /// `host` must be unbuffered, such as [`FdInput`]: bytes held in a
-    /// reader's buffer are invisible to `poll` and would stall.
-    pub(super) fn terminal_input<R: Read + AsRawFd>(&self, host: R) -> RemoteInput<R> {
+    /// `host` must be unbuffered, such as [`TerminalInput`]: bytes held in a
+    /// reader's buffer are invisible to the wait and would stall, unless the
+    /// reader reports them through [`HostInput::has_buffered`].
+    pub(super) fn terminal_input<R: HostInput>(&self, host: R) -> RemoteInput<R> {
         RemoteInput {
-            poll_fd: Some(host.as_raw_fd()),
+            poll: Some(HostPoll {
+                handle: host.wait_handle(),
+                buffered: R::has_buffered,
+            }),
             host,
             hub: Arc::clone(&self.hub),
         }
@@ -85,7 +99,7 @@ impl Remote {
         RemoteInput {
             host,
             hub: Arc::clone(&self.hub),
-            poll_fd: None,
+            poll: None,
         }
     }
 
@@ -154,67 +168,40 @@ impl Drop for Remote {
     }
 }
 
-/// Unbuffered reads from a terminal descriptor.
-pub(super) struct FdInput(RawFd);
+/// A host terminal reader that [`RemoteInput`] can wait on together with the
+/// hub's wake-up.
+pub(super) trait HostInput: Read {
+    /// The OS object that becomes ready when `read` has input to return.
+    fn wait_handle(&self) -> platform::Handle;
 
-impl FdInput {
-    pub(super) fn stdin() -> Self {
-        Self(libc::STDIN_FILENO)
-    }
-}
-
-impl Read for FdInput {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // SAFETY: `buf` is valid writable storage of `buf.len()` bytes and the
-        // descriptor stays open for the terminal's lifetime.
-        let read = unsafe { libc::read(self.0, buf.as_mut_ptr().cast(), buf.len()) };
-        if read < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(read as usize)
-    }
-}
-
-impl AsRawFd for FdInput {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
+    /// Whether the reader holds input the OS object does not show, such as
+    /// bytes left over from a small read buffer.
+    fn has_buffered(&self) -> bool {
+        false
     }
 }
 
 pub(super) struct RemoteInput<R> {
     host: R,
     hub: Arc<Hub>,
-    /// Host descriptor to wait on together with the hub's wake pipe.
-    poll_fd: Option<RawFd>,
+    /// How to wait on the host together with the hub's wake handle.
+    poll: Option<HostPoll<R>>,
 }
 
-/// Matches the raw-mode read timeout, which paces UI ticks.
-const TICK_MILLIS: libc::c_int = 100;
+struct HostPoll<R> {
+    handle: platform::Handle,
+    buffered: fn(&R) -> bool,
+}
 
 impl<R: Read> RemoteInput<R> {
     /// Waits until host input is readable, remote input is queued, or a tick
     /// elapses. Returns whether the host has input.
-    fn wait(&self, host: RawFd, wake: RawFd) -> bool {
-        let mut fds = [
-            libc::pollfd {
-                fd: host,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: wake,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        // SAFETY: `fds` is a valid array of two initialized pollfd entries
-        // for descriptors that stay open for the duration of the call.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, TICK_MILLIS) };
-        if fds[1].revents != 0 {
+    fn wait(&self, host: platform::Handle, wake: platform::Handle) -> bool {
+        let ready = platform::wait(host, wake);
+        if ready.wake {
             self.hub.drain_wake();
         }
-        // An interrupted or timed-out wait is a tick.
-        ready > 0 && fds[0].revents != 0
+        ready.host
     }
 }
 
@@ -224,8 +211,9 @@ impl<R: Read> Read for RemoteInput<R> {
         if queued > 0 {
             return Ok(queued);
         }
-        if let (Some(host), Some(wake)) = (self.poll_fd, self.hub.wake_fd())
-            && !self.wait(host, wake)
+        if let (Some(poll), Some(wake)) = (&self.poll, self.hub.wake_handle())
+            && !(poll.buffered)(&self.host)
+            && !self.wait(poll.handle, wake)
         {
             return Ok(self.hub.take_input(buf));
         }
@@ -450,15 +438,17 @@ mod tests {
         assert!(!listening_notice(address, "482913", false).contains("clipboard"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn bursts_larger_than_one_read_arrive_without_stalling() -> io::Result<()> {
         use std::io::Write;
+        use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
         use std::time::{Duration, Instant};
 
         let remote = Remote::new();
         let (host, mut terminal) = UnixStream::pair()?;
-        let mut input = remote.terminal_input(FdInput(host.as_raw_fd()));
+        let mut input = remote.terminal_input(TerminalInput::from_fd(host.as_raw_fd()));
         terminal.write_all(&[b'p'; 1024])?;
         let started = Instant::now();
         let mut buf = [0u8; 512];
@@ -472,6 +462,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_input_interrupts_the_terminal_wait() -> io::Result<()> {
         use std::os::unix::net::UnixStream;

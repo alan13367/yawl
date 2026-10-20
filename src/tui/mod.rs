@@ -1,4 +1,4 @@
-//! Full-screen terminal UI built directly on termios and ANSI escape
+//! Full-screen terminal UI built directly on a raw terminal and ANSI escape
 //! sequences. The terminal remains responsive while the blocking agent loop
 //! runs on a scoped worker thread.
 
@@ -124,7 +124,9 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
     };
     theme::init(agent.config().theme, light_background);
     let events = EventReader::with_pending(
-        terminal.remote().terminal_input(remote::FdInput::stdin()),
+        terminal
+            .remote()
+            .terminal_input(remote::TerminalInput::stdin()),
         &typed,
     );
     let editor = Editor::default();

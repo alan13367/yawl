@@ -13,6 +13,9 @@ use super::remote::{self, Remote, Snapshot};
 use super::render::{FrameImage, HIDDEN_CURSOR, ImageSupport, build_frame_with_images};
 use super::{ViewState, markdown, theme};
 
+#[cfg(windows)]
+mod windows;
+
 pub(super) struct Terminal {
     raw_mode: RawMode,
     stdout: io::Stdout,
@@ -239,7 +242,7 @@ impl Terminal {
             return (None, Vec::new());
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        let mut input = remote::FdInput::stdin();
+        let mut input = remote::TerminalInput::stdin();
         let mut reply = Vec::new();
         let mut buffer = [0_u8; 256];
         while !theme::has_device_attributes(&reply)
@@ -795,23 +798,20 @@ pub(super) fn copy_with_platform_command(text: &str) -> bool {
         || copy_command("xsel", &["--clipboard", "--input"], text)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Sets the Win32 clipboard directly; no helper program is involved.
+#[cfg(windows)]
+pub(super) fn copy_with_platform_command(text: &str) -> bool {
+    windows::set_text(text).is_ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub(super) fn copy_with_platform_command(_text: &str) -> bool {
     false
 }
 
 pub(super) fn terminal_size() -> (u16, u16) {
-    // SAFETY: A zeroed winsize has a valid all-integer representation and is
-    // passed to ioctl as writable storage.
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: STDOUT_FILENO is a terminal while the TUI is active and `size`
-    // points to writable winsize storage.
-    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0
-        && size.ws_col > 0
-        && size.ws_row > 0
-    {
-        (size.ws_col.max(20), size.ws_row.max(8))
-    } else {
-        (80, 24)
+    match crate::terminal_mode::window_size() {
+        Some((columns, rows)) if columns > 0 && rows > 0 => (columns.max(20), rows.max(8)),
+        _ => (80, 24),
     }
 }

@@ -93,7 +93,7 @@ fn prompt_project_trust(root: &Path) -> Result<ProjectTrustChoice, io::Error> {
         eprint!("Choice [3]: ");
         io::stderr().flush()?;
         let mut answer = String::new();
-        if io::stdin().read_line(&mut answer)? == 0 {
+        if crate::terminal_mode::read_line(&mut answer)? == 0 {
             return Ok(ProjectTrustChoice::Deny);
         }
         match answer.trim() {

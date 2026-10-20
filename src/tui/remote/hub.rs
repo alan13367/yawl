@@ -1,13 +1,12 @@
 //! State shared between the UI thread and the remote-control server threads.
 
 use std::collections::VecDeque;
-use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, MutexGuard};
 
 use super::Snapshot;
+use super::platform::{Handle, Wake};
 use crate::tui::events::{Event, EventReader, Key};
 
 /// Wrong pairing codes tolerated before the session shuts itself down.
@@ -91,59 +90,6 @@ pub(super) struct Hub {
     wake: Option<Wake>,
 }
 
-/// A non-blocking self-pipe that wakes the UI thread's input wait as soon as
-/// remote input arrives, instead of after the raw-mode read timeout.
-struct Wake {
-    read: OwnedFd,
-    write: OwnedFd,
-}
-
-impl Wake {
-    fn new() -> io::Result<Self> {
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `fds` is writable storage for the two descriptors pipe
-        // returns on success.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: pipe succeeded, so both descriptors are open and owned
-        // solely by this value from here on.
-        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        for fd in [&read, &write] {
-            // SAFETY: `fd` is an open descriptor owned by this value.
-            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-            if flags < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: `fd` is an open descriptor owned by this value; adding
-            // O_NONBLOCK changes no memory.
-            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: `fd` is an open descriptor owned by this value; setting
-            // FD_CLOEXEC changes no memory.
-            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok(Self { read, write })
-    }
-
-    fn notify(&self) {
-        // A full pipe already guarantees a pending wake-up.
-        // SAFETY: writes one byte from a valid buffer to an owned descriptor.
-        let _ = unsafe { libc::write(self.write.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
-    }
-
-    fn drain(&self) {
-        let mut buf = [0u8; 64];
-        // SAFETY: reads into a valid local buffer from an owned, non-blocking
-        // descriptor until it is empty.
-        while unsafe { libc::read(self.read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {
-        }
-    }
-}
-
 impl Hub {
     /// A hub whose remote input can interrupt the UI thread's input wait.
     pub(super) fn with_wake() -> Self {
@@ -153,9 +99,9 @@ impl Hub {
         }
     }
 
-    /// Descriptor that becomes readable when remote input is queued.
-    pub(super) fn wake_fd(&self) -> Option<RawFd> {
-        self.wake.as_ref().map(|wake| wake.read.as_raw_fd())
+    /// Handle that becomes ready when remote input is queued.
+    pub(super) fn wake_handle(&self) -> Option<Handle> {
+        self.wake.as_ref().map(Wake::handle)
     }
 
     pub(super) fn drain_wake(&self) {
