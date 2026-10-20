@@ -196,11 +196,12 @@ pub(crate) fn refresh_catalog(config: &Config) -> Result<Vec<CodexModel>, Error>
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let credential = auth::load_and_refresh_credential(config)?;
     let version = client_version(config);
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(6)))
-        .build()
-        .into();
+    let agent = crate::provider::cancellable_agent(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(6)))
+            .build(),
+    );
     let mut response = agent
         .get(format!("{MODELS_URL}?client_version={version}"))
         .header("accept", "application/json")

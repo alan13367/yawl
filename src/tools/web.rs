@@ -43,14 +43,15 @@ fn shared_agent() -> ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT
         .get_or_init(|| {
-            ureq::Agent::config_builder()
-                .http_status_as_error(false)
-                .timeout_global(Some(Duration::from_secs(30)))
-                .max_redirects(5)
-                .max_redirects_will_error(true)
-                .user_agent("Yawl/0.1 web tools")
-                .build()
-                .into()
+            crate::provider::cancellable_agent(
+                ureq::Agent::config_builder()
+                    .http_status_as_error(false)
+                    .timeout_global(Some(Duration::from_secs(30)))
+                    .max_redirects(5)
+                    .max_redirects_will_error(true)
+                    .user_agent("Yawl/0.1 web tools")
+                    .build(),
+            )
         })
         .clone()
 }

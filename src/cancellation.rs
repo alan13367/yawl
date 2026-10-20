@@ -1,4 +1,14 @@
 //! Run-scoped cancellation layered on top of the process-wide interrupt.
+//!
+//! The process-wide flag is set by the platform's Ctrl+C mechanism (SIGINT on
+//! Unix, a console control handler on Windows). Blocking HTTP reads observe
+//! cancellation by polling (see `provider::http`); on Unix a targeted
+//! `SIGUSR1` additionally wakes a blocked syscall immediately.
+
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -6,7 +16,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-static WAKE_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+pub(crate) use unix::{install_interrupt_handler, native_thread_id, wake_thread};
+#[cfg(windows)]
+pub(crate) use windows::{install_interrupt_handler, native_thread_id, wake_thread};
+
+/// Process-wide turn-abort flag set by Ctrl+C and explicit callers. TUI key
+/// cancellation uses a narrower conversation token instead. Aborts active
+/// work, never the process.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether Ctrl+C (or [`set_process_interrupted`]) aborted process activity.
+/// Most code wants [`interrupted`], which also honors the scoped token.
+pub(crate) fn process_interrupted() -> bool {
+    INTERRUPTED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_process_interrupted(value: bool) {
+    INTERRUPTED.store(value, Ordering::Relaxed);
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct CancellationToken {
@@ -75,45 +103,17 @@ pub(crate) fn with_timeout<T>(
     (result, timed_out.load(Ordering::Acquire))
 }
 
-/// True when SIGINT canceled the process activity or the current
+/// True when Ctrl+C canceled the process activity or the current
 /// conversation's token was canceled.
 pub(crate) fn interrupted() -> bool {
-    crate::interrupted()
+    process_interrupted()
         || CURRENT_TOKEN
             .with_borrow(|current| current.as_ref().is_some_and(CancellationToken::is_canceled))
 }
 
-#[cfg(unix)]
-pub(crate) fn native_thread_id() -> usize {
-    // SAFETY: `pthread_self` takes no arguments and returns the calling
-    // thread's stable pthread identifier.
-    unsafe { libc::pthread_self() as usize }
-}
-
-#[cfg(unix)]
-pub(crate) fn wake_thread(thread: usize) {
-    if !WAKE_HANDLER_INSTALLED.load(Ordering::Acquire) {
-        return;
-    }
-    // SAFETY: callers retain the worker until cancellation has settled, so
-    // this pthread identifier still refers to that worker. SIGUSR1 has a
-    // no-op handler and exists only to interrupt a blocking system call.
-    unsafe {
-        libc::pthread_kill(thread as libc::pthread_t, libc::SIGUSR1);
-    }
-}
-
-/// Whether a bounded cleanup read can be interrupted safely on this host.
-pub(crate) fn wake_handler_installed() -> bool {
-    WAKE_HANDLER_INSTALLED.load(Ordering::Acquire)
-}
-
-pub(crate) fn mark_wake_handler_installed() {
-    WAKE_HANDLER_INSTALLED.store(true, Ordering::Release);
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::process::Command;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -183,6 +183,7 @@ mod tests {
         assert_eq!(states, [false, true]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_scoped_token_kills_only_its_shell_process_group() {
         crate::set_interrupted(false);

@@ -20,5 +20,5 @@ pub use types::{
 
 #[cfg(test)]
 pub(crate) use http::SseReader;
-pub(crate) use http::{SseEvent, error_body, event_stream, http_agent};
+pub(crate) use http::{SseEvent, cancellable_agent, error_body, event_stream, http_agent};
 pub(crate) use streaming::append_reasoning;

@@ -162,11 +162,12 @@ fn open_device_browser() -> Result<(), String> {
 }
 
 fn oauth_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(30)))
-        .build()
-        .into()
+    crate::provider::cancellable_agent(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build(),
+    )
 }
 
 /// Posts `body` and returns the status with the response text, read up to

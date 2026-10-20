@@ -256,11 +256,12 @@ mod tests {
             );
         });
         let timed_tools = WebTools {
-            agent: ureq::Agent::config_builder()
-                .http_status_as_error(false)
-                .timeout_global(Some(Duration::from_millis(50)))
-                .build()
-                .into(),
+            agent: crate::provider::cancellable_agent(
+                ureq::Agent::config_builder()
+                    .http_status_as_error(false)
+                    .timeout_global(Some(Duration::from_millis(50)))
+                    .build(),
+            ),
             provider: WebSearchProvider::DuckDuckGo,
             fetch_max_chars: 20_000,
             artifact_dir: std::env::temp_dir(),

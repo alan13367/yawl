@@ -6,6 +6,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::Error;
 
+mod interruptible;
+
+pub(crate) use interruptible::cancellable_agent;
+
 /// Longest silence tolerated from a provider before its connection is
 /// presumed dead. Generous so slow models can think without streaming, yet
 /// bounded because a socket whose peer vanished never reports EOF.
@@ -61,21 +65,19 @@ pub(crate) fn stall_error() -> Error {
     ))
 }
 
-/// Runs one provider request under a watchdog that wakes the calling thread
-/// when the response goes silent for too long, or shortly after the host
-/// resumes from sleep with a silent connection. Returns whether it fired; the
-/// interrupted read then fails with [`stall_error`] so the caller can retry
-/// on a fresh connection instead of waiting forever on a dead socket.
+/// Runs one provider request under a watchdog that interrupts the calling
+/// thread's read when the response goes silent for too long, or shortly after
+/// the host resumes from sleep with a silent connection. The watchdog raises
+/// the stall flag, which the polling connector observes within one slice (see
+/// [`interruptible`]); on Unix it also wakes the blocked syscall at once.
+/// Returns whether it fired; the interrupted read then fails with
+/// [`stall_error`] so the caller can retry on a fresh connection instead of
+/// waiting forever on a dead socket.
 pub(crate) fn watch_stalls<T>(run: impl FnOnce() -> T) -> (T, bool) {
     watch_stalls_with(STALL_TIMEOUT, RESUME_GRACE, run)
 }
 
 fn watch_stalls_with<T>(idle: Duration, grace: Duration, run: impl FnOnce() -> T) -> (T, bool) {
-    // Without the wake handler a signal could not interrupt the read, and
-    // could terminate the process instead.
-    if !crate::cancellation::wake_handler_installed() {
-        return (run(), false);
-    }
     let watch = Arc::new(StallWatch::default());
     let thread = crate::cancellation::native_thread_id();
     let (done_tx, done_rx) = mpsc::channel::<()>();
@@ -108,7 +110,8 @@ fn watch_stalls_with<T>(idle: Duration, grace: Duration, run: impl FnOnce() -> T
                 }
                 if observed.stalled.load(Ordering::Acquire) {
                     // Repeat the wake: one that lands just before the reader
-                    // blocks again would otherwise be lost.
+                    // blocks again would otherwise be lost. A no-op where
+                    // waking is unavailable; the connector polls the flag.
                     crate::cancellation::wake_thread(thread);
                 }
             }
@@ -187,15 +190,16 @@ pub(crate) fn http_agent() -> ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT
         .get_or_init(|| {
-            ureq::Agent::config_builder()
-                .http_status_as_error(false)
-                .timeout_global(None)
-                // Bounded so a lookup on a network that is still waking up
-                // cannot hold a turn past cancellation for long.
-                .timeout_resolve(Some(Duration::from_secs(10)))
-                .timeout_connect(Some(Duration::from_secs(20)))
-                .build()
-                .into()
+            cancellable_agent(
+                ureq::Agent::config_builder()
+                    .http_status_as_error(false)
+                    .timeout_global(None)
+                    // Bounded so a lookup on a network that is still waking up
+                    // cannot hold a turn past cancellation for long.
+                    .timeout_resolve(Some(Duration::from_secs(10)))
+                    .timeout_connect(Some(Duration::from_secs(20)))
+                    .build(),
+            )
         })
         .clone()
 }
@@ -232,12 +236,9 @@ impl<R: BufRead> SseReader<R> {
     /// can return the connection to its pool. Trailers are best effort: timeout
     /// or malformed trailing bytes must never retry an already completed turn.
     pub(crate) fn finish(mut self) {
-        // Both front ends install the wake handler. Library users who have not
-        // installed it still finish immediately, dropping the connection rather
-        // than risking an uninterruptible read from a nonconforming server.
-        if !crate::cancellation::wake_handler_installed() {
-            return;
-        }
+        // The watchdog cancels the token after 100 ms, and every agent's
+        // connector polls the token, so a nonconforming server cannot hold
+        // this read past that on any platform.
         let token = crate::cancellation::CancellationToken::default();
         crate::cancellation::with_timeout(&token, Duration::from_millis(100), || {
             crate::cancellation::scope(&token, || {

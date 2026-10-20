@@ -67,6 +67,20 @@ pub(crate) fn write_event_stream(
     stream.flush()
 }
 
+/// Writes the head of a chunked `200 OK` response followed by one chunk of
+/// `chunk`, leaving the body open for the caller to end or abandon.
+pub(crate) fn write_chunked_head(
+    stream: &mut impl std::io::Write,
+    chunk: &str,
+) -> std::io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{chunk}\r\n",
+        chunk.len()
+    )?;
+    stream.flush()
+}
+
 /// Streams `text` as one OpenAI-compatible chat completion.
 pub(crate) fn write_completion(
     stream: &mut impl std::io::Write,

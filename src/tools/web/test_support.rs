@@ -32,12 +32,13 @@ pub(super) fn serve_bytes(
 
 pub(super) fn test_tools(max_chars: usize) -> WebTools {
     WebTools {
-        agent: ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(2)))
-            .max_redirects(5)
-            .build()
-            .into(),
+        agent: crate::provider::cancellable_agent(
+            ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .timeout_global(Some(Duration::from_secs(2)))
+                .max_redirects(5)
+                .build(),
+        ),
         provider: WebSearchProvider::DuckDuckGo,
         fetch_max_chars: max_chars,
         artifact_dir: std::env::temp_dir()
