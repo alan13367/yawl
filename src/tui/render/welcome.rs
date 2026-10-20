@@ -135,7 +135,7 @@ pub(in crate::tui) struct WelcomeDetails {
 impl WelcomeDetails {
     pub(in crate::tui) fn gather(agent: &Agent, skill_count: usize) -> Self {
         let cwd = crate::config::working_dir();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = std::env::home_dir();
         let mut location = home_relative(&cwd, home.as_deref());
         if let Some(branch) = git_branch(&cwd) {
             location.push_str(" · ");

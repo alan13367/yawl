@@ -229,7 +229,7 @@ impl Session {
             id: id.clone(),
             storage: Some(Storage {
                 file,
-                directory: fs::canonicalize(dir)?,
+                directory: crate::paths::canonicalize(dir)?,
                 rollback_to: None,
             }),
             state: SessionState::default(),
@@ -284,7 +284,7 @@ impl Session {
             id: id.to_string(),
             storage: Some(Storage {
                 file,
-                directory: fs::canonicalize(dir)?,
+                directory: crate::paths::canonicalize(dir)?,
                 rollback_to: None,
             }),
             state: replayed.state,

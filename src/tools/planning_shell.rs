@@ -279,11 +279,13 @@ fn render_pipeline(commands: &[Vec<String>]) -> String {
 
 pub(super) fn inspection_path() -> Option<std::ffi::OsString> {
     let cwd = std::env::current_dir().ok();
-    let canonical_cwd = cwd.as_ref().and_then(|path| path.canonicalize().ok());
+    let canonical_cwd = cwd
+        .as_ref()
+        .and_then(|path| crate::paths::canonicalize(path).ok());
     let paths = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .filter(|path| path.is_absolute())
         .filter(|path| {
-            let resolved = path.canonicalize().unwrap_or_else(|_| path.clone());
+            let resolved = crate::paths::canonicalize(path).unwrap_or_else(|_| path.clone());
             cwd.as_ref().is_none_or(|cwd| !path.starts_with(cwd))
                 && canonical_cwd
                     .as_ref()

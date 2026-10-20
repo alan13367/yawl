@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -61,9 +62,44 @@ fn needs_confirmation(fix: &Fix, apply_all: bool) -> bool {
     !apply_all || matches!(fix, Fix::RestoreBackup { .. })
 }
 
+#[cfg(unix)]
 fn read_answer() -> Result<String, Error> {
     let stdin = io::stdin();
     read_answer_from(&mut stdin.lock())
+}
+
+/// A console read on Windows is not interrupted by Ctrl+C, which only sets
+/// the interrupt flag. The read runs on a helper thread while this thread
+/// polls the flag, so Ctrl+C returns at once. The helper stays blocked in
+/// its read until the process exits, which it does right after the error.
+#[cfg(windows)]
+fn read_answer() -> Result<String, Error> {
+    read_answer_polling(|| read_answer_from(&mut io::stdin().lock()))
+}
+
+#[cfg(any(windows, test))]
+fn read_answer_polling(
+    read: impl FnOnce() -> Result<String, Error> + Send + 'static,
+) -> Result<String, Error> {
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    use std::time::Duration;
+
+    let (sender, receiver) = channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(read());
+    });
+    loop {
+        if crate::interrupted() {
+            return Err(Error::Interrupted);
+        }
+        match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(answer) => return answer,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(Error::Io(io::Error::other("the prompt reader stopped")));
+            }
+        }
+    }
 }
 
 fn read_answer_from(input: &mut impl Read) -> Result<String, Error> {
@@ -99,9 +135,9 @@ fn read_answer_from(input: &mut impl Read) -> Result<String, Error> {
 fn backup_once(fix: &Fix, backed_up: &mut HashSet<PathBuf>) -> Result<(), Error> {
     let target = match fix {
         Fix::QuarantineFile { .. } | Fix::RestoreBackup { .. } => return Ok(()),
-        Fix::RemoveKey { path, .. } | Fix::SetValue { path, .. } | Fix::ChmodPrivate { path } => {
-            path
-        }
+        Fix::RemoveKey { path, .. } | Fix::SetValue { path, .. } => path,
+        #[cfg(unix)]
+        Fix::ChmodPrivate { path } => path,
     };
     if !backed_up.insert(target.clone()) || !target.is_file() {
         return Ok(());
@@ -134,6 +170,7 @@ fn apply(fix: &Fix) -> Result<(), Error> {
                 write_json_object(path, &updated)?;
             }
         }
+        #[cfg(unix)]
         Fix::ChmodPrivate { path } => {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
@@ -142,7 +179,7 @@ fn apply(fix: &Fix) -> Result<(), Error> {
                 let backup = preserve_file(to)?;
                 println!("Backed up to {}.", backup.display());
             }
-            std::fs::rename(from, to)?;
+            crate::paths::replace_file(from, to)?;
         }
     }
     Ok(())
@@ -173,6 +210,20 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn polling_reads_return_answers() {
+        let answer = read_answer_polling(|| Ok("y".to_string())).unwrap();
+        assert_eq!(answer, "y");
+
+        // A slow reader is waited for across several polls. The interrupt
+        // flag itself is process-wide, so tests leave it alone.
+        let slow = read_answer_polling(|| {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            Ok("a".to_string())
+        });
+        assert_eq!(slow.unwrap(), "a");
+    }
 
     struct TestDirs {
         root: PathBuf,

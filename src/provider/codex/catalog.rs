@@ -1,7 +1,7 @@
 //! Account-scoped Codex model catalog. The service response is authoritative;
 //! a small local snapshot keeps model metadata available between refreshes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -78,16 +78,35 @@ struct FileStamp {
 
 impl FileStamp {
     fn of(path: PathBuf) -> Self {
-        use std::os::unix::fs::MetadataExt;
-        let state = std::fs::metadata(&path).ok().map(|metadata| {
-            (
-                metadata.ino(),
-                metadata.len(),
-                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-            )
-        });
+        let state = file_state(&path);
         Self { path, state }
     }
+}
+
+/// The file's identity, length, and modification time. The identity catches
+/// a file replaced by rename even when the length and time match.
+#[cfg(unix)]
+fn file_state(path: &Path) -> Option<(u64, u64, std::time::SystemTime)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((
+        metadata.ino(),
+        metadata.len(),
+        metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+    ))
+}
+
+/// The NTFS file index plays the part of the inode. The creation time is not
+/// used because file tunneling preserves it across a delete and recreate.
+#[cfg(windows)]
+fn file_state(path: &Path) -> Option<(u64, u64, std::time::SystemTime)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let info = crate::paths::file_info(path).ok()?;
+    Some((
+        info.index,
+        metadata.len(),
+        metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+    ))
 }
 
 /// Model lookups run several times per model step, so the parsed catalog is

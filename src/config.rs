@@ -224,14 +224,14 @@ pub struct SessionDirs {
 /// defaulting to `.` when the process environment cannot be queried.
 pub fn working_dir() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    fs::canonicalize(&cwd).unwrap_or(cwd)
+    crate::paths::canonicalize(&cwd).unwrap_or(cwd)
 }
 
 /// Stable directory key for a project: sanitized canonical basename plus a
 /// short FNV-1a digest of the full canonical path, so same-named directories
 /// stay distinct.
 fn project_key(cwd: &Path) -> String {
-    let canonical = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let canonical = crate::paths::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let digest = fnv1a(canonical.as_os_str().as_encoded_bytes());
     let name = canonical
         .file_name()
@@ -305,6 +305,7 @@ mod tests {
         assert!(empty.starts_with("project-"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn project_keys_match_through_symlinks() {
         let root = crate::test_support::unique_temp_dir("config-key");

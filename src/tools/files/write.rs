@@ -7,6 +7,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
+use super::reject_device;
 use crate::tools::{ToolEntry, ToolImpl, ToolOutcome, str_arg};
 
 /// Cap on `edit_file` input size. The whole file is read and rewritten, so a
@@ -59,6 +60,9 @@ pub(in crate::tools) fn write_file(args: &Value) -> ToolOutcome {
         Ok(c) => c,
         Err(e) => return e,
     };
+    if let Err(error) = reject_device(path) {
+        return ToolOutcome::error(error);
+    }
     if let Some(parent) = Path::new(path).parent()
         && !parent.as_os_str().is_empty()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -99,6 +103,9 @@ pub(in crate::tools) fn edit_file(args: &Value) -> ToolOutcome {
         Some(Value::Bool(value)) => *value,
         Some(_) => return ToolOutcome::error("'replace_all' must be a boolean"),
     };
+    if let Err(error) = reject_device(path) {
+        return ToolOutcome::error(error);
+    }
     if old_string.is_empty() {
         return ToolOutcome::error("old_string must not be empty");
     }
@@ -161,16 +168,16 @@ pub(in crate::tools) fn edit_file(args: &Value) -> ToolOutcome {
 /// it half written: the new contents go to a temporary file beside it,
 /// which then takes its place. A symlink is written through to its target.
 ///
-/// The temporary file gets the original group and mode before any contents
-/// reach it. A file that a new inode cannot stand in for is rewritten in
-/// place instead: one with other hard links, one owned by another user, one
-/// whose group the new file cannot take, anything other than a regular file,
-/// and any file whose temporary sibling cannot be created. Extended
-/// attributes and ACLs are not copied to the replacement.
+/// A file that a new file cannot stand in for is rewritten in place instead:
+/// one with other hard links, anything other than a regular file, any file
+/// whose temporary sibling cannot be created, and, on Unix, one owned by
+/// another user or whose group the new file cannot take. What the
+/// replacement carries over from the original differs by platform; see
+/// [`replace_through_temporary`].
 fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let target = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => match fs::canonicalize(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match crate::paths::canonicalize(path)
+        {
             Ok(target) => target,
             // A dangling link: create its target the usual way.
             Err(_) => return fs::write(path, contents),
@@ -180,7 +187,7 @@ fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         Err(error) => return Err(error),
     };
     let original = match fs::metadata(&target) {
-        Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => Some(metadata),
+        Ok(metadata) if metadata.is_file() && has_one_link(&target, &metadata) => Some(metadata),
         Ok(_) => return fs::write(&target, contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
@@ -193,18 +200,52 @@ fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         .file_name()
         .map_or_else(|| "file".into(), |name| name.to_string_lossy());
     let temporary = directory.join(format!(".{name}.yawl-{}.tmp", std::process::id()));
+    match replace_through_temporary(&temporary, &target, original.as_ref(), contents) {
+        Ok(true) => Ok(()),
+        Ok(false) => fs::write(&target, contents),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn has_one_link(_path: &Path, metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() == 1
+}
+
+/// A file with other hard links keeps its identity so every name sees the new
+/// contents. A file whose link count cannot be read is treated the same way.
+#[cfg(windows)]
+fn has_one_link(path: &Path, _metadata: &fs::Metadata) -> bool {
+    crate::paths::file_info(path).is_ok_and(|info| info.links == 1)
+}
+
+/// Writes `contents` to `temporary` and renames it over `target`. Returns
+/// `Ok(false)` when the replacement cannot stand in for the original and the
+/// caller should rewrite `target` in place.
+///
+/// The temporary file gets the original group and mode before any contents
+/// reach it. Extended attributes and ACLs are not copied to the replacement.
+#[cfg(unix)]
+fn replace_through_temporary(
+    temporary: &Path,
+    target: &Path,
+    original: Option<&fs::Metadata>,
+    contents: &[u8],
+) -> std::io::Result<bool> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     // An existing file's contents stay private until the temporary file has
     // its final mode; a new file starts with the default mode.
     let Ok(mut file) = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(if original.is_some() { 0o600 } else { 0o666 })
-        .open(&temporary)
+        .open(temporary)
     else {
-        return fs::write(&target, contents);
+        return Ok(false);
     };
     let replaced = (|| {
-        if let Some(original) = &original {
+        if let Some(original) = original {
             let created = file.metadata()?;
             if created.uid() != original.uid() {
                 return Ok(false);
@@ -219,17 +260,51 @@ fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         }
         std::io::Write::write_all(&mut file, contents)?;
         file.sync_all()?;
-        fs::rename(&temporary, &target)?;
+        crate::paths::replace_file(temporary, target)?;
         Ok(true)
     })();
     if !matches!(replaced, Ok(true)) {
-        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_file(temporary);
     }
-    match replaced {
-        Ok(true) => Ok(()),
-        Ok(false) => fs::write(&target, contents),
-        Err(error) => Err(error),
+    replaced
+}
+
+/// Windows has no owner, group, or mode to copy. The replacement inherits the
+/// directory's ACL and loses the original's explicit ACL, hidden and system
+/// attributes, and alternate data streams. The read-only attribute is the one
+/// piece of `Permissions` there, and it is copied. Replacing a read-only file,
+/// or one that another program holds open without sharing deletes, fails with
+/// an error that says so.
+#[cfg(windows)]
+fn replace_through_temporary(
+    temporary: &Path,
+    target: &Path,
+    original: Option<&fs::Metadata>,
+    contents: &[u8],
+) -> std::io::Result<bool> {
+    let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temporary)
+    else {
+        return Ok(false);
+    };
+    let written = (|| {
+        std::io::Write::write_all(&mut file, contents)?;
+        file.sync_all()?;
+        // After the contents, because a read-only file cannot be written.
+        if let Some(original) = original {
+            file.set_permissions(original.permissions())?;
+        }
+        Ok(())
+    })();
+    // Close the handle before the rename.
+    drop(file);
+    let replaced = written.and_then(|()| crate::paths::replace_file(temporary, target));
+    if replaced.is_err() {
+        let _ = fs::remove_file(temporary);
     }
+    replaced.map(|()| true)
 }
 
 /// Files with CRLF line endings rarely match model text, which uses `\n`.
@@ -442,6 +517,46 @@ mod tests {
     }
 
     #[test]
+    fn crlf_matching_applies_to_every_replacement_and_keeps_exact_matches_untouched() {
+        let root = TestDir::new();
+        let path = root.write("crlf.txt", "a\r\nb\r\nc\r\na\r\nb\r\n");
+        let ambiguous =
+            edit_file(&json!({"path": path, "old_string": "a\nb", "new_string": "x\ny"}));
+        assert!(ambiguous.is_error);
+        assert!(
+            ambiguous.content.contains("2 times"),
+            "{}",
+            ambiguous.content
+        );
+
+        let all = edit_file(&json!({
+            "path": path, "old_string": "a\nb", "new_string": "x\ny", "replace_all": true
+        }));
+        assert!(!all.is_error, "{}", all.content);
+        assert_eq!(
+            fs::read_to_string(&path).expect("edited"),
+            "x\r\ny\r\nc\r\nx\r\ny\r\n"
+        );
+
+        // An old string that already matches exactly is used as written.
+        let exact = edit_file(&json!({
+            "path": path, "old_string": "y\r\nc", "new_string": "z"
+        }));
+        assert!(!exact.is_error, "{}", exact.content);
+        assert!(!exact.content.contains("CRLF"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("edited"),
+            "x\r\nz\r\nx\r\ny\r\n"
+        );
+
+        // LF files never gain carriage returns.
+        let lf = root.write("lf.txt", "a\nb\n");
+        let edited = edit_file(&json!({"path": lf, "old_string": "a\nb", "new_string": "c\nd"}));
+        assert!(!edited.is_error);
+        assert_eq!(fs::read_to_string(&lf).expect("edited"), "c\nd\n");
+    }
+
+    #[test]
     fn write_file_reports_created_and_overwritten_files() {
         let root = TestDir::new();
         let path = root.0.join("notes.txt");
@@ -468,6 +583,48 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn writes_replace_files_and_leave_no_temporaries() -> std::io::Result<()> {
+        let dir = TestDir::new();
+        let file = dir.0.join("notes.txt");
+        write_atomically(&file, b"created")?;
+        assert_eq!(std::fs::read_to_string(&file)?, "created");
+        write_atomically(&file, b"replaced")?;
+        assert_eq!(std::fs::read_to_string(&file)?, "replaced");
+
+        // A hard-linked file is rewritten in place so both names see it.
+        let alias = dir.0.join("alias.txt");
+        std::fs::hard_link(&file, &alias)?;
+        write_atomically(&file, b"shared")?;
+        assert_eq!(std::fs::read_to_string(&alias)?, "shared");
+
+        let leftovers = std::fs::read_dir(&dir.0)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_only_files_are_not_replaced() -> std::io::Result<()> {
+        let dir = TestDir::new();
+        let file = dir.write("locked.txt", "old");
+        let mut permissions = std::fs::metadata(&file)?.permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&file, permissions)?;
+
+        let error = write_atomically(&file, b"new").unwrap_err();
+        assert!(error.to_string().contains("cannot replace"), "{error}");
+        assert_eq!(std::fs::read_to_string(&file)?, "old");
+
+        let mut permissions = std::fs::metadata(&file)?.permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&file, permissions)
+    }
+
+    #[cfg(unix)]
     #[test]
     fn writes_replace_atomically_and_keep_links_and_permissions() -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;

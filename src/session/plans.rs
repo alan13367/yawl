@@ -29,7 +29,7 @@ impl Session {
         // modified artifacts without exposing a partially written plan.
         let temporary = path.with_extension("md.tmp");
         fs::write(&temporary, plan)?;
-        fs::rename(&temporary, &path)?;
+        crate::paths::replace_file(&temporary, &path)?;
         Ok(Some(path))
     }
 

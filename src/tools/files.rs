@@ -4,18 +4,19 @@
 //! `search_files` are opt-in discovery tools for restricted children.
 
 mod discovery;
+mod open;
 mod read;
 #[cfg(test)]
 mod test_support;
 mod write;
 
-use std::fs::{File, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::File;
 use std::path::Path;
 
 use serde_json::Value;
 
 pub(super) use discovery::{discover, entries};
+use open::open_read;
 pub(super) use read::read_file_for_model;
 pub(super) use write::{edit_file, write_file};
 
@@ -44,15 +45,27 @@ fn check_canceled() -> Result<(), String> {
     }
 }
 
+/// Opens a regular file without following a final symlink.
 fn regular_file(path: &Path) -> std::io::Result<File> {
-    // O_NONBLOCK prevents a replaced path pointing at a FIFO from blocking
-    // before metadata can reject it; O_NOFOLLOW rejects final symlinks.
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(path)?;
+    let file = open_read(path, false)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::other("path is not a regular file"));
     }
     Ok(file)
+}
+
+/// Windows opens a reserved name such as `CON`, `NUL`, or `COM1` as a device
+/// wherever it appears, so writing to it would reach the terminal or a port
+/// and reading it could block forever. Only Windows has such names.
+#[cfg(windows)]
+fn reject_device(path: &str) -> Result<(), String> {
+    if crate::paths::names_device(Path::new(path)) {
+        return Err(format!("{path} names a device, not a file"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reject_device(_path: &str) -> Result<(), String> {
+    Ok(())
 }

@@ -1,6 +1,7 @@
 //! Configuration checks. Each finding names a file or section, states the
 //! problem, and carries a structured fix when one is safe to offer.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -105,17 +106,22 @@ fn read_config_file(
             return None;
         }
     };
-    let mode = std::fs::metadata(path)
-        .map(|metadata| metadata.permissions().mode() & 0o777)
-        .unwrap_or(0o600);
-    if mode != 0o600 {
-        findings.push(warning(
-            area,
-            format!("permissions are {mode:o}, expected 600; the file may hold API keys"),
-            Some(Fix::ChmodPrivate {
-                path: path.to_path_buf(),
-            }),
-        ));
+    // Windows files under the user profile are private through the ACL they
+    // inherit, so the permission check does not apply there.
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+            .unwrap_or(0o600);
+        if mode != 0o600 {
+            findings.push(warning(
+                area,
+                format!("permissions are {mode:o}, expected 600; the file may hold API keys"),
+                Some(Fix::ChmodPrivate {
+                    path: path.to_path_buf(),
+                }),
+            ));
+        }
     }
     match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(map)) => Some(map),

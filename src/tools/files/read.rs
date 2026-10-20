@@ -1,14 +1,13 @@
 //! `read_file`: whole text files, numbered line pages, UTF-8 byte pages, and
 //! image input.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use serde_json::{Value, json};
 
-use super::{MAX_PAGE_BYTES, check_canceled, number, regular_file};
+use super::{MAX_PAGE_BYTES, check_canceled, number, open_read, regular_file};
 use crate::tools::{ToolEntry, ToolImpl, ToolOutcome, str_arg};
 
 /// Largest text file `read_file` returns whole; it stays under the 60,000
@@ -120,11 +119,8 @@ pub(in crate::tools) fn read_file_for_model(args: &Value, supports_images: bool)
 }
 
 fn open_for_read(path: &Path) -> std::io::Result<File> {
-    // O_NONBLOCK keeps opening a FIFO from blocking; symlinks are followed.
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)?;
+    // Symlinks are followed; special files are rejected by their metadata.
+    let file = open_read(path, true)?;
     let metadata = file.metadata()?;
     if metadata.is_dir() {
         return Err(std::io::Error::other("it is a directory"));
@@ -449,8 +445,9 @@ mod tests {
         assert!(text[offset..].starts_with(rest["content"].as_str().expect("content")));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn plain_reads_reject_fifos_and_directories_without_blocking() {
+    fn plain_reads_reject_fifos_without_blocking() {
         let root = TestDir::new();
         let fifo = root.0.join("fifo");
         assert!(
@@ -464,6 +461,22 @@ mod tests {
         assert!(out.is_error);
         assert!(out.content.contains("not a regular file"));
         assert!(page(&json!({"path": fifo, "offset": 0})).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plain_reads_reject_devices_without_blocking() {
+        for name in ["CON", "NUL", "aux.txt"] {
+            let out = read_file_for_model(&json!({"path": name}), false);
+            assert!(out.is_error, "{name}");
+            assert!(out.content.contains("device"), "{}", out.content);
+            assert!(page(&json!({"path": name, "offset": 0})).is_err());
+        }
+    }
+
+    #[test]
+    fn plain_reads_reject_directories() {
+        let root = TestDir::new();
         let dir = read_file_for_model(&json!({"path": root.0}), false);
         assert!(dir.is_error);
         assert!(dir.content.contains("directory"));

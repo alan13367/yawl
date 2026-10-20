@@ -9,6 +9,9 @@ use crate::cancellation::CancellationToken;
 use crate::config::Config;
 use crate::error::Error;
 
+#[cfg(windows)]
+mod windows;
+
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
 const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
@@ -136,6 +139,12 @@ fn save_credential_if_active(
     save_credential(config, credential)
 }
 
+#[cfg(windows)]
+fn open_device_browser() -> Result<(), String> {
+    windows::open_url(DEVICE_VERIFICATION_URI)
+}
+
+#[cfg(unix)]
 fn open_device_browser() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut command = std::process::Command::new("open");

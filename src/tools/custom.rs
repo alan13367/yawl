@@ -242,7 +242,7 @@ impl CustomTool {
         // helper scripts next to the manifest.
         if let Some(directory) = self.path.parent() {
             let directory =
-                std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+                crate::paths::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
             process.env("YAWL_TOOL_DIR", super::exec::shell_path(&directory));
         }
         match super::exec::run_with_timeout(process, Some(input.as_bytes()), self.timeout) {

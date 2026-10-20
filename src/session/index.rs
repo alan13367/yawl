@@ -3,10 +3,12 @@
 use super::{SessionHeader, read_header};
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+/// What identifies one version of a session file. A rewrite that keeps the
+/// length and modification time still changes the file's identity, which is
+/// what catches replacement by rename.
 #[derive(PartialEq, Eq)]
 struct Signature {
     device: u64,
@@ -16,7 +18,9 @@ struct Signature {
     changed: (i64, i64),
 }
 
+#[cfg(unix)]
 fn signature(path: &Path) -> Option<Signature> {
+    use std::os::unix::fs::MetadataExt;
     let metadata = fs::metadata(path).ok()?;
     Some(Signature {
         device: metadata.dev(),
@@ -24,6 +28,25 @@ fn signature(path: &Path) -> Option<Signature> {
         bytes: metadata.len(),
         modified: (metadata.mtime(), metadata.mtime_nsec()),
         changed: (metadata.ctime(), metadata.ctime_nsec()),
+    })
+}
+
+/// The volume serial number and file index play the part of device and inode.
+/// The change time is not available on stable Rust, and the creation time is
+/// not used because NTFS file tunneling keeps it across a delete and
+/// recreate, so the write time stands in for both.
+#[cfg(windows)]
+fn signature(path: &Path) -> Option<Signature> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = fs::metadata(path).ok()?;
+    let info = crate::paths::file_info(path).ok()?;
+    let written = i64::try_from(metadata.last_write_time()).unwrap_or(i64::MAX);
+    Some(Signature {
+        device: u64::from(info.volume),
+        inode: info.index,
+        bytes: metadata.len(),
+        modified: (written, 0),
+        changed: (written, 0),
     })
 }
 
@@ -87,12 +110,13 @@ mod tests {
         session.append_model_switch("second").unwrap();
         assert_eq!(header(&path).model, "second");
         let previous = signature(&path).unwrap();
+        // Windows cannot replace a file this process still holds open.
+        drop(session);
         let replacement = path.with_extension("replacement");
         fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
         fs::rename(replacement, &path).unwrap();
         assert!(signature(&path).unwrap() != previous);
         assert_eq!(header(&path).model, "second");
-        drop(session);
         fs::remove_dir_all(directory).unwrap();
     }
 }

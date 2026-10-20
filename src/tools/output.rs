@@ -2,6 +2,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,7 +48,7 @@ pub(crate) fn save_artifact(
     content: &str,
 ) -> std::io::Result<PathBuf> {
     fs::create_dir_all(directory)?;
-    let directory = fs::canonicalize(directory)?;
+    let directory = crate::paths::canonicalize(directory)?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -58,12 +59,13 @@ pub(crate) fn save_artifact(
             "{prefix}-{}-{timestamp}-{sequence}.{extension}",
             std::process::id()
         ));
-        let mut file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        // Windows keeps files under the user profile private through the
+        // inherited ACL, so only Unix needs an explicit mode.
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = match options.open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
@@ -105,7 +107,12 @@ mod tests {
 
     #[test]
     fn save_failure_is_explicit_and_small_outputs_need_no_storage() {
-        let directory = Path::new("/dev/null/output");
+        // A directory cannot be created below a regular file.
+        let root = crate::test_support::unique_temp_dir("output-blocked");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("blocker"), "file").unwrap();
+        let directory = root.join("blocker/output");
+        let directory = directory.as_path();
         let mut small = "small".to_string();
         prepare(directory, &mut small);
         assert_eq!(small, "small");
@@ -113,5 +120,6 @@ mod tests {
         prepare(directory, &mut large);
         assert!(large.contains("Could not save full output"));
         assert!(large.len() < 5000);
+        fs::remove_dir_all(root).unwrap();
     }
 }

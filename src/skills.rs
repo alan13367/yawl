@@ -88,7 +88,7 @@ struct Source {
 
 impl Sources {
     fn collect(config: &Config, cwd: &Path) -> Sources {
-        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let cwd = crate::paths::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let mut sources = Sources {
             sources: Vec::new(),
         };
@@ -243,7 +243,7 @@ fn collect_candidates(
     visited: &mut HashSet<PathBuf>,
     warnings: &mut Vec<String>,
 ) {
-    let canonical = match std::fs::canonicalize(directory) {
+    let canonical = match crate::paths::canonicalize(directory) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
@@ -315,7 +315,7 @@ fn load_skill(path: &Path) -> Result<Skill, String> {
     if parsed.body.trim().is_empty() {
         return Err("instruction body must not be empty".into());
     }
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = crate::paths::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let directory = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     Ok(Skill {
         name,
@@ -527,8 +527,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_descriptions_and_survives_symlink_cycles() {
+    fn rejects_missing_descriptions() {
         let root = crate::test_support::unique_temp_dir("skills-bad");
+        std::fs::create_dir_all(root.join("global/bad")).unwrap();
+        std::fs::write(
+            root.join("global/bad/SKILL.md"),
+            "---\nname: bad\n---\nInstructions",
+        )
+        .unwrap();
+
+        let catalog = discover(&test_config(&root));
+        assert!(catalog.skills.is_empty());
+        assert_eq!(catalog.warnings.len(), 1);
+        assert!(catalog.warnings[0].contains("nonempty description"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn survives_symlink_cycles_and_dangling_links() {
+        let root = crate::test_support::unique_temp_dir("skills-cycle");
         std::fs::create_dir_all(root.join("global/bad")).unwrap();
         std::fs::write(
             root.join("global/bad/SKILL.md"),
@@ -541,10 +559,10 @@ mod tests {
         let catalog = discover(&test_config(&root));
         assert!(catalog.skills.is_empty());
         assert_eq!(catalog.warnings.len(), 1);
-        assert!(catalog.warnings[0].contains("nonempty description"));
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn links_to_large_trees_stop_at_the_directory_limit() {
         let root = crate::test_support::unique_temp_dir("skills-limit");
@@ -565,6 +583,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn follows_symlinked_skill_directories_and_files() {
         let root = crate::test_support::unique_temp_dir("skills-link");
@@ -599,7 +618,7 @@ mod tests {
         let minipc = &catalog.skills[0];
         assert_eq!(
             minipc.directory,
-            std::fs::canonicalize(root.join("elsewhere/minipc")).unwrap()
+            crate::paths::canonicalize(&root.join("elsewhere/minipc")).unwrap()
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -679,7 +698,7 @@ mod tests {
 
         let catalog = discover_from(&config, &nested);
         assert_eq!(catalog.skills[0].instructions, "nearest");
-        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let canonical_root = crate::paths::canonicalize(&root).unwrap();
         assert!(
             catalog
                 .directories

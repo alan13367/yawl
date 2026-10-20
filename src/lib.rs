@@ -17,6 +17,7 @@ mod error;
 mod image;
 mod model;
 mod onboarding;
+mod paths;
 mod print_mode;
 mod project_trust;
 mod prompt;

@@ -1,7 +1,8 @@
 //! Per-tool card content: call headers, argument previews, and readable
 //! summaries of results for each builtin tool.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -619,17 +620,64 @@ fn generic_summary(args: Option<&Value>, raw_args: &str) -> String {
 }
 
 fn display_path(path: &str) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = std::env::home_dir();
     home_relative(Path::new(path), home.as_deref())
 }
 
 /// Shortens a path under `home` to `~`, leaving other paths unchanged. An
-/// empty or root `home` would claim every path, so it is ignored.
+/// empty or root `home` would claim every path, so it is ignored. The rest of
+/// a shortened path always uses `/`, whatever the platform's separator.
 pub(in crate::tui) fn home_relative(path: &Path, home: Option<&Path>) -> String {
     let home = home.filter(|home| home.parent().is_some());
-    match home.and_then(|home| path.strip_prefix(home).ok()) {
+    match home.and_then(|home| strip_home(path, home, cfg!(windows))) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-        Some(rest) => format!("~/{}", rest.display()),
+        Some(rest) => {
+            let parts = rest
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>();
+            format!("~/{}", parts.join("/"))
+        }
         None => path.display().to_string(),
+    }
+}
+
+/// What remains of `path` below `home`, comparing whole components. Windows
+/// paths ignore case (`c:\users\Me` is `C:\Users\me`), so the caller says
+/// whether to.
+fn strip_home<'a>(path: &'a Path, home: &Path, ignore_case: bool) -> Option<&'a Path> {
+    let same = |a: &OsStr, b: &OsStr| {
+        a == b
+            || (ignore_case
+                && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase())
+    };
+    let mut rest = path.components();
+    for part in home.components() {
+        let own = rest.next()?;
+        if !same(own.as_os_str(), part.as_os_str()) {
+            return None;
+        }
+    }
+    Some(rest.as_path())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_homes_match_ignoring_case_and_separators() {
+        let home = Path::new("C:/Users/Me");
+        for path in [r"c:/users/me/code/app", "C:/Users/Me/code/app"] {
+            let rest = strip_home(Path::new(path), home, true);
+            assert_eq!(rest, Some(Path::new("code/app")), "{path}");
+        }
+        assert!(strip_home(Path::new("c:/users/me/code"), home, false).is_none());
+        assert!(strip_home(Path::new("C:/Users/Meg"), home, true).is_none());
+        assert!(strip_home(Path::new("C:/Users"), home, true).is_none());
+        assert_eq!(
+            strip_home(Path::new("C:/Users/Me"), home, true),
+            Some(Path::new(""))
+        );
     }
 }

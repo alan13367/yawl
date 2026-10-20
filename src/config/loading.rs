@@ -13,9 +13,8 @@ use crate::error::Error;
 
 impl Config {
     pub fn load() -> Result<Config, Error> {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| Error::Config("HOME is not set".into()))?;
+        let home = std::env::home_dir()
+            .ok_or_else(|| Error::Config("cannot find the home directory".into()))?;
         Self::load_from(home.join(".yawl"), PathBuf::from(".yawl"))
     }
 
@@ -325,7 +324,11 @@ pub(crate) fn expand_home_path(raw: &str, home_dir: &Path) -> PathBuf {
     if raw == "~" {
         return user_home.to_path_buf();
     }
-    if let Some(rest) = raw.strip_prefix("~/") {
+    let rest = raw.strip_prefix("~/");
+    // Windows users type `~\dir` as often as `~/dir`.
+    #[cfg(windows)]
+    let rest = rest.or_else(|| raw.strip_prefix("~\\"));
+    if let Some(rest) = rest {
         return user_home.join(rest);
     }
     PathBuf::from(raw)

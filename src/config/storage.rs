@@ -1,4 +1,5 @@
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -67,16 +68,17 @@ pub(crate) fn write_json_object(path: &Path, root: &Map<String, Value>) -> Resul
     }
     let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
     let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // Windows keeps files under the user profile private through the
+        // inherited ACL, so only Unix needs an explicit mode.
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
         serde_json::to_writer_pretty(&mut file, &Value::Object(root.clone()))?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
+        crate::paths::replace_file(&temporary, path)?;
         Ok::<(), Error>(())
     })();
     if result.is_err() {

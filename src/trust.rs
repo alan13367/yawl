@@ -17,7 +17,7 @@ pub enum Decision {
 }
 
 pub fn project_root(cwd: &Path) -> PathBuf {
-    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let canonical = crate::paths::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     canonical
         .ancestors()
         .find(|ancestor| ancestor.join(".git").exists())
@@ -61,8 +61,11 @@ fn path_key(root: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::ffi::OsString;
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
@@ -79,7 +82,7 @@ mod tests {
 
         assert_eq!(
             project_root(&root.join("repo/src/nested")),
-            std::fs::canonicalize(root.join("repo")).unwrap()
+            crate::paths::canonicalize(&root.join("repo")).unwrap()
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -93,6 +96,8 @@ mod tests {
         assert_eq!(load(&home, &project).unwrap(), Decision::Unknown);
         store(&home, &project, true).unwrap();
         assert_eq!(load(&home, &project).unwrap(), Decision::Trusted);
+        // Windows relies on the ACL the user profile directory passes down.
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(home.join("trust.json"))
                 .unwrap()
@@ -106,6 +111,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn distinct_non_utf8_paths_do_not_share_trust() {
         let root = temp_root("non-utf8");

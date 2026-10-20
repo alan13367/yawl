@@ -47,7 +47,9 @@ pub(crate) enum Fix {
         keys: Vec<String>,
         value: serde_json::Value,
     },
-    /// Restricts file permissions to owner-only.
+    /// Restricts file permissions to owner-only. Windows files under the user
+    /// profile are private through their inherited ACL, so only Unix has it.
+    #[cfg(unix)]
     ChmodPrivate { path: PathBuf },
     /// Moves a backup over the live file.
     RestoreBackup { from: PathBuf, to: PathBuf },
@@ -64,6 +66,7 @@ impl Fix {
             Fix::SetValue { keys, value, .. } => {
                 format!("set {} to {}", keys.join("."), value)
             }
+            #[cfg(unix)]
             Fix::ChmodPrivate { path } => format!("chmod 600 {}", path.display()),
             Fix::RestoreBackup { from, to } => {
                 format!("restore {} over {}", from.display(), to.display())
@@ -163,9 +166,8 @@ pub(crate) fn set_nested(
 ///
 /// Returns an error when a repair fails on disk input or output.
 pub fn run() -> Result<i32, Error> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| Error::Config("HOME is not set".into()))?;
+    let home = std::env::home_dir()
+        .ok_or_else(|| Error::Config("cannot find the home directory".into()))?;
     let paths = Paths {
         global: home.join(".yawl/config.json"),
         project: PathBuf::from(".yawl/config.json"),

@@ -1,13 +1,14 @@
 //! `list_files` and `search_files`: bounded recursive listing and literal
 //! text search for restricted children. No shell execution.
 
+use std::borrow::Cow;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-use super::{MAX_PAGE_BYTES, check_canceled, number, regular_file};
+use super::{MAX_PAGE_BYTES, check_canceled, number, regular_file, reject_device};
 use crate::tools::{ToolEntry, ToolImpl, ToolOutcome, str_arg};
 
 const MAX_ENTRIES: usize = 20_000;
@@ -88,6 +89,39 @@ fn format_discovery(value: &Value, search: bool) -> String {
     lines.join("\n")
 }
 
+/// Paths in tool results use `/` on every platform. Windows accepts it
+/// everywhere, Git Bash expects it, and models copy it into JSON arguments
+/// without the doubled backslashes that `\\` needs. A `\\?\` path stays as
+/// written because verbatim paths do not accept `/`. The same rewrite applies
+/// to `path_contains`, so a filter typed with either separator matches.
+fn display_text(text: &str) -> Cow<'_, str> {
+    if cfg!(windows) {
+        forward_slashes(text)
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+fn forward_slashes(text: &str) -> Cow<'_, str> {
+    if text.contains('\\') && !text.starts_with(r"\\?\") {
+        Cow::Owned(text.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// Whether a directory with this name is a dependency or build tree. File
+/// systems on Windows ignore case, so `Target` is `target` there.
+fn skipped_directory_name(name: &std::ffi::OsStr) -> bool {
+    SKIP_DIRS.iter().any(|skip| {
+        name == *skip
+            || (cfg!(windows)
+                && name
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(skip)))
+    })
+}
+
 fn escape_controls(text: &str) -> String {
     let mut output = String::new();
     for character in text.chars() {
@@ -110,8 +144,10 @@ fn optional_text<'a>(args: &'a Value, key: &str, default: &'a str) -> Result<&'a
 }
 
 fn inspect(args: &Value, search: bool) -> Result<Value, String> {
-    let root = PathBuf::from(optional_text(args, "path", ".")?);
-    let filter = optional_text(args, "path_contains", "")?;
+    let root = optional_text(args, "path", ".")?;
+    reject_device(root)?;
+    let root = PathBuf::from(root);
+    let filter = display_text(optional_text(args, "path_contains", "")?);
     let limit = number(args, "limit", 100, 1, 200)? as usize;
     let include_hidden = match args.get("include_hidden") {
         None => false,
@@ -186,7 +222,7 @@ fn inspect(args: &Value, search: bool) -> Result<Value, String> {
                 if !include_hidden && child.file_name().as_encoded_bytes().starts_with(b".") {
                     continue;
                 }
-                if SKIP_DIRS.iter().any(|name| child.file_name() == *name)
+                if skipped_directory_name(&child.file_name())
                     && child.file_type().is_ok_and(|kind| kind.is_dir())
                 {
                     continue;
@@ -201,11 +237,12 @@ fn inspect(args: &Value, search: bool) -> Result<Value, String> {
             skipped += 1;
             continue;
         }
-        let Some(path_text) = path.to_str() else {
+        let Some(path_text) = path.to_str().map(display_text) else {
             skipped += 1;
             continue;
         };
-        if !path_text.contains(filter) {
+        let path_text = path_text.as_ref();
+        if !path_text.contains(filter.as_ref()) {
             continue;
         }
         if let Some(query) = query {
@@ -307,8 +344,6 @@ fn prefix(text: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
-
     use super::super::test_support::TestDir;
     use super::*;
 
@@ -348,16 +383,19 @@ mod tests {
         let path = root.write("src/example.rs", "fn example() {}\n");
         let listing = discover(&json!({"path": root.0}), false);
         assert!(!listing.is_error);
-        assert_eq!(listing.content, path.display().to_string());
+        assert_eq!(listing.content, display_text(&path.display().to_string()));
         let search = discover(&json!({"path": root.0, "query": "example"}), true);
         assert_eq!(
             search.content,
-            format!("{}:1:4: fn example() {{}}", path.display())
+            format!(
+                "{}:1:4: fn example() {{}}",
+                display_text(&path.display().to_string())
+            )
         );
     }
 
     #[test]
-    fn discovery_is_scoped_and_skips_generated_trees_and_symlinks() {
+    fn discovery_is_scoped_and_skips_generated_trees() {
         let root = TestDir::new();
         root.write("src/a.rs", "first\nfind me here\n");
         root.write("src/b.txt", "find me here");
@@ -365,8 +403,6 @@ mod tests {
         root.write("node_modules/package/a.rs", "find me here");
         root.write(".git/config", "find me here");
         root.write("src/binary.rs", b"find me here\0\xff");
-        symlink(&root.0, root.0.join("loop")).expect("symlink loop");
-        symlink(root.0.join("src/a.rs"), root.0.join("alias.rs")).expect("file symlink");
 
         let listed =
             inspect(&json!({"path": root.0, "path_contains": "a.rs"}), false).expect("list");
@@ -387,7 +423,42 @@ mod tests {
         assert_eq!(found["results"][0]["column"], 1);
         assert_eq!(found["results"][0]["text"], "find me here");
         assert_eq!(found["truncated"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new();
+        root.write("src/a.rs", "find me here\n");
+        symlink(&root.0, root.0.join("loop")).expect("symlink loop");
+        symlink(root.0.join("src/a.rs"), root.0.join("alias.rs")).expect("file symlink");
+
+        let found = inspect(&json!({"path": root.0, "query": "find me"}), true).expect("search");
+        assert_eq!(found["results"].as_array().expect("matches").len(), 1);
         assert!(inspect(&json!({"path": root.0.join("alias.rs")}), false).is_err());
+    }
+
+    #[test]
+    fn separators_are_forward_slashes_except_in_verbatim_paths() {
+        assert_eq!(forward_slashes(r"C:\work\src/a.rs"), "C:/work/src/a.rs");
+        assert_eq!(forward_slashes(r"\\server\share\a"), "//server/share/a");
+        assert_eq!(forward_slashes("src/a.rs"), "src/a.rs");
+        assert_eq!(forward_slashes(r"\\?\C:\work"), r"\\?\C:\work");
+        for (name, skipped) in [
+            ("target", true),
+            ("node_modules", true),
+            (".git", true),
+            ("src", false),
+        ] {
+            assert_eq!(skipped_directory_name(name.as_ref()), skipped, "{name}");
+        }
+        assert_eq!(
+            skipped_directory_name("Target".as_ref()),
+            cfg!(windows),
+            "directory names match case-insensitively only on Windows"
+        );
     }
 
     // macOS filesystems reject these names before discovery can encounter them.
@@ -460,7 +531,17 @@ mod tests {
     }
 
     #[test]
-    fn oversized_and_special_files_do_not_block_inspection() {
+    fn oversized_files_are_skipped() {
+        let root = TestDir::new();
+        root.write("large", vec![b'x'; MAX_FILE_BYTES + 1]);
+        let found = inspect(&json!({"path": root.0, "query": "x"}), true).expect("search");
+        assert!(found["results"].as_array().expect("results").is_empty());
+        assert_eq!(found["skipped"], 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_files_do_not_block_inspection() {
         let root = TestDir::new();
         root.write("large", vec![b'x'; MAX_FILE_BYTES + 1]);
         let fifo = root.0.join("fifo");
