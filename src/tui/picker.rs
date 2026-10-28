@@ -242,6 +242,10 @@ pub(super) enum PickerAction {
         from_settings: bool,
     },
     ConnectChooseProvider(ProviderId),
+    /// Codex with a saved login: reuse it, or start a `fresh` device login.
+    ConnectLogin {
+        fresh: bool,
+    },
     EditConnect {
         field: ConnectEditField,
         initial: String,
@@ -296,6 +300,9 @@ pub(super) enum PickerAction {
     ReturnFromPlan,
     Reload,
     ShowSettings,
+    /// Picks the row at this index, for pickers whose caller only needs to
+    /// know which row was chosen.
+    Choice(usize),
 }
 
 #[derive(Clone)]
@@ -433,30 +440,75 @@ pub(super) fn sync_color_preview(state: &mut ViewState) {
     }
 }
 
+/// What a key did to a picker on its own.
+pub(super) enum PickerKey {
+    /// The picker stays open.
+    Handled,
+    /// Esc, or Esc in a standalone field: close and run the parent action.
+    Cancel(Option<PickerAction>),
+    /// Close and run this action.
+    Choose(PickerAction),
+}
+
+impl Picker {
+    /// The keys every picker shares, in the TUI and on the setup screens:
+    /// field editing, list movement, Enter, Esc, and reasoning checkboxes.
+    pub(super) fn handle_key(&mut self, key: Key) -> PickerKey {
+        if let Some(PickerEdit::Field(field)) = self.editing.as_mut() {
+            match field.handle_key(key) {
+                field::FieldKey::Submit(action) => return PickerKey::Choose(action),
+                // A field opened on its own has no list to return to.
+                field::FieldKey::Cancel if self.items.is_empty() => {
+                    return PickerKey::Cancel(self.parent.clone());
+                }
+                field::FieldKey::Cancel => self.editing = None,
+                field::FieldKey::Handled => {}
+            }
+            return PickerKey::Handled;
+        }
+
+        if let Some(PickerAction::ConnectToggleReasoning(index)) =
+            self.items.get(self.selected).map(|item| &item.action)
+        {
+            match key {
+                Key::Char(' ') => {
+                    return PickerKey::Choose(PickerAction::ConnectToggleReasoning(*index));
+                }
+                Key::Enter => return PickerKey::Choose(PickerAction::ConnectConfirmReasoning),
+                _ => {}
+            }
+        }
+
+        let last = self.items.len().saturating_sub(1);
+        match key {
+            Key::Escape | Key::Ctrl('c') => return PickerKey::Cancel(self.parent.clone()),
+            Key::Up | Key::Char('k') => self.selected = self.selected.saturating_sub(1),
+            Key::Down | Key::Char('j') => self.selected = (self.selected + 1).min(last),
+            Key::PageUp => self.selected = self.selected.saturating_sub(5),
+            Key::PageDown => self.selected = (self.selected + 5).min(last),
+            Key::Enter => {
+                let Some(item) = self.items.get(self.selected) else {
+                    return PickerKey::Handled;
+                };
+                // Edit rows open their field in place, focused and ready to type.
+                if let Some(field) = field::from_item(item) {
+                    self.editing = Some(PickerEdit::Field(Box::new(field)));
+                    return PickerKey::Handled;
+                }
+                return PickerKey::Choose(item.action.clone());
+            }
+            _ => {}
+        }
+        PickerKey::Handled
+    }
+}
+
 pub(super) fn take_picker_action(
     state: &mut ViewState,
     editor: &mut Editor,
     key: Key,
 ) -> Option<PickerAction> {
     let picker = state.picker.as_mut()?;
-
-    if let Some(PickerEdit::Field(field)) = picker.editing.as_mut() {
-        match field.handle_key(key) {
-            field::FieldKey::Submit(action) => {
-                state.picker = None;
-                return Some(action);
-            }
-            // A field opened on its own has no list to return to.
-            field::FieldKey::Cancel if picker.items.is_empty() => {
-                let cancel = picker_cancel_action(picker);
-                state.picker = None;
-                return cancel;
-            }
-            field::FieldKey::Cancel => picker.editing = None,
-            field::FieldKey::Handled => {}
-        }
-        return None;
-    }
 
     if let Some(PickerEdit::Queued(index)) = picker.editing {
         match key {
@@ -477,121 +529,92 @@ pub(super) fn take_picker_action(
         return None;
     }
 
-    if picker_is_plan_handoff(picker)
-        && let Key::Char(digit @ '1'..='2') = key
-    {
-        picker.selected = usize::from(digit as u8 - b'1');
-        return None;
-    }
-
-    if let Some(PickerAction::ConnectToggleReasoning(index)) =
-        picker.items.get(picker.selected).map(|item| &item.action)
-    {
-        let action = match key {
-            Key::Char(' ') => Some(PickerAction::ConnectToggleReasoning(*index)),
-            Key::Enter => Some(PickerAction::ConnectConfirmReasoning),
-            _ => None,
-        };
-        if action.is_some() {
-            state.picker = None;
+    if picker.editing.is_none() {
+        if picker_is_plan_handoff(picker)
+            && let Key::Char(digit @ '1'..='2') = key
+        {
+            picker.selected = usize::from(digit as u8 - b'1');
+            return None;
+        }
+        if let Some(action) = row_shortcut(state, editor, key) {
             return action;
         }
     }
 
-    match key {
-        Key::Escape | Key::Ctrl('c') => {
-            let cancel = picker_cancel_action(picker);
+    let picker = state.picker.as_mut()?;
+    match picker.handle_key(key) {
+        PickerKey::Handled => None,
+        PickerKey::Cancel(action) => {
             state.picker = None;
             // Unconditional: restoring committed colors is a no-op when no
             // preview is live, and it keeps cancel correct if a picker that
             // previews colors ever gains a different shape.
             state.end_color_preview();
-            return cancel;
+            action
         }
-        Key::Up | Key::Char('k') => picker.selected = picker.selected.saturating_sub(1),
-        Key::Down | Key::Char('j') => {
-            picker.selected = (picker.selected + 1).min(picker.items.len().saturating_sub(1));
-        }
-        Key::PageUp => picker.selected = picker.selected.saturating_sub(5),
-        Key::PageDown => {
-            picker.selected = (picker.selected + 5).min(picker.items.len().saturating_sub(1));
-        }
-        Key::Enter => {
-            let item = picker.items.get(picker.selected)?;
-            // Edit rows open their field in place, focused and ready to type.
-            if let Some(field) = field::from_item(item) {
-                picker.editing = Some(PickerEdit::Field(Box::new(field)));
-                return None;
-            }
-            let action = item.action.clone();
+        PickerKey::Choose(action) => {
             state.picker = None;
-            return Some(action);
+            Some(action)
         }
-        Key::Char('e') => {
-            if let Some(PickerAction::SendQueued(index)) = picker
-                .items
-                .get(picker.selected)
-                .map(|item| item.action.clone())
-                && let Some(initial) = state.queued_inputs.get(index)
-            {
-                editor.clear();
-                editor.restore_submission(initial.clone());
-                picker.editing = Some(PickerEdit::Queued(index));
-            }
-        }
-        Key::Char('K') | Key::Char('J') => {
-            let action = picker
-                .items
-                .get(picker.selected)
-                .map(|item| item.action.clone());
-            match action {
-                Some(PickerAction::SendQueued(index)) => {
-                    state.picker = None;
-                    return Some(PickerAction::MoveQueued {
-                        index,
-                        direction: if key == Key::Char('K') { -1 } else { 1 },
-                    });
-                }
-                Some(PickerAction::OpenStatusBarItem { index, .. }) => {
-                    state.picker = None;
-                    return Some(PickerAction::MoveStatusBarItem {
-                        index,
-                        direction: if key == Key::Char('K') { -1 } else { 1 },
-                    });
-                }
-                _ => {}
-            }
-        }
-        Key::Delete | Key::Char('d') => {
-            let selected = picker.selected;
-            let action = picker.items.get(selected).map(|item| item.action.clone());
-            match action {
-                Some(PickerAction::ResumeSession(id)) => {
-                    let label = picker.items[selected].label.clone();
-                    let description = picker.items[selected].description.clone();
-                    *picker = delete_session_confirm(id, label, description, selected);
-                }
-                Some(PickerAction::SwitchModel(model) | PickerAction::SaveModel(model)) => {
-                    let save = matches!(picker.items[selected].action, PickerAction::SaveModel(_));
-                    state.picker = None;
-                    return Some(PickerAction::ConfirmRemoveModel {
-                        model,
-                        save,
-                        selected,
-                    });
-                }
-                Some(PickerAction::SendQueued(index)) => {
-                    return Some(PickerAction::RemoveQueued(index));
-                }
-                Some(PickerAction::OpenStatusBarItem { index, .. }) => {
-                    return Some(PickerAction::RemoveStatusBarItem(index));
-                }
-                _ => {}
-            }
-        }
-        _ => {}
     }
-    None
+}
+
+/// TUI-only keys that act on the selected row: `e` edits a queued message,
+/// `K`/`J` reorder queued messages and status-bar items, and `d`/Delete
+/// removes sessions, models, queued messages, and status-bar items.
+/// `Some` means the key was consumed, carrying the action to run, if any.
+fn row_shortcut(
+    state: &mut ViewState,
+    editor: &mut Editor,
+    key: Key,
+) -> Option<Option<PickerAction>> {
+    let selected = state.picker.as_ref()?.selected;
+    let action = state.picker.as_ref()?.items.get(selected)?.action.clone();
+    if let (Key::Char('e'), PickerAction::SendQueued(index)) = (key, &action) {
+        let initial = state.queued_inputs.get(*index)?.clone();
+        editor.clear();
+        editor.restore_submission(initial);
+        state.picker.as_mut()?.editing = Some(PickerEdit::Queued(*index));
+        return Some(None);
+    }
+    let picker = state.picker.as_mut()?;
+    match (key, action) {
+        (Key::Char(letter @ ('K' | 'J')), action) => {
+            let direction = if letter == 'K' { -1 } else { 1 };
+            let moved = match action {
+                PickerAction::SendQueued(index) => PickerAction::MoveQueued { index, direction },
+                PickerAction::OpenStatusBarItem { index, .. } => {
+                    PickerAction::MoveStatusBarItem { index, direction }
+                }
+                _ => return None,
+            };
+            state.picker = None;
+            Some(Some(moved))
+        }
+        (Key::Delete | Key::Char('d'), action) => match action {
+            PickerAction::ResumeSession(id) => {
+                let label = picker.items[selected].label.clone();
+                let description = picker.items[selected].description.clone();
+                *picker = delete_session_confirm(id, label, description, selected);
+                Some(None)
+            }
+            PickerAction::SwitchModel(model) | PickerAction::SaveModel(model) => {
+                let save = matches!(picker.items[selected].action, PickerAction::SaveModel(_));
+                state.picker = None;
+                Some(Some(PickerAction::ConfirmRemoveModel {
+                    model,
+                    save,
+                    selected,
+                }))
+            }
+            PickerAction::SendQueued(index) => Some(Some(PickerAction::RemoveQueued(index))),
+            PickerAction::OpenStatusBarItem { index, .. } => {
+                Some(Some(PickerAction::RemoveStatusBarItem(index)))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn delete_session_confirm(
@@ -669,10 +692,6 @@ pub(super) fn remove_model_confirm(
         editing: None,
         parent: Some(back),
     })
-}
-
-fn picker_cancel_action(picker: &Picker) -> Option<PickerAction> {
-    picker.parent.clone()
 }
 
 pub(super) fn select_picker_item(state: &mut ViewState, selected: usize) {

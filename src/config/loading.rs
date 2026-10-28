@@ -334,17 +334,21 @@ pub(crate) fn expand_home_path(raw: &str, home_dir: &Path) -> PathBuf {
     PathBuf::from(raw)
 }
 
+/// The local OpenAI-compatible servers every config starts with, as
+/// `(name, label, base URL)`, in the order setup lists them.
+pub(crate) const LOCAL_PROVIDERS: [(&str, &str, &str); 5] = [
+    ("ollama", "Ollama", "http://localhost:11434/v1"),
+    ("lmstudio", "LM Studio", "http://localhost:1234/v1"),
+    ("omlx", "OMLX", "http://localhost:8000/v1"),
+    ("vllm", "vLLM", "http://localhost:8000/v1"),
+    ("sglang", "SGLang", "http://localhost:30000/v1"),
+];
+
 fn default_local_providers() -> HashMap<String, ProviderConfig> {
-    let mut providers = [
-        ("lmstudio", "http://localhost:1234/v1"),
-        ("ollama", "http://localhost:11434/v1"),
-        ("omlx", "http://localhost:8000/v1"),
-        ("vllm", "http://localhost:8000/v1"),
-        ("sglang", "http://localhost:30000/v1"),
-    ]
-    .into_iter()
-    .map(|(name, url)| (name.to_string(), ProviderConfig::openai_compatible(url)))
-    .collect::<HashMap<_, _>>();
+    let mut providers = LOCAL_PROVIDERS
+        .into_iter()
+        .map(|(name, _, url)| (name.to_string(), ProviderConfig::openai_compatible(url)))
+        .collect::<HashMap<_, _>>();
     if let Some(omlx) = providers.get_mut("omlx") {
         omlx.compat.requires_reasoning_content_on_assistant_messages = Some(true);
     }

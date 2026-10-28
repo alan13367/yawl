@@ -39,6 +39,7 @@ pub(super) enum ConnectStep {
 
 pub(super) struct ConnectFlow {
     config: Config,
+    context: ConnectContext,
     step: ConnectStep,
     provider: Option<ProviderId>,
     provider_label: String,
@@ -67,50 +68,135 @@ enum LoginEvent {
     Done(Result<(), Error>),
 }
 
+/// Where the flow runs. Setup runs before Yawl starts, so it has no
+/// session to switch and offers a way out of setup in the provider list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConnectContext {
+    Session,
+    Setup,
+}
+
+/// Where the flow shows its next screen: the TUI view, or a setup screen.
+pub(super) trait ConnectView {
+    fn show(&mut self, picker: Picker);
+    fn notice(&mut self, message: String);
+}
+
+impl ConnectView for ViewState {
+    fn show(&mut self, picker: Picker) {
+        self.picker = Some(picker);
+    }
+
+    fn notice(&mut self, message: String) {
+        ViewState::notice(self, message);
+    }
+}
+
+/// What an action did to the flow.
+pub(super) enum FlowStep {
+    /// The flow continues on the screen it showed.
+    Continue,
+    /// Not a connection action; the flow stays open behind it.
+    Pass(PickerAction),
+    /// The flow ended, with the action to run next, if any.
+    End(Option<PickerAction>),
+}
+
+impl ConnectFlow {
+    pub(super) fn new(
+        config: &Config,
+        context: ConnectContext,
+        root_parent: Option<PickerAction>,
+    ) -> Self {
+        Self {
+            config: config.clone(),
+            context,
+            step: ConnectStep::Provider,
+            provider: None,
+            provider_label: String::new(),
+            endpoint: String::new(),
+            credential: CredentialChoice::Keep,
+            model: String::new(),
+            models: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            job: None,
+            root_parent,
+        }
+    }
+
+    pub(super) fn step(&self) -> ConnectStep {
+        self.step
+    }
+
+    /// Whether discovery or a login runs in the background.
+    pub(super) fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// The first screen: the provider list.
+    pub(super) fn first_screen(&self) -> Picker {
+        provider_picker(self)
+    }
+
+    /// Ends any background discovery or login.
+    pub(super) fn cancel(&mut self) {
+        cancel_job(self);
+    }
+}
+
 pub(super) fn open(state: &mut ViewState, config: &Config, from_settings: bool) {
     let root_parent = from_settings.then_some(PickerAction::OpenSettingsCategory {
         category: super::picker::SettingsCategory::Providers,
         selected: 0,
     });
-    state.connection = Some(ConnectFlow {
-        config: config.clone(),
-        step: ConnectStep::Provider,
-        provider: None,
-        provider_label: String::new(),
-        endpoint: String::new(),
-        credential: CredentialChoice::Keep,
-        model: String::new(),
-        models: Vec::new(),
-        reasoning_efforts: Vec::new(),
-        job: None,
-        root_parent: root_parent.clone(),
-    });
-    state.picker = Some(provider_picker(config, root_parent));
+    let flow = ConnectFlow::new(config, ConnectContext::Session, root_parent);
+    state.picker = Some(flow.first_screen());
+    state.connection = Some(flow);
 }
 
 pub(super) fn handle_action(state: &mut ViewState, action: PickerAction) -> Option<PickerAction> {
     let Some(mut flow) = state.connection.take() else {
         return Some(action);
     };
-    let mut keep_flow = true;
-    let result = match action {
-        PickerAction::ConnectChooseProvider(provider) => {
-            choose_provider(&mut flow, provider, state);
+    match handle(&mut flow, state, action) {
+        FlowStep::Continue => {
+            state.connection = Some(flow);
             None
         }
-        PickerAction::ApplyConnect { field, value } => {
-            apply_edit(&mut flow, field, value, state);
-            None
+        FlowStep::Pass(action) => {
+            state.connection = Some(flow);
+            Some(action)
         }
+        FlowStep::End(action) => {
+            state.picker = None;
+            action
+        }
+    }
+}
+
+/// Advances `flow` by one picker action, showing the next screen in `view`.
+pub(super) fn handle(
+    flow: &mut ConnectFlow,
+    view: &mut dyn ConnectView,
+    action: PickerAction,
+) -> FlowStep {
+    match action {
+        PickerAction::ConnectChooseProvider(provider) => choose_provider(flow, provider, view),
+        PickerAction::ConnectLogin { fresh } => {
+            if fresh {
+                start_login(flow, view);
+            } else {
+                start_codex_discovery(flow, view);
+            }
+        }
+        PickerAction::ApplyConnect { field, value } => apply_edit(flow, field, value, view),
         PickerAction::ConnectCredential(credential) => {
             flow.credential = credential;
-            start_discovery(&mut flow, state);
-            None
+            start_discovery(flow, view);
         }
         PickerAction::ConnectChooseModel(model) => {
             flow.model = model;
-            configure_model_reasoning(&mut flow, state);
-            None
+            configure_model_reasoning(flow, view);
         }
         PickerAction::ConnectToggleReasoning(index) => {
             if let Some(effort) = crate::config::REASONING_EFFORTS.get(index) {
@@ -120,89 +206,98 @@ pub(super) fn handle_action(state: &mut ViewState, action: PickerAction) -> Opti
                     flow.reasoning_efforts.push((*effort).into());
                 }
             }
-            let mut picker = connection_reasoning_picker(&flow);
+            let mut picker = connection_reasoning_picker(flow);
             picker.selected = index.min(picker.items.len().saturating_sub(1));
-            state.picker = Some(picker);
-            None
+            view.show(picker);
         }
         PickerAction::ConnectConfirmReasoning => {
             flow.step = ConnectStep::Review;
-            state.picker = Some(review_picker(&flow));
-            None
+            view.show(review_picker(flow));
         }
         PickerAction::ConnectRetry => {
             if flow.provider == Some(ProviderId::Codex) {
                 if crate::provider::codex::credential_status(&flow.config)
                     == CodexLoginStatus::LoggedIn
                 {
-                    start_codex_discovery(&mut flow, state);
+                    start_codex_discovery(flow, view);
                 } else {
-                    start_login(&mut flow, state);
+                    start_login(flow, view);
                 }
             } else {
-                start_discovery(&mut flow, state);
+                start_discovery(flow, view);
             }
-            None
         }
         PickerAction::ConnectCancelJob => {
-            cancel_job(&mut flow);
+            cancel_job(flow);
             flow.step = ConnectStep::Provider;
-            state.picker = Some(provider_picker(&flow.config, flow.root_parent.clone()));
-            None
+            view.show(provider_picker(flow));
         }
         PickerAction::CloseConnect => {
-            cancel_job(&mut flow);
-            keep_flow = false;
-            state.picker = None;
-            flow.root_parent.clone()
+            cancel_job(flow);
+            return FlowStep::End(flow.root_parent.clone());
         }
-        PickerAction::ConnectBack(step) => {
-            go_back(&mut flow, step, state);
-            None
-        }
-        PickerAction::ConnectActivation(activation) => match build_plan(&flow, activation) {
-            Ok(plan) => {
-                keep_flow = false;
-                state.picker = None;
-                Some(PickerAction::ApplyConnectionPlan(plan))
-            }
+        PickerAction::ConnectBack(step) => go_back(flow, step, view),
+        PickerAction::ConnectActivation(activation) => match build_plan(flow, activation) {
+            Ok(plan) => return FlowStep::End(Some(PickerAction::ApplyConnectionPlan(plan))),
             Err(error) => {
-                state.notice(format!("Could not prepare connection: {error}"));
-                state.picker = Some(review_picker(&flow));
-                None
+                view.notice(format!("Could not prepare connection: {error}"));
+                view.show(review_picker(flow));
             }
         },
         PickerAction::OpenSettingsCategory { .. } | PickerAction::OpenSettingsRoot { .. } => {
-            cancel_job(&mut flow);
-            keep_flow = false;
-            Some(action)
+            cancel_job(flow);
+            return FlowStep::End(Some(action));
         }
-        action => Some(action),
-    };
-    if keep_flow {
-        state.connection = Some(flow);
+        action => return FlowStep::Pass(action),
     }
-    result
+    FlowStep::Continue
 }
 
-fn provider_picker(config: &Config, parent: Option<PickerAction>) -> Picker {
+fn provider_picker(flow: &ConnectFlow) -> Picker {
+    let mut items = provider::provider_catalog(&flow.config)
+        .into_iter()
+        .map(|definition| {
+            let description = provider_description(&definition);
+            PickerItem {
+                label: definition.label,
+                description,
+                action: PickerAction::ConnectChooseProvider(definition.id),
+            }
+        })
+        .collect::<Vec<_>>();
+    let (title, hint) = match flow.context {
+        ConnectContext::Session => ("Connect provider", "↑/↓ move  Enter configure  Esc close"),
+        ConnectContext::Setup => {
+            // Esc does the same, but a first run should not have to guess.
+            items.push(match &flow.config.model {
+                Some(model) => PickerItem {
+                    label: "Keep current setup".into(),
+                    description: format!("Start with {model}"),
+                    action: PickerAction::CloseConnect,
+                },
+                None => PickerItem {
+                    label: "Skip for now".into(),
+                    description: "Run 'yawl --setup' anytime, or pass --model".into(),
+                    action: PickerAction::CloseConnect,
+                },
+            });
+            (
+                "Choose a provider",
+                "↑/↓ move  Enter select  Esc leave setup",
+            )
+        }
+    };
     Picker {
-        title: "Connect provider".into(),
-        hint: "↑/↓ move  Enter configure  Esc close".into(),
-        items: provider::provider_catalog(config)
-            .into_iter()
-            .map(|definition| {
-                let description = provider_description(&definition);
-                PickerItem {
-                    label: definition.label,
-                    description,
-                    action: PickerAction::ConnectChooseProvider(definition.id),
-                }
-            })
-            .collect(),
+        title: title.into(),
+        hint: hint.into(),
+        items,
         selected: 0,
         editing: None,
-        parent: Some(parent.unwrap_or(PickerAction::CloseConnect)),
+        parent: Some(
+            flow.root_parent
+                .clone()
+                .unwrap_or(PickerAction::CloseConnect),
+        ),
     }
 }
 
@@ -294,40 +389,26 @@ fn endpoint_picker(flow: &ConnectFlow, value: String, error: Option<&str>) -> Pi
     )
 }
 
-fn choose_provider(flow: &mut ConnectFlow, provider: ProviderId, state: &mut ViewState) {
+fn choose_provider(flow: &mut ConnectFlow, provider: ProviderId, view: &mut dyn ConnectView) {
     if provider == ProviderId::Other {
         flow.step = ConnectStep::ProviderName;
-        state.picker = Some(provider_name_picker(String::new(), None));
+        view.show(provider_name_picker(String::new(), None));
         return;
     }
-    flow.provider_label = provider_label(&provider);
+    flow.provider_label = provider::label(&provider);
     flow.provider = Some(provider.clone());
     if provider == ProviderId::Codex {
         if crate::provider::codex::credential_status(&flow.config) == CodexLoginStatus::LoggedIn {
-            start_codex_discovery(flow, state);
+            flow.step = ConnectStep::Login;
+            view.show(codex_login_picker());
         } else {
-            start_login(flow, state);
+            start_login(flow, view);
         }
         return;
     }
     flow.endpoint = provider::default_endpoint(&provider, &flow.config);
     flow.step = ConnectStep::Endpoint;
-    state.picker = Some(endpoint_picker(flow, flow.endpoint.clone(), None));
-}
-
-fn provider_label(provider: &ProviderId) -> String {
-    match provider {
-        ProviderId::Codex => "OpenAI Codex".into(),
-        ProviderId::Anthropic => "Anthropic".into(),
-        ProviderId::OpenAi => "OpenAI".into(),
-        ProviderId::Compatible(name) => match name.as_str() {
-            "ollama" => "Ollama".into(),
-            "lmstudio" => "LM Studio".into(),
-            "omlx" => "OMLX".into(),
-            _ => name.clone(),
-        },
-        ProviderId::Other => "Other OpenAI-compatible".into(),
-    }
+    view.show(endpoint_picker(flow, flow.endpoint.clone(), None));
 }
 
 /// Applies a submitted value, or reopens its field with the problem shown
@@ -336,18 +417,18 @@ fn apply_edit(
     flow: &mut ConnectFlow,
     field: ConnectEditField,
     value: String,
-    state: &mut ViewState,
+    view: &mut dyn ConnectView,
 ) {
     match field {
         ConnectEditField::ProviderName => match provider::validate_provider_name(&value) {
-            Ok(()) => choose_provider(flow, ProviderId::Compatible(value), state),
+            Ok(()) => choose_provider(flow, ProviderId::Compatible(value), view),
             Err(error) => {
-                state.picker = Some(provider_name_picker(value, Some(field_error(error))));
+                view.show(provider_name_picker(value, Some(field_error(error))));
             }
         },
         ConnectEditField::Endpoint => {
             if !value.starts_with("http://") && !value.starts_with("https://") {
-                state.picker = Some(endpoint_picker(
+                view.show(endpoint_picker(
                     flow,
                     value,
                     Some("Start the URL with http:// or https://."),
@@ -356,24 +437,24 @@ fn apply_edit(
             }
             flow.endpoint = value;
             flow.step = ConnectStep::Authentication;
-            state.picker = Some(authentication_picker(flow));
+            view.show(authentication_picker(flow));
         }
         ConnectEditField::Environment => {
             let name = value.trim().trim_start_matches('$').to_string();
             if let Err(error) = provider::validate_environment_name(&name) {
-                state.picker = Some(environment_picker(flow, name, Some(field_error(error))));
+                view.show(environment_picker(flow, name, Some(field_error(error))));
                 return;
             }
             flow.credential = CredentialChoice::Environment(name);
-            start_discovery(flow, state);
+            start_discovery(flow, view);
         }
         ConnectEditField::Secret => {
             flow.credential = CredentialChoice::Literal(value);
-            start_discovery(flow, state);
+            start_discovery(flow, view);
         }
         ConnectEditField::Model => {
             flow.model = value;
-            configure_model_reasoning(flow, state);
+            configure_model_reasoning(flow, view);
         }
     }
 }
@@ -465,23 +546,23 @@ fn environment_picker(flow: &ConnectFlow, initial: String, error: Option<String>
     )
 }
 
-fn start_discovery(flow: &mut ConnectFlow, state: &mut ViewState) {
+fn start_discovery(flow: &mut ConnectFlow, view: &mut dyn ConnectView) {
     let Some(provider) = flow.provider.clone() else {
         return;
     };
     let endpoint = flow.endpoint.clone();
     let key = provider::request_credential(&flow.config, &provider, &flow.credential);
     let description = format!("Testing {} in the background", flow.provider_label);
-    spawn_discovery(flow, state, "Discovering models", &description, move || {
+    spawn_discovery(flow, view, "Discovering models", &description, move || {
         provider::discover_models(&provider, &endpoint, &key)
     });
 }
 
-fn start_codex_discovery(flow: &mut ConnectFlow, state: &mut ViewState) {
+fn start_codex_discovery(flow: &mut ConnectFlow, view: &mut dyn ConnectView) {
     let config = flow.config.clone();
     spawn_discovery(
         flow,
-        state,
+        view,
         "Discovering Codex models",
         "Fetching models for this account",
         move || {
@@ -498,7 +579,7 @@ fn start_codex_discovery(flow: &mut ConnectFlow, state: &mut ViewState) {
 /// cancel during the request reports an interruption instead of its result.
 fn spawn_discovery(
     flow: &mut ConnectFlow,
-    state: &mut ViewState,
+    view: &mut dyn ConnectView,
     title: &str,
     description: &str,
     discover: impl FnOnce() -> Result<Vec<DiscoveredModel>, Error> + Send + 'static,
@@ -525,14 +606,14 @@ fn spawn_discovery(
         receiver,
         cancellation,
     });
-    state.picker = Some(waiting_picker(
+    view.show(waiting_picker(
         title,
         description,
         PickerAction::ConnectCancelJob,
     ));
 }
 
-fn start_login(flow: &mut ConnectFlow, state: &mut ViewState) {
+fn start_login(flow: &mut ConnectFlow, view: &mut dyn ConnectView) {
     let config = flow.config.clone();
     let cancellation = CancellationToken::default();
     let worker_cancellation = cancellation.clone();
@@ -554,11 +635,35 @@ fn start_login(flow: &mut ConnectFlow, state: &mut ViewState) {
         receiver,
         cancellation,
     });
-    state.picker = Some(waiting_picker(
+    view.show(waiting_picker(
         "OpenAI Codex login",
         "Starting device authentication…",
         PickerAction::ConnectCancelJob,
     ));
+}
+
+/// Offers a fresh device login when an account is already saved, for
+/// switching accounts.
+fn codex_login_picker() -> Picker {
+    Picker {
+        title: "OpenAI Codex login".into(),
+        hint: "↑/↓ move  Enter select  Esc back".into(),
+        items: vec![
+            PickerItem {
+                label: "Use the existing login".into(),
+                description: "Already saved in ~/.yawl/auth.json".into(),
+                action: PickerAction::ConnectLogin { fresh: false },
+            },
+            PickerItem {
+                label: "Sign in again".into(),
+                description: "Start a new device login, for another account".into(),
+                action: PickerAction::ConnectLogin { fresh: true },
+            },
+        ],
+        selected: 0,
+        editing: None,
+        parent: Some(PickerAction::ConnectBack(ConnectStep::Provider)),
+    }
 }
 
 fn waiting_picker(title: &str, description: &str, parent: PickerAction) -> Picker {
@@ -608,8 +713,15 @@ pub(super) fn poll(state: &mut ViewState) -> bool {
     let Some(mut flow) = state.connection.take() else {
         return false;
     };
+    let changed = poll_flow(&mut flow, state);
+    state.connection = Some(flow);
+    changed
+}
+
+/// Shows the next screen once background discovery or login reports.
+/// Returns whether anything changed.
+pub(super) fn poll_flow(flow: &mut ConnectFlow, view: &mut dyn ConnectView) -> bool {
     let Some(job) = flow.job.as_mut() else {
-        state.connection = Some(flow);
         return false;
     };
     enum PollEvent {
@@ -640,11 +752,11 @@ pub(super) fn poll(state: &mut ViewState) -> bool {
             }
         },
     };
-    let changed = match event {
+    match event {
         PollEvent::None => false,
         PollEvent::Models(models) => {
             flow.job = None;
-            show_models(&mut flow, models, state);
+            show_models(flow, models, view);
             true
         }
         PollEvent::DiscoveryFailure(message) => {
@@ -658,36 +770,34 @@ pub(super) fn poll(state: &mut ViewState) -> bool {
                 Vec::new()
             };
             if cached.is_empty() {
-                show_recovery(&mut flow, message, state);
+                show_recovery(flow, message, view);
             } else {
-                state.notice("Could not refresh Codex models. Showing the saved catalog.");
-                show_models(&mut flow, cached, state);
+                view.notice("Could not refresh Codex models. Showing the saved catalog.".into());
+                show_models(flow, cached, view);
             }
             true
         }
         PollEvent::LoginPrompt(prompt) => {
-            state.picker = Some(login_prompt_picker(&prompt));
+            view.show(login_prompt_picker(&prompt));
             true
         }
         PollEvent::LoginDone => {
             flow.job = None;
-            start_codex_discovery(&mut flow, state);
+            start_codex_discovery(flow, view);
             true
         }
         PollEvent::LoginFailure => {
             flow.job = None;
-            show_recovery(&mut flow, "OpenAI Codex login did not complete.", state);
+            show_recovery(flow, "OpenAI Codex login did not complete.", view);
             true
         }
-    };
-    state.connection = Some(flow);
-    changed
+    }
 }
 
-fn show_models(flow: &mut ConnectFlow, models: Vec<DiscoveredModel>, state: &mut ViewState) {
+fn show_models(flow: &mut ConnectFlow, models: Vec<DiscoveredModel>, view: &mut dyn ConnectView) {
     flow.step = ConnectStep::Models;
     flow.models = models.clone();
-    state.picker = Some(models_picker(flow, &models));
+    view.show(models_picker(flow, &models));
 }
 
 fn models_picker(flow: &ConnectFlow, models: &[DiscoveredModel]) -> Picker {
@@ -739,9 +849,9 @@ fn models_picker(flow: &ConnectFlow, models: &[DiscoveredModel]) -> Picker {
     }
 }
 
-fn show_recovery(flow: &mut ConnectFlow, message: &str, state: &mut ViewState) {
+fn show_recovery(flow: &mut ConnectFlow, message: &str, view: &mut dyn ConnectView) {
     flow.step = ConnectStep::Recovery;
-    state.picker = Some(recovery_picker(flow, message));
+    view.show(recovery_picker(flow, message));
 }
 
 fn recovery_picker(flow: &ConnectFlow, message: &str) -> Picker {
@@ -781,7 +891,7 @@ fn recovery_picker(flow: &ConnectFlow, message: &str) -> Picker {
     }
 }
 
-fn configure_model_reasoning(flow: &mut ConnectFlow, state: &mut ViewState) {
+fn configure_model_reasoning(flow: &mut ConnectFlow, view: &mut dyn ConnectView) {
     if matches!(flow.provider, Some(ProviderId::Compatible(_))) {
         let saved = crate::model::saved_reasoning_efforts(&flow.config, &qualified_model(flow));
         // `None` is an unknown provider or unlisted model and defaults to
@@ -795,11 +905,11 @@ fn configure_model_reasoning(flow: &mut ConnectFlow, state: &mut ViewState) {
             Some(efforts) => efforts.into_iter().map(str::to_string).collect(),
         };
         flow.step = ConnectStep::Reasoning;
-        state.picker = Some(connection_reasoning_picker(flow));
+        view.show(connection_reasoning_picker(flow));
     } else {
         flow.reasoning_efforts.clear();
         flow.step = ConnectStep::Review;
-        state.picker = Some(review_picker(flow));
+        view.show(review_picker(flow));
     }
 }
 
@@ -828,26 +938,34 @@ fn connection_reasoning_picker(flow: &ConnectFlow) -> Picker {
 
 fn review_picker(flow: &ConnectFlow) -> Picker {
     let description = format!("{} · {}", flow.provider_label, qualified_model(flow));
+    let item = |label: &str, activation| PickerItem {
+        label: label.into(),
+        description: description.clone(),
+        action: PickerAction::ConnectActivation(activation),
+    };
+    let mut items = vec![item(
+        "Save and use as default",
+        ConnectionActivation::Default,
+    )];
+    let session = flow.context == ConnectContext::Session;
+    if session {
+        items.push(item(
+            "Save and use this session",
+            ConnectionActivation::Session,
+        ));
+    }
+    // Setup has no session yet, and its first connection must become the
+    // default for Yawl to start.
+    if session || flow.config.model.is_some() {
+        items.push(item(
+            "Save connection only",
+            ConnectionActivation::ConnectionOnly,
+        ));
+    }
     Picker {
         title: "Review connection".into(),
         hint: "↑/↓ move  Enter save  Esc back".into(),
-        items: vec![
-            PickerItem {
-                label: "Save and use as default".into(),
-                description: description.clone(),
-                action: PickerAction::ConnectActivation(ConnectionActivation::Default),
-            },
-            PickerItem {
-                label: "Save and use this session".into(),
-                description: description.clone(),
-                action: PickerAction::ConnectActivation(ConnectionActivation::Session),
-            },
-            PickerItem {
-                label: "Save connection only".into(),
-                description,
-                action: PickerAction::ConnectActivation(ConnectionActivation::ConnectionOnly),
-            },
-        ],
+        items,
         selected: 0,
         editing: None,
         parent: Some(PickerAction::ConnectBack(
@@ -924,10 +1042,10 @@ fn cancel_job(flow: &mut ConnectFlow) {
     }
 }
 
-fn go_back(flow: &mut ConnectFlow, step: ConnectStep, state: &mut ViewState) {
+fn go_back(flow: &mut ConnectFlow, step: ConnectStep, view: &mut dyn ConnectView) {
     flow.step = step;
-    state.picker = Some(match step {
-        ConnectStep::Provider => provider_picker(&flow.config, flow.root_parent.clone()),
+    view.show(match step {
+        ConnectStep::Provider => provider_picker(flow),
         ConnectStep::Endpoint => endpoint_picker(flow, flow.endpoint.clone(), None),
         ConnectStep::Authentication => authentication_picker(flow),
         ConnectStep::Models => models_picker(flow, &flow.models),
@@ -936,7 +1054,7 @@ fn go_back(flow: &mut ConnectFlow, step: ConnectStep, state: &mut ViewState) {
         ConnectStep::ProviderName
         | ConnectStep::Discovery
         | ConnectStep::Login
-        | ConnectStep::Review => provider_picker(&flow.config, flow.root_parent.clone()),
+        | ConnectStep::Review => provider_picker(flow),
     });
 }
 
@@ -950,6 +1068,7 @@ mod tests {
         let config = Config::load_from(root.join("home/.yawl"), root.join("project/.yawl"))?;
         let flow = ConnectFlow {
             config: config.clone(),
+            context: ConnectContext::Session,
             step: ConnectStep::Review,
             provider: Some(ProviderId::Compatible("local-api".into())),
             provider_label: "Local API".into(),

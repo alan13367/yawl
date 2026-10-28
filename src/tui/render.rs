@@ -34,6 +34,7 @@ pub(super) use transcript::{loading_label, render_transcript_window};
 pub(super) use welcome::WELCOME_ANIMATION_TICKS;
 pub(super) use welcome::WelcomeDetails;
 use welcome::render_welcome;
+pub(super) use welcome::render_wordmark;
 
 pub(super) use super::status_bar::format_token_count;
 

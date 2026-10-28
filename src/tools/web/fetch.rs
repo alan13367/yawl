@@ -42,7 +42,7 @@ impl WebTools {
             .map_err(|error| transport_error("fetch", error))?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            return Err(format!("web fetch failed with HTTP status {status}"));
+            return Err(status_error(status, response.headers()));
         }
         let final_url = response.get_uri().to_string();
         if validate_http_url(&final_url).is_err() {
@@ -104,6 +104,27 @@ impl WebTools {
     }
 }
 
+/// Explains refusals so the model moves on instead of retrying a page that
+/// only a real browser can open.
+fn status_error(status: u16, headers: &ureq::http::HeaderMap) -> String {
+    let challenge = headers
+        .get("cf-mitigated")
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"challenge"))
+        || headers.contains_key("x-px-blocked")
+        || headers.contains_key("x-datadome");
+    if challenge {
+        format!(
+            "web fetch was blocked by the site's bot protection (HTTP {status}), which requires a real browser to pass a JavaScript or CAPTCHA check. Retrying will not help; use a different source."
+        )
+    } else if matches!(status, 401 | 403) {
+        format!(
+            "web fetch failed with HTTP status {status}: the site refused the request, often because it blocks automated clients. Retrying will not help; use a different source."
+        )
+    } else {
+        format!("web fetch failed with HTTP status {status}")
+    }
+}
+
 fn supported_content_type(content_type: &str) -> bool {
     content_type.starts_with("text/")
         || matches!(
@@ -134,6 +155,23 @@ mod tests {
         assert!(supported_content_type("application/problem+json"));
         assert!(!supported_content_type("application/pdf"));
         assert!(!supported_content_type("image/png"));
+    }
+
+    #[test]
+    fn refusals_tell_the_model_not_to_retry() {
+        let mut headers = ureq::http::HeaderMap::new();
+        let refused = status_error(403, &headers);
+        assert!(refused.contains("HTTP status 403"), "{refused}");
+        assert!(refused.contains("blocks automated clients"), "{refused}");
+        assert_eq!(
+            status_error(404, &headers),
+            "web fetch failed with HTTP status 404"
+        );
+        headers.insert("x-px-blocked", "1".parse().expect("header value"));
+        assert!(status_error(403, &headers).contains("bot protection"));
+        let mut headers = ureq::http::HeaderMap::new();
+        headers.insert("cf-mitigated", "Challenge".parse().expect("header value"));
+        assert!(status_error(503, &headers).contains("bot protection (HTTP 503)"));
     }
 
     #[test]
@@ -201,6 +239,16 @@ mod tests {
             .expect_err("status error");
         status_server.join().expect("status server");
         assert!(error.contains("HTTP status 503"));
+
+        let (challenge_base, challenge_server) = serve(vec![
+            "HTTP/1.1 403 Forbidden\r\ncf-mitigated: challenge\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        ]);
+        let error = test_tools(20_000)
+            .fetch(&challenge_base)
+            .expect_err("challenge error");
+        challenge_server.join().expect("challenge server");
+        assert!(error.contains("bot protection (HTTP 403)"), "{error}");
+        assert!(error.contains("use a different source"), "{error}");
 
         let (binary_base, binary_server) = serve(vec![
             "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: 4\r\nConnection: close\r\n\r\n%PDF".into(),

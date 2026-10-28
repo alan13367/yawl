@@ -1,7 +1,8 @@
 //! Shared provider catalog and connection plan construction for setup UIs.
 
 use crate::config::{
-    Config, ConfigChange, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_OPENAI_BASE_URL, resolve_config_value,
+    Config, ConfigChange, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_OPENAI_BASE_URL, LOCAL_PROVIDERS,
+    resolve_config_value,
 };
 use crate::error::Error;
 
@@ -75,38 +76,28 @@ pub(crate) fn provider_catalog(config: &Config) -> Vec<ProviderDefinition> {
         },
         builtin(
             ProviderId::Anthropic,
-            "Anthropic",
             "Claude models with an API key",
             config.anthropic_api_key.is_some() || std::env::var_os("ANTHROPIC_API_KEY").is_some(),
         ),
         builtin(
             ProviderId::OpenAi,
-            "OpenAI",
             "GPT models with an API key",
             config.openai_api_key.is_some() || std::env::var_os("OPENAI_API_KEY").is_some(),
         ),
-        compatible(
-            config,
-            "ollama",
-            "Ollama",
-            "local models at 127.0.0.1:11434",
-        ),
-        compatible(
-            config,
-            "lmstudio",
-            "LM Studio",
-            "local models at 127.0.0.1:1234",
-        ),
-        compatible(config, "omlx", "OMLX", "local models at 127.0.0.1:8000"),
     ];
+    providers.extend(
+        LOCAL_PROVIDERS
+            .iter()
+            .map(|(name, _, url)| compatible(config, name, url)),
+    );
     let mut custom = config
         .providers
         .iter()
-        .filter(|(name, _)| !matches!(name.as_str(), "ollama" | "lmstudio" | "omlx"))
+        .filter(|(name, _)| local_provider(name).is_none())
         .map(|(name, _provider)| ProviderDefinition {
             id: ProviderId::Compatible(name.clone()),
             label: name.clone(),
-            description: "configured OpenAI-compatible provider".into(),
+            description: "OpenAI-compatible provider".into(),
             configured: true,
         })
         .collect::<Vec<_>>();
@@ -121,35 +112,56 @@ pub(crate) fn provider_catalog(config: &Config) -> Vec<ProviderDefinition> {
     providers
 }
 
-fn builtin(id: ProviderId, label: &str, description: &str, configured: bool) -> ProviderDefinition {
+fn builtin(id: ProviderId, description: &str, configured: bool) -> ProviderDefinition {
     ProviderDefinition {
+        label: label(&id),
         id,
-        label: label.into(),
         description: description.into(),
         configured,
     }
 }
 
-fn compatible(config: &Config, name: &str, label: &str, description: &str) -> ProviderDefinition {
+/// A local server from [`LOCAL_PROVIDERS`], configured once it differs from
+/// the entry every config starts with.
+fn compatible(config: &Config, name: &str, default_url: &str) -> ProviderDefinition {
     let provider = config.providers.get(name);
+    let address = default_url
+        .trim_start_matches("http://")
+        .trim_end_matches("/v1");
+    let id = ProviderId::Compatible(name.into());
     ProviderDefinition {
-        id: ProviderId::Compatible(name.into()),
-        label: label.into(),
-        description: description.into(),
+        label: label(&id),
+        id,
+        description: format!("local models at {address}"),
         configured: provider.is_some_and(|provider| {
             provider.api_key.is_some()
                 || !provider.models.is_empty()
-                || provider.base_url != default_compatible_url(name)
+                || provider.base_url != default_url
         }),
     }
 }
 
-pub(crate) fn default_compatible_url(name: &str) -> &'static str {
-    match name {
-        "ollama" => "http://127.0.0.1:11434/v1",
-        "lmstudio" => "http://127.0.0.1:1234/v1",
-        _ => "http://127.0.0.1:8000/v1",
+fn local_provider(name: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
+    LOCAL_PROVIDERS.iter().find(|(local, _, _)| *local == name)
+}
+
+/// The display name setup and `/connect` use for `provider`.
+pub(crate) fn label(provider: &ProviderId) -> String {
+    match provider {
+        ProviderId::Codex => "OpenAI Codex".into(),
+        ProviderId::Anthropic => "Anthropic".into(),
+        ProviderId::OpenAi => "OpenAI".into(),
+        ProviderId::Compatible(name) => {
+            local_provider(name).map_or_else(|| name.clone(), |(_, label, _)| (*label).into())
+        }
+        ProviderId::Other => "Other OpenAI-compatible".into(),
     }
+}
+
+/// The base URL a provider without one starts from: its local default, or
+/// the usual port for a new OpenAI-compatible server.
+pub(crate) fn default_compatible_url(name: &str) -> &'static str {
+    local_provider(name).map_or("http://localhost:8000/v1", |(_, _, url)| url)
 }
 
 pub(crate) fn validate_provider_name(name: &str) -> Result<(), Error> {
@@ -369,17 +381,19 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(
-            &labels[..6],
+            &labels[..8],
             &[
                 "OpenAI Codex",
                 "Anthropic",
                 "OpenAI",
                 "Ollama",
                 "LM Studio",
-                "OMLX"
+                "OMLX",
+                "vLLM",
+                "SGLang",
             ]
         );
-        assert_eq!(&labels[6..8], &["alpha", "zeta"]);
+        assert_eq!(&labels[8..10], &["alpha", "zeta"]);
         assert_eq!(
             labels.last().map(String::as_str),
             Some("Other OpenAI-compatible")
@@ -451,6 +465,68 @@ mod tests {
         assert!(validate_environment_name("_PRIVATE_KEY_2").is_ok());
         assert!(validate_environment_name("2BAD").is_err());
         assert!(validate_environment_name("BAD-NAME").is_err());
+    }
+
+    #[test]
+    fn trusted_project_providers_appear_in_setup_catalog() -> Result<(), Error> {
+        let root = crate::test_support::unique_temp_dir("setup-project-provider");
+        let project = root.join("project/.yawl");
+        std::fs::create_dir_all(&project)?;
+        std::fs::write(
+            project.join("config.json"),
+            r#"{"providers":{"project-llm":{"base_url":"https://example.test/v1","models":[{"id":"demo"}]}}}"#,
+        )?;
+        let mut config = Config::load_from(root.join("home/.yawl"), project)?;
+        let project_provider = ProviderId::Compatible("project-llm".into());
+        assert!(
+            !provider_catalog(&config)
+                .iter()
+                .any(|entry| entry.id == project_provider)
+        );
+
+        config.apply_project_trusted_config()?;
+        assert!(
+            provider_catalog(&config)
+                .iter()
+                .any(|entry| entry.id == project_provider)
+        );
+        assert_eq!(
+            default_endpoint(&project_provider, &config),
+            "https://example.test/v1"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn local_endpoints_use_effective_config_then_builtin_default() {
+        // A fresh config's local providers are not reported as configured.
+        let fresh = Config::load_from(
+            crate::test_support::unique_temp_dir("fresh-catalog").join(".yawl"),
+            std::path::PathBuf::from("missing-project/.yawl"),
+        )
+        .expect("defaults");
+        assert!(
+            provider_catalog(&fresh)
+                .iter()
+                .filter(|entry| matches!(entry.id, ProviderId::Compatible(_)))
+                .all(|entry| !entry.configured)
+        );
+
+        let mut config = Config::test_default();
+        let ollama = ProviderId::Compatible("ollama".into());
+        assert_eq!(
+            default_endpoint(&ollama, &config),
+            "http://localhost:11434/v1"
+        );
+        config.providers.insert(
+            "ollama".into(),
+            test_provider("http://remote-host:11434/v1"),
+        );
+        assert_eq!(
+            default_endpoint(&ollama, &config),
+            "http://remote-host:11434/v1"
+        );
     }
 
     fn test_provider(base_url: &str) -> crate::config::ProviderConfig {

@@ -238,25 +238,7 @@ impl Terminal {
     /// reach the input reader, which discards the replies themselves,
     /// including ones that arrive after the deadline.
     pub(super) fn query_light_background(&mut self) -> (Option<bool>, Vec<u8>) {
-        if self.stdout.write_all(theme::BACKGROUND_QUERY).is_err() || self.stdout.flush().is_err() {
-            return (None, Vec::new());
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        let mut input = remote::TerminalInput::stdin();
-        let mut reply = Vec::new();
-        let mut buffer = [0_u8; 256];
-        while !theme::has_device_attributes(&reply)
-            && reply.len() < 4096
-            && std::time::Instant::now() < deadline
-        {
-            // Raw mode returns from an idle read after 100 ms.
-            match input.read(&mut buffer) {
-                Ok(read) => reply.extend_from_slice(&buffer[..read]),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-        (theme::reported_background_is_light(&reply), reply)
+        query_light_background(&mut self.stdout)
     }
 
     pub(super) fn invalidate(&mut self) {
@@ -589,6 +571,30 @@ fn write_kitty_image(
 /// Without the neighbors, a changed row's old glyph could leave a stray pixel
 /// in an unchanged row beside it, as the scroll rail did above the composer
 /// corner when it auto-hid.
+/// Asks a raw-mode terminal whether its background is light, as
+/// [`Terminal::query_light_background`] describes.
+pub(super) fn query_light_background(stdout: &mut impl Write) -> (Option<bool>, Vec<u8>) {
+    if stdout.write_all(theme::BACKGROUND_QUERY).is_err() || stdout.flush().is_err() {
+        return (None, Vec::new());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut input = remote::TerminalInput::stdin();
+    let mut reply = Vec::new();
+    let mut buffer = [0_u8; 256];
+    while !theme::has_device_attributes(&reply)
+        && reply.len() < 4096
+        && std::time::Instant::now() < deadline
+    {
+        // Raw mode returns from an idle read after 100 ms.
+        match input.read(&mut buffer) {
+            Ok(read) => reply.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    (theme::reported_background_is_light(&reply), reply)
+}
+
 pub(super) fn write_frame_rows(
     output: &mut impl Write,
     frame: &[String],

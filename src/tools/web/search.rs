@@ -2,6 +2,8 @@
 //! untrusted result format.
 
 use std::collections::HashSet;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use scraper::Html;
 use serde::Deserialize;
@@ -23,9 +25,81 @@ const BRAVE_QUERY_MAX_CHARS: usize = 400;
 const BRAVE_QUERY_MAX_WORDS: usize = 50;
 const TITLE_MAX_CHARS: usize = 200;
 const SNIPPET_MAX_CHARS: usize = 500;
-/// DuckDuckGo answers rapid automated searches with HTTP 202 and a puzzle
-/// page instead of results.
-const DUCKDUCKGO_BOT_CHECK: &str = "DuckDuckGo blocked this search with a bot check, which it does after several quick searches. Wait a minute before searching again, or have the user switch the web search provider to Brave or Firecrawl in /settings.";
+/// DuckDuckGo answers a few back-to-back searches and then serves a bot check
+/// instead of results, so every thread in the process shares one spacing.
+const DUCKDUCKGO_INTERVAL: Duration = Duration::from_secs(3);
+/// How long searches stay paused after a bot check. Searching again sooner
+/// only prolongs the block.
+const DUCKDUCKGO_COOLDOWN: Duration = Duration::from_secs(60);
+
+static DUCKDUCKGO_PACE: Mutex<DuckDuckGoPace> = Mutex::new(DuckDuckGoPace {
+    last_slot: None,
+    blocked_until: None,
+});
+
+struct DuckDuckGoPace {
+    last_slot: Option<Instant>,
+    blocked_until: Option<Instant>,
+}
+
+impl DuckDuckGoPace {
+    fn blocked_for(&self, now: Instant) -> Option<Duration> {
+        self.blocked_until
+            .filter(|until| *until > now)
+            .map(|until| until - now)
+    }
+
+    /// Reserves the next request time at least `DUCKDUCKGO_INTERVAL` after
+    /// the previous one, or reports how long searches remain blocked.
+    fn claim(&mut self, now: Instant) -> Result<Instant, Duration> {
+        if let Some(remaining) = self.blocked_for(now) {
+            return Err(remaining);
+        }
+        let slot = self
+            .last_slot
+            .map_or(now, |last| (last + DUCKDUCKGO_INTERVAL).max(now));
+        self.last_slot = Some(slot);
+        Ok(slot)
+    }
+
+    fn block(&mut self, now: Instant) {
+        self.blocked_until = Some(now + DUCKDUCKGO_COOLDOWN);
+    }
+}
+
+fn duckduckgo_pace() -> std::sync::MutexGuard<'static, DuckDuckGoPace> {
+    DUCKDUCKGO_PACE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn duckduckgo_blocked(remaining: Duration) -> String {
+    let seconds = remaining.as_millis().div_ceil(1000);
+    format!(
+        "DuckDuckGo blocked web searches with a bot check, which it does after several quick searches. Searching resumes in {seconds} seconds; until then, work with the results you already have or web_fetch a known URL, or have the user switch the web search provider to Brave or Firecrawl in /settings."
+    )
+}
+
+/// Waits for this request's DuckDuckGo slot without blocking other threads,
+/// checking for cancellation while it sleeps.
+fn wait_for_duckduckgo() -> Result<(), String> {
+    let slot = duckduckgo_pace()
+        .claim(Instant::now())
+        .map_err(duckduckgo_blocked)?;
+    loop {
+        interrupted()?;
+        let now = Instant::now();
+        if now >= slot {
+            break;
+        }
+        std::thread::sleep((slot - now).min(Duration::from_millis(50)));
+    }
+    // Another thread may have hit the bot check while this one waited.
+    match duckduckgo_pace().blocked_for(Instant::now()) {
+        Some(remaining) => Err(duckduckgo_blocked(remaining)),
+        None => Ok(()),
+    }
+}
 
 pub(super) fn entry(provider: WebSearchProvider) -> ToolEntry {
     let query_max_chars = query_max_chars(provider);
@@ -83,19 +157,32 @@ impl WebTools {
     }
 
     fn search_duckduckgo(&self, query: &str) -> Result<Vec<SearchResult>, String> {
+        wait_for_duckduckgo()?;
         let mut response = self
             .agent
             .post("https://html.duckduckgo.com/html/")
             .header("accept", "text/html")
             .send_form([("q", query)])
             .map_err(|error| transport_error("DuckDuckGo search", error))?;
-        require_success(&response, "DuckDuckGo search")?;
-        let bot_check = response.status().as_u16() == 202;
-        let body = read_body(&mut response, SEARCH_BODY_LIMIT, "DuckDuckGo response")?;
-        if bot_check {
-            return Err(DUCKDUCKGO_BOT_CHECK.into());
-        }
-        parse_duckduckgo(&body)
+        // DuckDuckGo takes no key, so 403 and 429 mean it is refusing
+        // automated searches, like the 202 bot check.
+        let status = response.status().as_u16();
+        let results = match status {
+            202 | 403 | 429 => None,
+            200..=299 => {
+                let body = read_body(&mut response, SEARCH_BODY_LIMIT, "DuckDuckGo response")?;
+                parse_duckduckgo(&body)?
+            }
+            _ => {
+                return Err(format!(
+                    "DuckDuckGo search failed with HTTP status {status}"
+                ));
+            }
+        };
+        results.ok_or_else(|| {
+            duckduckgo_pace().block(Instant::now());
+            duckduckgo_blocked(DUCKDUCKGO_COOLDOWN)
+        })
     }
 
     fn search_brave(&self, query: &str) -> Result<Vec<SearchResult>, String> {
@@ -180,7 +267,9 @@ fn query_max_chars(provider: WebSearchProvider) -> usize {
     }
 }
 
-fn parse_duckduckgo(body: &str) -> Result<Vec<SearchResult>, String> {
+/// Returns `None` when DuckDuckGo served its bot-check puzzle instead of
+/// results.
+fn parse_duckduckgo(body: &str) -> Result<Option<Vec<SearchResult>>, String> {
     let document = Html::parse_document(body);
     let result_selector = selector(".result")?;
     let title_selector = selector(".result__a")?;
@@ -225,19 +314,19 @@ fn parse_duckduckgo(body: &str) -> Result<Vec<SearchResult>, String> {
         }
     }
     if !results.is_empty() {
-        Ok(results)
+        Ok(Some(results))
     } else if document
         .select(&selector(".anomaly-modal__modal, .anomaly-modal__puzzle")?)
         .next()
         .is_some()
     {
-        Err(DUCKDUCKGO_BOT_CHECK.into())
+        Ok(None)
     } else if document
         .select(&selector(".no-results, .no-results__message")?)
         .next()
         .is_some()
     {
-        Ok(Vec::new())
+        Ok(Some(Vec::new()))
     } else if containers > 0 {
         Err("DuckDuckGo returned results, but their markup could not be parsed".into())
     } else {
@@ -415,7 +504,7 @@ mod tests {
             <div class="result"><a class="result__a" href="https://example.com/a">Duplicate</a></div>
             <div class="result"><a class="result__a" href="https://example.com/b">Second</a></div>
         "#;
-        let results = parse_duckduckgo(html).expect("results");
+        let results = parse_duckduckgo(html).expect("parse").expect("results");
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].url, "https://example.com/a");
         assert_eq!(results[0].snippet, "Useful result");
@@ -425,7 +514,7 @@ mod tests {
     fn duckduckgo_parser_distinguishes_no_results_and_markup_changes() {
         assert_eq!(
             parse_duckduckgo("<div class='no-results'>None</div>").expect("empty"),
-            Vec::new()
+            Some(Vec::new())
         );
         assert!(parse_duckduckgo("<html><body>changed</body></html>").is_err());
     }
@@ -435,9 +524,35 @@ mod tests {
         let page = r#"<html><body><div class="anomaly-modal__mask"><div class="anomaly-modal__modal">
             <div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div>
             <div class="anomaly-modal__puzzle"></div></div></div></body></html>"#;
-        let error = parse_duckduckgo(page).expect_err("bot check");
+        assert_eq!(parse_duckduckgo(page).expect("bot check page"), None);
+        let error = duckduckgo_blocked(Duration::from_millis(41_200));
         assert!(error.contains("bot check"), "{error}");
+        assert!(error.contains("resumes in 42 seconds"), "{error}");
         assert!(error.contains("Brave or Firecrawl"), "{error}");
+    }
+
+    #[test]
+    fn duckduckgo_requests_are_spaced_and_paused_after_a_block() {
+        let start = Instant::now();
+        let mut pace = DuckDuckGoPace {
+            last_slot: None,
+            blocked_until: None,
+        };
+        assert_eq!(pace.claim(start), Ok(start));
+        assert_eq!(pace.claim(start), Ok(start + DUCKDUCKGO_INTERVAL));
+        assert_eq!(pace.claim(start), Ok(start + DUCKDUCKGO_INTERVAL * 2));
+        let later = start + Duration::from_secs(30);
+        assert_eq!(pace.claim(later), Ok(later));
+
+        pace.block(later);
+        let during = later + Duration::from_secs(20);
+        assert_eq!(
+            pace.claim(during),
+            Err(DUCKDUCKGO_COOLDOWN - Duration::from_secs(20))
+        );
+        let after = later + DUCKDUCKGO_COOLDOWN;
+        assert_eq!(pace.blocked_for(after), None);
+        assert_eq!(pace.claim(after), Ok(after));
     }
 
     #[test]

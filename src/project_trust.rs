@@ -1,9 +1,8 @@
-//! Invocation-level project skill trust resolution and terminal prompting.
-
-use std::io::{self, Write};
-use std::path::Path;
+//! Invocation-level project skill trust resolution. The question itself is
+//! a setup screen drawn by the TUI.
 
 use crate::config::Config;
+use crate::tui::TrustAnswer;
 
 pub(super) fn resolve(
     config: &mut Config,
@@ -33,17 +32,17 @@ pub(super) fn resolve(
             Ok(())
         }
         crate::trust::Decision::Unknown if stdin_is_terminal => {
-            match prompt_project_trust(&root)? {
-                ProjectTrustChoice::Permanent => {
+            match crate::tui::ask_project_trust(config, &root, &project_settings(config))? {
+                TrustAnswer::Permanent => {
                     crate::trust::store(&config.home_dir, &root, true)?;
                     config.set_project_skills_trusted(true);
                     apply_trusted_project_config(config)
                 }
-                ProjectTrustChoice::Session => {
+                TrustAnswer::Session => {
                     config.set_project_skills_trusted(true);
                     apply_trusted_project_config(config)
                 }
-                ProjectTrustChoice::Deny => {
+                TrustAnswer::Deny => {
                     crate::trust::store(&config.home_dir, &root, false)?;
                     config.set_project_skills_trusted(false);
                     Ok(())
@@ -72,35 +71,17 @@ fn apply_trusted_project_config(config: &mut Config) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-enum ProjectTrustChoice {
-    Permanent,
-    Session,
-    Deny,
-}
-
-fn prompt_project_trust(root: &Path) -> Result<ProjectTrustChoice, io::Error> {
-    loop {
-        eprintln!(
-            "Project-controlled settings were found under {}.",
-            root.display()
-        );
-        eprintln!(
-            "Trusting enables project skills, project tools, and any provider endpoints or credentials it defines."
-        );
-        eprintln!("  1. Trust this project permanently");
-        eprintln!("  2. Trust for this session");
-        eprintln!("  3. Do not trust");
-        eprint!("Choice [3]: ");
-        io::stderr().flush()?;
-        let mut answer = String::new();
-        if crate::terminal_mode::read_line(&mut answer)? == 0 {
-            return Ok(ProjectTrustChoice::Deny);
-        }
-        match answer.trim() {
-            "1" => return Ok(ProjectTrustChoice::Permanent),
-            "2" => return Ok(ProjectTrustChoice::Session),
-            "" | "3" => return Ok(ProjectTrustChoice::Deny),
-            _ => eprintln!("Enter 1, 2, or 3."),
-        }
+/// What trusting the project would enable, for the trust question.
+fn project_settings(config: &Config) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    if crate::skills::has_project_sources(config) {
+        found.push("skills");
     }
+    if crate::tools::has_project_tools(config) {
+        found.push("tools");
+    }
+    if config.project_config_restricted() {
+        found.push("provider settings");
+    }
+    found
 }

@@ -482,6 +482,8 @@ pub(super) fn activate_picker_action(
             }
         }
         PickerAction::ShowSettings => show_settings(agent, state),
+        // Only the setup screens build choice pickers.
+        PickerAction::Choice(_) => {}
         PickerAction::ImplementPlan => {
             state.pending_plan_implementation = true;
         }
@@ -513,6 +515,7 @@ pub(super) fn activate_picker_action(
         | PickerAction::EditConnect { .. }
         | PickerAction::ApplyConnect { .. }
         | PickerAction::ConnectChooseProvider(_)
+        | PickerAction::ConnectLogin { .. }
         | PickerAction::ConnectCredential(_)
         | PickerAction::ConnectChooseModel(_)
         | PickerAction::ConnectToggleReasoning(_)

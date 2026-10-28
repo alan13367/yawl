@@ -10,7 +10,7 @@ Never spawn subagents if not explicitly requested by the user.
 
 - `src/main.rs`: one-line binary that calls `yawl::main`. `src/lib.rs` declares every module crate-private and exports only `main`, so the compiler reports unused code
 - `src/app.rs`: startup, session selection, and TUI/print-mode dispatch
-- `src/cli.rs`, `src/print_mode.rs`, `src/project_trust.rs`: argument parsing, streamed text presentation, and project skill trust prompts
+- `src/cli.rs`, `src/print_mode.rs`, `src/project_trust.rs`: argument parsing, streamed text presentation, and project trust resolution (the question itself is a `tui/setup.rs` screen)
 - `src/agent.rs`: `Agent` facade: one `run(TurnRequest)` entry point for every kind of turn, plus session, undo, and config operations
 - `src/agent/conversation.rs`, `events.rs`: conversation state over a session (a file for the main agent, memory-only for subagents), session switching, undo, and streamed turn events
 - `src/agent/conversation/turn.rs`, `conversation/step.rs`: the turn lifecycle (`TurnRequest`, preamble, per-step preparation, provider request with retries, tool execution, compaction) and one model step (`classify` plus one handler per step kind)
@@ -49,11 +49,12 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tui/git.rs`: Git dashboard entry points, shared state and geometry, and refresh coordination
 - `src/tui/git/repository.rs`, `git/jobs.rs`, `git/operations.rs`: Git subprocess execution and data loading, cancellable workers, UI result merging, and blocking repository actions
 - `src/tui/git/input.rs`, `git/init.rs`, `git/render.rs`, `git/diff.rs`: dashboard input and commit editing, repository initialization, panel rendering, and diff wrapping/highlighting
-- `src/tui/processes.rs`, `subagents.rs`, `connection.rs`, `dashboard.rs`: background-process and subagent dashboards, provider setup, and shared dashboard layout
+- `src/tui/processes.rs`, `subagents.rs`, `connection.rs`, `dashboard.rs`: background-process and subagent dashboards, the provider connection flow shared by `/connect` and first-run setup (it shows screens through `ConnectView`), and shared dashboard layout
+- `src/tui/setup.rs`: screens shown before a session starts, provider setup and the project trust question, as pickers behind a `Surface`. `setup/screen.rs` draws them full screen under the wordmark; `setup/lines.rs` asks numbered prompts on stderr for piped input
 - `src/tui/remote.rs`: `/remote` command, merged host/remote input reader, and host lock screen
 - `src/tui/remote/hub.rs`, `remote/server.rs`, `remote/http.rs`, `remote/address.rs`, `remote/qr.rs`: shared session state and input wake-ups between UI and server threads, pairing and SSE/POST routes, minimal keep-alive HTTP/1.1, Tailscale address discovery with pairing secrets, and the QR encoder for the pairing link. `remote/index.html` is the embedded page for phones and computers
 - `src/tui/remote/unix.rs`, `remote/windows.rs`, `remote/address/{unix,windows}.rs`: the host terminal reader (`TerminalInput`), the input wake handle and wait (a self-pipe with `poll`, or an event with `WaitForMultipleObjects`), and interface listing with random bytes
-- `src/onboarding.rs`, `src/onboarding/`: setup wizard coordination, arrow-key selection, model discovery, and terminal prompts
+- `src/onboarding.rs`, `src/onboarding/`: the setup outcome (configured or skipped), the provider catalog, and model discovery shared with `/connect`
 - `src/doctor.rs`, `src/doctor/`: configuration diagnosis, interactive repair, and report rendering
 - `src/tools/`: builtin registry and custom-tool discovery
 - `src/tools/registry.rs`: per-step tool registry, tool entries and outcomes, and dispatch to each tool
@@ -77,7 +78,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/subagent/manager/format.rs`: snapshot and deferred-result presentation
 - `src/subagent/reports.rs`: durable large-report storage and bounded result excerpts
 - `src/background.rs`, `src/subagent/`, `src/cancellation.rs`: session-bound shell processes, parallel subagents, and interrupt tokens. `background/{unix,windows}.rs` hold the process-tree `Group`, and `cancellation/{unix,windows}.rs` hold the Ctrl+C handler (SIGINT, or a console control handler) and the Unix `SIGUSR1` thread wake. `lib.rs` re-exports the interrupt helpers
-- `src/terminal_mode.rs`: shared raw-terminal lifecycle for the TUI and onboarding selector, over `unix.rs` (termios) and `windows.rs` (console modes and the `ConsoleInput` key reader). `key_text.rs` turns console key records into UTF-8 on every platform so it can be tested
+- `src/terminal_mode.rs`: shared raw-terminal lifecycle for the TUI and setup screens, over `unix.rs` (termios) and `windows.rs` (console modes and the `ConsoleInput` key reader). `key_text.rs` turns console key records into UTF-8 on every platform so it can be tested
 - `src/paths.rs`, `src/paths/windows.rs`: `canonicalize` without Windows verbatim prefixes, reserved device names, `replace_file`, and Windows file identity from `GetFileInformationByHandle`
 - `src/skills.rs`, `src/trust.rs`, `src/image.rs`: skill discovery, project skill trust, and image input
 - `src/text.rs`: terminal-safe text: the one rule for which characters (controls and bidirectional overrides) must not reach the terminal

@@ -31,14 +31,6 @@ pub(crate) fn enable_escape_output() {
     windows::enable_escape_output();
 }
 
-/// Width of the terminal on stdout, or 80 when it cannot be read.
-pub(crate) fn terminal_columns() -> usize {
-    match window_size() {
-        Some((columns, _)) if columns > 0 => usize::from(columns),
-        _ => 80,
-    }
-}
-
 /// Reads one line from stdin, appending it to `line`, and returns the byte
 /// count (0 at end of input). On Windows the read returns an `Interrupted`
 /// error soon after Ctrl+C, because a console read cannot be interrupted

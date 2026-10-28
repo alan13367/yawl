@@ -266,13 +266,15 @@ fn git_branch(cwd: &Path) -> Option<String> {
     }
 }
 
-pub(super) fn render_welcome(
+/// The wordmark that fits `width` by `height`, centered, in the accent
+/// color, and typed out over the first ticks. Returns the rows and the
+/// ticks the typing takes.
+pub(in crate::tui) fn render_wordmark(
     accent: UiColor,
-    details: &WelcomeDetails,
     width: usize,
     height: usize,
     tick: usize,
-) -> Vec<String> {
+) -> (Vec<String>, usize) {
     let color = format!("{}\x1b[1m", foreground_color(accent));
     let logo = welcome_logo(width, height);
     let block_width = logo
@@ -282,7 +284,7 @@ pub(super) fn render_welcome(
         .unwrap_or(0);
     let revealed = typed_amount(tick, block_width);
     let show_cursor = revealed < block_width && tick.is_multiple_of(2);
-    let mut content: Vec<String> = logo
+    let rows = logo
         .iter()
         .map(|line| {
             let padded = pad_to_width(line, block_width);
@@ -290,11 +292,21 @@ pub(super) fn render_welcome(
             center_styled(&typed, &color, width)
         })
         .collect();
+    (rows, block_width.div_ceil(WELCOME_COLUMNS_PER_TICK))
+}
+
+pub(super) fn render_welcome(
+    accent: UiColor,
+    details: &WelcomeDetails,
+    width: usize,
+    height: usize,
+    tick: usize,
+) -> Vec<String> {
+    let (mut content, logo_ticks) = render_wordmark(accent, width, height, tick);
     const HINT: &str = "Type /help for commands.";
     if height >= content.len() + 2 && markdown::visible_width(HINT) <= width {
         let blank = markdown::fit_width("", width);
         content.push(blank.clone());
-        let logo_ticks = block_width.div_ceil(WELCOME_COLUMNS_PER_TICK);
         let hint = typed_hint(tick, logo_ticks, HINT);
         if hint.is_empty() {
             content.push(blank.clone());

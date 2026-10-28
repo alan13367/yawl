@@ -22,7 +22,7 @@ Yawl is a terminal AI agent for macOS, Linux, and Windows. Use the full-screen i
 
 ## Install
 
-Requires Rust 1.99 or newer.
+Requires Rust 1.99.1 or newer.
 
 ```sh
 git clone https://github.com/alan13367/yawl.git
@@ -30,7 +30,7 @@ cd yawl
 cargo install --path .
 ```
 
-Run `yawl` to choose a provider and model. Use `yawl --setup` to reopen setup or `yawl --doctor` to check and repair configuration.
+Run `yawl` to choose a provider and model. Setup uses the same screens as `/connect`, under the Yawl wordmark with a progress line, and you can connect several providers before starting. Use `yawl --setup` to reopen setup or `yawl --doctor` to check and repair configuration. Piped input gets numbered prompts on stderr instead.
 
 On Windows, Yawl needs Windows 10 version 1809 or later and runs in Windows Terminal or the standard console; the mintty window that Git Bash opens is not supported. Shell commands and custom tools run in the bash that comes with [Git for Windows](https://git-scm.com/download/win), so install it first. Yawl finds it through `git.exe` on `PATH` or the standard install folders; set `YAWL_GIT_BASH` to the full path of `bash.exe` to choose another. Paths written as `~/.yawl` below mean `%USERPROFILE%\.yawl`.
 
@@ -183,7 +183,7 @@ Use `/reasoning` to change the session's effort, `/reasoning default` to let the
 
 ### Project trust
 
-Project skills, project tools, and provider endpoints, base URLs, and credentials require trust before use. A project tool the agent defines during a session works for the rest of that session; later sessions load it once you trust the project. Yawl stores your decision in `~/.yawl/trust.json`. `--trust-project` grants trust for one invocation, including piped runs that cannot prompt.
+Project skills, project tools, and provider endpoints, base URLs, and credentials require trust before use. The first time Yawl starts in a project that defines any of them, it asks whether to trust it permanently, for this session, or not at all; "not at all" is selected by default, and Esc chooses it. A project tool the agent defines during a session works for the rest of that session; later sessions load it once you trust the project. Yawl stores your decision in `~/.yawl/trust.json`. `--trust-project` grants trust for one invocation, including piped runs that cannot prompt.
 
 ### Interface settings
 
@@ -203,7 +203,7 @@ Provider requests are retried with backoff on rate limits, 5xx responses, droppe
 
 ## Web browsing
 
-Enable with `/settings web_browsing on`. DuckDuckGo search needs no key; Brave and Firecrawl require `BRAVE_API_KEY` or `FIRECRAWL_API_KEY`. If DuckDuckGo blocks automated searches, wait or switch providers in Settings > Web.
+Enable with `/settings web_browsing on`. DuckDuckGo search needs no key; Brave and Firecrawl require `BRAVE_API_KEY` or `FIRECRAWL_API_KEY`. DuckDuckGo searches are spaced at least 3 seconds apart, and after a bot check they pause for a minute; to avoid the wait, switch providers in Settings > Web.
 
 `web_fetch` retrieves HTTP(S) pages without JavaScript and converts HTML to Markdown. It returns up to `web_fetch_max_chars`, 20,000 by default, and saves longer pages for the model to read in sections. Web content is treated as untrusted input. Fetching is not network-sandboxed and can reach private addresses.
 

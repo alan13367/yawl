@@ -91,9 +91,24 @@ impl PickerField {
         self
     }
 
-    #[cfg(test)]
     pub(in crate::tui) fn value(&self) -> &str {
         &self.value
+    }
+
+    pub(in crate::tui) fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// The validation problem, or else the help text.
+    pub(in crate::tui) fn message(&self) -> &str {
+        self.error.as_deref().unwrap_or(&self.help)
+    }
+
+    /// Replaces the value, as a line prompt does with what was typed.
+    pub(in crate::tui) fn set_value(&mut self, text: &str) {
+        self.value = clean(text);
+        self.cursor = self.value.chars().count();
+        self.error = None;
     }
 
     /// Inserts pasted text at the cursor. Newlines and control characters

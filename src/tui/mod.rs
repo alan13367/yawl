@@ -28,6 +28,7 @@ mod render;
 #[cfg(test)]
 mod render_tests;
 mod search;
+mod setup;
 mod state;
 #[cfg(test)]
 mod state_tests;
@@ -47,6 +48,8 @@ mod worker_tests;
 
 use crate::agent::{Agent, TurnRequest};
 use crate::error::Error;
+
+pub(crate) use self::setup::{TrustAnswer, ask_project_trust, run_setup};
 
 use self::commands::{
     Command, GoalAction, HOTKEYS, PlanAction, copy_all_messages, copy_last_reply, goal, help,
