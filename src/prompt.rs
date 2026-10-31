@@ -27,6 +27,10 @@ pub(crate) struct MainPromptState<'a> {
     /// Present when `define_tool` is available; names the custom tools
     /// already saved for this user.
     pub(crate) custom_tools: Option<&'a [String]>,
+    /// The role instruction of a preset the run uses (`yawl --agent`).
+    pub(crate) preset_role: Option<&'a str>,
+    /// The allowed tools of that preset, when it restricts them.
+    pub(crate) restriction: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -82,7 +86,34 @@ fn build_main_system_prompt_from(
         state.goal,
     );
     append_init_task(&mut prompt, state.init);
+    if print_mode {
+        prompt.push_str(NON_INTERACTIVE_NOTE);
+    }
+    append_preset(&mut prompt, state.preset_role, state.restriction);
     prompt
+}
+
+/// A one-shot run is often started by a script or another agent that reads
+/// only the final answer, and nobody can reply until it ends.
+const NON_INTERACTIVE_NOTE: &str = "
+<non_interactive_run>
+This is a one-shot run, often started by a script or another agent. Nobody can answer questions until it ends, so make reasonable assumptions, state them, and finish the task. The caller may read only your final message: make it self-contained, with the result, the files you changed, and how you verified it.
+</non_interactive_run>
+";
+
+fn append_preset(prompt: &mut String, role: Option<&str>, restriction: Option<&str>) {
+    let parts = [role, restriction]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return;
+    }
+    prompt.push_str("\n<agent_preset>\n");
+    prompt.push_str(&parts.join("\n"));
+    prompt.push_str("\n</agent_preset>\n");
 }
 
 /// `restriction` states a preset child's allowed tools inside its role
@@ -786,7 +817,7 @@ mod tests {
         let restricted = build_subagent_system_prompt(
             &dirs.0,
             Some("You are a scout."),
-            Some("This subagent may use only these tools: read_file (read files)."),
+            Some("You may use only these tools: read_file (read files)."),
             false,
             &[],
         );

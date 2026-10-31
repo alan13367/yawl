@@ -43,12 +43,44 @@ git diff | yawl "Review this patch"   # use stdin as context
 yawl -c                              # resume the latest session here
 yawl --session SESSION_ID            # resume from any directory
 yawl -m openai:gpt-4o "Release note"  # choose a model for one run
+yawl --json --no-stdin "Fix the test"  # one JSON result for scripts and agents
+yawl --list-models                   # providers, models, and capabilities
 yawl --list-tools                    # inspect available tools
 ```
 
 Use `yawl --help` for CLI options and `/hotkeys` for keyboard shortcuts.
 
 Yawl has no approval prompt or permission layer. Tools run with your account's access to files and the network. Review the working directory before starting a task; `Escape` or `Ctrl+C` stops the active response or tool without exiting.
+
+## Use from scripts and other agents
+
+Print mode is built to be called by other programs, including agent harnesses such as Claude Code, Codex, and OpenCode, which can hand Yawl a task on any model you have configured.
+
+```sh
+yawl --install-skill all             # teach Claude Code, Codex, and OpenCode to use Yawl
+yawl --check --json                  # can a turn start? if not, what to fix
+yawl --list-models --refresh --json  # what each provider serves right now
+yawl --json --no-stdin -m ollama:qwen3-coder:30b "Add tests for src/range.rs"
+git diff | yawl --json --agent scout "Review this diff"   # read-only review
+```
+
+`--json` prints exactly one object on stdout when the run ends: `status` (`completed`, `error`, `timeout`, or `interrupted`), `exit_code`, `session_id`, `model`, `text` (the final answer), `error` (`kind`, `message`, and `hint`), `duration_ms`, `requests`, `usage`, `context`, `tool_calls`, `tool_errors`, `edited_files` (files changed by `write_file` and `edit_file`; shell commands are not tracked), and `warnings`. A run that fails before it starts, for example on an unknown option or a missing credential, prints an object of the same shape. `--format jsonl` streams one event per line instead (`start`, `text`, `reasoning`, `message`, `tool_start`, `tool_end`, `usage`, `retry`, `warning`, `compacted`, and others), ending with the same result object. Text in both formats is escaped so it cannot steer a terminal.
+
+| Option | Effect |
+| --- | --- |
+| `--no-stdin` | Never read standard input. Without it, print mode reads stdin until it closes, and says on stderr after 3 seconds why it is waiting |
+| `--timeout SECONDS` | Stop the whole run, including the wait for stdin, after this long; the session can be continued with `--session` |
+| `--agent PRESET` | Use a subagent preset's tools, role, and model. `--agent scout` gives a read-only run with no shell |
+| `--reasoning EFFORT` | Reasoning effort for this run, checked against what the model accepts |
+| `--ephemeral` | Keep the session in memory only, out of `/resume` and `--list-sessions` |
+
+`--check` reports whether a turn could start: configuration problems from the doctor, the model and its provider, a missing key or login, and project settings ignored until the project is trusted. With `--refresh` it also asks the provider for its model list, which proves the endpoint and credential work without spending a completion. `--list-models` lists providers with their credential state and every saved model with its context window, output limit, reasoning efforts, and image support; `--refresh` adds what each provider currently serves. `--list-sessions` and `--list-agents` list resumable sessions in the working directory and the presets `--agent` accepts. Every listing takes `--json`.
+
+Print mode tells the model that the run is non-interactive, so it states its assumptions instead of asking, and ends with a self-contained final answer.
+
+Exit codes are 0 on success, 1 for other failures, 2 for usage errors, 3 for configuration or authentication problems, 4 when the provider fails or cannot be reached, 124 on timeout, and 130 on interrupt.
+
+`--print-skill` prints the [Agent Skills](https://agentskills.io) `SKILL.md` that teaches another harness all of this: when to delegate, how to choose a model and a preset, how to read the result, and how to continue a session. `--install-skill` writes it for `claude` (`~/.claude/skills`, or `$CLAUDE_CONFIG_DIR/skills`), `codex` or `agents` (`~/.agents/skills`), `opencode` (`~/.config/opencode/skills`), `all` (Claude and agents, which OpenCode also reads), or a skills directory path. Yawl does not load this skill itself. The skill is compiled into the binary, so reinstall it after upgrading Yawl.
 
 ### Terminal controls
 
@@ -193,7 +225,7 @@ The `theme` setting (`auto`, `dark`, or `light`) picks interface colors for the 
 
 ## Sessions and undo
 
-Sessions live under `~/.yawl/sessions/projects/<project-key>/`. `yawl -c` resumes the latest session in the working directory; `/resume` opens its session picker. `--session ID` resumes from any directory. Sessions restore the selected model and reasoning effort; `-m MODEL` overrides the model for one run. A session log is append-only: every change is an event that replay applies the same way the live session did. Unreadable entries, for example from a newer Yawl version, are skipped with a warning when the session opens, and an entry cut short by a crash is dropped.
+Sessions live under `~/.yawl/sessions/projects/<project-key>/`. `yawl -c` resumes the latest session in the working directory; `/resume` opens its session picker. `--session ID` resumes from any directory, and print mode reports the id on stderr, or as `session_id` in JSON. Sessions restore the selected model and reasoning effort; `-m MODEL` overrides the model for one run. A session log is append-only: every change is an event that replay applies the same way the live session did. Unreadable entries, for example from a newer Yawl version, are skipped with a warning when the session opens, and an entry cut short by a crash is dropped.
 
 `/undo` restores files changed through `write_file`, `edit_file`, and `define_tool`, and removes the last turn. It does not track file changes made by shell commands or custom tools. Snapshots are limited to 32 MiB per file. If the agent moved Git `HEAD`, undo also soft-resets it to the pre-turn commit. When a turn's snapshot is missing, for example after copying a session log without `~/.yawl/checkpoints`, undo still removes the turn and warns that files were not restored. A session that cannot finish recovering never blocks `/new` or `/resume`. `/diff` compares files touched by the file tools with their original session contents.
 
@@ -213,7 +245,7 @@ Enable with `/settings subagents on`. Children share the working directory, run 
 
 `/subagents` shows their progress; `Enter` takes over a child. The takeover mirrors the main screen under a `Subagent` header: `Enter` steers a running child or messages a settled one, `Tab` queues a private turn, `Ctrl+O` expands all tool output and thinking (or click one thinking tag or tool card), `Ctrl+C` cancels the run, and `Esc` returns to the dashboard. Steers show who sent them and are marked delivered once the child accepts them.
 
-Settings > Subagents controls the default model, concurrency, request budget, and timeout. Children spawned past the concurrency limit queue and start in order as running ones settle. JSON presets in `~/.yawl/agents/` or `./.yawl/agents/` define roles, models, and tool access. The bundled `scout` preset provides read-only file search and Git inspection. Restricted tools limit available operations; they are not an OS sandbox. A restricted child's prompt lists its allowed tools, and any other call is rejected with that list and what to do instead, so weaker local models stop retrying.
+Settings > Subagents controls the default model, concurrency, request budget, and timeout. Children spawned past the concurrency limit queue and start in order as running ones settle. JSON presets in `~/.yawl/agents/` or `./.yawl/agents/` define roles, models, and tool access. The bundled `scout` preset provides read-only file search and Git inspection. Restricted tools limit available operations; they are not an OS sandbox. A restricted child's prompt lists its allowed tools, and any other call is rejected with that list and what to do instead, so weaker local models stop retrying. `yawl --agent PRESET` runs a print-mode turn under a preset the same way.
 
 Long reports are saved under `~/.yawl/artifacts/subagents/`, with a summary and path returned to the parent. These files persist until manually removed.
 

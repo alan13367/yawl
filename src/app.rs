@@ -8,30 +8,36 @@ use crate::agent::Agent;
 use crate::cli::{Cli, HELP, parse_args};
 use crate::config::{Config, SessionDirs};
 use crate::error::Error;
-use crate::print_mode::{read_prompt, run as run_print_mode};
+use crate::exit_status::Failure;
+use crate::print_mode::{RunOptions, read_prompt, run as run_print_mode};
 use crate::session::Session;
-use crate::tools::{CatalogCache, Registry};
 
 /// Runs the `yawl` command line and exits with its status.
 pub fn main() {
-    match run() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let machine = crate::cli::wants_machine_output(&args);
+    match run(args) {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
         Err(error) => {
-            eprintln!("yawl: {error}");
-            std::process::exit(1);
+            let failure = crate::exit_status::classify(error.as_ref());
+            if machine {
+                println!("{}", crate::print_mode::startup_failure(&failure));
+            } else {
+                eprintln!("yawl: {}", failure.message);
+                if let Some(hint) = failure.hint {
+                    eprintln!("hint: {hint}");
+                }
+            }
+            std::process::exit(failure.code);
         }
     }
 }
 
-fn run() -> Result<i32, Box<dyn std::error::Error>> {
+fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
     crate::terminal_mode::enable_escape_output();
-    let cli = parse_args(std::env::args().skip(1)).map_err(|message| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{message}\nTry 'yawl --help' for usage."),
-        )
-    })?;
+    let mut cli = parse_args(args).map_err(Failure::usage)?;
+    let machine = cli.format.is_machine();
     if cli.help {
         print!("{HELP}");
         return Ok(0);
@@ -40,19 +46,41 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         println!("yawl {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
     }
+    if cli.print_skill {
+        print!("{}", crate::skill_export::text());
+        return Ok(0);
+    }
+    if let Some(target) = &cli.install_skill {
+        let paths = crate::skill_export::install(target)?;
+        if machine {
+            let installed = serde_json::json!({ "installed": paths });
+            println!("{}", crate::text::json_line(&installed));
+        } else {
+            for path in paths {
+                println!("installed {}", path.display());
+            }
+        }
+        return Ok(0);
+    }
     if cli.doctor {
         crate::install_interrupt_handler()?;
         return Ok(crate::doctor::run()?);
     }
+    if cli.check {
+        crate::install_interrupt_handler()?;
+        return Ok(crate::inspect::check(
+            cli.model.as_deref(),
+            cli.trust_project,
+            cli.refresh,
+            machine,
+        ));
+    }
 
-    let mut config = match Config::load() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("yawl: {error}");
-            eprintln!("Run 'yawl --doctor' to diagnose and repair the configuration.");
-            return Ok(1);
-        }
-    };
+    let mut config = Config::load().map_err(|error| {
+        Error::Config(format!(
+            "{error}; run 'yawl --doctor' to diagnose and repair the configuration"
+        ))
+    })?;
     if let Some(provider) = &cli.login {
         crate::install_interrupt_handler()?;
         match provider.as_str() {
@@ -66,9 +94,15 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         return Ok(0);
     }
     let stdin_is_terminal = io::stdin().is_terminal();
+    let inspecting = cli.list_tools || cli.list_models || cli.list_sessions || cli.list_agents;
     // Setup also reads project provider definitions, so resolve trust before
     // either explicit setup or first-run onboarding can use the config.
-    crate::project_trust::resolve(&mut config, cli.trust_project, stdin_is_terminal)?;
+    // Inspection never asks; it lists what the current trust allows.
+    if inspecting {
+        crate::project_trust::resolve_quietly(&mut config, cli.trust_project)?;
+    } else {
+        crate::project_trust::resolve(&mut config, cli.trust_project, stdin_is_terminal)?;
+    }
     if cli.setup {
         crate::install_interrupt_handler()?;
         crate::onboarding::run(&config)?;
@@ -78,46 +112,180 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         config.model = Some(model.clone());
     }
     if cli.list_tools {
-        list_tools(&config);
+        crate::inspect::list_tools(&config, machine);
+        return Ok(0);
+    }
+    if cli.list_models {
+        crate::install_interrupt_handler()?;
+        return Ok(crate::inspect::list_models(&config, machine, cli.refresh));
+    }
+    if cli.list_sessions {
+        crate::inspect::list_sessions(&config, machine)?;
+        return Ok(0);
+    }
+    if cli.list_agents {
+        crate::inspect::list_agents(&config, machine);
         return Ok(0);
     }
 
-    if config.model.is_none() && !config.setup_skipped && cli.prompt.is_empty() && stdin_is_terminal
-    {
+    let interactive =
+        cli.prompt.is_empty() && stdin_is_terminal && cli.print_only_option().is_none();
+    if config.model.is_none() && !config.setup_skipped && interactive {
         crate::install_interrupt_handler()?;
         config = match crate::onboarding::run(&config)? {
             crate::onboarding::SetupOutcome::Configured(config) => *config,
             crate::onboarding::SetupOutcome::Skipped => return Ok(0),
         };
     }
-    let model = config.model.clone().ok_or_else(|| {
-        Error::Config("no model configured; run 'yawl --setup' or pass --model".into())
-    })?;
-    let session = open_session(&config, &cli, &model)?;
-    // An explicit `-m` wins; otherwise a resumed session continues with the
-    // model it last used.
-    let model = if cli.model.is_some() {
-        model
+    // A one-shot run reads its prompt before anything is saved, so a missing
+    // prompt leaves no session behind.
+    let mut timeout = cli.timeout;
+    let prompt = if interactive {
+        None
     } else {
-        session.resumed_model(&config, &model)
+        if cli.prompt.is_empty()
+            && stdin_is_terminal
+            && let Some(option) = cli.print_only_option()
+        {
+            return Err(Box::new(Failure::usage(format!(
+                "{option} needs a prompt, such as yawl {option} ... \"TASK\""
+            ))));
+        }
+        let reading_started = std::time::Instant::now();
+        let prompt = read_prompt(
+            std::mem::take(&mut cli.prompt),
+            !stdin_is_terminal && !cli.no_stdin,
+            cli.timeout,
+        )?;
+        // The deadline covers the whole run, including the wait for stdin.
+        timeout = timeout.map(|timeout| timeout.saturating_sub(reading_started.elapsed()));
+        Some(prompt)
+    };
+    let preset = cli
+        .agent
+        .as_deref()
+        .map(|name| find_preset(&config, name))
+        .transpose()?;
+    // An explicit `-m` wins, then the preset's model; otherwise a resumed
+    // session continues with the model it last used.
+    let explicit_model = cli
+        .model
+        .clone()
+        .or_else(|| preset.as_ref().and_then(|preset| preset.model.clone()));
+    let model = explicit_model
+        .clone()
+        .or_else(|| config.model.clone())
+        .ok_or_else(|| {
+            Error::Config(
+                "no model configured; run 'yawl --setup', or pass --model PROVIDER:MODEL \
+                 (see 'yawl --list-models')"
+                    .into(),
+            )
+        })?;
+    ensure_resolvable(&config, &model)?;
+    let session = if cli.ephemeral {
+        Session::memory(ephemeral_id(), &model)
+    } else {
+        open_session(&config, &cli, &model)?
+    };
+    let model = match explicit_model {
+        Some(model) => model,
+        None => session.resumed_model(&config, &model),
     };
     let mut agent = Agent::new(config, model, session);
+    if let Some(preset) = &preset {
+        agent.apply_preset(preset);
+    }
+    if let Some(effort) = &cli.reasoning {
+        apply_reasoning(&mut agent, effort)?;
+    }
+    // Building the provider needs no network, but it fails on a missing
+    // key or login exactly as the first request would. Failing here keeps
+    // the prompt out of a session that could never answer it.
+    if !interactive && let Err(error) = crate::provider::resolve(agent.model(), agent.config()) {
+        let _ = agent.discard_if_empty();
+        return Err(Box::new(error));
+    }
 
-    if cli.prompt.is_empty() && stdin_is_terminal {
+    let Some(prompt) = prompt else {
         crate::tui::run(&mut agent)?;
         if agent.discard_if_empty()? {
             return Ok(0);
         }
         println!("yawl --session {}", agent.session_id());
         return Ok(0);
-    }
+    };
 
-    let prompt = read_prompt(cli.prompt, stdin_is_terminal)?;
-    if let Some(warning) = agent.session_warning() {
-        eprintln!("yawl: {warning}");
-    }
     crate::install_interrupt_handler()?;
-    run_print_mode(&mut agent, prompt)
+    let options = RunOptions {
+        format: cli.format,
+        timeout,
+        ephemeral: cli.ephemeral,
+        session_warning: agent.session_warning(),
+    };
+    run_print_mode(&mut agent, prompt, options)
+}
+
+/// The preset `--agent` names, from the same directories subagents use.
+fn find_preset(config: &Config, name: &str) -> Result<crate::subagent::AgentPreset, Error> {
+    let (presets, _) = crate::subagent::presets::discover_cached(
+        config,
+        &mut crate::subagent::presets::DiscoveryCache::default(),
+    );
+    let names = presets
+        .iter()
+        .map(|preset| preset.name.clone())
+        .collect::<Vec<_>>();
+    presets
+        .into_iter()
+        .find(|preset| preset.name == name)
+        .ok_or_else(|| {
+            Error::Invalid(format!(
+                "unknown agent preset '{name}'; available: {} (see 'yawl --list-agents')",
+                names.join(", ")
+            ))
+        })
+}
+
+/// Rejects a model whose provider prefix names no configured provider
+/// before a session is created for it.
+fn ensure_resolvable(config: &Config, model: &str) -> Result<(), Error> {
+    if crate::model::is_resolvable(config, model) {
+        return Ok(());
+    }
+    let provider = model
+        .split_once(':')
+        .map_or(model, |(provider, _)| provider);
+    Err(Error::Config(format!(
+        "model '{model}' names provider '{provider}', which is not configured; \
+         run 'yawl --list-models' to see configured providers"
+    )))
+}
+
+/// Applies `--reasoning`, checked against what the model accepts.
+fn apply_reasoning(agent: &mut Agent, effort: &str) -> Result<(), Error> {
+    let accepted = crate::model::reasoning_efforts(agent.config(), agent.model());
+    if !accepted.contains(&effort) {
+        let expected = if accepted.is_empty() {
+            "it accepts no reasoning effort".to_string()
+        } else {
+            format!("expected {}", accepted.join(", "))
+        };
+        return Err(Error::Invalid(format!(
+            "model '{}' does not support reasoning effort '{effort}'; {expected}",
+            agent.model()
+        )));
+    }
+    agent.set_reasoning_effort(Some(effort.to_string()))
+}
+
+/// An id for a memory-only session. It never names a file.
+fn ephemeral_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("ephemeral-{:x}-{nanos:x}", std::process::id())
 }
 
 fn open_session(config: &Config, cli: &Cli, model: &str) -> Result<Session, Error> {
@@ -141,17 +309,6 @@ fn select_session(
         return Ok(session);
     }
     Session::create(&dirs.project, cwd, model)
-}
-
-fn list_tools(config: &Config) {
-    let mut cache = CatalogCache::default();
-    let registry = Registry::scan_for_main_listing(config, &mut cache);
-    for (name, description, origin) in registry.describe_all() {
-        println!("{name}\t{origin}\n  {description}");
-    }
-    for warning in registry.warnings {
-        eprintln!("warning: skipped {warning}");
-    }
 }
 
 #[cfg(test)]

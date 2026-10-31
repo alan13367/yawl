@@ -942,6 +942,8 @@ impl Conversation {
                     goal: goal.then(|| self.session.active_goal()).flatten(),
                     init,
                     custom_tools: registry.personalization().as_deref(),
+                    preset_role: self.role_fragment(),
+                    restriction: registry.restriction_summary().as_deref(),
                 },
             ),
             Some(_) => crate::prompt::build_subagent_system_prompt(

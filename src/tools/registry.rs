@@ -140,7 +140,7 @@ pub struct Registry {
     /// Present once `define_tool` is advertised.
     toolsmith: Option<custom::Toolsmith>,
     planning_only: bool,
-    /// Set for preset children whose tools come from an allowlist.
+    /// Set when the tools come from a preset allowlist.
     restricted: bool,
 }
 
@@ -151,8 +151,8 @@ impl Registry {
         Self::scan_inner(config, cache, None)
     }
 
-    /// Restricted children can opt into native file discovery through their
-    /// preset allowlist. Main agents and unrestricted children use shell.
+    /// A preset allowlist can opt into native file discovery, for children
+    /// and for a main run under `--agent`. Unrestricted agents use shell.
     pub(crate) fn scan_for_child(
         config: &Config,
         cache: &mut CatalogCache,
@@ -170,9 +170,15 @@ impl Registry {
         registry
     }
 
-    /// For restricted children, a plain statement of the only tools they
-    /// may call and what that rules out. It goes into the child's system
-    /// prompt and into every rejected call, so weaker models stop retrying.
+    /// Whether the tools come from a preset allowlist.
+    pub(crate) fn is_restricted(&self) -> bool {
+        self.restricted
+    }
+
+    /// For restricted registries (preset children, or a main run under
+    /// `--agent`), a plain statement of the only tools the model may call and
+    /// what that rules out. It goes into the system prompt and into every
+    /// rejected call, so weaker models stop retrying.
     pub(crate) fn restriction_summary(&self) -> Option<String> {
         if !self.restricted {
             return None;
@@ -204,14 +210,14 @@ impl Registry {
         {
             limits.push("create, edit, or delete files");
         }
-        let mut summary = format!("This subagent may use only these tools: {allowed}.");
+        let mut summary = format!("You may use only these tools: {allowed}.");
         if !limits.is_empty() {
-            summary.push_str(&format!(" It cannot {}.", limits.join(" or ")));
+            summary.push_str(&format!(" You cannot {}.", limits.join(" or ")));
         }
         summary.push_str(
             " Any other tool call fails. When the task needs more, finish with the listed tools \
              and end with a final answer that reports your findings and states exactly which \
-             change or command the parent agent should make.",
+             change or command whoever delegated the task should make.",
         );
         Some(summary)
     }
@@ -476,7 +482,7 @@ impl Registry {
         let Some(entry) = self.entries.iter().find(|e| e.spec.name == name) else {
             if let Some(summary) = self.restriction_summary() {
                 return ToolOutcome::error(format!(
-                    "'{name}' is not available to this subagent, so nothing ran. {summary} \
+                    "'{name}' is not available in this run, so nothing ran. {summary} \
                      Do not call '{name}' again; it will fail the same way."
                 ));
             }
@@ -1069,17 +1075,17 @@ mod tests {
         let rejected = registry.execute("shell", r#"{"command":"ls"}"#, "session", false);
         assert!(rejected.is_error);
         for expected in [
-            "'shell' is not available to this subagent, so nothing ran.",
+            "'shell' is not available in this run, so nothing ran.",
             "read_file (read files)",
             "git_inspect (read-only Git status, diffs, and history)",
-            "It cannot run shell commands or programs or create, edit, or delete files.",
-            "states exactly which change or command the parent agent should make",
+            "You cannot run shell commands or programs or create, edit, or delete files.",
+            "states exactly which change or command whoever delegated the task should make",
             "Do not call 'shell' again",
         ] {
             assert!(rejected.content.contains(expected), "{}", rejected.content);
         }
         let summary = registry.restriction_summary().expect("restricted summary");
-        assert!(summary.starts_with("This subagent may use only these tools:"));
+        assert!(summary.starts_with("You may use only these tools:"));
 
         let mut allowed = scout.clone();
         allowed.push("shell".into());
@@ -1090,7 +1096,7 @@ mod tests {
             .expect("restricted summary");
         assert!(summary.contains("shell (run shell commands)"));
         assert!(!summary.contains("run shell commands or programs"));
-        assert!(summary.contains("It cannot create, edit, or delete files."));
+        assert!(summary.contains("You cannot create, edit, or delete files."));
 
         let unrestricted = Registry::scan_for_child(&config, &mut CatalogCache::default(), None);
         assert!(unrestricted.restriction_summary().is_none());

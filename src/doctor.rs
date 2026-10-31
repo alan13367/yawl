@@ -166,14 +166,7 @@ pub(crate) fn set_nested(
 ///
 /// Returns an error when a repair fails on disk input or output.
 pub fn run() -> Result<i32, Error> {
-    let home = std::env::home_dir()
-        .ok_or_else(|| Error::Config("cannot find the home directory".into()))?;
-    let paths = Paths {
-        global: home.join(".yawl/config.json"),
-        project: PathBuf::from(".yawl/config.json"),
-        auth: home.join(".yawl/auth.json"),
-    };
-
+    let paths = default_paths()?;
     let findings = checks::run(&paths);
     report::print(&findings);
     if std::io::stdin().is_terminal() && repair::offer(&findings)? {
@@ -182,4 +175,20 @@ pub fn run() -> Result<i32, Error> {
         return Ok(report::exit_code(&findings));
     }
     Ok(report::exit_code(&findings))
+}
+
+/// The doctor's findings without printing or repairing anything, for
+/// `yawl --check`.
+pub(crate) fn diagnose() -> Result<Vec<Finding>, Error> {
+    Ok(checks::run(&default_paths()?))
+}
+
+fn default_paths() -> Result<Paths, Error> {
+    let home = std::env::home_dir()
+        .ok_or_else(|| Error::Config("cannot find the home directory".into()))?;
+    Ok(Paths {
+        global: home.join(".yawl/config.json"),
+        project: PathBuf::from(".yawl/config.json"),
+        auth: home.join(".yawl/auth.json"),
+    })
 }

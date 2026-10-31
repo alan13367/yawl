@@ -103,6 +103,13 @@ struct ChildPolicy {
     role_fragment: Option<String>,
 }
 
+/// A subagent preset applied to the main conversation (`yawl --agent`): an
+/// optional tool allowlist and an extra role instruction.
+struct MainPreset {
+    tools: Option<Vec<String>>,
+    role: Option<String>,
+}
+
 /// Provider-neutral turn state. The main conversation records to a session
 /// file; subagent conversations record to a memory-only session and carry a
 /// [`ChildPolicy`].
@@ -119,6 +126,8 @@ pub(crate) struct Conversation {
     services: Services,
     /// Set for subagent conversations.
     child: Option<ChildPolicy>,
+    /// Set for a main conversation run under a preset.
+    preset: Option<MainPreset>,
     /// Last provider-reported total (input + output) tokens — the best
     /// estimate of current context usage.
     context_tokens: u64,
@@ -186,6 +195,7 @@ impl Conversation {
             session,
             services,
             child,
+            preset: None,
             context_tokens: 0,
             context_usage: None,
             pending_tool_results: Default::default(),
@@ -229,6 +239,14 @@ impl Conversation {
     pub(crate) fn set_role_fragment(&mut self, fragment: String) {
         if let Some(child) = &mut self.child {
             child.role_fragment = Some(fragment);
+        }
+    }
+
+    /// Runs the main conversation with a preset's tools and role. Subagent
+    /// conversations take their policy from [`ChildPolicy`] instead.
+    pub(crate) fn apply_preset(&mut self, tools: Option<Vec<String>>, role: Option<String>) {
+        if self.child.is_none() {
+            self.preset = Some(MainPreset { tools, role });
         }
     }
 
@@ -518,20 +536,30 @@ impl Conversation {
                 &mut self.catalog_cache,
                 child.tool_allowlist.as_deref(),
             ),
-            None if self.config.subagents => Registry::scan_with_subagents_and_background(
-                &self.config,
-                &mut self.catalog_cache,
-                self.services.subagents.clone(),
-                &self.model,
-                self.services.background.clone(),
-            ),
-            None => Registry::scan_with_background(
-                &self.config,
-                &mut self.catalog_cache,
-                self.services.background.clone(),
-            ),
+            None => match self
+                .preset
+                .as_ref()
+                .and_then(|preset| preset.tools.as_deref())
+            {
+                Some(allowlist) => {
+                    Registry::scan_for_child(&self.config, &mut self.catalog_cache, Some(allowlist))
+                }
+                None if self.config.subagents => Registry::scan_with_subagents_and_background(
+                    &self.config,
+                    &mut self.catalog_cache,
+                    self.services.subagents.clone(),
+                    &self.model,
+                    self.services.background.clone(),
+                ),
+                None => Registry::scan_with_background(
+                    &self.config,
+                    &mut self.catalog_cache,
+                    self.services.background.clone(),
+                ),
+            },
         };
-        if self.child.is_none() {
+        // A preset allowlist is the whole tool set; it gains no tools here.
+        if self.child.is_none() && !registry.is_restricted() {
             if self.questions.is_enabled() {
                 registry.advertise_user_input(self.questions.clone());
             }
@@ -654,9 +682,13 @@ impl Conversation {
     }
 
     fn role_fragment(&self) -> Option<&str> {
-        self.child
-            .as_ref()
-            .and_then(|child| child.role_fragment.as_deref())
+        match &self.child {
+            Some(child) => child.role_fragment.as_deref(),
+            None => self
+                .preset
+                .as_ref()
+                .and_then(|preset| preset.role.as_deref()),
+        }
     }
 
     fn set_stop_reason(&mut self, reason: Option<RunStopReason>) {

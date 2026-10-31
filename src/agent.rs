@@ -138,6 +138,13 @@ impl Agent {
         self.conversation.set_print_mode();
     }
 
+    /// Runs with a subagent preset's tool allowlist and role instruction
+    /// (`yawl --agent`).
+    pub(crate) fn apply_preset(&mut self, preset: &crate::subagent::AgentPreset) {
+        self.conversation
+            .apply_preset(preset.tools.clone(), preset.prompt.clone());
+    }
+
     pub(crate) fn switch_model(&mut self, model: String) -> Result<(), Error> {
         self.conversation.switch_model(model)
     }

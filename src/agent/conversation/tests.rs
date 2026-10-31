@@ -206,6 +206,48 @@ fn tool_allowlist_filters_child_tool_scans() {
 }
 
 #[test]
+fn a_main_preset_restricts_tools_and_adds_its_role_to_the_prompt() {
+    let mut test = TestAgent::new("main-preset");
+    let scout = crate::subagent::presets::bundled().remove(0);
+    test.agent.set_print_mode();
+    test.agent
+        .apply_preset(scout.tools.clone(), scout.prompt.clone());
+
+    let mut names = test
+        .agent
+        .scan_tools()
+        .specs()
+        .into_iter()
+        .map(|spec| spec.name.clone())
+        .collect::<Vec<_>>();
+    names.sort();
+    let mut expected = scout.tools.clone().expect("scout allowlist");
+    // read_skill is only advertised when skills exist.
+    expected.retain(|name| name != "read_skill");
+    expected.sort();
+    assert_eq!(names, expected, "no shell, writes, or define_tool");
+
+    let steps = Rc::new(RefCell::new(VecDeque::from([ProviderStep::Output {
+        text: "found it",
+        tool_calls: Vec::new(),
+        input_tokens: 1,
+        output_tokens: 1,
+    }])));
+    let systems = Rc::new(RefCell::new(Vec::new()));
+    let mut resolve = scripted_resolve_with_systems(steps, Rc::default(), Rc::clone(&systems));
+    assert!(
+        test.agent
+            .run_with(prompt("where is the parser?"), &mut |_| {}, &mut resolve)
+            .expect("turn runs")
+    );
+    let system = systems.borrow()[0].clone();
+    assert!(system.contains("<agent_preset>"));
+    assert!(system.contains("read-only research specialist"));
+    assert!(system.contains("You may use only these tools"));
+    assert!(system.contains("<non_interactive_run>"));
+}
+
+#[test]
 fn print_mode_pump_delivers_deferred_results_in_a_follow_up_turn() {
     let mut test = TestAgent::new("subagent-pump");
     test.agent.config.subagents = true;

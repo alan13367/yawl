@@ -23,11 +23,7 @@ pub(super) fn resolve(
             config.set_project_skills_trusted(false);
             Ok(())
         }
-        crate::trust::Decision::Unknown
-            if !crate::skills::has_project_sources(config)
-                && !crate::tools::has_project_tools(config)
-                && !config.project_config_restricted() =>
-        {
+        crate::trust::Decision::Unknown if project_settings(config).is_empty() => {
             config.set_project_skills_trusted(false);
             Ok(())
         }
@@ -60,6 +56,29 @@ pub(super) fn resolve(
             Ok(())
         }
     }
+}
+
+/// Settles trust without asking or printing anything, for inspection
+/// commands. Returns what trusting the project would enable when nobody has
+/// decided yet; those settings stay ignored.
+pub(super) fn resolve_quietly(
+    config: &mut Config,
+    trust_override: bool,
+) -> Result<Vec<&'static str>, Box<dyn std::error::Error>> {
+    let root = crate::trust::project_root(&crate::config::working_dir());
+    let undecided = !trust_override
+        && crate::trust::load(&config.home_dir, &root)? == crate::trust::Decision::Unknown;
+    let pending = if undecided {
+        project_settings(config)
+    } else {
+        Vec::new()
+    };
+    if pending.is_empty() {
+        resolve(config, trust_override, false)?;
+    } else {
+        config.set_project_skills_trusted(false);
+    }
+    Ok(pending)
 }
 
 /// Applies the project config's provider endpoints and credentials once the

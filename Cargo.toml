@@ -10,7 +10,9 @@ exclude = ["Assets/"]
 
 [dependencies]
 base64 = "0.23"
-ureq = { version = "3", features = ["charset"] }
+# The custom transports use ureq's `unversioned` API, which may break in any
+# minor release, so stay on one minor version and move to the next by hand.
+ureq = { version = "~3.5", features = ["charset"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 scraper = { version = "0.27", default-features = false }

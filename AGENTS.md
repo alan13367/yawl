@@ -10,7 +10,11 @@ Never spawn subagents if not explicitly requested by the user.
 
 - `src/main.rs`: one-line binary that calls `yawl::main`. `src/lib.rs` declares every module crate-private and exports only `main`, so the compiler reports unused code
 - `src/app.rs`: startup, session selection, and TUI/print-mode dispatch
-- `src/cli.rs`, `src/print_mode.rs`, `src/project_trust.rs`: argument parsing, streamed text presentation, and project trust resolution (the question itself is a `tui/setup.rs` screen)
+- `src/cli.rs`, `src/project_trust.rs`: argument parsing with `--help` text and output formats, and project trust resolution (the question itself is a `tui/setup.rs` screen; inspection resolves it quietly)
+- `src/print_mode.rs`: one-shot runs: prompt and bounded stdin reading, `--timeout`, the outcome, and the JSON result object. `print_mode/text.rs` streams plain text, `print_mode/json.rs` turns turn events into JSON lines, and `print_mode/report.rs` collects the final answer, tool counts, edited files, and usage from the events
+- `src/exit_status.rs`: process exit codes and the error kinds machine-readable output reports
+- `src/inspect.rs`, `src/inspect/`: non-turn commands for people and other agents: `--check` readiness, `--list-models` with optional provider probes, and the session, preset, and tool listings
+- `src/skill_export.rs`: the compiled-in `skill_export/SKILL.md` that teaches other harnesses to call Yawl, with `--print-skill` and `--install-skill` targets. Yawl's own skill discovery skips it
 - `src/agent.rs`: `Agent` facade: one `run(TurnRequest)` entry point for every kind of turn, plus session, undo, and config operations
 - `src/agent/conversation.rs`, `events.rs`: conversation state over a session (a file for the main agent, memory-only for subagents), session switching, undo, and streamed turn events
 - `src/agent/conversation/turn.rs`, `conversation/step.rs`: the turn lifecycle (`TurnRequest`, preamble, per-step preparation, provider request with retries, tool execution, compaction) and one model step (`classify` plus one handler per step kind)
@@ -81,7 +85,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/terminal_mode.rs`: shared raw-terminal lifecycle for the TUI and setup screens, over `unix.rs` (termios) and `windows.rs` (console modes and the `ConsoleInput` key reader). `key_text.rs` turns console key records into UTF-8 on every platform so it can be tested
 - `src/paths.rs`, `src/paths/windows.rs`: `canonicalize` without Windows verbatim prefixes, reserved device names, `replace_file`, and Windows file identity from `GetFileInformationByHandle`
 - `src/skills.rs`, `src/trust.rs`, `src/image.rs`: skill discovery, project skill trust, and image input
-- `src/text.rs`: terminal-safe text: the one rule for which characters (controls and bidirectional overrides) must not reach the terminal
+- `src/text.rs`: terminal-safe text: the one rule for which characters (controls and bidirectional overrides) must not reach the terminal, and `json_line`, which escapes them in machine-readable output
 - `src/session.rs`, `src/session/state.rs`: append-only session logs that own the conversation history. Every change is an event written first and then applied by `SessionState::apply`, the one reducer replay also uses
 - `src/session/recovery.rs`, `src/session/plans.rs`, `src/session/index.rs`, `src/compaction.rs`, `src/checkpoint.rs`: recovery records, saved plan revisions and implementation handoffs, session-list metadata caching, compaction summaries, and `/undo` working-tree snapshots
 - `README.md`: user-facing behavior, contracts, and a concise architecture map
@@ -117,6 +121,7 @@ Run `cargo fmt --all` after editing Rust. After making code changes, run `cargo 
 - Keep OS-specific code in private `unix.rs` and `windows.rs` children selected with `#[cfg(unix)]` and `#[cfg(windows)]`, or in small paired functions, and keep the logic they share testable on every platform. Gate tests that need POSIX behavior with `#[cfg(unix)]`. Windows code must at least type-check for `x86_64-pc-windows-msvc`.
 - Define slash commands only in `tui/commands/table.rs`.
 - Advertise `web_search` and `web_fetch` in the system prompt only when the current registry actually contains those builtins, not merely when `web_browsing` is enabled in config.
+- Keep machine-readable output stable: add JSON fields rather than renaming or removing them, print it through `crate::text::json_line`, and keep `skill_export/SKILL.md` in step with the CLI (its tests check every flag it names against `--help`).
 - Update `README.md` when changing CLI behavior, configuration, slash commands, or the custom-tool manifest contract. Update this file when the module layout above changes.
 
 Before editing, check `git status` and preserve unrelated work. Before finishing, run the three validation commands above and review `git diff`.

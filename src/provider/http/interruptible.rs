@@ -130,14 +130,17 @@ impl Abort {
 
 /// Runs `await_input` in slices of at most [`SLICE`], checking for
 /// cancellation between them, while preserving ureq's own deadline: once
-/// `timeout.after` has elapsed the result is `Timeout(timeout.reason)`, as if
-/// the wait had never been split. A timed-out slice consumes no bytes in
-/// either the TCP or the TLS transport, so the next slice resumes cleanly.
+/// `timeout.after`, capped by any per-read limit, has elapsed the result is
+/// `Timeout(timeout.reason)`, as if the wait had never been split. The slices
+/// carry no per-read limit of their own, since it already shaped the
+/// deadline. A timed-out slice consumes no bytes in either the TCP or the TLS
+/// transport, so the next slice resumes cleanly.
 fn await_in_slices(
     timeout: NextTimeout,
     abort: &mut Abort,
     mut await_input: impl FnMut(NextTimeout) -> Result<bool, Error>,
 ) -> Result<bool, Error> {
+    let timeout = timeout.for_read();
     // Like ureq's own transports, treat a zero `after` as one second rather
     // than an instant timeout (`not_zero`), and no deadline at all for
     // `NotHappening` (`None`).
@@ -161,6 +164,7 @@ fn await_in_slices(
         let slice = NextTimeout {
             after: UreqDuration::Exact(slice),
             reason: timeout.reason,
+            ..NextTimeout::default()
         };
         match await_input(slice) {
             // The slice elapsed without data; the deadline check above decides
@@ -185,6 +189,7 @@ mod tests {
         NextTimeout {
             after: UreqDuration::from_millis(after_ms),
             reason: Timeout::RecvBody,
+            ..NextTimeout::default()
         }
     }
 
@@ -226,6 +231,23 @@ mod tests {
     }
 
     #[test]
+    fn a_per_read_limit_bounds_the_whole_sliced_wait() {
+        let started = Instant::now();
+        let timeout = NextTimeout {
+            per_read: Some(UreqDuration::from_millis(250)),
+            ..next(5_000)
+        };
+        let result = await_in_slices(timeout, &mut Abort::default(), |slice| {
+            assert_eq!(slice.per_read, None, "slices must not re-apply the limit");
+            std::thread::sleep(*slice.after);
+            Err(Error::Timeout(slice.reason))
+        });
+        assert!(matches!(result, Err(Error::Timeout(Timeout::PerRead))));
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn a_zero_timeout_waits_one_second_like_ureq() {
         let started = Instant::now();
         let result = await_in_slices(next(0), &mut Abort::default(), |slice| {
@@ -246,6 +268,7 @@ mod tests {
                 NextTimeout {
                     after: UreqDuration::NotHappening,
                     reason: Timeout::Global,
+                    ..NextTimeout::default()
                 },
                 &mut Abort::default(),
                 |slice| {

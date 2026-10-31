@@ -128,6 +128,7 @@ impl Transport for ReadyTcpTransport {
     }
 
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), Error> {
+        let timeout = timeout.for_write();
         let wanted = timeout.not_zero();
         if wanted != self.write_timeout {
             self.stream.set_write_timeout(wanted.map(|after| *after))?;
@@ -144,6 +145,7 @@ impl Transport for ReadyTcpTransport {
     /// read, and the read then completes at once, so no receive ever times
     /// out. Callers wanting cancellation hand this short timeouts.
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, Error> {
+        let timeout = timeout.for_read();
         if !wait_readable(&self.stream, timeout.not_zero().map(|after| *after))? {
             return Err(Error::Timeout(timeout.reason));
         }
@@ -265,6 +267,7 @@ mod tests {
         NextTimeout {
             after: UreqDuration::from_millis(millis),
             reason: Timeout::Connect,
+            ..NextTimeout::default()
         }
     }
 
@@ -319,6 +322,7 @@ mod tests {
             NextTimeout {
                 after: UreqDuration::NotHappening,
                 reason: Timeout::Connect,
+                ..NextTimeout::default()
             },
         )
         .expect("no limit");

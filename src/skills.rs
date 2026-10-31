@@ -150,6 +150,10 @@ impl Sources {
             catalog.warnings.extend(source.warnings);
             for path in source.candidates {
                 match load_skill(&path) {
+                    // The skill Yawl exports teaches other harnesses to call
+                    // Yawl. It shares `~/.agents/skills` with Yawl's own
+                    // skills, and is no use to Yawl itself.
+                    Ok(skill) if skill.name == crate::skill_export::SKILL_NAME => {}
                     Ok(skill) => {
                         skills.insert(skill.name.clone(), skill);
                     }
@@ -452,6 +456,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["format", "review"]
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_exported_yawl_skill_is_not_loaded_into_yawl() {
+        let root = crate::test_support::unique_temp_dir("skills-exported");
+        let installed = root.join("global").to_string_lossy().into_owned();
+        crate::skill_export::install(&installed).expect("install the exported skill");
+        std::fs::write(
+            root.join("global/format.md"),
+            skill("format", "Format code", "Run the formatter."),
+        )
+        .unwrap();
+        let catalog = discover(&test_config(&root));
+        let names = catalog
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["format"]);
         let _ = std::fs::remove_dir_all(root);
     }
 

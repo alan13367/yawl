@@ -69,9 +69,47 @@ pub(crate) fn ellipsize(text: &str, max_chars: usize) -> String {
     format!("{}…", &text[..end])
 }
 
+/// `value` serialized on one line for machine-readable output. `serde_json`
+/// escapes ASCII controls; this also escapes the C1 controls and
+/// bidirectional overrides above, which can only occur inside strings, where
+/// a `\u` escape decodes to the same text. The line is safe to display.
+pub(crate) fn json_line(value: &serde_json::Value) -> String {
+    let needs_escape = |character: char| !character.is_ascii() && is_unsafe(character);
+    let raw = value.to_string();
+    if !raw.chars().any(needs_escape) {
+        return raw;
+    }
+    let mut line = String::with_capacity(raw.len() + 16);
+    for character in raw.chars() {
+        if needs_escape(character) {
+            // A `\u` escape names one UTF-16 unit, which holds every unsafe
+            // character today (C1 controls and bidirectional marks).
+            // Anything beyond U+FFFF would need a surrogate pair.
+            debug_assert!(
+                u32::from(character) <= 0xFFFF,
+                "is_unsafe matched {character:?} outside the BMP"
+            );
+            line.push_str(&format!("\\u{:04x}", u32::from(character)));
+        } else {
+            line.push(character);
+        }
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_lines_escape_terminal_controls_but_keep_the_text() {
+        let value = serde_json::json!({"text": "a\u{1b}[2Jb\u{202e}c\u{85}d\u{e9}\nz"});
+        let line = json_line(&value);
+        assert!(!line.chars().any(is_unsafe));
+        assert!(line.contains('\u{e9}'), "ordinary non-ASCII stays readable");
+        let decoded: serde_json::Value = serde_json::from_str(&line).expect("still valid JSON");
+        assert_eq!(decoded, value);
+    }
 
     #[test]
     fn controls_and_bidirectional_overrides_are_unsafe() {
