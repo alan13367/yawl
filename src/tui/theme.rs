@@ -7,8 +7,7 @@
 
 use std::cell::RefCell;
 #[cfg(not(test))]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::config::{Theme, UiColor};
 
@@ -37,10 +36,14 @@ pub(super) struct Palette {
     /// `@` file mentions and `/skill:` invocations in the composer and in
     /// user prompts.
     pub(super) mention: &'static str,
-    /// Warm gray behind fenced code, distinct from the user panel and the
-    /// tool cards. Background escapes never survive `strip_ansi`, so
-    /// drag-select copies stay clean.
+    /// Warm gray behind fenced code when the terminal did not report its
+    /// background (see [`code_background`]), distinct from the user panel
+    /// and the tool cards. Background escapes never survive `strip_ansi`,
+    /// so drag-select copies stay clean.
     pub(super) code_background: &'static str,
+    /// Plain code text. Set explicitly because Terminal.app does not
+    /// reliably apply its default text color over an explicit background.
+    pub(super) code_text: &'static str,
     pub(super) heading_major: &'static str,
     pub(super) heading_minor: &'static str,
     /// List bullets, quote bars, and other Markdown structure.
@@ -55,6 +58,12 @@ pub(super) struct Palette {
     pub(super) number: &'static str,
     pub(super) comment: &'static str,
     pub(super) literal: &'static str,
+    /// Function calls, macros, shell commands, and object keys.
+    pub(super) function: &'static str,
+    /// Type names and HTML attributes.
+    pub(super) type_name: &'static str,
+    /// Shell variables, flags, and assignments.
+    pub(super) variable: &'static str,
     /// Full-row Git diff tints with their text and `+`/`-` prefixes.
     pub(super) diff_add_background: &'static str,
     pub(super) diff_add_text: &'static str,
@@ -87,7 +96,8 @@ const DARK: Palette = Palette {
     tool_error: "\x1b[38;5;210m",
     inline_code: "\x1b[38;2;155;188;198m",
     mention: "\x1b[38;2;170;160;255m",
-    code_background: "\x1b[48;2;36;34;30m",
+    code_background: "\x1b[48;2;46;44;41m",
+    code_text: "\x1b[38;2;214;214;220m",
     heading_major: "\x1b[1;38;2;137;180;250m",
     heading_minor: "\x1b[1;38;2;180;205;250m",
     marker: "\x1b[38;2;116;199;213m",
@@ -98,6 +108,9 @@ const DARK: Palette = Palette {
     number: "\x1b[38;2;239;159;118m",
     comment: "\x1b[3;38;2;140;146;160m",
     literal: "\x1b[38;2;133;193;220m",
+    function: "\x1b[38;2;138;173;244m",
+    type_name: "\x1b[38;2;238;212;159m",
+    variable: "\x1b[38;2;238;153;160m",
     diff_add_background: "\x1b[48;2;30;64;39m",
     diff_add_text: "\x1b[38;2;215;236;217m",
     diff_add_prefix: "\x1b[1;38;5;114m",
@@ -127,6 +140,7 @@ const LIGHT: Palette = Palette {
     inline_code: "\x1b[38;2;16;104;128m",
     mention: "\x1b[38;2;92;60;196m",
     code_background: "\x1b[48;2;243;240;233m",
+    code_text: "\x1b[38;2;36;38;48m",
     heading_major: "\x1b[1;38;2;28;84;188m",
     heading_minor: "\x1b[1;38;2;52;100;170m",
     marker: "\x1b[38;2;0;118;140m",
@@ -137,6 +151,9 @@ const LIGHT: Palette = Palette {
     number: "\x1b[38;2;170;80;14m",
     comment: "\x1b[3;38;2;98;104;116m",
     literal: "\x1b[38;2;16;104;150m",
+    function: "\x1b[38;2;22;88;214m",
+    type_name: "\x1b[38;2;150;88;0m",
+    variable: "\x1b[38;2;190;40;60m",
     diff_add_background: "\x1b[48;2;218;242;222m",
     diff_add_text: "\x1b[38;2;20;72;32m",
     diff_add_prefix: "\x1b[1;38;2;24;120;48m",
@@ -155,10 +172,16 @@ static LIGHT_ACTIVE: AtomicBool = AtomicBool::new(false);
 thread_local! {
     /// Tests switch themes per thread so parallel tests keep the dark default.
     static TEST_LIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests report a terminal background per thread for the same reason.
+    static TEST_DETECTED: std::cell::Cell<Option<UiColor>> = const { std::cell::Cell::new(None) };
 }
 
-/// What the terminal reported at startup: 0 unknown, 1 dark, 2 light.
-static DETECTED: AtomicU8 = AtomicU8::new(0);
+/// The background color the terminal reported at startup, as
+/// `0x0100_0000 | rgb`, or 0 when it reported none.
+#[cfg(not(test))]
+static DETECTED: AtomicU32 = AtomicU32::new(0);
+
+const DETECTED_KNOWN: u32 = 0x0100_0000;
 
 pub(super) fn is_light() -> bool {
     #[cfg(test)]
@@ -174,33 +197,94 @@ fn set_light(light: bool) {
     LIGHT_ACTIVE.store(light, Ordering::Relaxed);
 }
 
+fn detected_background() -> Option<UiColor> {
+    #[cfg(test)]
+    return TEST_DETECTED.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    decode_detected(DETECTED.load(Ordering::Relaxed))
+}
+
+fn set_detected_background(color: Option<UiColor>) {
+    #[cfg(test)]
+    TEST_DETECTED.with(|cell| cell.set(color));
+    #[cfg(not(test))]
+    DETECTED.store(encode_detected(color), Ordering::Relaxed);
+}
+
+fn encode_detected(color: Option<UiColor>) -> u32 {
+    color.map_or(0, |color| {
+        DETECTED_KNOWN
+            | u32::from(color.red) << 16
+            | u32::from(color.green) << 8
+            | u32::from(color.blue)
+    })
+}
+
+fn decode_detected(code: u32) -> Option<UiColor> {
+    (code & DETECTED_KNOWN != 0).then(|| {
+        UiColor::new(
+            (code >> 16 & 0xff) as u8,
+            (code >> 8 & 0xff) as u8,
+            (code & 0xff) as u8,
+        )
+    })
+}
+
 #[cfg(test)]
 pub(super) fn use_light(light: bool) {
     set_light(light);
+}
+
+#[cfg(test)]
+pub(super) fn use_detected_background(color: Option<UiColor>) {
+    set_detected_background(color);
 }
 
 pub(super) fn palette() -> &'static Palette {
     if is_light() { &LIGHT } else { &DARK }
 }
 
-/// Records the background the terminal reported and applies `setting`.
-pub(super) fn init(setting: Theme, detected_light: Option<bool>) {
-    let code = match detected_light {
-        None => 0,
-        Some(false) => 1,
-        Some(true) => 2,
+/// Background escape behind fenced code. When the terminal reported its
+/// background and the active theme agrees with it, the shade is that
+/// background lifted one step toward the text, so code stands out by the
+/// same amount on every color scheme instead of vanishing on terminals
+/// that happen to match the fixed palette shade. Otherwise it is the
+/// palette's fixed shade.
+pub(super) fn code_background() -> String {
+    let light = is_light();
+    match detected_background().filter(|color| color_is_light(*color) == light) {
+        Some(color) => {
+            let lifted = lift(color, light);
+            format!("\x1b[48;2;{};{};{}m", lifted.red, lifted.green, lifted.blue)
+        }
+        None => palette().code_background.to_string(),
+    }
+}
+
+/// Moves a background 9% of the way toward white on dark backgrounds, or
+/// 6% toward black on light ones: visible, but still a background.
+fn lift(color: UiColor, light: bool) -> UiColor {
+    let step = |channel: u8| {
+        let value = f64::from(channel);
+        let moved = if light {
+            value * 0.94
+        } else {
+            value + (255.0 - value) * 0.09
+        };
+        moved.round().clamp(0.0, 255.0) as u8
     };
-    DETECTED.store(code, Ordering::Relaxed);
+    UiColor::new(step(color.red), step(color.green), step(color.blue))
+}
+
+/// Records the background the terminal reported and applies `setting`.
+pub(super) fn init(setting: Theme, detected: Option<UiColor>) {
+    set_detected_background(detected);
     apply(setting);
 }
 
 /// Applies a theme setting; `auto` reuses the startup detection.
 pub(super) fn apply(setting: Theme) {
-    let detected = match DETECTED.load(Ordering::Relaxed) {
-        1 => Some(false),
-        2 => Some(true),
-        _ => None,
-    };
+    let detected = detected_background().map(color_is_light);
     let colorfgbg = std::env::var("COLORFGBG").ok();
     set_light(resolve(setting, detected, colorfgbg.as_deref()));
 }
@@ -241,9 +325,9 @@ pub(super) fn has_device_attributes(reply: &[u8]) -> bool {
     })
 }
 
-/// Whether the terminal's OSC 11 reply (`ESC ] 11 ; rgb:R/G/B`, with one to
-/// four hex digits per channel) names a light background.
-pub(super) fn reported_background_is_light(reply: &[u8]) -> Option<bool> {
+/// The background color in the terminal's OSC 11 reply (`ESC ] 11 ;
+/// rgb:R/G/B`, with one to four hex digits per channel).
+pub(super) fn reported_background(reply: &[u8]) -> Option<UiColor> {
     let text = String::from_utf8_lossy(reply);
     let body = &text[text.find("]11;")? + 4..];
     let body = &body[..body.find(['\x07', '\x1b']).unwrap_or(body.len())];
@@ -256,10 +340,19 @@ pub(super) fn reported_background_is_light(reply: &[u8]) -> Option<bool> {
         }
         let value = u32::from_str_radix(hex, 16).ok()?;
         let max = (1_u32 << (4 * hex.len())) - 1;
-        Some(f64::from(value) / f64::from(max))
+        Some((f64::from(value) * 255.0 / f64::from(max)).round() as u8)
     });
-    let (red, green, blue) = (channels.next()??, channels.next()??, channels.next()??);
-    Some(0.299 * red + 0.587 * green + 0.114 * blue > 0.5)
+    Some(UiColor::new(
+        channels.next()??,
+        channels.next()??,
+        channels.next()??,
+    ))
+}
+
+/// Whether a background color reads as light.
+pub(super) fn color_is_light(color: UiColor) -> bool {
+    let [red, green, blue] = [color.red, color.green, color.blue].map(|c| f64::from(c) / 255.0);
+    0.299 * red + 0.587 * green + 0.114 * blue > 0.5
 }
 
 /// A foreground color readable on the terminal background: unchanged on a
@@ -377,6 +470,11 @@ mod tests {
             LIGHT.number,
             LIGHT.comment,
             LIGHT.literal,
+            LIGHT.function,
+            LIGHT.type_name,
+            LIGHT.variable,
+            LIGHT.muted,
+            LIGHT.code_text,
         ]
         .map(|escape| (escape, code, 4.5));
         let cards = [
@@ -437,17 +535,53 @@ mod tests {
     #[test]
     fn background_reports_parse_any_channel_width_and_terminator() {
         let light = b"\x1b]11;rgb:ffff/fefe/f0f0\x1b\\\x1b[?62;22c";
-        assert_eq!(reported_background_is_light(light), Some(true));
+        let reported = reported_background(light).expect("light reply");
+        assert_eq!(reported, UiColor::new(255, 254, 240));
+        assert!(color_is_light(reported));
         assert!(has_device_attributes(light));
         let dark = b"\x1b]11;rgb:1e/1e/2e\x07";
-        assert_eq!(reported_background_is_light(dark), Some(false));
+        let reported = reported_background(dark).expect("dark reply");
+        assert_eq!(reported, UiColor::new(0x1e, 0x1e, 0x2e));
+        assert!(!color_is_light(reported));
         assert!(!has_device_attributes(dark));
-        assert_eq!(reported_background_is_light(b"\x1b[?1;2c"), None);
+        assert_eq!(reported_background(b"\x1b[?1;2c"), None);
         assert!(has_device_attributes(b"\x1b[?1;2c"));
-        assert_eq!(
-            reported_background_is_light(b"\x1b]11;rgb:zz/00/00\x07"),
-            None
-        );
+        assert_eq!(reported_background(b"\x1b]11;rgb:zz/00/00\x07"), None);
         assert!(!has_device_attributes(b"\x1b]11;rgb:cccc/cccc/cccc\x07"));
+        for color in [
+            None,
+            Some(UiColor::new(0, 0, 0)),
+            Some(UiColor::new(30, 31, 46)),
+            Some(UiColor::new(255, 255, 255)),
+        ] {
+            assert_eq!(decode_detected(encode_detected(color)), color);
+        }
+    }
+
+    #[test]
+    fn code_background_follows_the_reported_terminal_background() {
+        use_light(false);
+        use_detected_background(None);
+        assert_eq!(code_background(), DARK.code_background);
+
+        // A near-black terminal gets a visibly lighter shade of itself.
+        use_detected_background(Some(UiColor::new(30, 30, 30)));
+        assert_eq!(code_background(), "\x1b[48;2;50;50;50m");
+        use_detected_background(Some(UiColor::new(0, 0, 0)));
+        assert_eq!(code_background(), "\x1b[48;2;23;23;23m");
+
+        // A light terminal gets a slightly darker shade of itself.
+        use_light(true);
+        use_detected_background(Some(UiColor::new(255, 255, 255)));
+        assert_eq!(code_background(), "\x1b[48;2;240;240;240m");
+
+        // A theme forced against the reported background keeps the palette
+        // shade, so the syntax colors stay readable on it.
+        use_detected_background(Some(UiColor::new(30, 30, 30)));
+        assert_eq!(code_background(), LIGHT.code_background);
+        use_light(false);
+        use_detected_background(Some(UiColor::new(255, 255, 255)));
+        assert_eq!(code_background(), DARK.code_background);
+        use_detected_background(None);
     }
 }

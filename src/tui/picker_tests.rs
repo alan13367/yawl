@@ -43,6 +43,7 @@ fn picker_is_bounded_and_highlights_selection() {
             },
         ],
         editing: None,
+        filter: None,
         parent: None,
     };
     let rendered = render_picker(
@@ -86,6 +87,7 @@ fn narrow_picker_lists_labels_and_wraps_the_selected_description() {
             ),
         ],
         editing: None,
+        filter: None,
         parent: None,
     };
     let rendered = render_picker(&picker, &Editor::default(), "\x1b[7m", "", 40, 14).0;
@@ -125,6 +127,7 @@ fn picker_aligns_descriptions_in_one_column() {
             item(long_label, "omlx:qwythos"),
         ],
         editing: None,
+        filter: None,
         parent: None,
     };
     let rendered = render_picker(&picker, &Editor::default(), "\x1b[7m", "", 80, 12).0;
@@ -164,6 +167,7 @@ fn picker_uses_available_width_and_accent_colored_outline() {
             action: PickerAction::SwitchModel(model.into()),
         }],
         editing: None,
+        filter: None,
         parent: None,
     };
     let outline = "\x1b[38;2;117;169;255m";
@@ -390,6 +394,7 @@ fn status_bar_editor_lists_unique_items_and_returns_move_and_remove_actions() {
         items: Vec::new(),
         selected: 0,
         editing: None,
+        filter: None,
         parent: None,
     });
     state.status_bar_draft = Some(crate::config::StatusBarConfig {
@@ -436,6 +441,7 @@ fn status_bar_label_editor_can_submit_an_empty_label() {
         }],
         selected: 0,
         editing: None,
+        filter: None,
         parent: None,
     });
     let mut editor = Editor::default();
@@ -458,6 +464,7 @@ fn escape_returns_the_typed_parent_action() {
         items: Vec::new(),
         selected: 0,
         editing: None,
+        filter: None,
         parent: Some(parent),
     });
 
@@ -498,6 +505,7 @@ fn api_key_field_opens_focused_masks_input_and_keeps_the_composer_draft() {
         }],
         selected: 0,
         editing: None,
+        filter: None,
         parent: None,
     };
     let mut state = test_picker_state(picker);
@@ -563,6 +571,191 @@ fn escape_returns_from_a_list_field_but_leaves_a_standalone_field() {
     let action = take_picker_action(&mut state, &mut editor, Key::Escape);
     assert!(matches!(action, Some(PickerAction::CloseConnect)));
     assert!(state.picker.is_none());
+}
+
+fn searchable_picker() -> Picker {
+    let model = |name: &str| PickerItem {
+        label: name.into(),
+        description: "128k context".into(),
+        action: PickerAction::ConnectChooseModel(name.into()),
+    };
+    Picker {
+        title: "Router models".into(),
+        hint: "Type to search".into(),
+        selected: 0,
+        items: vec![
+            model("anthropic/claude-sonnet"),
+            model("qwen/qwen3-coder"),
+            model("qwen/qwen3-235b"),
+            model("deepseek/deepseek-chat"),
+            PickerItem {
+                label: "Enter model manually…".into(),
+                description: "Use an exact model ID".into(),
+                action: PickerAction::CloseConnect,
+            },
+        ],
+        editing: None,
+        filter: None,
+        parent: Some(PickerAction::CloseConnect),
+    }
+    .searchable(1)
+}
+
+fn labels(state: &ViewState) -> Vec<String> {
+    state
+        .picker
+        .as_ref()
+        .expect("picker open")
+        .items
+        .iter()
+        .map(|item| item.label.clone())
+        .collect()
+}
+
+#[test]
+fn searchable_picker_filters_as_you_type_and_keeps_pinned_rows() {
+    let mut state = test_picker_state(searchable_picker());
+    let mut editor = Editor::default();
+    // Letters that are shortcuts elsewhere type into the search.
+    for key in "Qwen cod".chars().map(Key::Char) {
+        assert!(take_picker_action(&mut state, &mut editor, key).is_none());
+    }
+    assert_eq!(
+        labels(&state),
+        ["qwen/qwen3-coder", "Enter model manually…"]
+    );
+    let picker = state.picker.as_ref().unwrap();
+    assert_eq!(picker.filter.as_ref().unwrap().query, "Qwen cod");
+    assert_eq!(
+        picker.filter.as_ref().unwrap().counts(picker.items.len()),
+        (1, 4)
+    );
+    assert_eq!(picker.selected, 0);
+
+    // Descriptions match too, and `j` moves nothing because it is typed.
+    for _ in 0..8 {
+        take_picker_action(&mut state, &mut editor, Key::Backspace);
+    }
+    for key in "128k".chars().map(Key::Char) {
+        take_picker_action(&mut state, &mut editor, key);
+    }
+    assert_eq!(labels(&state).len(), 5);
+    take_picker_action(&mut state, &mut editor, Key::Char('j'));
+    assert_eq!(labels(&state), ["Enter model manually…"]);
+    take_picker_action(&mut state, &mut editor, Key::Backspace);
+    take_picker_action(&mut state, &mut editor, Key::Down);
+    assert_eq!(state.picker.as_ref().unwrap().selected, 1);
+
+    // A new query starts the selection over, and Enter chooses the match.
+    for _ in 0..4 {
+        take_picker_action(&mut state, &mut editor, Key::Backspace);
+    }
+    for key in "deep".chars().map(Key::Char) {
+        take_picker_action(&mut state, &mut editor, key);
+    }
+    assert_eq!(
+        labels(&state),
+        ["deepseek/deepseek-chat", "Enter model manually…"]
+    );
+    let action = take_picker_action(&mut state, &mut editor, Key::Enter);
+    assert!(
+        matches!(action, Some(PickerAction::ConnectChooseModel(model)) if model == "deepseek/deepseek-chat")
+    );
+}
+
+#[test]
+fn searchable_picker_escape_clears_the_query_before_closing() {
+    let mut state = test_picker_state(searchable_picker());
+    let mut editor = Editor::default();
+    take_picker_action(&mut state, &mut editor, Key::Char('z'));
+    assert_eq!(labels(&state), ["Enter model manually…"]);
+    assert!(take_picker_action(&mut state, &mut editor, Key::Escape).is_none());
+    assert_eq!(labels(&state).len(), 5);
+    assert_eq!(
+        state
+            .picker
+            .as_ref()
+            .unwrap()
+            .filter
+            .as_ref()
+            .unwrap()
+            .query,
+        ""
+    );
+    let action = take_picker_action(&mut state, &mut editor, Key::Escape);
+    assert!(matches!(action, Some(PickerAction::CloseConnect)));
+    assert!(state.picker.is_none());
+}
+
+#[test]
+fn searchable_picker_renders_the_query_and_match_count() {
+    let render = |picker: &Picker| {
+        render_picker(
+            picker,
+            &Editor::default(),
+            "\x1b[7m",
+            "\x1b[38;2;116;199;213m",
+            70,
+            14,
+        )
+        .0
+        .iter()
+        .map(|line| markdown::strip_ansi(line))
+        .collect::<Vec<_>>()
+    };
+    let mut picker = searchable_picker();
+    let empty = render(&picker);
+    assert!(
+        empty
+            .iter()
+            .any(|line| line.contains("Type to search…") && line.contains("4 to search")),
+        "{empty:?}"
+    );
+    assert!(
+        empty
+            .iter()
+            .any(|line| line.contains("anthropic/claude-sonnet"))
+    );
+
+    picker.set_filter("qwen");
+    let filtered = render(&picker);
+    assert!(
+        filtered
+            .iter()
+            .any(|line| line.contains("qwen▏") && line.contains("2 of 4")),
+        "{filtered:?}"
+    );
+    assert!(!filtered.iter().any(|line| line.contains("anthropic")));
+    assert!(
+        filtered
+            .iter()
+            .any(|line| line.contains("Enter model manually…"))
+    );
+
+    // Pinned rows survive an empty result; without them the list says so.
+    picker.set_filter("nothing here");
+    let pinned = render(&picker);
+    assert!(
+        pinned.iter().any(|line| line.contains("0 of 4")),
+        "{pinned:?}"
+    );
+    assert!(
+        pinned
+            .iter()
+            .any(|line| line.contains("Enter model manually…"))
+    );
+    let mut unpinned = Picker {
+        filter: None,
+        ..searchable_picker()
+    }
+    .searchable(0);
+    unpinned.set_filter("nothing here");
+    let none = render(&unpinned);
+    assert!(
+        none.iter().any(|line| line.contains("No matches")),
+        "{none:?}"
+    );
+    assert!(none.iter().any(|line| line.contains("0 of 5")));
 }
 
 fn field_text(state: &ViewState) -> String {
@@ -704,6 +897,7 @@ fn editable_setting_stays_in_the_picker_and_submits_without_a_slash_command() {
                 },
             }],
             editing: None,
+            filter: None,
             parent: None,
         }),
         ..ViewState::test_default()
@@ -744,6 +938,7 @@ fn escape_cancels_picker_editing_and_dismisses_picker() {
                 },
             }],
             editing: None,
+            filter: None,
             parent: None,
         }),
         ..ViewState::test_default()

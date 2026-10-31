@@ -1,6 +1,7 @@
 //! Terminal markdown renderer with ANSI styling, box-drawing tables, and
-//! chrome-free fenced-code highlighting (code renders as background-shaded
-//! highlighted lines so terminal drag-select copies clean commands).
+//! chrome-free fenced code. A code block is a shaded panel: a label row
+//! naming the language, then the highlighted lines flush left with no
+//! border characters, so terminal drag-select copies clean commands.
 
 use super::input::highlighted_token_end;
 use super::{highlight, theme};
@@ -43,16 +44,18 @@ fn render_with(markdown: &str, width: usize, tokens: Option<&str>) -> Vec<String
     while index < source.len() {
         let line = source[index];
         let trimmed = line.trim_start();
-        if let Some(open) = &fence {
+        if let Some(open) = &mut fence {
             if open.closes(trimmed) {
                 fence = None;
             } else {
-                render_code_line(&open.language, open.strip_indent(line), width, &mut output);
+                let code = open.strip_indent(line);
+                render_code_line(&mut open.highlighter, code, width, &mut output);
             }
             index += 1;
             continue;
         }
         if let Some(open) = Fence::open(line) {
+            render_code_label(&open.language, width, &mut output);
             fence = Some(open);
             index += 1;
             continue;
@@ -131,12 +134,14 @@ fn render_with(markdown: &str, width: usize, tokens: Option<&str>) -> Vec<String
 }
 
 /// An open fenced code block: its marker, minimum length, opening indent,
-/// and info-string language.
+/// info-string language, and the highlighter carrying state between its
+/// lines.
 struct Fence {
     marker: char,
     length: usize,
     indent: usize,
     language: String,
+    highlighter: highlight::Highlighter,
 }
 
 impl Fence {
@@ -153,11 +158,13 @@ impl Fence {
         if marker == '`' && info.contains('`') {
             return None;
         }
+        let language = info.split_whitespace().next().unwrap_or("").to_string();
         Some(Self {
             marker,
             length,
             indent: line.len() - trimmed.len(),
-            language: info.split_whitespace().next().unwrap_or("").to_string(),
+            highlighter: highlight::Highlighter::new(&language),
+            language,
         })
     }
 
@@ -261,25 +268,52 @@ fn is_rule(line: &str) -> bool {
         && compact.chars().all(|character| character == first)
 }
 
-fn render_code_line(language: &str, line: &str, width: usize, output: &mut Vec<String>) {
-    let code_background = theme::palette().code_background;
+/// The longest language label a code block shows.
+const MAX_CODE_LABEL: usize = 24;
+
+/// The first row of a code block: the language from the fence's info
+/// string, muted, on the code background. A fence without a language gets
+/// a blank shaded row, so every block starts the same way.
+fn render_code_label(language: &str, width: usize, output: &mut Vec<String>) {
+    let label: String = sanitize(language)
+        .chars()
+        .take(MAX_CODE_LABEL.min(width))
+        .collect();
+    let styled = format!("{}{label}{RESET}", theme::palette().muted);
+    output.push(shade_code_row(&fit_width(&styled, width), &code_style()));
+}
+
+/// The background and plain-text color of code rows, as one prefix. The
+/// text color is explicit because plain tokens would otherwise depend on
+/// the terminal's default, which Terminal.app does not reliably apply over
+/// an explicit background.
+fn code_style() -> String {
+    format!("{}{}", theme::code_background(), theme::palette().code_text)
+}
+
+/// Highlights one source line, then hard-wraps it, so a string or comment
+/// split across rows keeps its color on the continuation rows.
+fn render_code_line(
+    highlighter: &mut highlight::Highlighter,
+    line: &str,
+    width: usize,
+    output: &mut Vec<String>,
+) {
+    let style = code_style();
     let plain = sanitize(line).replace('\t', "    ");
-    let chunks = split_chars(&plain, width.max(1));
-    if chunks.is_empty() {
-        output.push(format!(
-            "{code_background}{path}{RESET}",
-            path = " ".repeat(width)
-        ));
-    } else {
-        for chunk in chunks {
-            let highlighted = highlight::render_line(language, &chunk);
-            let padded = fit_width(&highlighted, width);
-            output.push(format!(
-                "{code_background}{}{RESET}",
-                padded.replace(RESET, &format!("{RESET}{code_background}"))
-            ));
-        }
+    let highlighted = highlighter.line(&plain);
+    for chunk in wrap_ansi_hard(&highlighted, width.max(1)) {
+        output.push(shade_code_row(&fit_width(&chunk, width), &style));
     }
+}
+
+/// Paints a fitted row in the code style, re-arming it after every reset a
+/// syntax color leaves behind.
+fn shade_code_row(row: &str, style: &str) -> String {
+    format!(
+        "{style}{}{RESET}",
+        row.replace(RESET, &format!("{RESET}{style}"))
+    )
 }
 
 fn render_inline(text: &str, tokens: Option<&str>) -> String {
@@ -1386,7 +1420,8 @@ mod tests {
             80,
         );
         // Drag-select strips ANSI and trims line ends, so trimmed plain text
-        // is what lands on the clipboard.
+        // is what lands on the clipboard: the label row, then the code
+        // exactly as written.
         let plain = lines
             .iter()
             .map(|line| strip_ansi(line).trim_end().to_string())
@@ -1394,6 +1429,7 @@ mod tests {
         assert_eq!(
             plain,
             [
+                "bash",
                 "hf download foo/bar model.gguf \\",
                 "  --local-dir ~/models",
                 "",
@@ -1408,12 +1444,94 @@ mod tests {
     }
 
     #[test]
+    fn code_label_row_shows_the_language_or_stays_blank() {
+        let labeled = render("```rust\nfn main() {}\n```", 30);
+        assert_eq!(strip_ansi(&labeled[0]).trim_end(), "rust");
+        assert!(labeled[0].starts_with(&theme::code_background()));
+        assert!(labeled[0].contains(palette().muted));
+        assert_eq!(visible_width(&labeled[0]), 30);
+
+        let unlabeled = render("```\nplain\n```", 30);
+        assert_eq!(strip_ansi(&unlabeled[0]).trim_end(), "");
+        assert!(unlabeled[0].starts_with(&theme::code_background()));
+        assert_eq!(strip_ansi(&unlabeled[1]).trim_end(), "plain");
+        assert_eq!(unlabeled.len(), 2);
+
+        // Only the first word of the info string is the language, cut to
+        // the label limit and never wider than the block.
+        let long = render(
+            "```averyveryveryverylonglanguagename {.numbers} extra\nx\n```",
+            12,
+        );
+        assert_eq!(strip_ansi(&long[0]), "averyveryver");
+        assert_eq!(visible_width(&long[0]), 12);
+        let unsafe_label = render("```ba\x1bsh\nx\n```", 20);
+        assert_eq!(strip_ansi(&unsafe_label[0]).trim_end(), "ba�sh");
+    }
+
+    #[test]
+    fn wrapped_code_rows_keep_their_syntax_color() {
+        let lines = render("```python\nx = \"a long string that wraps\"\n```", 16);
+        let plain = lines
+            .iter()
+            .map(|line| strip_ansi(line).trim_end().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(plain, ["python", "x = \"a long stri", "ng that wraps\""]);
+        assert!(
+            lines[2].contains(&format!(
+                "{}{}{}ng that wraps\"",
+                theme::code_background(),
+                palette().code_text,
+                palette().string
+            )),
+            "{:?}",
+            lines[2]
+        );
+        for line in &lines {
+            assert_eq!(visible_width(line), 16);
+        }
+    }
+
+    #[test]
+    fn plain_code_text_always_carries_a_foreground_color() {
+        // Terminal.app may draw default-colored text in the wrong color over
+        // an explicit background, so after every reset the row must restate
+        // both the background and the text color before any plain token.
+        for light in [false, true] {
+            theme::use_light(light);
+            let lines = render("```bash\ncargo clean --manifest-path ~/x\n```", 60);
+            let style = format!("{}{}", theme::code_background(), palette().code_text);
+            for line in &lines {
+                assert!(line.starts_with(&style), "{line:?}");
+                for (index, _) in line.match_indices(RESET) {
+                    let after = &line[index + RESET.len()..];
+                    assert!(after.is_empty() || after.starts_with(&style), "{line:?}");
+                }
+            }
+            assert!(
+                lines[1].contains(&format!("{style} clean ")),
+                "{:?}",
+                lines[1]
+            );
+        }
+        theme::use_light(false);
+    }
+
+    #[test]
+    fn block_comments_stay_styled_across_code_lines() {
+        let lines = render("```rust\n/* one\ntwo */ let x = 1;\n```", 40);
+        assert!(lines[1].contains(&format!("{}/* one", palette().comment)));
+        assert!(lines[2].contains(&format!("{}two */", palette().comment)));
+        assert!(lines[2].contains(&format!("{}let{RESET}", palette().keyword)));
+    }
+
+    #[test]
     fn fenced_code_background_differs_from_user_and_tool_cards() {
         let lines = render("```bash\necho hi\n```", 40);
-        assert!(!lines.is_empty());
+        assert_eq!(lines.len(), 2);
         for line in &lines {
             assert!(
-                line.contains(palette().code_background),
+                line.contains(&theme::code_background()),
                 "code lines need the shaded background: {line:?}"
             );
             assert_eq!(visible_width(line), 40);
@@ -1438,7 +1556,7 @@ mod tests {
             .iter()
             .map(|line| strip_ansi(line).trim_end().to_string())
             .collect::<Vec<_>>();
-        assert_eq!(plain, ["echo hi"]);
+        assert_eq!(plain, ["bash", "echo hi"]);
     }
 
     #[test]
@@ -1561,11 +1679,13 @@ mod tests {
         assert_eq!(plain[0], "─".repeat(30));
         assert_eq!(plain[1], "│ quoted bold");
         assert_eq!(plain[2], "│ │ deeper");
-        assert_eq!(plain[3], "x = 1");
-        assert!(lines[3].contains(palette().code_background));
-        assert_eq!(plain[4], "• item");
-        assert_eq!(plain[5], "echo hi", "fence indentation is stripped");
-        assert_eq!(plain.len(), 6);
+        assert_eq!(plain[3], "python");
+        assert_eq!(plain[4], "x = 1");
+        assert!(lines[4].contains(&theme::code_background()));
+        assert_eq!(plain[5], "• item");
+        assert_eq!(plain[6], "sh");
+        assert_eq!(plain[7], "echo hi", "fence indentation is stripped");
+        assert_eq!(plain.len(), 8);
     }
 
     #[test]

@@ -222,6 +222,7 @@ fn saved_picker(config: &Config, plan: &ConnectionPlan) -> Picker {
         ],
         selected: 0,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::Choice(START)),
     }
 }
@@ -304,6 +305,7 @@ fn trust_page(root: &Path, found: &[&str]) -> Page {
             // The safe answer is the default, as Enter alone always meant.
             selected: DENY,
             editing: None,
+            filter: None,
             parent: Some(PickerAction::Choice(DENY)),
         },
         notice: None,

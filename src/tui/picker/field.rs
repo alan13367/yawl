@@ -295,6 +295,7 @@ pub(in crate::tui) fn field_picker(
         items: Vec::new(),
         selected: 0,
         editing: Some(PickerEdit::Field(Box::new(field))),
+        filter: None,
         parent: Some(parent),
     }
 }

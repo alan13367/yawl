@@ -293,6 +293,7 @@ fn provider_picker(flow: &ConnectFlow) -> Picker {
         items,
         selected: 0,
         editing: None,
+        filter: None,
         parent: Some(
             flow.root_parent
                 .clone()
@@ -506,6 +507,7 @@ fn authentication_picker(flow: &ConnectFlow) -> Picker {
         items,
         selected: 0,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::ConnectBack(ConnectStep::Endpoint)),
     }
 }
@@ -662,6 +664,7 @@ fn codex_login_picker() -> Picker {
         ],
         selected: 0,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::ConnectBack(ConnectStep::Provider)),
     }
 }
@@ -677,6 +680,7 @@ fn waiting_picker(title: &str, description: &str, parent: PickerAction) -> Picke
         }],
         selected: 0,
         editing: None,
+        filter: None,
         parent: Some(parent),
     }
 }
@@ -705,6 +709,7 @@ fn login_prompt_picker(prompt: &DeviceLoginPrompt) -> Picker {
         ],
         selected: 0,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::ConnectCancelJob),
     }
 }
@@ -808,20 +813,21 @@ fn models_picker(flow: &ConnectFlow, models: &[DiscoveredModel]) -> Picker {
     };
     let mut items = models
         .iter()
-        .map(|model| model.id.clone())
         .map(|model| PickerItem {
             label: codex
                 .iter()
-                .find(|entry| entry.slug == model)
+                .find(|entry| entry.slug == model.id)
                 .map(|entry| entry.display_name.clone())
                 .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| model.clone()),
-            description: if codex.is_empty() {
-                "Available from this provider".into()
+                .unwrap_or_else(|| model.id.clone()),
+            description: if !codex.is_empty() {
+                model.id.clone()
+            } else if let Some(window) = model.context_window {
+                format!("{} context", super::status_bar::format_token_count(window))
             } else {
-                model.clone()
+                "Available from this provider".into()
             },
-            action: PickerAction::ConnectChooseModel(model),
+            action: PickerAction::ConnectChooseModel(model.id.clone()),
         })
         .collect::<Vec<_>>();
     items.push(PickerItem {
@@ -833,12 +839,15 @@ fn models_picker(flow: &ConnectFlow, models: &[DiscoveredModel]) -> Picker {
             secret: false,
         },
     });
+    // Every discovered model is listed; aggregators list hundreds, so the
+    // picker searches as you type and keeps the manual entry row.
     Picker {
         title: format!("{} models", flow.provider_label),
-        hint: "↑/↓ move  Enter select  Esc back".into(),
+        hint: "Type to search  ↑/↓ move  Enter select  Esc back".into(),
         items,
         selected: 0,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::ConnectBack(
             if flow.provider == Some(ProviderId::Codex) {
                 ConnectStep::Provider
@@ -847,6 +856,7 @@ fn models_picker(flow: &ConnectFlow, models: &[DiscoveredModel]) -> Picker {
             },
         )),
     }
+    .searchable(1)
 }
 
 fn show_recovery(flow: &mut ConnectFlow, message: &str, view: &mut dyn ConnectView) {
@@ -881,6 +891,7 @@ fn recovery_picker(flow: &ConnectFlow, message: &str) -> Picker {
         ],
         selected: 0,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::ConnectBack(
             if flow.provider == Some(ProviderId::Codex) {
                 ConnectStep::Provider
@@ -932,6 +943,7 @@ fn connection_reasoning_picker(flow: &ConnectFlow) -> Picker {
             .collect(),
         selected: 0,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::ConnectBack(ConnectStep::Models)),
     }
 }
@@ -968,6 +980,7 @@ fn review_picker(flow: &ConnectFlow) -> Picker {
         items,
         selected: 0,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::ConnectBack(
             if matches!(flow.provider, Some(ProviderId::Compatible(_))) {
                 ConnectStep::Reasoning
@@ -1118,6 +1131,54 @@ mod tests {
 
         let saved_again = saved.change_global_batch(plan.changes_for_save())?.config;
         assert_eq!(saved_again.providers["local-api"].models.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn models_picker_lists_every_model_and_searches_them() -> Result<(), Error> {
+        let root = crate::test_support::unique_temp_dir("connection-models-picker");
+        let config = Config::load_from(root.join("home/.yawl"), root.join("project/.yawl"))?;
+        let flow = ConnectFlow {
+            provider: Some(ProviderId::Compatible("router".into())),
+            provider_label: "Router".into(),
+            ..ConnectFlow::new(&config, ConnectContext::Session, None)
+        };
+        let mut models = (0..300)
+            .map(|index| DiscoveredModel::named(format!("vendor{}/model-{index:03}", index % 7)))
+            .collect::<Vec<_>>();
+        models.push(DiscoveredModel {
+            id: "qwen/qwen3-coder".into(),
+            context_window: Some(262_144),
+        });
+
+        let mut picker = models_picker(&flow, &models);
+
+        assert_eq!(picker.items.len(), 301 + 1, "no cap on discovered models");
+        assert!(picker.filter.is_some());
+        assert_eq!(
+            picker.hint,
+            "Type to search  ↑/↓ move  Enter select  Esc back"
+        );
+        let qwen = picker
+            .items
+            .iter()
+            .find(|item| item.label == "qwen/qwen3-coder")
+            .expect("qwen listed");
+        assert_eq!(qwen.description, "262.1k context");
+        assert_eq!(picker.items[0].description, "Available from this provider");
+
+        picker.set_filter("vendor3 -00");
+        let labels = picker
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            ["vendor3/model-003", "Enter model manually…"],
+            "the manual row stays while the list narrows"
+        );
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }

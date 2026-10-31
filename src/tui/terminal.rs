@@ -4,6 +4,7 @@ use std::io::{self, IsTerminal, Read, Write};
 
 use base64::Engine as _;
 
+use crate::config::UiColor;
 use crate::error::Error;
 use crate::terminal_mode::RawMode;
 
@@ -232,13 +233,13 @@ impl Terminal {
         Ok(terminal)
     }
 
-    /// Asks the terminal whether its background is light. The answer is
-    /// `None` when the terminal does not report a color within half a
-    /// second. Everything read is returned too, so keys typed meanwhile
-    /// reach the input reader, which discards the replies themselves,
-    /// including ones that arrive after the deadline.
-    pub(super) fn query_light_background(&mut self) -> (Option<bool>, Vec<u8>) {
-        query_light_background(&mut self.stdout)
+    /// Asks the terminal for its background color. The answer is `None`
+    /// when the terminal does not report one within half a second.
+    /// Everything read is returned too, so keys typed meanwhile reach the
+    /// input reader, which discards the replies themselves, including ones
+    /// that arrive after the deadline.
+    pub(super) fn query_background(&mut self) -> (Option<UiColor>, Vec<u8>) {
+        query_background(&mut self.stdout)
     }
 
     pub(super) fn invalidate(&mut self) {
@@ -571,9 +572,9 @@ fn write_kitty_image(
 /// Without the neighbors, a changed row's old glyph could leave a stray pixel
 /// in an unchanged row beside it, as the scroll rail did above the composer
 /// corner when it auto-hid.
-/// Asks a raw-mode terminal whether its background is light, as
-/// [`Terminal::query_light_background`] describes.
-pub(super) fn query_light_background(stdout: &mut impl Write) -> (Option<bool>, Vec<u8>) {
+/// Asks a raw-mode terminal for its background color, as
+/// [`Terminal::query_background`] describes.
+pub(super) fn query_background(stdout: &mut impl Write) -> (Option<UiColor>, Vec<u8>) {
     if stdout.write_all(theme::BACKGROUND_QUERY).is_err() || stdout.flush().is_err() {
         return (None, Vec::new());
     }
@@ -592,7 +593,7 @@ pub(super) fn query_light_background(stdout: &mut impl Write) -> (Option<bool>, 
             Err(_) => break,
         }
     }
-    (theme::reported_background_is_light(&reply), reply)
+    (theme::reported_background(&reply), reply)
 }
 
 pub(super) fn write_frame_rows(

@@ -16,6 +16,30 @@ const COMPACT_DETAIL_ROWS: usize = 3;
 /// Gap between the label column and the description column.
 const COLUMN_GAP: usize = 3;
 
+/// The search field plus its separator on a searchable picker.
+const SEARCH_ROWS: usize = 2;
+
+/// The search field: the query with a caret, or a dim prompt when empty,
+/// and the match count at the right edge.
+fn search_row(filter: &super::PickerFilter, shown: usize, inner: usize) -> String {
+    let (matched, total) = filter.counts(shown);
+    let count = if filter.query.is_empty() {
+        format!("{total} to search")
+    } else {
+        format!("{matched} of {total}")
+    };
+    let query = if filter.query.is_empty() {
+        " \x1b[2mType to search…\x1b[0m".to_string()
+    } else {
+        format!(" {}\x1b[2m▏\x1b[0m", filter.query)
+    };
+    let used = markdown::visible_width(&query) + markdown::visible_width(&count) + 1;
+    if used > inner {
+        return query;
+    }
+    format!("{query}{}\x1b[2m{count}\x1b[0m ", " ".repeat(inner - used))
+}
+
 /// Draws the picker panel centered in `height` rows. Returns the lines and,
 /// while a field is focused, the cursor's row and column within them.
 pub(in crate::tui) fn render_picker(
@@ -57,6 +81,10 @@ pub(in crate::tui) fn render_picker(
         panel.extend(rows.iter().map(|row| boxed(row)));
         field.hint(picker.items.is_empty())
     } else {
+        if let Some(filter) = &picker.filter {
+            panel.push(boxed(&search_row(filter, picker.items.len(), inner)));
+            panel.push(separator.clone());
+        }
         render_items(
             picker, editor, selection, compact, inner, height, &boxed, &separator, &mut panel,
         );
@@ -105,10 +133,21 @@ fn render_items(
     panel: &mut Vec<String>,
 ) {
     let detail_rows = if compact { COMPACT_DETAIL_ROWS } else { 0 };
+    let search_rows = if picker.filter.is_some() {
+        SEARCH_ROWS
+    } else {
+        0
+    };
     let capacity = height
-        .saturating_sub(5 + detail_rows)
+        .saturating_sub(5 + detail_rows + search_rows)
         .max(1)
         .min(picker.items.len().max(1));
+    if picker.items.is_empty() {
+        if picker.filter.is_some() {
+            panel.push(boxed(" \x1b[2mNo matches\x1b[0m"));
+        }
+        return;
+    }
     let mut start = picker.selected.saturating_sub(capacity / 2);
     start = start.min(picker.items.len().saturating_sub(capacity));
     let end = (start + capacity).min(picker.items.len());

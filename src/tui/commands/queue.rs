@@ -29,6 +29,7 @@ fn queue_picker(state: &ViewState, selected: usize) -> Option<Picker> {
         selected: selected.min(items.len().saturating_sub(1)),
         items,
         editing: None,
+        filter: None,
         parent: None,
     })
 }

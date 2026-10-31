@@ -183,10 +183,12 @@ fn image_previews(
 }
 
 fn render_collapsed(label: &str, content: &str, width: usize) -> Vec<String> {
+    // A fence line would render as a shaded label row; preview the first
+    // line of text or code instead.
     let preview = content
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
+        .find(|line| !line.is_empty() && !line.starts_with("```") && !line.starts_with("~~~"))
         .unwrap_or("");
     let preview = markdown::render(preview, width)
         .into_iter()
@@ -327,4 +329,22 @@ pub(super) fn render_steer_panel(content: &str, position: usize, width: usize) -
 
 fn yawl_label(accent: UiColor) -> String {
     format!("{}\x1b[1mYawl\x1b[0m", foreground_color(accent))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collapsed_previews_skip_fence_lines() {
+        let lines = render_collapsed("Reply", "\n```bash\ncargo build\n```", 40);
+        let plain = markdown::strip_ansi(&lines[0]);
+        assert_eq!(plain.trim_end(), "▸ Reply  cargo build");
+        assert!(
+            !lines[0].contains(&theme::code_background()),
+            "{:?}",
+            lines[0]
+        );
+        assert_eq!(markdown::visible_width(&lines[0]), 40);
+    }
 }

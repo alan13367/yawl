@@ -95,10 +95,13 @@ impl Surface for Lines {
                 .items
                 .iter()
                 .any(|item| matches!(item.action, PickerAction::ConnectToggleReasoning(_)));
+            let searchable = page.picker.filter.is_some();
             eprint!(
                 "{}",
                 if toggles {
                     "Number to toggle, Enter to confirm, or 'q' to go back: "
+                } else if searchable {
+                    "Number, text to search, or Enter to go back: "
                 } else {
                     "Number, or Enter to go back: "
                 }
@@ -119,6 +122,12 @@ impl Surface for Lines {
                         page.picker.selected = index;
                         if toggles { Key::Char(' ') } else { Key::Enter }
                     }
+                    None if searchable => {
+                        // Any other text narrows the list; the next prompt
+                        // numbers the matches.
+                        page.picker.set_filter(number);
+                        continue;
+                    }
                     None => {
                         eprintln!("Enter a number from 1 through {}.", page.picker.items.len());
                         continue;
@@ -138,6 +147,13 @@ fn print_list(page: &Page) {
     let mut lines = vec![String::new(), page.picker.title.clone()];
     if let Some(notice) = &page.notice {
         lines.push(notice.clone());
+    }
+    if let Some(filter) = page.picker.filter.as_ref().filter(|f| !f.query.is_empty()) {
+        let (matched, total) = filter.counts(page.picker.items.len());
+        lines.push(format!(
+            "Search \"{}\": {matched} of {total} (Enter clears)",
+            filter.query
+        ));
     }
     for (index, item) in page.picker.items.iter().enumerate() {
         if page.busy {

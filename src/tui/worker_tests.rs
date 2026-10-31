@@ -63,6 +63,7 @@ fn display_settings_apply_during_an_active_turn() {
         selected: 0,
         items: Vec::new(),
         editing: None,
+        filter: None,
         parent: None,
     };
     let settings_category_count = SettingsCategory::ALL.len();

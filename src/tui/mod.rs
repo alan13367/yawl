@@ -120,12 +120,12 @@ pub fn run(agent: &mut Agent) -> Result<(), Error> {
     let mut terminal = Terminal::enter()?;
     // An explicit theme needs no answer from the terminal, which some
     // multiplexers and slow links never give in time.
-    let (light_background, typed) = if agent.config().theme == crate::config::Theme::Auto {
-        terminal.query_light_background()
+    let (background, typed) = if agent.config().theme == crate::config::Theme::Auto {
+        terminal.query_background()
     } else {
         (None, Vec::new())
     };
-    theme::init(agent.config().theme, light_background);
+    theme::init(agent.config().theme, background);
     let events = EventReader::with_pending(
         terminal
             .remote()

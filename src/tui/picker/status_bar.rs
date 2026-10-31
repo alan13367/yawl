@@ -67,6 +67,7 @@ pub(in crate::tui) fn status_bar_editor_picker(state: &ViewState, selected: usiz
         selected: selected.min(items.len().saturating_sub(1)),
         items,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::CancelStatusBarEditor),
     }
 }
@@ -126,6 +127,7 @@ pub(in crate::tui) fn status_bar_item_picker(
         selected: selected.min(items.len().saturating_sub(1)),
         items,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::OpenStatusBarEditor { selected: index }),
     }
 }
@@ -159,6 +161,7 @@ pub(in crate::tui) fn status_bar_format_picker(state: &ViewState, index: usize) 
         selected,
         items,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::OpenStatusBarItem { index, selected: 0 }),
     }
 }
@@ -180,6 +183,7 @@ pub(in crate::tui) fn status_bar_add_picker(state: &ViewState) -> Picker {
         selected: 0,
         items,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::OpenStatusBarEditor {
             selected: layout.items.len(),
         }),
@@ -212,6 +216,7 @@ pub(in crate::tui) fn status_bar_style_picker(state: &ViewState) -> Picker {
         selected,
         items,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::OpenStatusBarEditor {
             selected: layout.items.len() + 1,
         }),
@@ -252,6 +257,7 @@ pub(in crate::tui) fn status_bar_separator_picker(state: &ViewState) -> Picker {
         selected,
         items,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::OpenStatusBarEditor {
             selected: layout.items.len() + 2,
         }),

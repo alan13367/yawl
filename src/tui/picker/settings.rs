@@ -66,6 +66,7 @@ pub(in crate::tui) fn settings_picker(_agent: &Agent) -> Picker {
             })
             .collect(),
         editing: None,
+        filter: None,
         parent: None,
     }
 }
@@ -350,6 +351,7 @@ pub(in crate::tui) fn settings_category_picker_from(
         items: std::mem::take(&mut items),
         selected,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::OpenSettingsRoot {
             selected: category.index(),
         }),
@@ -422,6 +424,7 @@ pub(in crate::tui) fn web_search_provider_picker(current: WebSearchProvider) -> 
         items,
         selected,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::OpenSettingsCategory {
             category: SettingsCategory::Web,
             selected: settings_item_index(SettingsCategory::Web, SettingsItem::WebSearchProvider),
@@ -465,6 +468,7 @@ pub(in crate::tui) fn color_picker(current: UiColor) -> Picker {
         items,
         selected,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::OpenSettingsCategory {
             category: SettingsCategory::Interface,
             selected: settings_item_index(SettingsCategory::Interface, SettingsItem::AccentColor),
@@ -510,6 +514,7 @@ pub(in crate::tui) fn selection_color_picker(current: Option<UiColor>) -> Picker
         items,
         selected,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::OpenSettingsCategory {
             category: SettingsCategory::Interface,
             selected: settings_item_index(

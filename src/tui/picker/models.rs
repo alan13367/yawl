@@ -228,6 +228,7 @@ pub(in crate::tui) fn subagent_model_picker(config: &Config, selected_model: &st
         items,
         selected,
         editing: None,
+        filter: None,
         parent: Some(PickerAction::OpenSettingsCategory {
             category: SettingsCategory::Subagents,
             selected: settings_item_index(SettingsCategory::Subagents, SettingsItem::SubagentModel),
@@ -282,6 +283,7 @@ pub(in crate::tui) fn model_picker(config: &Config, selected_model: &str, save: 
         items,
         selected,
         editing: None,
+        filter: None,
         parent: save.then_some(PickerAction::OpenSettingsCategory {
             category: SettingsCategory::Model,
             selected: settings_item_index(SettingsCategory::Model, SettingsItem::DefaultModel),
@@ -338,6 +340,7 @@ pub(in crate::tui) fn reasoning_picker_from_config(
         items,
         selected,
         editing: None,
+        filter: None,
         parent: save.then_some(PickerAction::OpenSettingsCategory {
             category: SettingsCategory::Model,
             selected: settings_item_index(SettingsCategory::Model, SettingsItem::ReasoningEffort),

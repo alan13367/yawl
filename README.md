@@ -207,7 +207,7 @@ Use `/connect` for guided setup or add an OpenAI-compatible endpoint under `prov
 }
 ```
 
-`apiKey` accepts `$ENV_VAR` and `${ENV_VAR}` references; omit it for keyless servers. The optional `models` array supplies model capabilities and picker entries. When the models endpoint reports a served context length (`max_model_len`, as oMLX and vLLM do), `/connect` saves it as the model's `context_window`. Unlisted model IDs work but remain text-only. In `/model`, `d` or `Delete` removes a configured entry after confirmation.
+`apiKey` accepts `$ENV_VAR` and `${ENV_VAR}` references; omit it for keyless servers. The optional `models` array supplies model capabilities and picker entries. `/connect` lists every model the endpoint reports, however many; type to search the list by ID, `Esc` clears the search, and the manual-entry row stays available. When the endpoint reports a served context length (`max_model_len`, as oMLX and vLLM do, or `context_length`, as OpenRouter does), the list shows it and `/connect` saves it as the model's `context_window`. Unlisted model IDs work but remain text-only. In `/model`, `d` or `Delete` removes a configured entry after confirmation.
 
 Declare the reasoning levels your endpoint accepts in `reasoning_efforts`, or select them during setup. An empty list disables explicit reasoning for that model. Model selection offers supported levels and a provider-default option, including when you save a new connection for the current session.
 
@@ -222,6 +222,8 @@ Project skills, project tools, and provider endpoints, base URLs, and credential
 `/settings` includes colors, the theme, the bell, reasoning display, and a configurable status bar. Color pickers preview as you move; `Enter` saves and `Esc` restores the previous color. The status-bar editor supports reordering with `K`/`J` and custom labels.
 
 The `theme` setting (`auto`, `dark`, or `light`) picks interface colors for the terminal background. `auto`, the default, asks the terminal for its background color at startup, then falls back to `COLORFGBG`, then to dark. On a light background, accent and selection colors that would be too pale are darkened, so the default white accent stays visible. Remote-control pages switch their terminal background to match. Use `/settings theme light` when a terminal does not report its color, for example inside some multiplexers; an explicit `dark` or `light` skips the startup query.
+
+Fenced code blocks render as a shaded panel: a row naming the fence's language, then the code with syntax highlighting for shell, Rust, Python, JavaScript, TypeScript, Go, C, C++, Java, Kotlin, Swift, SQL, JSON, TOML, YAML, HTML, CSS, and `diff`. Shell blocks color the command, its flags, and variables. The panel has no border characters, and code lines stay flush left, so drag-selecting them copies exactly what was written. With `auto`, the shade is the terminal's reported background lifted one step, so it stays visible on any color scheme; otherwise it is a fixed gray.
 
 ## Sessions and undo
 

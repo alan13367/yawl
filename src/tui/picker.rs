@@ -316,11 +316,97 @@ pub(super) struct PickerItem {
 pub(super) struct Picker {
     pub(super) title: String,
     pub(super) hint: String,
+    /// The rows shown: every row, or the rows matching the search query.
     pub(super) items: Vec<PickerItem>,
     pub(super) selected: usize,
     pub(super) editing: Option<PickerEdit>,
     /// Action performed by Escape. Standalone pickers leave this unset.
     pub(super) parent: Option<PickerAction>,
+    /// Live search over a long list, enabled with [`Picker::searchable`].
+    pub(super) filter: Option<PickerFilter>,
+}
+
+/// Type-to-search state: the query, every row, and how many trailing rows
+/// (such as "Enter manually…") stay visible whatever the query.
+#[derive(Clone)]
+pub(super) struct PickerFilter {
+    pub(super) query: String,
+    all: Vec<PickerItem>,
+    pinned_tail: usize,
+}
+
+impl PickerFilter {
+    /// How many rows match the query, and how many there are to search.
+    pub(super) fn counts(&self, shown: usize) -> (usize, usize) {
+        (
+            shown.saturating_sub(self.pinned_tail),
+            self.all.len().saturating_sub(self.pinned_tail),
+        )
+    }
+}
+
+impl Picker {
+    /// Makes the picker searchable. Printable keys then filter the rows
+    /// instead of acting as shortcuts, Backspace edits the query, and Esc
+    /// clears it before it closes the picker. The last `pinned_tail` rows
+    /// always stay listed.
+    pub(super) fn searchable(mut self, pinned_tail: usize) -> Self {
+        self.filter = Some(PickerFilter {
+            query: String::new(),
+            all: self.items.clone(),
+            pinned_tail: pinned_tail.min(self.items.len()),
+        });
+        self
+    }
+
+    /// Replaces the search query and shows the rows it matches: every
+    /// whitespace-separated term must appear in the label or description,
+    /// ignoring case.
+    pub(super) fn set_filter(&mut self, query: &str) {
+        let Some(filter) = self.filter.as_mut() else {
+            return;
+        };
+        filter.query = query.to_string();
+        let terms = query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        let searchable = filter.all.len() - filter.pinned_tail;
+        self.items = filter
+            .all
+            .iter()
+            .enumerate()
+            .filter(|(index, item)| {
+                *index >= searchable || {
+                    let haystack = format!("{} {}", item.label, item.description).to_lowercase();
+                    terms.iter().all(|term| haystack.contains(term.as_str()))
+                }
+            })
+            .map(|(_, item)| item.clone())
+            .collect();
+        self.selected = 0;
+    }
+
+    /// Applies a key to the search query. Returns whether it was one.
+    fn edit_filter(&mut self, key: Key) -> bool {
+        let Some(filter) = self.filter.as_ref() else {
+            return false;
+        };
+        match key {
+            Key::Char(character) if !character.is_control() => {
+                let query = format!("{}{character}", filter.query);
+                self.set_filter(&query);
+            }
+            Key::Backspace if !filter.query.is_empty() => {
+                let mut query = filter.query.clone();
+                query.pop();
+                self.set_filter(&query);
+            }
+            Key::Escape | Key::Ctrl('c') if !filter.query.is_empty() => self.set_filter(""),
+            _ => return false,
+        }
+        true
+    }
 }
 
 #[derive(Clone)]
@@ -467,6 +553,10 @@ impl Picker {
             return PickerKey::Handled;
         }
 
+        if self.edit_filter(key) {
+            return PickerKey::Handled;
+        }
+
         if let Some(PickerAction::ConnectToggleReasoning(index)) =
             self.items.get(self.selected).map(|item| &item.action)
         {
@@ -536,7 +626,10 @@ pub(super) fn take_picker_action(
             picker.selected = usize::from(digit as u8 - b'1');
             return None;
         }
-        if let Some(action) = row_shortcut(state, editor, key) {
+        // Letters type into a search field when the picker has one.
+        if picker.filter.is_none()
+            && let Some(action) = row_shortcut(state, editor, key)
+        {
             return action;
         }
     }
@@ -642,6 +735,7 @@ fn delete_session_confirm(
             },
         ],
         editing: None,
+        filter: None,
         parent: Some(PickerAction::OpenResume {
             selected: resume_selected,
         }),
@@ -690,6 +784,7 @@ pub(super) fn remove_model_confirm(
             },
         ],
         editing: None,
+        filter: None,
         parent: Some(back),
     })
 }

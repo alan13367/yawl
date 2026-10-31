@@ -394,6 +394,7 @@ fn image_tool_results_reserve_rows_below_their_tool_card() {
         selected: 0,
         items: Vec::new(),
         editing: None,
+        filter: None,
         parent: None,
     });
     let with_picker =
@@ -1281,6 +1282,7 @@ fn scroll_bar_does_not_overlay_an_open_picker() {
         selected: 0,
         items: Vec::new(),
         editing: None,
+        filter: None,
         parent: None,
     });
     let editor = Editor::default();

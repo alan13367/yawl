@@ -39,6 +39,7 @@ pub(in crate::tui) fn open_resume_picker(agent: &Agent, state: &mut ViewState) {
             })
             .collect(),
         editing: None,
+        filter: None,
         parent: None,
     });
 }

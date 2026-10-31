@@ -164,6 +164,7 @@ pub(in crate::tui) fn plan_handoff_picker() -> Picker {
             },
         ],
         editing: None,
+        filter: None,
         parent: Some(PickerAction::ReturnFromPlan),
     }
 }

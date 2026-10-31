@@ -13,9 +13,7 @@ use super::super::markdown;
 use super::super::picker::{PickerAction, PickerEdit, PickerKey, render_picker};
 use super::super::remote::TerminalInput;
 use super::super::render::{foreground_color, render_wordmark, selection_style, status_style};
-use super::super::terminal::{
-    cursor_control, query_light_background, terminal_size, write_frame_rows,
-};
+use super::super::terminal::{cursor_control, query_background, terminal_size, write_frame_rows};
 use super::super::theme;
 use super::{Backdrop, Page, SETUP_STEPS, Surface};
 
@@ -47,12 +45,12 @@ impl Screen {
         stdout.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h")?;
         stdout.flush()?;
         // An explicit theme needs no answer from the terminal.
-        let (light_background, typed) = if config.theme == Theme::Auto {
-            query_light_background(&mut stdout)
+        let (background, typed) = if config.theme == Theme::Auto {
+            query_background(&mut stdout)
         } else {
             (None, Vec::new())
         };
-        theme::init(config.theme, light_background);
+        theme::init(config.theme, background);
         Ok(Self {
             _raw_mode: raw_mode,
             stdout,
@@ -299,6 +297,7 @@ mod tests {
                 }],
                 selected: 0,
                 editing: None,
+                filter: None,
                 parent: None,
             },
             notice: notice.map(str::to_string),

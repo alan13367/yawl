@@ -4,14 +4,17 @@ use serde_json::Value;
 
 use crate::error::Error;
 
-const MAX_DISCOVERED_MODELS: usize = 30;
+/// Aggregators such as OpenRouter list hundreds of models with pricing and
+/// descriptions, so their catalog runs to a few megabytes.
+const MAX_MODELS_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
 /// A model listed by a provider's models endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscoveredModel {
     pub(crate) id: String,
     /// The served context limit, when the server reports one. oMLX and vLLM
-    /// add a non-standard `max_model_len` to each OpenAI-style entry.
+    /// add a non-standard `max_model_len` to each OpenAI-style entry, and
+    /// OpenRouter reports `context_length`.
     pub(crate) context_window: Option<u64>,
 }
 
@@ -71,7 +74,7 @@ fn fetch_models(url: &str, style: AuthStyle<'_>) -> Result<Vec<DiscoveredModel>,
     let body = response
         .body_mut()
         .with_config()
-        .limit(2 * 1024 * 1024)
+        .limit(MAX_MODELS_BODY_BYTES)
         .read_to_string()?;
     if status != 200 {
         return Err(Error::Http { status, body });
@@ -86,15 +89,19 @@ fn parse_models(payload: &str) -> Result<Vec<DiscoveredModel>, Error> {
         .into_iter()
         .flatten()
         .filter_map(|model| {
+            let context_window = ["max_model_len", "context_length"]
+                .into_iter()
+                .find_map(|key| model[key].as_u64())
+                .filter(|window| *window > 0);
             Some(DiscoveredModel {
                 id: model["id"].as_str()?.to_string(),
-                context_window: model["max_model_len"].as_u64().filter(|window| *window > 0),
+                context_window,
             })
         })
         .collect::<Vec<_>>();
+    // Every model is listed; the picker searches long lists.
     models.sort_by(|left, right| left.id.cmp(&right.id));
     models.dedup_by(|left, right| left.id == right.id);
-    models.truncate(MAX_DISCOVERED_MODELS);
     Ok(models)
 }
 
@@ -103,17 +110,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_ids_are_sorted_deduplicated_and_capped() -> Result<(), Error> {
+    fn model_ids_are_sorted_deduplicated_and_uncapped() -> Result<(), Error> {
         let mut data = vec![serde_json::json!({"id": "zeta"})];
-        data.extend((0..40).map(|index| serde_json::json!({"id": format!("m{index:02}")})));
+        data.extend((0..400).map(|index| serde_json::json!({"id": format!("m{index:03}")})));
         data.push(serde_json::json!({"id": "zeta"}));
         let payload = serde_json::json!({"data": data}).to_string();
 
         let models = parse_models(&payload)?;
 
-        assert_eq!(models.len(), MAX_DISCOVERED_MODELS);
-        assert_eq!(models.first().map(|model| model.id.as_str()), Some("m00"));
-        assert_eq!(models.last().map(|model| model.id.as_str()), Some("m29"));
+        assert_eq!(models.len(), 401);
+        assert_eq!(models.first().map(|model| model.id.as_str()), Some("m000"));
+        assert_eq!(models.last().map(|model| model.id.as_str()), Some("zeta"));
         Ok(())
     }
 
@@ -121,6 +128,7 @@ mod tests {
     fn served_context_length_is_read_when_reported() -> Result<(), Error> {
         let payload = serde_json::json!({"data": [
             {"id": "omlx-model", "object": "model", "owned_by": "omlx", "max_model_len": 65536},
+            {"id": "router-model", "context_length": 200000, "pricing": {"prompt": "0.000001"}},
             {"id": "plain-model", "object": "model"},
             {"id": "zero-model", "max_model_len": 0},
             {"id": "text-model", "max_model_len": "big"}
@@ -136,6 +144,7 @@ mod tests {
                 .and_then(|model| model.context_window)
         };
         assert_eq!(window("omlx-model"), Some(65_536));
+        assert_eq!(window("router-model"), Some(200_000));
         assert_eq!(window("plain-model"), None);
         assert_eq!(window("zero-model"), None);
         assert_eq!(window("text-model"), None);
