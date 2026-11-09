@@ -140,7 +140,16 @@ impl SessionState {
                 self.active_plan = None;
                 self.plan_before_turn = None;
             }
-            SessionEvent::Usage { usage } => self.usage.record(usage),
+            SessionEvent::Usage { usage, duration_ms } => {
+                self.usage.record(usage);
+                self.usage.model_ms = self.usage.model_ms.saturating_add(duration_ms.unwrap_or(0));
+            }
+            SessionEvent::ToolOutputsShortened { before, keep_chars } => {
+                let end = before.min(self.messages.len());
+                crate::compaction::shorten_tool_outputs(&mut self.messages[..end], keep_chars);
+                self.context = None;
+                self.usage.record_cache_reset();
+            }
         }
     }
 
@@ -150,6 +159,10 @@ impl SessionState {
         if message.starts_user_turn() {
             self.plan_before_turn.clone_from(&self.active_plan);
         }
+        self.usage.tool_ms = self
+            .usage
+            .tool_ms
+            .saturating_add(message.duration_ms.unwrap_or(0));
         self.messages.push(message);
     }
 

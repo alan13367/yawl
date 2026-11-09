@@ -56,6 +56,19 @@ fn direct_web_settings_apply_and_validate() {
         "brave_api_key test-secret",
         &mut state
     ));
+    assert!(settings(
+        &mut agent,
+        "searxng_url http://localhost:8080",
+        &mut state
+    ));
+    assert_eq!(
+        agent.config().searxng_url.as_deref(),
+        Some("http://localhost:8080")
+    );
+    assert!(settings(&mut agent, "searxng_url -", &mut state));
+    assert_eq!(agent.config().searxng_url, None);
+    assert!(settings(&mut agent, "web_search_fallback off", &mut state));
+    assert!(!agent.config().web_search_fallback);
     assert!(agent.config().web_browsing);
     assert_eq!(
         agent.config().web_search_provider,
@@ -72,11 +85,12 @@ fn direct_web_settings_apply_and_validate() {
         "web_fetch_max_chars 50001",
         &mut state
     ));
+    assert!(!settings(&mut agent, "searxng_url nope", &mut state));
 
     activate_picker_action(&mut agent, &mut state, PickerAction::OpenWebSearchProviders);
     assert_eq!(
         state.picker.as_ref().map(|picker| picker.items.len()),
-        Some(3)
+        Some(4)
     );
     activate_picker_action(
         &mut agent,
@@ -88,6 +102,15 @@ fn direct_web_settings_apply_and_validate() {
         crate::config::WebSearchProvider::Firecrawl
     );
     assert_eq!(state.picker.as_ref().map(|picker| picker.selected), Some(1));
+
+    activate_picker_action(
+        &mut agent,
+        &mut state,
+        PickerAction::SetWebSearchFallback(true),
+    );
+    assert!(agent.config().web_search_fallback);
+    let picker = state.picker.as_ref().expect("settings picker");
+    assert_eq!(picker.items[picker.selected].label, "Search fallback");
 
     let _ = std::fs::remove_dir_all(root);
 }

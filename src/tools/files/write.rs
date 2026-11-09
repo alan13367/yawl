@@ -36,7 +36,7 @@ pub(super) fn write_entry() -> ToolEntry {
 pub(super) fn edit_entry() -> ToolEntry {
     ToolEntry::new(crate::provider::ToolSpec {
             name: "edit_file".into(),
-            description: "Replace exact `old_string` text in a file. It must match once unless replace_all is true; include enough context for uniqueness."
+            description: "Replace exact `old_string` text in a file. It must match once unless replace_all is true; include enough context for uniqueness. To change several places in one file, pass them together in `edits` instead of making separate calls: they apply in order, and if any fails, none are written."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -44,9 +44,23 @@ pub(super) fn edit_entry() -> ToolEntry {
                     "path": {"type": "string"},
                     "old_string": {"type": "string"},
                     "new_string": {"type": "string"},
-                    "replace_all": {"type": "boolean", "description": "Replace every occurrence; default false."}
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence; default false."},
+                    "edits": {
+                        "type": "array",
+                        "description": "Several replacements for this file, used instead of old_string and new_string.",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": {"type": "string"},
+                                "new_string": {"type": "string"},
+                                "replace_all": {"type": "boolean"}
+                            },
+                            "required": ["old_string", "new_string"]
+                        }
+                    }
                 },
-                "required": ["path", "old_string", "new_string"]
+                "required": ["path"]
             }),
         }, ToolImpl::EditFile)
 }
@@ -85,32 +99,130 @@ pub(in crate::tools) fn write_file(args: &Value) -> ToolOutcome {
     }
 }
 
+/// One requested replacement.
+struct Edit<'a> {
+    old: &'a str,
+    new: &'a str,
+    replace_all: bool,
+}
+
+impl<'a> Edit<'a> {
+    fn parse(args: &'a Value) -> Result<Self, String> {
+        let text = |key: &str| str_arg(args, key).map_err(|error| error.content);
+        let edit = Edit {
+            old: text("old_string")?,
+            new: text("new_string")?,
+            replace_all: match args.get("replace_all") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return Err("'replace_all' must be a boolean".into()),
+            },
+        };
+        if edit.old.is_empty() {
+            return Err("old_string must not be empty".into());
+        }
+        if edit.old == edit.new {
+            return Err("old_string and new_string are identical; nothing to change".into());
+        }
+        Ok(edit)
+    }
+}
+
+/// The replacements a call asks for: its top-level strings, or its `edits`.
+fn parse_edits(args: &Value) -> Result<Vec<Edit<'_>>, String> {
+    // Some models fill in every field of a schema, so a null, empty, or blank
+    // value means the field is not in use.
+    let edits = args
+        .get("edits")
+        .filter(|edits| !edits.is_null() && edits.as_array().is_none_or(|edits| !edits.is_empty()));
+    let Some(edits) = edits else {
+        return Edit::parse(args).map(|edit| vec![edit]);
+    };
+    let filled = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    };
+    if filled("old_string") || filled("new_string") {
+        return Err("use either old_string and new_string or edits, not both".into());
+    }
+    let edits = edits
+        .as_array()
+        .ok_or("'edits' must be a non-empty array")?;
+    edits
+        .iter()
+        .enumerate()
+        .map(|(index, edit)| {
+            Edit::parse(edit).map_err(|error| {
+                format!(
+                    "edit {} of {}: {error}; no edits were applied",
+                    index + 1,
+                    edits.len()
+                )
+            })
+        })
+        .collect()
+}
+
+/// What one replacement did to the text.
+struct Applied {
+    lines: Vec<usize>,
+    crlf: bool,
+    /// Where the new text ends when it replaced a single match, for reporting
+    /// the range it now covers.
+    end_line: Option<usize>,
+    deleted: bool,
+}
+
+fn apply_edit(text: &str, edit: &Edit<'_>, path: &str) -> Result<(String, Applied), String> {
+    let (old_string, new_string, crlf) = match_line_endings(text, edit.old, edit.new);
+    let count = text.matches(old_string.as_ref()).count();
+    if count == 0 {
+        return Err(format!(
+            "old_string not found in {path}; {}",
+            not_found_hint(text, &old_string)
+        ));
+    }
+    if count > 1 && !edit.replace_all {
+        return Err(format!(
+            "old_string appears {count} times in {path} (lines {}); add surrounding context to make it unique, or set replace_all",
+            line_list(&match_lines(text, &old_string))
+        ));
+    }
+    let (updated, lines) = replace_matches(text, &old_string, &new_string);
+    let end_line = (count == 1)
+        .then(|| lines[0] + new_string.trim_end_matches('\n').matches('\n').count())
+        .filter(|end| *end > lines[0]);
+    Ok((
+        updated,
+        Applied {
+            lines,
+            crlf,
+            end_line,
+            deleted: new_string.is_empty(),
+        },
+    ))
+}
+
+/// Where one edit landed, as line numbers at the time it was applied.
+fn applied_location(applied: &Applied) -> String {
+    match applied.end_line {
+        Some(end) => format!("{}-{end}", applied.lines[0]),
+        None => line_list(&applied.lines),
+    }
+}
+
 pub(in crate::tools) fn edit_file(args: &Value) -> ToolOutcome {
     let path = match str_arg(args, "path") {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let old_string = match str_arg(args, "old_string") {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let new_string = match str_arg(args, "new_string") {
-        Ok(s) => s,
-        Err(e) => return e,
-    };
-    let replace_all = match args.get("replace_all") {
-        None => false,
-        Some(Value::Bool(value)) => *value,
-        Some(_) => return ToolOutcome::error("'replace_all' must be a boolean"),
+    let edits = match parse_edits(args) {
+        Ok(edits) => edits,
+        Err(error) => return ToolOutcome::error(error),
     };
     if let Err(error) = reject_device(path) {
         return ToolOutcome::error(error);
-    }
-    if old_string.is_empty() {
-        return ToolOutcome::error("old_string must not be empty");
-    }
-    if old_string == new_string {
-        return ToolOutcome::error("old_string and new_string are identical; nothing to change");
     }
     match std::fs::metadata(path) {
         Ok(metadata) if metadata.len() > MAX_EDIT_FILE_BYTES => {
@@ -125,38 +237,58 @@ pub(in crate::tools) fn edit_file(args: &Value) -> ToolOutcome {
         Ok(t) => t,
         Err(e) => return ToolOutcome::error(format!("cannot read {path}: {e}")),
     };
-    let (old_string, new_string, crlf) = match_line_endings(&text, old_string, new_string);
-    let count = text.matches(old_string.as_ref()).count();
-    if count == 0 {
-        return ToolOutcome::error(format!(
-            "old_string not found in {path}; {}",
-            not_found_hint(&text, &old_string)
-        ));
+    // Nothing is written until every edit has applied, so a failure part way
+    // leaves the file as the model last read it.
+    let total = edits.len();
+    let mut current = text;
+    let mut applied_edits = Vec::with_capacity(total);
+    for (index, edit) in edits.iter().enumerate() {
+        match apply_edit(&current, edit, path) {
+            Ok((updated, applied)) => {
+                current = updated;
+                applied_edits.push(applied);
+            }
+            Err(error) if total > 1 => {
+                let numbering = if index > 0 {
+                    " Any line numbers above count the earlier edits in this batch."
+                } else {
+                    ""
+                };
+                return ToolOutcome::error(format!(
+                    "edit {} of {total}: {error}; no edits were applied.{numbering}",
+                    index + 1
+                ));
+            }
+            Err(error) => return ToolOutcome::error(error),
+        }
     }
-    if count > 1 && !replace_all {
-        return ToolOutcome::error(format!(
-            "old_string appears {count} times in {path} (lines {}); add surrounding context to make it unique, or set replace_all",
-            line_list(&match_lines(&text, &old_string))
-        ));
-    }
-    let (updated, lines) = replace_matches(&text, &old_string, &new_string);
-    if let Err(e) = write_atomically(Path::new(path), updated.as_bytes()) {
+    if let Err(e) = write_atomically(Path::new(path), current.as_bytes()) {
         return ToolOutcome::error(format!("cannot write {path}: {e}"));
     }
-    let mut message = if count > 1 {
-        format!(
-            "edited {path} ({count} replacements at lines {})",
-            line_list(&lines)
-        )
-    } else if new_string.is_empty() {
-        format!("edited {path} (deleted text at line {})", lines[0])
-    } else {
-        let end = lines[0] + new_string.trim_end_matches('\n').matches('\n').count();
-        if end > lines[0] {
-            format!("edited {path} (lines {}-{end})", lines[0])
+    let crlf = applied_edits.iter().any(|applied| applied.crlf);
+    let mut message = if let [applied] = applied_edits.as_slice() {
+        if applied.lines.len() > 1 {
+            format!(
+                "edited {path} ({} replacements at lines {})",
+                applied.lines.len(),
+                line_list(&applied.lines)
+            )
+        } else if applied.deleted {
+            format!("edited {path} (deleted text at line {})", applied.lines[0])
+        } else if applied.end_line.is_some() {
+            format!("edited {path} (lines {})", applied_location(applied))
         } else {
-            format!("edited {path} (line {})", lines[0])
+            format!("edited {path} (line {})", applied.lines[0])
         }
+    } else {
+        format!(
+            "edited {path} ({total} edits at lines {}); each line number is from when that edit applied",
+            applied_edits
+                .iter()
+                .map(applied_location)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
     if crlf {
         message.push_str("; matched CRLF line endings");
@@ -310,11 +442,24 @@ fn replace_through_temporary(
 }
 
 /// Files with CRLF line endings rarely match model text, which uses `\n`.
+fn uses_only_crlf(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.contains("\r\n")
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| *byte != b'\n' || (index > 0 && bytes[index - 1] == b'\r'))
+}
+
 fn match_line_endings<'a>(
     text: &str,
     old: &'a str,
     new: &'a str,
 ) -> (Cow<'a, str>, Cow<'a, str>, bool) {
+    // New lines added to a file that uses CRLF throughout keep its line endings.
+    if !old.contains('\n') && new.contains('\n') && !new.contains('\r') && uses_only_crlf(text) {
+        return (old.into(), new.replace('\n', "\r\n").into(), true);
+    }
     if !text.contains("\r\n") || !old.contains('\n') || old.contains('\r') || text.contains(old) {
         return (old.into(), new.into(), false);
     }
@@ -436,6 +581,177 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path)?, "aaa yyy aaa");
         let _ = std::fs::remove_file(&path);
         Ok(())
+    }
+
+    #[test]
+    fn several_edits_apply_in_order_and_report_each_location() {
+        let root = TestDir::new();
+        let path = root.write("batch.rs", "fn a() {}\nfn b() {}\nfn c() {}\n");
+        let out = edit_file(&json!({"path": path, "edits": [
+            {"old_string": "fn a() {}", "new_string": "fn a() {\n    one();\n}"},
+            // Sees the text the first edit left behind.
+            {"old_string": "one();", "new_string": "two();"},
+            {"old_string": "fn", "new_string": "pub fn", "replace_all": true},
+        ]}));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "pub fn a() {\n    two();\n}\npub fn b() {}\npub fn c() {}\n"
+        );
+        assert!(
+            out.content.contains("(3 edits at lines 1-3, 2, 1, 4, 5)"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn a_failed_edit_leaves_the_whole_batch_unwritten() {
+        let root = TestDir::new();
+        let original = "alpha\nbeta\nbeta\n";
+        let path = root.write("atomic.txt", original);
+        for (edits, expected) in [
+            (
+                json!([{"old_string": "alpha", "new_string": "A"}, {"old_string": "gone", "new_string": "B"}]),
+                "edit 2 of 2: old_string not found",
+            ),
+            (
+                json!([{"old_string": "alpha", "new_string": "A"}, {"old_string": "beta", "new_string": "B"}]),
+                "edit 2 of 2: old_string appears 2 times",
+            ),
+            (
+                json!([{"old_string": "alpha", "new_string": "A"}, {"old_string": "", "new_string": "B"}]),
+                "edit 2 of 2: old_string must not be empty",
+            ),
+            (
+                json!([{"old_string": "alpha", "new_string": "alpha"}]),
+                "edit 1 of 1: old_string and new_string are identical",
+            ),
+            (
+                json!([{"old_string": "alpha"}]),
+                "edit 1 of 1: missing required",
+            ),
+        ] {
+            let out = edit_file(&json!({"path": path, "edits": edits}));
+            assert!(out.is_error, "{expected}");
+            assert!(out.content.contains(expected), "{}", out.content);
+            assert!(
+                out.content.contains("no edits were applied"),
+                "{}",
+                out.content
+            );
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), original);
+        }
+    }
+
+    #[test]
+    fn fields_a_model_filled_in_without_using_them_do_not_fail_the_call() {
+        let root = TestDir::new();
+        for (args, expected) in [
+            (
+                json!({"old_string": "alpha", "new_string": "one", "edits": null}),
+                "one\n",
+            ),
+            (
+                json!({"old_string": "alpha", "new_string": "two", "edits": []}),
+                "two\n",
+            ),
+            (
+                json!({"old_string": "", "new_string": "", "edits": [{"old_string": "alpha", "new_string": "three"}]}),
+                "three\n",
+            ),
+            (
+                json!({"old_string": null, "new_string": null, "edits": [{"old_string": "alpha", "new_string": "four"}]}),
+                "four\n",
+            ),
+        ] {
+            let path = root.write("filled.txt", "alpha\n");
+            let mut call = args.clone();
+            call["path"] = json!(path);
+            let out = edit_file(&call);
+            assert!(!out.is_error, "{}", out.content);
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), expected);
+        }
+    }
+
+    #[test]
+    fn batch_line_numbers_say_what_they_count() {
+        let root = TestDir::new();
+        let path = root.write("numbers.txt", "a\nb\ndup\nc\ndup\n");
+        let failed = edit_file(&json!({"path": path, "edits": [
+            {"old_string": "a", "new_string": "a\nnew\nnew"},
+            {"old_string": "dup", "new_string": "x"},
+        ]}));
+        assert!(failed.is_error);
+        assert!(
+            failed.content.contains("count the earlier edits"),
+            "{}",
+            failed.content
+        );
+        let first_fails = edit_file(&json!({"path": path, "edits": [
+            {"old_string": "dup", "new_string": "x"},
+            {"old_string": "a", "new_string": "z"},
+        ]}));
+        assert!(first_fails.is_error);
+        assert!(
+            !first_fails.content.contains("count the earlier"),
+            "{}",
+            first_fails.content
+        );
+
+        let done = edit_file(&json!({"path": path, "edits": [
+            {"old_string": "a", "new_string": "A"},
+            {"old_string": "b", "new_string": "B"},
+        ]}));
+        assert!(
+            done.content.contains("from when that edit applied"),
+            "{}",
+            done.content
+        );
+    }
+
+    #[test]
+    fn new_lines_in_a_crlf_file_keep_its_line_endings() {
+        let root = TestDir::new();
+        let path = root.write("crlf.txt", "one\r\ntwo\r\n");
+        let out =
+            edit_file(&json!({"path": path, "old_string": "one", "new_string": "one\nextra"}));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "one\r\nextra\r\ntwo\r\n"
+        );
+        assert!(out.content.contains("CRLF"), "{}", out.content);
+
+        // A file that mixes endings is left to what was written.
+        let mixed = root.write("mixed.txt", "one\r\ntwo\nthree\r\n");
+        edit_file(&json!({"path": mixed, "old_string": "one", "new_string": "one\nextra"}));
+        assert_eq!(
+            std::fs::read_to_string(&mixed).expect("read"),
+            "one\nextra\r\ntwo\nthree\r\n"
+        );
+        // A plain file is untouched by any of this.
+        let plain = root.write("plain.txt", "one\ntwo\n");
+        edit_file(&json!({"path": plain, "old_string": "one", "new_string": "one\nextra"}));
+        assert_eq!(
+            std::fs::read_to_string(&plain).expect("read"),
+            "one\nextra\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn a_call_uses_old_string_or_edits_but_not_both() {
+        let root = TestDir::new();
+        let path = root.write("either.txt", "alpha\n");
+        for args in [
+            json!({"path": path, "edits": [], }),
+            json!({"path": path, "edits": "alpha"}),
+            json!({"path": path, "old_string": "alpha", "new_string": "b", "edits": [{"old_string": "alpha", "new_string": "c"}]}),
+            json!({"path": path}),
+        ] {
+            assert!(edit_file(&args).is_error, "{args}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "alpha\n");
     }
 
     #[test]

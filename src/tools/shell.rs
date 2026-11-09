@@ -159,7 +159,14 @@ pub(super) fn execute_with_path(
     };
     match super::exec::run_with_timeout(cmd, None, timeout) {
         Ok(result) => {
-            let (content, is_error) = super::exec::render_result(&result, timeout);
+            let (mut content, is_error) = super::exec::render_result(&result, timeout);
+            if result.timed_out {
+                content.push_str(if background.is_some() {
+                    ". Run it again with a longer timeout_secs, or with background=true and read it with shell_output."
+                } else {
+                    ". Run it again with a longer timeout_secs."
+                });
+            }
             ToolOutcome {
                 content,
                 images: Vec::new(),
@@ -282,6 +289,23 @@ mod tests {
     use crate::background::{
         BackgroundId, BackgroundSnapshot, BackgroundStatus, LogChunk, OutputStream,
     };
+
+    #[test]
+    fn timeouts_say_how_to_run_the_command_again() {
+        let out = execute(
+            &json!({"command": "echo started; sleep 30", "timeout_secs": 1}),
+            None,
+        );
+        assert!(out.is_error);
+        assert!(out.content.contains("started"), "{}", out.content);
+        assert!(
+            out.content.contains("longer timeout_secs"),
+            "{}",
+            out.content
+        );
+        // Children have no background mode, so it must not be suggested.
+        assert!(!out.content.contains("background=true"), "{}", out.content);
+    }
 
     #[test]
     fn shell_builtin_reports_exit_code() {

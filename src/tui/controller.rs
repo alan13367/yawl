@@ -292,6 +292,8 @@ impl<'scope, 'env, R: Read> Controller<'scope, 'env, R> {
         }
         self.state.question = None;
         self.draw()?;
+        // Tool time is recorded after the last request of an interrupted turn.
+        self.state.usage = agent.usage();
         hand_back_busy_changes(agent, &mut self.state, &job.active_config);
         match outcome {
             JobOutcome::Turn(result) => self.finish_turn(agent, result),

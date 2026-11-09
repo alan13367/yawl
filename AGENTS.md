@@ -18,7 +18,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/agent.rs`: `Agent` facade: one `run(TurnRequest)` entry point for every kind of turn, plus session, undo, and config operations
 - `src/agent/conversation.rs`, `events.rs`: conversation state over a session (a file for the main agent, memory-only for subagents), session switching, undo, and streamed turn events
 - `src/agent/conversation/turn.rs`, `conversation/step.rs`: the turn lifecycle (`TurnRequest`, preamble, per-step preparation, provider request with retries, tool execution, compaction) and one model step (`classify` plus one handler per step kind)
-- `src/agent/conversation/goal.rs`, `conversation/plan.rs`, `conversation/steer.rs`, `conversation/recovery.rs`, `conversation/context.rs`: goal and planning helpers, live steering, undo and tool-result recovery, and context estimates
+- `src/agent/conversation/goal.rs`, `conversation/plan.rs`, `conversation/steer.rs`, `conversation/recovery.rs`, `conversation/context.rs`, `conversation/verify.rs`: goal and planning helpers, live steering, undo and tool-result recovery, context estimates, and the `verify_command` check at the end of a turn
 - `src/prompt.rs`: compact system prompt, skill catalog, and `AGENTS.md` instruction injection
 - `src/provider/mod.rs`: stable provider facade and re-exports
 - `src/provider/types.rs`, `streaming.rs`, `resolution.rs`, `http.rs`: provider-neutral protocol, retries, provider selection, and SSE/HTTP support
@@ -68,15 +68,17 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/tools/shell.rs`: foreground/background shell schemas and execution
 - `src/tools/files.rs`: native file-tool facade with shared argument, cancellation, and no-follow open helpers
 - `src/tools/files/read.rs`, `files/write.rs`, `files/discovery.rs`: `read_file` whole, line-page, byte-page, and image reads; `write_file` and `edit_file`; restricted-child `list_files` and `search_files`. `files/open.rs` opens files for reading without blocking on FIFOs or devices or following a final symlink, and `files/test_support.rs` holds shared test fixtures
-- `src/tools/git.rs`: fixed read-only Git inspection for restricted children
+- `src/tools/git.rs`: fixed read-only Git inspection for restricted children, and the settings that stop Git running a repository's own filter commands
 - `src/tools/mode.rs`: goal and plan single-call mode entries
 - `src/tools/orchestration.rs`: subagent spawn/send/wait/cancel/list entries and dispatch
 - `src/tools/skills.rs`: `read_skill` entry and execution
+- `src/tools/verify.rs`: runs `verify_command` and says which paths are documents it can ignore
 - `src/tools/exec.rs`: the one child-process runner (tools, Git inspection, the Git dashboard, and `/undo` checkpoints): process trees, deadlines, cancellation, head/tail output capture, and `shell_command`, which builds every shell invocation
 - `src/tools/exec/unix.rs`, `exec/windows.rs`, `exec/git_bash.rs`: sessions and process groups with nonblocking pipes; Job Objects, suspended starts, and `PeekNamedPipe` polling; and Git for Windows `bash.exe` discovery and command-line quoting
 - `src/tools/planning_shell.rs`, `src/tools/user_input.rs`: gated planning inspection and interactive question broker
 - `src/tools/web.rs`: web tool facade with the shared HTTP agent, bounded body reads, cancellation, and untrusted-content delimiters
-- `src/tools/web/search.rs`, `web/fetch.rs`, `web/html.rs`: DuckDuckGo, Brave, and Firecrawl search backends; page fetch with inline limits and saved full pages; HTML-to-Markdown extraction with bounded concurrency. `web/test_support.rs` holds local HTTP test fixtures
+- `src/tools/web/search.rs`, `web/fetch.rs`, `web/html.rs`: `web_search` arguments, the backend chain, page reading, and the result format; page fetch with inline limits and saved full pages; HTML-to-Markdown extraction with bounded concurrency. `web/test_support.rs` holds local HTTP test fixtures
+- `src/tools/web/search/duckduckgo.rs`, `search/backends.rs`, `search/pace.rs`, `search/cache.rs`, `search/quality.rs`, `search/passages.rs`: the DuckDuckGo page; SearXNG, Brave, and Firecrawl APIs; DuckDuckGo spacing and cooldowns shared across processes through a state file; the in-memory answer cache; result deduplication, domain filtering, and source spread; and BM25 passage selection for read pages
 - `src/subagent/manager.rs`: subagent capacity, execution, waiting, and delivery facade
 - `src/subagent/manager/capacity.rs`, `manager/execution.rs`, `manager/waiting.rs`, `manager/delivery.rs`, `manager/validation.rs`: admission and queueing, worker threads, blocking observers, deferred results, and input validation
 - `src/subagent/manager/format.rs`: snapshot and deferred-result presentation
@@ -87,7 +89,7 @@ Never spawn subagents if not explicitly requested by the user.
 - `src/skills.rs`, `src/trust.rs`, `src/image.rs`: skill discovery, project skill trust, and image input
 - `src/text.rs`: terminal-safe text: the one rule for which characters (controls and bidirectional overrides) must not reach the terminal, and `json_line`, which escapes them in machine-readable output
 - `src/session.rs`, `src/session/state.rs`: append-only session logs that own the conversation history. Every change is an event written first and then applied by `SessionState::apply`, the one reducer replay also uses
-- `src/session/recovery.rs`, `src/session/plans.rs`, `src/session/index.rs`, `src/compaction.rs`, `src/checkpoint.rs`: recovery records, saved plan revisions and implementation handoffs, session-list metadata caching, compaction summaries, and `/undo` working-tree snapshots
+- `src/session/recovery.rs`, `src/session/plans.rs`, `src/session/index.rs`, `src/compaction.rs`, `src/checkpoint.rs`: recovery records, saved plan revisions and implementation handoffs, session-list metadata caching, compaction summaries and old tool-output shortening, and `/undo` pre-images of the files the file tools touch, with a report of what else changed
 - `README.md`: user-facing behavior, contracts, and a concise architecture map
 
 Most tests live in `#[cfg(test)]` modules beside their implementation. TUI cross-module tests use focused `*_tests.rs` modules under `src/tui/` so production visibility stays narrow. `src/test_support.rs` holds crate-wide test helpers (unique temp directories and local HTTP request and response writers), and `src/tui/test_support.rs` holds the agent fixture shared by TUI tests. Git unit tests follow their owning child modules; `src/tui/git/test_support.rs` contains shared test-only repository helpers, and `src/tui/git_tests.rs` covers dashboard behavior across children.

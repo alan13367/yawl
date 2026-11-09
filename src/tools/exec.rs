@@ -98,9 +98,6 @@ pub fn render_result(result: &ExecResult, timeout: Duration) -> (String, bool) {
     if result.interrupted {
         return ("[interrupted by user]".to_string(), true);
     }
-    if result.timed_out {
-        return (format!("tool timed out after {}s", timeout.as_secs()), true);
-    }
     let mut out = result.stdout.clone();
     if !result.stderr.trim().is_empty() {
         if !out.is_empty() && !out.ends_with('\n') {
@@ -108,6 +105,14 @@ pub fn render_result(result: &ExecResult, timeout: Duration) -> (String, bool) {
         }
         out.push_str("[stderr]\n");
         out.push_str(result.stderr.trim_end());
+    }
+    if result.timed_out {
+        // What it printed first is often why it hung, or how far it got.
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("tool timed out after {}s", timeout.as_secs()));
+        return (out, true);
     }
     if result.status == Some(0) {
         return (out, false);
@@ -372,6 +377,22 @@ mod tests {
         let r = run_with_timeout(sh("sleep 30 & wait"), None, Duration::from_millis(200))?;
         assert!(r.timed_out);
         assert!(start.elapsed() < Duration::from_secs(5));
+        Ok(())
+    }
+
+    #[test]
+    fn a_timed_out_command_keeps_what_it_printed() -> std::io::Result<()> {
+        let timeout = Duration::from_secs(1);
+        let r = run_with_timeout(
+            sh("echo progress; echo warning >&2; sleep 30"),
+            None,
+            timeout,
+        )?;
+        let (rendered, is_error) = render_result(&r, timeout);
+        assert!(is_error);
+        assert!(rendered.starts_with("progress\n"), "{rendered}");
+        assert!(rendered.contains("[stderr]\nwarning"), "{rendered}");
+        assert!(rendered.ends_with("tool timed out after 1s"), "{rendered}");
         Ok(())
     }
 

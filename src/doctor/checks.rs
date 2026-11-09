@@ -37,9 +37,12 @@ const KNOWN_KEYS: &[&str] = &[
     "compact_threshold",
     "web_browsing",
     "web_search_provider",
+    "web_search_fallback",
     "web_fetch_max_chars",
     "brave_api_key",
     "firecrawl_api_key",
+    "searxng_url",
+    "verify_command",
     "subagents",
     "max_subagents",
     "subagent_model",
@@ -247,12 +250,26 @@ fn semantic_checks(
     {
         findings.push(error(
             area,
-            "web_search_provider must be duckduckgo, brave, or firecrawl".into(),
+            "web_search_provider must be duckduckgo, brave, firecrawl, or searxng".into(),
             Some(set(
                 path,
                 ["web_search_provider"],
                 json!(config::WebSearchProvider::DuckDuckGo.as_str()),
             )),
+        ));
+    }
+    if let Some(url) = map.get("searxng_url").and_then(Value::as_str)
+        && !url.trim_start().starts_with('$')
+        && !url.starts_with("http://")
+        && !url.starts_with("https://")
+    {
+        findings.push(error(
+            area,
+            "searxng_url must be an http or https URL".into(),
+            Some(Fix::RemoveKey {
+                path: path.to_path_buf(),
+                keys: vec!["searxng_url".into()],
+            }),
         ));
     }
     if let Some(theme) = map.get("theme").and_then(Value::as_str)
@@ -487,6 +504,7 @@ fn check_env_references(
         "openai_api_key",
         "brave_api_key",
         "firecrawl_api_key",
+        "searxng_url",
     ] {
         if let Some(value) = map.get(key).and_then(Value::as_str) {
             check(vec![key], value);
@@ -705,8 +723,8 @@ fn cross_checks(
     if config.project_config_restricted() {
         findings.push(info(
             "project config",
-            "project provider endpoints, base URLs, and credentials apply only after the project \
-             is trusted; run with --trust-project or answer the trust prompt"
+            "project provider endpoints, base URLs, credentials, and verify commands apply only \
+             after the project is trusted; run with --trust-project or answer the trust prompt"
                 .into(),
         ));
         // Diagnose routing as a trusted run would see it.
@@ -740,6 +758,9 @@ fn cross_checks(
                 config.firecrawl_api_key.as_deref(),
                 "firecrawl_api_key",
             ),
+            config::WebSearchProvider::SearXng => {
+                missing_web_key("SEARXNG_URL", config.searxng_url.as_deref(), "searxng_url")
+            }
         };
         if let Some(message) = missing {
             findings.push(warning("web search", message, None));
@@ -1056,7 +1077,7 @@ mod tests {
             "max_tokens must be a positive integer",
             "compact_threshold must be between 0.1 and 0.99",
             "unsupported reasoning effort 'extreme'",
-            "web_search_provider must be duckduckgo, brave, or firecrawl",
+            "web_search_provider must be duckduckgo, brave, firecrawl, or searxng",
             "theme must be auto, dark, or light",
             "web_fetch_max_chars must be between 1 and 50000",
             "setup must be",

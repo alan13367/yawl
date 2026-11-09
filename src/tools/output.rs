@@ -37,6 +37,31 @@ pub(super) fn save(directory: &Path, content: &str) -> std::io::Result<PathBuf> 
     save_artifact(directory, "output", "txt", content)
 }
 
+/// Removes saved tool output older than `max_age`. Only files this module
+/// named are touched, and anything that cannot be removed is left alone.
+pub(crate) fn remove_expired(directory: &Path, max_age: std::time::Duration) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let saved_by_us = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("output-") && name.ends_with(".txt"));
+        let expired = entry
+            .metadata()
+            .ok()
+            .filter(fs::Metadata::is_file)
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > max_age);
+        if saved_by_us && expired {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Writes `content` to a new owner-only file named
 /// `{prefix}-{pid}-{nanos}-{sequence}.{extension}` in `directory` and returns
 /// its absolute path. Existing files are never replaced, and a failed write
@@ -102,6 +127,26 @@ mod tests {
             .unwrap()
             .path();
         assert_eq!(fs::read_to_string(path).unwrap(), original);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn only_old_saved_output_expires() {
+        let directory = crate::test_support::unique_temp_dir("output-expiry");
+        fs::create_dir_all(&directory).unwrap();
+        let saved = save(&directory, "recent").unwrap();
+        let other = directory.join("notes.txt");
+        fs::write(&other, "not ours").unwrap();
+
+        remove_expired(&directory, std::time::Duration::from_secs(3600));
+        assert!(saved.exists(), "recent output must stay");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        remove_expired(&directory, std::time::Duration::from_millis(1));
+        assert!(!saved.exists(), "old output must go");
+        assert!(other.exists(), "only files this module named are removed");
+
+        remove_expired(&directory.join("missing"), std::time::Duration::ZERO);
         fs::remove_dir_all(directory).unwrap();
     }
 

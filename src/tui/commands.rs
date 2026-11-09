@@ -457,6 +457,18 @@ pub(super) fn activate_picker_action(
                 );
             }
         }
+        PickerAction::SetWebSearchFallback(enabled) => {
+            if apply_config_change(agent, ConfigChange::WebSearchFallback(enabled), state) {
+                open_settings_location(
+                    agent,
+                    state,
+                    SettingsLocation {
+                        category: SettingsCategory::Web,
+                        item: SettingsItem::WebSearchFallback,
+                    },
+                );
+            }
+        }
         PickerAction::SetSubagents(enabled) => {
             if apply_config_change(agent, ConfigChange::Subagents(enabled), state) {
                 open_settings_location(

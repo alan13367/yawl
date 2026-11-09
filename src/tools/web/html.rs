@@ -140,7 +140,10 @@ fn extract_html_inner(body: &str, page_url: &str) -> Result<(Option<String>, Str
     render_element(root, &mut output, 0, &render);
     let output = cleanup_markdown(&output);
     if output.is_empty() {
-        Err("the fetched HTML page did not contain readable content".into())
+        Err(
+            "the fetched HTML page did not contain readable content; it may need JavaScript, which web_fetch cannot run. Use a different source."
+                .into(),
+        )
     } else {
         Ok((title, output))
     }
@@ -389,7 +392,7 @@ fn code_language(pre: ElementRef<'_>) -> String {
 
 /// Resolves `href` against the absolute `base` URL. Returns `None` for
 /// same-page fragments and non-HTTP schemes such as `mailto:`.
-fn resolve_link(base: &str, href: &str) -> Option<String> {
+pub(super) fn resolve_link(base: &str, href: &str) -> Option<String> {
     let href = href.trim();
     if href.is_empty() || href.starts_with('#') {
         return None;

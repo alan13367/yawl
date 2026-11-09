@@ -64,9 +64,12 @@ impl Config {
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
             web_browsing: false,
             web_search_provider: WebSearchProvider::DuckDuckGo,
+            web_search_fallback: true,
             web_fetch_max_chars: DEFAULT_WEB_FETCH_MAX_CHARS,
             brave_api_key: None,
             firecrawl_api_key: None,
+            searxng_url: None,
+            verify_command: None,
             subagents: false,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
             subagent_model: DEFAULT_SUBAGENT_MODEL.to_string(),
@@ -104,6 +107,28 @@ impl Config {
         }
         self.project_config_restricted = false;
         Ok(())
+    }
+
+    /// The command a project file withheld until the project is trusted.
+    pub(crate) fn project_verify_command(&self) -> Option<String> {
+        if !self.project_config_restricted {
+            return None;
+        }
+        read_config_file(&self.project_config_path())
+            .ok()
+            .flatten()?
+            .verify_command
+            .filter(|command| !command.trim().is_empty())
+    }
+
+    /// Whether a project file withheld anything besides its verify command. A
+    /// file that cannot be read now is assumed to, since it was restricted.
+    pub(crate) fn project_has_provider_settings(&self) -> bool {
+        self.project_config_restricted
+            && read_config_file(&self.project_config_path())
+                .ok()
+                .flatten()
+                .is_none_or(|file| file.has_provider_settings())
     }
 
     pub(crate) fn reload(&self) -> Result<Config, Error> {
@@ -196,6 +221,9 @@ impl Config {
         if let Some(value) = file.web_search_provider {
             self.web_search_provider = value.parse().map_err(Error::Config)?;
         }
+        if let Some(value) = file.web_search_fallback {
+            self.web_search_fallback = value;
+        }
         if let Some(value) = file.web_fetch_max_chars {
             self.web_fetch_max_chars =
                 validate_bounded(value, 1, MAX_WEB_FETCH_MAX_CHARS, "web_fetch_max_chars")?;
@@ -205,6 +233,12 @@ impl Config {
         }
         if let Some(value) = file.firecrawl_api_key {
             self.firecrawl_api_key = (!value.trim().is_empty()).then_some(value);
+        }
+        if let Some(value) = file.searxng_url {
+            self.searxng_url = (!value.trim().is_empty()).then_some(value);
+        }
+        if let Some(value) = file.verify_command {
+            self.verify_command = (!value.trim().is_empty()).then_some(value);
         }
         if let Some(value) = file.subagents {
             self.subagents = value;
@@ -699,20 +733,27 @@ mod tests {
         )?;
         std::fs::write(
             project.join("config.json"),
-            r#"{"web_search_provider":"firecrawl","web_fetch_max_chars":25000,"firecrawl_api_key":"$FIRECRAWL_KEY"}"#,
+            r#"{"web_search_provider":"firecrawl","web_search_fallback":false,"web_fetch_max_chars":25000,"firecrawl_api_key":"$FIRECRAWL_KEY","searxng_url":"http://project.test","verify_command":"cargo check"}"#,
         )?;
 
         let mut config = Config::load_from(home, project)?;
         assert!(config.web_browsing);
         assert_eq!(config.web_search_provider, WebSearchProvider::Firecrawl);
+        assert!(!config.web_search_fallback);
         assert_eq!(config.web_fetch_max_chars, 25_000);
         assert_eq!(config.brave_api_key.as_deref(), Some("global-key"));
-        // A project credential is withheld until the project is trusted.
+        // A project credential, search address, or command is withheld until
+        // the project is trusted, so a clone cannot redirect searches or run
+        // anything.
         assert!(config.project_config_restricted());
         assert_eq!(config.firecrawl_api_key, None);
+        assert_eq!(config.searxng_url, None);
+        assert_eq!(config.verify_command, None);
 
         config.apply_project_trusted_config()?;
         assert_eq!(config.firecrawl_api_key.as_deref(), Some("$FIRECRAWL_KEY"));
+        assert_eq!(config.searxng_url.as_deref(), Some("http://project.test"));
+        assert_eq!(config.verify_command.as_deref(), Some("cargo check"));
         assert!(!config.project_config_restricted());
         let _ = std::fs::remove_dir_all(root);
         Ok(())

@@ -74,6 +74,7 @@ Standard output is exactly one JSON object:
 - `text` is yawl's final answer. It is the part to read, summarize, or act on.
 - `edited_files` lists the files yawl's own file tools changed. Changes made through shell commands are not listed, so run `git status` or `git diff` to see everything that changed.
 - `error` is `{kind, message, hint}` when the run failed.
+- `verify` is `{runs, passed}` when the project's `verify_command` ran, otherwise null. A run that ends with it failing exits with code 1 and `error.kind` `verify`, even if `text` says the work is done.
 - Standard error carries warnings for people; you can ignore it.
 
 Treat `text` as another agent's claims, not as facts. Verify important claims, especially "tests pass", before you report them to the user.

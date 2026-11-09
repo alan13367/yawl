@@ -26,8 +26,8 @@ pub(super) fn entry() -> ToolEntry {
                     "path": {"type": "string", "description": "File path (absolute or relative to cwd)"},
                     "start_line": {"type": "integer", "minimum": 1, "description": "1-based first line; continue with returned next_start_line."},
                     "line_count": {"type": "integer", "minimum": 1, "maximum": MAX_LINE_COUNT, "description": "Lines to return; default 400."},
-                    "offset": {"type": "integer", "minimum": 0, "description": "Byte offset; continue with returned next_offset."},
-                    "limit": {"type": "integer", "minimum": 4, "maximum": 32768, "description": "Byte page size; default 16384."}
+                    "offset": {"type": "integer", "minimum": 0, "description": "Byte offset; continue with returned next_offset. With start_line or line_count it means a line number."},
+                    "limit": {"type": "integer", "minimum": 4, "maximum": 32768, "description": "Byte page size; default 16384. With start_line or line_count it means a number of lines."}
                 },
                 "required": ["path"]
             }),
@@ -91,10 +91,7 @@ fn page(args: &Value) -> Result<Value, String> {
 pub(in crate::tools) fn read_file_for_model(args: &Value, supports_images: bool) -> ToolOutcome {
     let byte_page = args.get("offset").is_some() || args.get("limit").is_some();
     let line_page = args.get("start_line").is_some() || args.get("line_count").is_some();
-    if byte_page && line_page {
-        return ToolOutcome::error("use either start_line/line_count or offset/limit, not both");
-    }
-    if byte_page {
+    if byte_page && !line_page {
         return read_page(args);
     }
     let path = match str_arg(args, "path") {
@@ -108,14 +105,29 @@ pub(in crate::tools) fn read_file_for_model(args: &Value, supports_images: bool)
     if !line_page {
         return read_bounded_file(path, file, supports_images);
     }
-    let range = number(args, "start_line", 1, 1, u64::MAX).and_then(|start| {
-        number(args, "line_count", DEFAULT_LINE_COUNT, 1, MAX_LINE_COUNT)
-            .map(|count| (start, count))
-    });
-    match range.and_then(|(start, count)| line_page_text(BufReader::new(file), start, count)) {
+    match line_range(args)
+        .and_then(|(start, count)| line_page_text(BufReader::new(file), start, count))
+    {
         Ok(text) => ToolOutcome::ok(text),
         Err(error) => ToolOutcome::error(format!("cannot read {path}: {error}")),
     }
+}
+
+/// The lines a page asks for. Models often mix the two paging styles, such as
+/// `start_line` with `limit`, and a call that names a line means lines, so the
+/// byte arguments stand in for whichever line argument is missing.
+fn line_range(args: &Value) -> Result<(u64, u64), String> {
+    let start = if args.get("start_line").is_some() {
+        number(args, "start_line", 1, 1, u64::MAX)?
+    } else {
+        number(args, "offset", 1, 0, u64::MAX)?.max(1)
+    };
+    let count = if args.get("line_count").is_some() {
+        number(args, "line_count", DEFAULT_LINE_COUNT, 1, MAX_LINE_COUNT)?
+    } else {
+        number(args, "limit", DEFAULT_LINE_COUNT, 1, u64::MAX)?.min(MAX_LINE_COUNT)
+    };
+    Ok((start, count))
 }
 
 fn open_for_read(path: &Path) -> std::io::Result<File> {
@@ -368,6 +380,24 @@ mod tests {
     }
 
     #[test]
+    fn mixed_paging_arguments_mean_lines() {
+        let limit_for_count = line_range(&json!({"start_line": 10, "limit": 5}));
+        assert_eq!(limit_for_count, Ok((10, 5)));
+        let offset_for_start = line_range(&json!({"offset": 7, "line_count": 3}));
+        assert_eq!(offset_for_start, Ok((7, 3)));
+        let zero_offset = line_range(&json!({"offset": 0, "line_count": 3}));
+        assert_eq!(zero_offset, Ok((1, 3)));
+        // A byte-sized limit is not an error, only more lines than one page.
+        let large_limit = line_range(&json!({"start_line": 1, "limit": 16384}));
+        assert_eq!(large_limit, Ok((1, MAX_LINE_COUNT)));
+        // The line arguments win when both styles name the same thing.
+        let both =
+            line_range(&json!({"start_line": 2, "offset": 900, "line_count": 4, "limit": 900}));
+        assert_eq!(both, Ok((2, 4)));
+        assert!(line_range(&json!({"line_count": MAX_LINE_COUNT + 1})).is_err());
+    }
+
+    #[test]
     fn line_range_reads_are_numbered_and_report_the_next_line() {
         let root = TestDir::new();
         let text = (1..=10)
@@ -386,8 +416,11 @@ mod tests {
         let past = read(json!({"path": path, "start_line": 11}));
         assert!(past.is_error);
         assert!(past.content.contains("past the end of the file (10 lines)"));
-        let mixed = read(json!({"path": path, "start_line": 1, "offset": 0}));
-        assert!(mixed.is_error);
+        let mixed = read(json!({"path": path, "start_line": 9, "offset": 0, "limit": 1}));
+        assert_eq!(
+            mixed.content,
+            "lines 9-9; next_start_line=10\n\n9\tline 9\n"
+        );
         let empty = root.write("empty.txt", "");
         assert_eq!(
             read(json!({"path": empty, "start_line": 1})).content,

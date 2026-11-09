@@ -102,6 +102,9 @@ pub enum MessageControl {
     /// The portable summary that replaced compacted history. Built at
     /// replay from compaction events, so session logs never store it.
     Summary,
+    /// Output of a failed `verify_command`, sent back to the model so it can
+    /// fix what it changed.
+    VerifyFailure,
 }
 
 /// Metadata for one synthetic background result delivered to the parent.
@@ -175,6 +178,9 @@ pub struct Message {
     /// Marks goal and steering control messages. Older session files omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<MessageControl>,
+    /// How long a tool took to run. Older session files omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 const REASONING_DURATIONS_TYPE: &str = "yawl.reasoning_durations.v1";
@@ -264,6 +270,7 @@ impl Message {
             provider_data_model: None,
             subagent_results: Vec::new(),
             control: None,
+            duration_ms: None,
         }
     }
 
@@ -315,6 +322,11 @@ impl Message {
         self
     }
 
+    pub fn with_duration(mut self, duration: Option<std::time::Duration>) -> Message {
+        self.duration_ms = duration.map(|duration| duration.as_millis() as u64);
+        self
+    }
+
     pub fn is_hidden_control(&self) -> bool {
         matches!(
             self.control,
@@ -323,6 +335,7 @@ impl Message {
                     | MessageControl::PlanContinuation
                     | MessageControl::PlanImplementationStart
                     | MessageControl::PlanPhase
+                    | MessageControl::VerifyFailure
             )
         )
     }
@@ -481,6 +494,10 @@ pub struct UsageSummary {
     /// providers with different reporting support.
     pub cache_reported_input_tokens: u64,
     pub cache_resets: u64,
+    /// Time spent waiting for model responses, including retries.
+    pub model_ms: u64,
+    /// Time tools spent running. Waiting for the user's answers is left out.
+    pub tool_ms: u64,
 }
 
 impl UsageSummary {
@@ -492,6 +509,22 @@ impl UsageSummary {
                 .saturating_add(usage.input_tokens);
         }
         self.tokens = self.tokens.saturating_add(usage);
+    }
+
+    /// Adds the time and cache resets `current` has beyond `previous`, both
+    /// from one conversation's running totals. These happen between requests,
+    /// so they reach another summary only this way.
+    pub fn absorb_new_time_and_resets(&mut self, previous: Self, current: Self) {
+        let new = |now: u64, then: u64| now.saturating_sub(then);
+        self.model_ms = self
+            .model_ms
+            .saturating_add(new(current.model_ms, previous.model_ms));
+        self.tool_ms = self
+            .tool_ms
+            .saturating_add(new(current.tool_ms, previous.tool_ms));
+        self.cache_resets = self
+            .cache_resets
+            .saturating_add(new(current.cache_resets, previous.cache_resets));
     }
 
     pub fn record_cache_reset(&mut self) {

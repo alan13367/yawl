@@ -159,6 +159,9 @@ pub(super) fn run(
     };
     let outcome = match result {
         _ if timed_out => Outcome::TimedOut,
+        // A script that trusts the exit code must not read a failing check as
+        // success, whatever the model said at the end.
+        Ok(true) if sink.report.verify_failed => Outcome::Failed(Failure::verify_failed()),
         Ok(true) => Outcome::Completed,
         Ok(false) | Err(Error::Interrupted) => Outcome::Interrupted,
         Err(error) => Outcome::Failed(exit_status::classify_error(&error)),
@@ -280,6 +283,10 @@ fn result_json(
         "context": context,
         "tool_calls": report.tool_calls,
         "tool_errors": report.tool_errors,
+        "verify": (report.verify_runs > 0).then(|| json!({
+            "runs": report.verify_runs,
+            "passed": !report.verify_failed,
+        })),
         "edited_files": report.edited_files,
         "warnings": report.warnings,
     })

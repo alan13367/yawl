@@ -368,6 +368,7 @@ impl Conversation {
         self.questions.begin_turn();
         self.plan_ready_this_turn = false;
         self.latest_turn_result.clear();
+        self.begin_verify_tracking(resuming);
         if !resuming {
             self.append_turn_input(input, mode, sink)?;
         }
@@ -395,10 +396,10 @@ impl Conversation {
             // already made run first instead of wasting their output.
             self.inject_pending_steers(sink)?;
             let step = self.prepare_step(progress.mode, sink, resolve_provider)?;
-            let Some(out) = self.request_step(&step, sink, resolve_provider)? else {
+            let Some((out, waited)) = self.request_step(&step, sink, resolve_provider)? else {
                 return Ok(false);
             };
-            let (assistant, calls) = self.record_step(out, &step, &mut progress, sink)?;
+            let (assistant, calls) = self.record_step(out, waited, &step, &mut progress, sink)?;
             let kind = step::classify(progress.mode, &calls);
             match self.handle_step(kind, assistant, &calls, &step, &mut progress, sink)? {
                 Flow::Continue => {}
@@ -546,6 +547,7 @@ impl Conversation {
         let specs = registry.specs();
         let system = self.system_prompt(&registry, mode == TurnMode::Goal, mode == TurnMode::Init);
         let overhead = context::prompt_tokens(&system, registry.tool_tokens());
+        self.maybe_shorten_tool_outputs(overhead)?;
         self.maybe_compact(overhead, sink, resolve_provider)?;
 
         let active_plan = self.session.active_plan();
@@ -579,13 +581,15 @@ impl Conversation {
 
     /// Streams one response, compacting once on a context-limit error and
     /// asking again with a corrective note after a malformed tool call.
-    /// `None` means the user interrupted.
+    /// `None` means the user interrupted. Also returns the time spent waiting
+    /// for the model, which leaves out any compaction in between: that records
+    /// its own requests.
     fn request_step<F>(
         &mut self,
         step: &Step,
         sink: &mut dyn FnMut(TurnEvent<'_>),
         resolve_provider: &mut F,
-    ) -> Result<Option<TurnOutput>, Error>
+    ) -> Result<Option<(TurnOutput, std::time::Duration)>, Error>
     where
         F: FnMut(&str, &Config) -> Result<(Box<dyn provider::Provider>, String), Error>,
     {
@@ -594,6 +598,7 @@ impl Conversation {
         // persisted, so the session keeps the clean transcript.
         let mut corrected: Option<Vec<Message>> = None;
         let mut tool_call_retries = 0;
+        let mut waited = std::time::Duration::ZERO;
         let out = loop {
             let request = provider::Request {
                 model: &step.bare_model,
@@ -605,7 +610,9 @@ impl Conversation {
                 prompt_cache_control: true,
                 prompt_cache_key: Some(self.prompt_cache_key()),
             };
+            let started = std::time::Instant::now();
             let response = stream_turn(step.provider.as_ref(), &request, &mut forward(sink));
+            waited += started.elapsed();
             match response {
                 Ok(out) => break out,
                 Err(Error::Interrupted) => return Ok(None),
@@ -643,7 +650,7 @@ impl Conversation {
         if crate::cancellation::interrupted() {
             return Ok(None);
         }
-        Ok(Some(out))
+        Ok(Some((out, waited)))
     }
 
     /// Records the response's usage and context and builds its assistant
@@ -651,11 +658,12 @@ impl Conversation {
     fn record_step(
         &mut self,
         out: TurnOutput,
+        duration: std::time::Duration,
         step: &Step,
         progress: &mut TurnProgress,
         sink: &mut dyn FnMut(TurnEvent<'_>),
     ) -> Result<(Message, Vec<ToolCall>), Error> {
-        self.session.append_usage(out.usage)?;
+        self.session.append_timed_usage(out.usage, duration)?;
         self.record_context(out.usage.total_tokens(), step.overhead)?;
         progress.budget.made = progress.budget.made.saturating_add(1);
         sink(TurnEvent::Usage {
@@ -768,21 +776,30 @@ impl Conversation {
                         path.display()
                     )));
                 }
-                let outcome = registry.execute(
-                    &call.name,
-                    &call.arguments,
-                    self.session_id(),
-                    crate::model::supports_images(&self.config, &self.model),
-                );
+                let started = std::time::Instant::now();
+                let outcome = registry
+                    .repeated_skill(&call.name, &call.arguments, self.session.messages())
+                    .unwrap_or_else(|| {
+                        registry.execute(
+                            &call.name,
+                            &call.arguments,
+                            self.session_id(),
+                            crate::model::supports_images(&self.config, &self.model),
+                        )
+                    });
                 sink(TurnEvent::ToolEnd {
                     name: &call.name,
                     output: &outcome.content,
                     images: &outcome.images,
                     is_error: outcome.is_error,
                 });
+                self.note_tool_ran(&call.name, &call.arguments, outcome.is_error);
                 if interrupted() {
                     aborted = true;
                 }
+                // Time spent waiting for the user is not the tool's.
+                let duration =
+                    (call.name != crate::tools::USER_INPUT_TOOL_NAME).then(|| started.elapsed());
                 Message::tool_result_with_images(
                     &call.id,
                     &call.name,
@@ -790,6 +807,7 @@ impl Conversation {
                     outcome.images,
                     outcome.is_error,
                 )
+                .with_duration(duration)
             };
             if let Err(error) = self.save_tool_result(result) {
                 self.pending_tool_results
@@ -865,6 +883,7 @@ impl Conversation {
         if deliveries.is_empty() {
             return Ok(false);
         }
+        self.note_subagent_results();
         let backup = deliveries.clone();
         let mut results = Vec::new();
         for delivery in deliveries {
@@ -893,6 +912,35 @@ impl Conversation {
             return Err(error);
         }
         Ok(true)
+    }
+
+    /// Frees context by cutting down old tool output, which costs no model
+    /// request and loses less than a summary. The full output stays in the
+    /// session log, and large results are also saved where the model can
+    /// read them again.
+    pub(super) fn maybe_shorten_tool_outputs(&mut self, overhead: u64) -> Result<(), Error> {
+        if !self.config.auto_compact {
+            return Ok(());
+        }
+        let context = self.estimated_context(overhead);
+        let Some(plan) = compaction::shorten_plan(
+            self.session.messages(),
+            context,
+            self.context_window(),
+            self.config.compact_threshold,
+        ) else {
+            return Ok(());
+        };
+        self.session
+            .append_tool_outputs_shortened(plan.before, compaction::SHORTEN_KEEP_CHARS)?;
+        // Anchoring the estimate here keeps it from falling back to a fresh
+        // byte count, which could trigger compaction this same step.
+        // The saving is estimated from bytes, and output that compresses well
+        // costs far fewer tokens, so it can exceed the measured context.
+        let remaining = context
+            .saturating_sub(plan.reclaimed_tokens)
+            .max(overhead.max(1));
+        self.record_context(remaining, overhead)
     }
 
     fn maybe_compact<F>(
@@ -982,6 +1030,7 @@ impl Conversation {
             self.set_reasoning_effort(effort)?;
         }
         let (provider, bare_model) = resolve_provider(&self.model, &self.config)?;
+        let started = std::time::Instant::now();
         let (summary, range, summary_usage) = compaction::summarize(
             provider.as_ref(),
             &bare_model,
@@ -991,7 +1040,8 @@ impl Conversation {
             // Summarizer output is not user-facing; swallow its deltas.
             &mut |_| {},
         )?;
-        self.session.append_usage(summary_usage)?;
+        self.session
+            .append_timed_usage(summary_usage, started.elapsed())?;
 
         let remote_request = provider::Request {
             model: &bare_model,
@@ -1003,6 +1053,7 @@ impl Conversation {
             prompt_cache_control: true,
             prompt_cache_key: Some(self.prompt_cache_key()),
         };
+        let started = std::time::Instant::now();
         let remote = match provider.compact(&remote_request) {
             Ok(output) => output,
             Err(_) if crate::cancellation::interrupted() => return Err(Error::Interrupted),
@@ -1015,7 +1066,8 @@ impl Conversation {
         };
         let mut request_usage = summary_usage;
         let (provider_data, provider_data_model) = if let Some(remote) = remote {
-            self.session.append_usage(remote.usage)?;
+            self.session
+                .append_timed_usage(remote.usage, started.elapsed())?;
             request_usage = request_usage.saturating_add(remote.usage);
             (remote.replacement_history, Some(bare_model.clone()))
         } else {

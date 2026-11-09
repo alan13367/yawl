@@ -7,6 +7,7 @@ mod recovery;
 mod steer;
 mod step;
 mod turn;
+mod verify;
 
 use std::time::Duration;
 
@@ -148,6 +149,8 @@ pub(crate) struct Conversation {
     print_mode: bool,
     steers: SteerInbox,
     questions: QuestionBroker,
+    /// What the current turn changed, for `verify_command`.
+    verify: verify::VerifyState,
 }
 
 impl Conversation {
@@ -202,6 +205,7 @@ impl Conversation {
             latest_turn_result: String::new(),
             plan_ready_this_turn: false,
             unfinished_mode: None,
+            verify: verify::VerifyState::default(),
             catalog_cache: CatalogCache::default(),
             reported_warnings: Default::default(),
             cancellation: CancellationToken::default(),

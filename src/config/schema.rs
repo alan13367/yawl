@@ -47,9 +47,12 @@ pub(super) struct ConfigFile {
     pub(super) compact_threshold: Option<f64>,
     pub(super) web_browsing: Option<bool>,
     pub(super) web_search_provider: Option<String>,
+    pub(super) web_search_fallback: Option<bool>,
     pub(super) web_fetch_max_chars: Option<usize>,
     pub(super) brave_api_key: Option<String>,
     pub(super) firecrawl_api_key: Option<String>,
+    pub(super) searxng_url: Option<String>,
+    pub(super) verify_command: Option<String>,
     pub(super) subagents: Option<bool>,
     pub(super) max_subagents: Option<usize>,
     pub(super) subagent_model: Option<String>,
@@ -65,17 +68,25 @@ pub(super) struct ConfigFile {
 }
 
 impl ConfigFile {
-    /// True when the file sets a key that can route model or search traffic
-    /// or carry a credential. A project file may only set these once the
-    /// project is trusted, so a cloned repository cannot point Yawl at its
-    /// own endpoint or resolve `$ENV` references into its headers.
+    /// True when the file sets a key that can route model or search traffic,
+    /// carry a credential, or run a command. A project file may only set these
+    /// once the project is trusted, so a cloned repository cannot point Yawl
+    /// at its own endpoint, resolve `$ENV` references into its headers, or run
+    /// anything.
     pub(super) fn has_trust_gated_fields(&self) -> bool {
+        self.verify_command.is_some() || self.has_provider_settings()
+    }
+
+    /// The trust-gated fields other than `verify_command`, which the trust
+    /// question names on its own.
+    pub(super) fn has_provider_settings(&self) -> bool {
         self.anthropic_base_url.is_some()
             || self.openai_base_url.is_some()
             || self.anthropic_api_key.is_some()
             || self.openai_api_key.is_some()
             || self.brave_api_key.is_some()
             || self.firecrawl_api_key.is_some()
+            || self.searxng_url.is_some()
             || self.providers.is_some()
     }
 
@@ -88,6 +99,8 @@ impl ConfigFile {
         self.openai_api_key = None;
         self.brave_api_key = None;
         self.firecrawl_api_key = None;
+        self.searxng_url = None;
+        self.verify_command = None;
         self.providers = None;
         self
     }
@@ -103,6 +116,8 @@ impl ConfigFile {
             openai_api_key: self.openai_api_key.take(),
             brave_api_key: self.brave_api_key.take(),
             firecrawl_api_key: self.firecrawl_api_key.take(),
+            searxng_url: self.searxng_url.take(),
+            verify_command: self.verify_command.take(),
             providers: self.providers.take(),
             ..ConfigFile::default()
         }

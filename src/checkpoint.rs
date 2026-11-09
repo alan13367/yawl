@@ -6,10 +6,13 @@
 //! copied. If the working directory is a git repo, the user's HEAD is also
 //! recorded so `/undo` can reset it when the agent moved it.
 
+use std::collections::HashSet;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +20,11 @@ use crate::error::Error;
 
 const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const STORE_VERSION: u32 = 1;
+/// How many unrestored files an undo names before summarizing the rest.
+const MAX_UNRESTORED_LISTED: usize = 8;
+const UNDO_REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const FINGERPRINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const STATUS_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -41,6 +49,9 @@ struct Overlay {
 struct TurnRecord {
     user_head: UserHead,
     overlays: Vec<Overlay>,
+    /// When the turn began, in Unix milliseconds. Older stores omit it.
+    #[serde(default)]
+    started_unix_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +136,10 @@ impl Checkpoints {
         let record = TurnRecord {
             user_head: read_user_head(&self.work_tree),
             overlays: Vec::new(),
+            started_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
         };
         self.stack.push(record);
         persist_stack(&self.dir, &self.stack)
@@ -307,7 +322,82 @@ impl Checkpoints {
                 None => detail,
             });
         }
+        if let Some(detail) = self.unrestored_changes(turn) {
+            report.warning = Some(match report.warning.take() {
+                Some(existing) => format!("{existing}; {detail}"),
+                None => detail,
+            });
+        }
         Ok(report)
+    }
+
+    /// Names files that changed since the undone turn began and were not
+    /// restored. Undo restores only what it saved first, and it must not touch
+    /// anything else: a file that changed could as easily be the user's own
+    /// edit. Deleted files leave nothing to date, so they are not named.
+    fn unrestored_changes(&self, turn: &TurnRecord) -> Option<String> {
+        if turn.started_unix_ms == 0 {
+            return None;
+        }
+        let root = git_root(&self.work_tree).ok()?;
+        let canonical =
+            |path: &Path| crate::paths::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let restored = turn
+            .overlays
+            .iter()
+            .map(|overlay| canonical(Path::new(&overlay.path)))
+            .collect::<HashSet<_>>();
+        // This runs on the interface thread, so a huge tree only costs the
+        // report: untracked directories stay whole and the wait is short.
+        let changed = changed_paths(&root, "normal", UNDO_REPORT_TIMEOUT)?
+            .into_iter()
+            .map(|(_, path)| path)
+            .filter(|path| {
+                let path = root.join(path);
+                !restored.contains(&canonical(&path)) && modified_since(&path, turn.started_unix_ms)
+            })
+            .collect::<Vec<_>>();
+        if changed.is_empty() {
+            return None;
+        }
+        let listed = changed[..changed.len().min(MAX_UNRESTORED_LISTED)]
+            .iter()
+            .map(|path| format!("`{path}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = changed.len().saturating_sub(MAX_UNRESTORED_LISTED);
+        let more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "These files have changed since that turn began and were not restored, because /undo only restores changes made with write_file and edit_file: {listed}{more}. Review them with git diff."
+        ))
+    }
+
+    /// A value that changes when the commit or the working tree's changed files
+    /// do, leaving out paths `ignored` rejects. `None` outside a Git repository.
+    pub(crate) fn work_fingerprint(&self, ignored: impl Fn(&Path) -> bool) -> Option<u64> {
+        let root = git_root(&self.work_tree).ok()?;
+        let mut hasher = DefaultHasher::new();
+        // A change that was also committed leaves a clean status behind.
+        user_git(&root, &["rev-parse", "--verify", "HEAD"])
+            .ok()
+            .hash(&mut hasher);
+        for (status, path) in changed_paths(&root, "all", FINGERPRINT_TIMEOUT)? {
+            if ignored(Path::new(&path)) {
+                continue;
+            }
+            status.hash(&mut hasher);
+            path.hash(&mut hasher);
+            // Status alone misses a further change to an already changed file.
+            if let Ok(metadata) = fs::symlink_metadata(root.join(&path)) {
+                metadata.len().hash(&mut hasher);
+                metadata.modified().ok().hash(&mut hasher);
+            }
+        }
+        Some(hasher.finish())
     }
 
     /// Idempotent cleanup after the session's undo event has committed.
@@ -327,6 +417,43 @@ impl Checkpoints {
         let _ = fs::remove_dir_all(self.dir.join("overlays").join(index.to_string()));
         Ok(())
     }
+}
+
+/// Files Git reports as changed under `root`, as status and path relative to
+/// the root. A clean filter the repository's own config defines would run here,
+/// so those are turned off.
+fn changed_paths(
+    root: &Path,
+    untracked: &str,
+    timeout: std::time::Duration,
+) -> Option<Vec<(String, String)>> {
+    let mut command = git_command(root);
+    for setting in crate::tools::git::repository_filters_off(root) {
+        command.args(["-c", &setting]);
+    }
+    command.args([
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--no-renames",
+        &format!("--untracked-files={untracked}"),
+    ]);
+    let status = run_git_within(&mut command, timeout, STATUS_OUTPUT_LIMIT).ok()?;
+    Some(
+        status
+            .split('\0')
+            .filter_map(|entry| Some((entry.get(..2)?.to_string(), entry.get(3..)?.to_string())))
+            .filter(|(_, path)| !path.is_empty())
+            .collect(),
+    )
+}
+
+fn modified_since(path: &Path, unix_ms: u64) -> bool {
+    fs::symlink_metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .is_some_and(|modified| modified.as_millis() as u64 >= unix_ms)
 }
 
 /// Path argument for `write_file` or `edit_file`, if present.
@@ -510,13 +637,31 @@ fn git_command(work_tree: &Path) -> Command {
 const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 fn run_git(cmd: &mut Command) -> Result<String, Error> {
+    run_git_keeping(cmd, GIT_TIMEOUT, crate::tools::exec::Keep::All)
+}
+
+/// Runs a query whose answer is optional: it gives up sooner and keeps only the
+/// start of very long output.
+fn run_git_within(
+    cmd: &mut Command,
+    timeout: std::time::Duration,
+    limit: usize,
+) -> Result<String, Error> {
+    run_git_keeping(cmd, timeout, crate::tools::exec::Keep::Head(limit))
+}
+
+fn run_git_keeping(
+    cmd: &mut Command,
+    timeout: std::time::Duration,
+    stdout: crate::tools::exec::Keep,
+) -> Result<String, Error> {
     let command = std::mem::replace(cmd, Command::new("git"));
     let result = crate::tools::exec::run(
         command,
         crate::tools::exec::RunOptions {
             stdin: None,
-            timeout: Some(GIT_TIMEOUT),
-            stdout: crate::tools::exec::Keep::All,
+            timeout: Some(timeout),
+            stdout,
             stderr: crate::tools::exec::Keep::All,
         },
     )
@@ -533,7 +678,7 @@ fn run_git(cmd: &mut Command) -> Result<String, Error> {
     if result.timed_out {
         return Err(Error::Protocol(format!(
             "git timed out after {}s",
-            GIT_TIMEOUT.as_secs()
+            timeout.as_secs()
         )));
     }
     if result.status != Some(0) {
@@ -550,7 +695,6 @@ fn run_git(cmd: &mut Command) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -981,6 +1125,180 @@ mod tests {
             }
             other => panic!("expected recorded HEAD, got {other:?}"),
         }
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn undo_names_what_changed_outside_its_tracking_and_leaves_it_alone() -> Result<(), Error> {
+        if !git_available() {
+            return Ok(());
+        }
+        // Outside this repository, so its own changes are not reported.
+        let root = crate::test_support::unique_temp_dir("undo-unrestored");
+        let home = root.join("home");
+        let work = root.join("work");
+        fs::create_dir_all(&work)?;
+        write(&work.join("tracked.txt"), "v1");
+        write(&work.join("edited-by-shell.txt"), "v1");
+        user_git(&work, &["init", "--template="])?;
+        user_git(&work, &["add", "."])?;
+        commit(&work, "init")?;
+
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
+        checkpoints.snapshot()?;
+        checkpoints.remember_path(&work.join("tracked.txt"))?;
+        write(&work.join("tracked.txt"), "agent");
+        write(&work.join("edited-by-shell.txt"), "shell");
+        write(&work.join("created/by-shell.txt"), "shell");
+
+        let report = checkpoints.restore_last()?;
+        let warning = report.warning.expect("unrestored files are reported");
+        assert!(warning.contains("`edited-by-shell.txt`"), "{warning}");
+        assert!(warning.contains("`created/`"), "{warning}");
+        assert!(!warning.contains("`tracked.txt`"), "{warning}");
+        assert!(warning.contains("write_file and edit_file"), "{warning}");
+        // Named, not touched: this could as easily be the user's own edit.
+        assert_eq!(fs::read_to_string(work.join("tracked.txt"))?, "v1");
+        assert_eq!(
+            fs::read_to_string(work.join("edited-by-shell.txt"))?,
+            "shell"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn undo_stays_quiet_when_it_restored_everything_or_git_is_absent() -> Result<(), Error> {
+        // Not a repository, so there is nothing to compare.
+        let root = crate::test_support::unique_temp_dir("undo-quiet");
+        let home = root.join("home");
+        let work = root.join("work");
+        write(&work.join("note.txt"), "v1");
+        let mut checkpoints = Checkpoints::open(&home, "plain", work.clone());
+        checkpoints.snapshot()?;
+        write(&work.join("other.txt"), "changed");
+        assert_eq!(checkpoints.restore_last()?.warning, None);
+
+        if git_available() {
+            user_git(&work, &["init", "--template="])?;
+            user_git(&work, &["add", "."])?;
+            commit(&work, "init")?;
+            let mut checkpoints = Checkpoints::open(&home, "repo", work.clone());
+            checkpoints.snapshot()?;
+            checkpoints.remember_path(&work.join("note.txt"))?;
+            write(&work.join("note.txt"), "agent");
+            assert_eq!(checkpoints.restore_last()?.warning, None);
+        }
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn undo_does_not_blame_the_turn_for_edits_made_before_it_began() -> Result<(), Error> {
+        if !git_available() {
+            return Ok(());
+        }
+        let root = crate::test_support::unique_temp_dir("undo-before");
+        let home = root.join("home");
+        let work = root.join("work");
+        fs::create_dir_all(&work)?;
+        user_git(&work, &["init", "--template="])?;
+        write(&work.join("mine.rs"), "my own edit");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
+        checkpoints.snapshot()?;
+        assert_eq!(checkpoints.restore_last()?.warning, None);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn a_planted_filter_does_not_run_for_the_undo_report_or_the_fingerprint() -> Result<(), Error> {
+        if !git_available() {
+            return Ok(());
+        }
+        let root = crate::test_support::unique_temp_dir("undo-filter");
+        let home = root.join("home");
+        let work = root.join("work");
+        let marker = root.join("MARKER");
+        fs::create_dir_all(&work)?;
+        write(&work.join("a.txt"), "v1");
+        write(&work.join(".gitattributes"), "a.txt filter=evil\n");
+        user_git(&work, &["init", "--template="])?;
+        user_git(&work, &["add", "."])?;
+        commit(&work, "init")?;
+        let planted = format!("touch '{}'; cat", marker.display());
+        user_git(&work, &["config", "--local", "filter.evil.clean", &planted])?;
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
+        checkpoints.snapshot()?;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(&work.join("a.txt"), "changed");
+        assert!(checkpoints.work_fingerprint(|_| false).is_some());
+        checkpoints.restore_last()?;
+        assert!(!marker.exists(), "the planted filter ran");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn long_lists_of_unrestored_files_are_summarized() -> Result<(), Error> {
+        if !git_available() {
+            return Ok(());
+        }
+        let root = crate::test_support::unique_temp_dir("undo-many");
+        let home = root.join("home");
+        let work = root.join("work");
+        fs::create_dir_all(&work)?;
+        user_git(&work, &["init", "--template="])?;
+        let mut checkpoints = Checkpoints::open(&home, "sess", work.clone());
+        checkpoints.snapshot()?;
+        for index in 0..MAX_UNRESTORED_LISTED + 3 {
+            write(&work.join(format!("file{index:02}.txt")), "new");
+        }
+        let warning = checkpoints.restore_last()?.warning.expect("reported");
+        assert!(warning.contains("and 3 more"), "{warning}");
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprints_follow_changes_and_skip_ignored_paths() -> Result<(), Error> {
+        if !git_available() {
+            return Ok(());
+        }
+        let root = crate::test_support::unique_temp_dir("fingerprint");
+        let home = root.join("home");
+        let work = root.join("work");
+        let document = |path: &Path| path.extension().is_some_and(|ext| ext == "md");
+        fs::create_dir_all(&work)?;
+        let checkpoints = Checkpoints::open(&home, "sess", work.clone());
+        assert_eq!(checkpoints.work_fingerprint(document), None, "not a repo");
+
+        write(&work.join("code.rs"), "v1");
+        user_git(&work, &["init", "--template="])?;
+        user_git(&work, &["add", "."])?;
+        commit(&work, "init")?;
+        let clean = checkpoints.work_fingerprint(document);
+        assert!(clean.is_some());
+
+        write(&work.join("notes.md"), "ignored");
+        assert_eq!(checkpoints.work_fingerprint(document), clean);
+
+        write(&work.join("code.rs"), "v2");
+        let changed = checkpoints.work_fingerprint(document);
+        assert_ne!(changed, clean);
+
+        // Already changed, and changed again: only size and time can tell.
+        write(&work.join("code.rs"), "v2 and more");
+        let again = checkpoints.work_fingerprint(document);
+        assert_ne!(again, changed);
+
+        // A change that was committed leaves a clean status behind.
+        user_git(&work, &["add", "code.rs"])?;
+        commit(&work, "second")?;
+        assert_ne!(checkpoints.work_fingerprint(document), clean);
+        assert_ne!(checkpoints.work_fingerprint(document), again);
         let _ = fs::remove_dir_all(root);
         Ok(())
     }

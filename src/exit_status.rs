@@ -31,6 +31,16 @@ impl Failure {
         )
     }
 
+    /// The project's `verify_command` was still failing when the run ended.
+    pub(crate) fn verify_failed() -> Self {
+        failure(
+            "verify",
+            FAILURE,
+            "verify_command was still failing when the run ended".to_string(),
+            Some("the run's warnings and tool output say why"),
+        )
+    }
+
     /// `--timeout` expired before the run could start.
     pub(crate) fn timeout(message: impl Into<String>) -> Self {
         failure("timeout", TIMEOUT, message.into(), None)

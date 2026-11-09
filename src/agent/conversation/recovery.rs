@@ -49,6 +49,7 @@ impl Conversation {
             self.latest_turn_result.clear();
             self.plan_ready_this_turn = false;
             self.unfinished_mode = None;
+            self.verify = super::verify::VerifyState::default();
             restore
         };
         if let Some(checkpoints) = &mut self.services.checkpoints {

@@ -255,7 +255,7 @@ pub(crate) fn ask_project_trust(
     found: &[&str],
 ) -> Result<TrustAnswer, Error> {
     let mut surface = surface(config, Some(PickerAction::Choice(DENY)))?;
-    let mut page = trust_page(root, found);
+    let mut page = trust_page(root, found, config.project_verify_command().as_deref());
     match surface.choose(&mut page, &mut |_| false)? {
         PickerAction::Choice(index) => Ok(TRUST_ANSWERS
             .get(index)
@@ -265,7 +265,7 @@ pub(crate) fn ask_project_trust(
     }
 }
 
-fn trust_page(root: &Path, found: &[&str]) -> Page {
+fn trust_page(root: &Path, found: &[&str], verify_command: Option<&str>) -> Page {
     let path = crate::text::sanitize_line(
         &super::tool_view::home_relative(root, std::env::home_dir().as_deref()),
         crate::text::Tabs::Space,
@@ -273,6 +273,12 @@ fn trust_page(root: &Path, found: &[&str]) -> Page {
     let mut details = vec![path.clone()];
     if !found.is_empty() {
         details.push(format!("This project defines {}.", list(found)));
+    }
+    if let Some(command) = verify_command {
+        details.push(format!(
+            "Verify command: {}",
+            crate::text::sanitize_line(command, crate::text::Tabs::Space)
+        ));
     }
     details.push("Trusting lets them run with your credentials and network access.".into());
     let item = |label: &str, description: String, index: usize| PickerItem {
@@ -436,12 +442,29 @@ mod tests {
     }
 
     #[test]
+    fn the_trust_question_shows_the_command_a_project_would_run() {
+        let page = trust_page(
+            Path::new("/srv/app"),
+            &["a verify command it would run"],
+            Some("make test\x1b[2J"),
+        );
+        assert!(
+            page.backdrop.details[1].contains("a verify command it would run"),
+            "{:?}",
+            page.backdrop.details
+        );
+        let shown = &page.backdrop.details[2];
+        assert!(shown.contains("make test"), "{shown}");
+        assert!(!shown.contains('\x1b'), "{shown}");
+    }
+
+    #[test]
     fn trust_defaults_to_no_and_names_what_the_project_defines() {
         let mut script = Script {
             actions: vec![PickerAction::Choice(1)],
             titles: Vec::new(),
         };
-        let page = trust_page(Path::new("/srv/app\x1b[2J"), &["skills", "tools"]);
+        let page = trust_page(Path::new("/srv/app\x1b[2J"), &["skills", "tools"], None);
         assert_eq!(page.picker.selected, 2);
         assert!(!page.backdrop.details[0].contains('\x1b'));
         assert_eq!(

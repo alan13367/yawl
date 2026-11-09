@@ -250,8 +250,10 @@ impl Transcript {
             .and_then(|index| self.entries.get(index))
     }
 
+    /// An open search counts as focus so its selected match is marked, without
+    /// touching `focused`: closing the search restores what it found.
     pub(super) fn is_focused(&self) -> bool {
-        self.focused
+        self.focused || self.search.is_some()
     }
 
     pub(super) fn focus(&mut self) {
@@ -364,7 +366,6 @@ impl Transcript {
             .collect();
         self.search = Some(TranscriptSearch::open(corpus));
         self.viewer_open = false;
-        self.focused = true;
     }
 
     pub(super) fn close_search(&mut self) {
@@ -1035,6 +1036,30 @@ mod tests {
         transcript.focus();
         assert!(!transcript.is_focused());
         assert_eq!(transcript.selected_index(), None);
+    }
+
+    #[test]
+    fn closing_search_restores_the_focus_it_found() {
+        let mut transcript = Transcript::from_messages(&[crate::provider::Message::assistant(
+            "hello".into(),
+            Vec::new(),
+        )]);
+
+        transcript.open_search();
+        assert!(transcript.is_focused(), "search marks the selected match");
+        transcript.close_search();
+        assert!(
+            !transcript.is_focused(),
+            "the composer must get keys back when search opened from it"
+        );
+
+        transcript.focus();
+        transcript.open_search();
+        transcript.close_search();
+        assert!(
+            transcript.is_focused(),
+            "block navigation resumes when search opened from it"
+        );
     }
 
     #[test]

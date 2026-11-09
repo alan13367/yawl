@@ -144,6 +144,57 @@ fn inspect_at(args: &Value, cwd: &Path) -> ToolOutcome {
 /// The file that always reads as empty.
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
+/// `-c` settings that stop Git running the filter commands a repository's own
+/// config defines. A clean filter runs on `git status` and `git diff`, and
+/// unlike hooks there is no single switch for it, so each one is named. Filters
+/// from the user's own global config, such as Git LFS, keep working.
+///
+/// A blank filter means no filter, and `required` would otherwise make a blank
+/// one fatal.
+pub(crate) fn repository_filters_off(cwd: &Path) -> Vec<String> {
+    let mut command = Command::new("git");
+    command.current_dir(cwd);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    command.args([
+        "config",
+        "--show-scope",
+        "--name-only",
+        "-z",
+        "--get-regexp",
+        r"^filter\.",
+    ]);
+    let Ok(listed) = super::exec::run_with_timeout(command, None, Duration::from_secs(5)) else {
+        return Vec::new();
+    };
+    filters_off(&listed.stdout)
+}
+
+/// Reads `scope NUL name NUL` pairs from `git config --show-scope`.
+fn filters_off(listing: &str) -> Vec<String> {
+    let fields = listing.split('\0').collect::<Vec<_>>();
+    let (pairs, _) = fields.as_chunks::<2>();
+    pairs
+        .iter()
+        .filter(|[scope, _]| matches!(*scope, "local" | "worktree"))
+        .filter_map(|[_, name]| {
+            if name.ends_with(".required") {
+                Some(format!("{name}=false"))
+            } else if name.ends_with(".clean")
+                || name.ends_with(".smudge")
+                || name.ends_with(".process")
+            {
+                Some(format!("{name}="))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn inspection_command(cwd: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(cwd);
@@ -174,6 +225,65 @@ fn inspection_command(cwd: &Path) -> Command {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn only_filters_from_the_repository_itself_are_turned_off() {
+        let listing = "global\0filter.lfs.clean\0local\0filter.evil.clean\0local\0filter.evil.required\0worktree\0filter.w.process\0local\0filter.evil.description\0";
+        assert_eq!(
+            filters_off(listing),
+            [
+                "filter.evil.clean=",
+                "filter.evil.required=false",
+                "filter.w.process="
+            ]
+        );
+        assert!(filters_off("").is_empty());
+    }
+
+    #[test]
+    fn a_planted_clean_filter_does_not_run() {
+        let root = TestDir::new();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(root.path())
+                .args(args)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if !git(&["init", "--template="]) {
+            return;
+        }
+        let marker = root.path().join("MARKER");
+        fs::write(root.path().join("a.txt"), "one\n").unwrap();
+        fs::write(root.path().join(".gitattributes"), "a.txt filter=evil\n").unwrap();
+        assert!(git(&["add", ".gitattributes"]));
+        let planted = format!("touch '{}'; cat", marker.display());
+        assert!(git(&["config", "--local", "filter.evil.clean", &planted]));
+        assert!(git(&["config", "--local", "filter.evil.required", "true"]));
+        assert!(git(&["config", "--local", "include.path", "extra.config"]));
+        fs::write(
+            root.path().join(".git/extra.config"),
+            "[filter \"sneaky\"]\n\tclean = touch elsewhere\n",
+        )
+        .unwrap();
+
+        let off = repository_filters_off(root.path());
+        assert!(off.contains(&"filter.evil.clean=".to_string()), "{off:?}");
+        assert!(
+            off.contains(&"filter.sneaky.clean=".to_string()),
+            "included too: {off:?}"
+        );
+
+        let mut status = Command::new("git");
+        status.current_dir(root.path());
+        for setting in &off {
+            status.args(["-c", setting]);
+        }
+        status.args(["status", "--porcelain"]);
+        let output = status.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(!marker.exists(), "the planted filter ran");
+    }
 
     struct TestDir(std::path::PathBuf);
 

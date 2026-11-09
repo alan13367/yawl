@@ -49,8 +49,8 @@ pub(super) fn resolve(
             config.set_project_skills_trusted(false);
             eprintln!(
                 "warning: project-controlled settings under {} are not trusted; project skills, \
-                 tools, provider endpoints, and credentials from this repository are ignored. \
-                 Pass --trust-project to enable them for this invocation",
+                 tools, verify commands, provider endpoints, and credentials from this repository \
+                 are ignored. Pass --trust-project to enable them for this invocation",
                 root.display()
             );
             Ok(())
@@ -99,7 +99,10 @@ fn project_settings(config: &Config) -> Vec<&'static str> {
     if crate::tools::has_project_tools(config) {
         found.push("tools");
     }
-    if config.project_config_restricted() {
+    if config.project_verify_command().is_some() {
+        found.push("a verify command it would run");
+    }
+    if config.project_has_provider_settings() {
         found.push("provider settings");
     }
     found

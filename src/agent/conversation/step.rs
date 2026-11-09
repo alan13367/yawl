@@ -11,6 +11,7 @@ use super::Conversation;
 use super::goal;
 use super::plan::{self, FollowUpAction, ImplementationStatus};
 use super::turn::{Step, TurnMode, TurnProgress, plan_continuation};
+use super::verify::{Finish, Verification};
 use crate::agent::events::TurnEvent;
 
 /// Consecutive text-only replies a plan phase accepts before stopping the
@@ -161,8 +162,13 @@ impl Conversation {
             TurnMode::PlanImplement if plan::is_plan_implemented(call) => {
                 match plan::parse_implemented(&call.arguments) {
                     Ok((result, ImplementationStatus::Completed)) => {
-                        self.finish_plan_implemented(assistant, result, sink)?;
-                        return Ok(Flow::Finish(true));
+                        return match self.verify_changes(mode, Finish::Tool, sink) {
+                            Verification::Clear => {
+                                self.finish_plan_implemented(assistant, result, sink)?;
+                                Ok(Flow::Finish(true))
+                            }
+                            refused => self.refuse_finish(assistant, calls, refused, sink),
+                        };
                     }
                     Ok((result, ImplementationStatus::Blocked)) => {
                         self.finish_plan_blocked(assistant, result, sink)?;
@@ -190,8 +196,13 @@ impl Conversation {
         if let [call] = calls {
             match goal::parse_goal_complete_result(&call.arguments) {
                 Ok(result) => {
-                    self.finish_goal_complete(assistant, result, sink)?;
-                    return Ok(Flow::Finish(true));
+                    return match self.verify_changes(TurnMode::Goal, Finish::Tool, sink) {
+                        Verification::Clear => {
+                            self.finish_goal_complete(assistant, result, sink)?;
+                            Ok(Flow::Finish(true))
+                        }
+                        refused => self.refuse_finish(assistant, calls, refused, sink),
+                    };
                 }
                 Err(error) => {
                     self.persist_assistant(assistant, sink)?;
@@ -236,7 +247,42 @@ impl Conversation {
             self.append_plan_continuation(continuation)?;
             return Ok(Flow::Continue);
         }
-        Ok(Flow::Finish(true))
+        match self.verify_changes(mode, Finish::Reply, sink) {
+            Verification::Clear | Verification::Stop(_) => Ok(Flow::Finish(true)),
+            Verification::Failed(note) => {
+                self.append_input_message(
+                    Message::user(note).with_control(MessageControl::VerifyFailure),
+                )?;
+                Ok(Flow::Continue)
+            }
+            Verification::Interrupted => Ok(Flow::Finish(false)),
+        }
+    }
+
+    /// Answers a finishing tool the check would not let finish, keeping every
+    /// tool call paired with a result.
+    fn refuse_finish(
+        &mut self,
+        assistant: Message,
+        calls: &[ToolCall],
+        refused: Verification,
+        sink: &mut dyn FnMut(TurnEvent<'_>),
+    ) -> Result<Flow, Error> {
+        self.persist_assistant(assistant, sink)?;
+        match refused {
+            Verification::Failed(note) => {
+                self.reject_tool_calls(calls, &note)?;
+                Ok(Flow::Continue)
+            }
+            Verification::Stop(note) => {
+                self.reject_tool_calls(calls, &note)?;
+                Ok(Flow::Finish(true))
+            }
+            Verification::Interrupted | Verification::Clear => {
+                self.reject_tool_calls(calls, "[interrupted by user]")?;
+                Ok(Flow::Finish(false))
+            }
+        }
     }
 
     fn on_tools(

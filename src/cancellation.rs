@@ -67,6 +67,12 @@ impl Drop for ScopeGuard {
     }
 }
 
+/// The calling thread's token, for handing to threads it starts: each thread
+/// sees only the token it entered [`scope`] with.
+pub(crate) fn current_token() -> Option<CancellationToken> {
+    CURRENT_TOKEN.with_borrow(Clone::clone)
+}
+
 pub(crate) fn scope<T>(token: &CancellationToken, run: impl FnOnce() -> T) -> T {
     let previous = CURRENT_TOKEN.with_borrow_mut(|current| current.replace(token.clone()));
     let _guard = ScopeGuard(previous);

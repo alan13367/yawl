@@ -133,8 +133,9 @@ pub(super) fn render_call(
         )],
         "web_search" => vec![ToolLine::new(
             format!(
-                "Search web  \u{b7}  {}{status}",
-                string_arg(args, "query").unwrap_or("?")
+                "Search web  \u{b7}  {}{}{status}",
+                string_arg(args, "query").unwrap_or("?"),
+                web_search_filters(args)
             ),
             Tone::Header,
         )],
@@ -179,9 +180,24 @@ pub(super) fn render_call(
             )];
             let old = string_arg(args, "old_string");
             let new = string_arg(args, "new_string");
+            let mut diff = Vec::new();
             if old.is_some() || new.is_some() {
+                diff = edit_diff(old.unwrap_or_default(), new.unwrap_or_default());
+            }
+            let edits = args
+                .and_then(|args| args.get("edits"))
+                .and_then(Value::as_array);
+            for edit in edits.into_iter().flatten() {
+                if !diff.is_empty() {
+                    diff.push(ToolLine::new("", Tone::Output));
+                }
+                diff.extend(edit_diff(
+                    string_arg(Some(edit), "old_string").unwrap_or_default(),
+                    string_arg(Some(edit), "new_string").unwrap_or_default(),
+                ));
+            }
+            if !diff.is_empty() {
                 call.push(ToolLine::new("", Tone::Output));
-                let diff = edit_diff(old.unwrap_or_default(), new.unwrap_or_default());
                 call.extend(preview_lines(diff, CALL_PREVIEW_LINES, expanded, false));
             }
             call
@@ -452,6 +468,25 @@ fn string_arg<'a>(args: Option<&'a Value>, key: &str) -> Option<&'a str> {
     args?.get(key)?.as_str()
 }
 
+/// The optional `web_search` arguments worth seeing on the card's header.
+fn web_search_filters(args: Option<&Value>) -> String {
+    let mut filters = String::new();
+    if let Some(site) = string_arg(args, "site").filter(|site| !site.is_empty()) {
+        filters.push_str(&format!("  \u{b7}  {site}"));
+    }
+    if let Some(freshness) = string_arg(args, "freshness").filter(|value| !value.is_empty()) {
+        filters.push_str(&format!("  \u{b7}  past {freshness}"));
+    }
+    let read = args
+        .and_then(|args| args.get("read"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if read > 0 {
+        filters.push_str(&format!("  \u{b7}  read {read}"));
+    }
+    filters
+}
+
 pub(super) fn bool_arg(args: Option<&Value>, key: &str) -> Option<bool> {
     args?.get(key)?.as_bool()
 }
@@ -600,7 +635,11 @@ fn edit_location(output: &str) -> Option<String> {
         .or_else(|| detail.strip_prefix("deleted text at line "));
     match lines {
         Some(lines) => Some(format!(":{lines}")),
-        None if detail.contains(" replacements at lines ") => Some(format!(" ({detail})")),
+        None if detail.contains(" replacements at lines ")
+            || detail.contains(" edits at lines ") =>
+        {
+            Some(format!(" ({detail})"))
+        }
         None => None,
     }
 }

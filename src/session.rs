@@ -162,6 +162,15 @@ enum SessionEvent {
     /// Provider-reported usage for one successful model request.
     Usage {
         usage: TokenUsage,
+        /// How long the request took. Older logs omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
+    /// Tool outputs among the first `before` messages were cut down to
+    /// `keep_chars` from each end, to free context without a summary.
+    ToolOutputsShortened {
+        before: usize,
+        keep_chars: usize,
     },
 }
 
@@ -524,8 +533,34 @@ impl Session {
         self.state.usage
     }
 
+    /// Records usage for a model request together with how long it took.
+    pub(crate) fn append_timed_usage(
+        &mut self,
+        usage: TokenUsage,
+        duration: std::time::Duration,
+    ) -> Result<(), Error> {
+        self.record(SessionEvent::Usage {
+            usage,
+            duration_ms: Some(duration.as_millis() as u64),
+        })
+    }
+
+    /// Cuts tool outputs among the first `before` messages down to
+    /// `keep_chars` from each end.
+    pub(crate) fn append_tool_outputs_shortened(
+        &mut self,
+        before: usize,
+        keep_chars: usize,
+    ) -> Result<(), Error> {
+        self.record(SessionEvent::ToolOutputsShortened { before, keep_chars })
+    }
+
+    #[cfg(test)]
     pub(crate) fn append_usage(&mut self, usage: TokenUsage) -> Result<(), Error> {
-        self.record(SessionEvent::Usage { usage })
+        self.record(SessionEvent::Usage {
+            usage,
+            duration_ms: None,
+        })
     }
 
     /// Removes a session log from `dir`. Missing files are treated as success.
@@ -775,7 +810,7 @@ fn read_header(path: &Path) -> SessionHeader {
             Ok(SessionEvent::ModelSwitch { model }) => header.model = model,
             Ok(SessionEvent::Message { message }) => {
                 header.has_message = true;
-                if message.role == Role::User {
+                if message.role == Role::User && !message.is_hidden_control() {
                     let first = message.content.lines().next().unwrap_or("");
                     header.preview = crate::error::truncate(first, 60);
                 }

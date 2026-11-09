@@ -8,7 +8,7 @@ mod catalog;
 mod custom;
 pub mod exec;
 mod files;
-mod git;
+pub(crate) mod git;
 mod mode;
 mod orchestration;
 mod output;
@@ -17,6 +17,7 @@ mod registry;
 mod shell;
 mod skills;
 mod user_input;
+pub(crate) mod verify;
 mod web;
 
 use serde_json::Value;
@@ -24,10 +25,11 @@ use serde_json::Value;
 pub use catalog::CatalogCache;
 pub(crate) use custom::DEFINE_TOOL_NAME;
 pub use custom::has_project_tools;
-pub(crate) use output::save_artifact;
+pub(crate) use output::{remove_expired, save_artifact};
 pub use registry::{Registry, ToolOutcome};
 use registry::{ToolEntry, ToolImpl};
 pub(crate) use user_input::{QuestionBroker, QuestionSnapshot};
+pub(crate) use web::{holds_marked_web_content, neutralize_untrusted_delimiters};
 /// Short plain-language purposes for builtin tools named in restriction
 /// notices.
 fn capability(name: &str) -> Option<&'static str> {

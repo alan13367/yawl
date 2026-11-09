@@ -259,6 +259,14 @@ pub(in crate::tui) fn settings_category_picker_from(
                 ),
                 action: PickerAction::OpenWebSearchProviders,
             },
+            PickerItem {
+                label: "Search fallback".into(),
+                description: format!(
+                    "{} · Try other configured providers when one fails · Enter to toggle",
+                    on_off(config.web_search_fallback)
+                ),
+                action: PickerAction::SetWebSearchFallback(!config.web_search_fallback),
+            },
             edit(
                 SettingsItem::WebFetchMaxChars,
                 "Maximum fetched characters",
@@ -281,6 +289,15 @@ pub(in crate::tui) fn settings_category_picker_from(
                 action: PickerAction::EditSecretSetting {
                     key: "firecrawl_api_key".into(),
                     location: location(SettingsItem::FirecrawlApiKey),
+                },
+            },
+            PickerItem {
+                label: "SearXNG URL".into(),
+                description: web_key_status("SEARXNG_URL", config.searxng_url.as_deref()),
+                action: PickerAction::EditSetting {
+                    key: "searxng_url".into(),
+                    initial: config.searxng_url.clone().unwrap_or_default(),
+                    location: location(SettingsItem::SearxngUrl),
                 },
             },
         ],
@@ -388,6 +405,7 @@ fn web_search_provider_label(provider: WebSearchProvider) -> &'static str {
         WebSearchProvider::DuckDuckGo => "DuckDuckGo",
         WebSearchProvider::Firecrawl => "Firecrawl",
         WebSearchProvider::Brave => "Brave",
+        WebSearchProvider::SearXng => "SearXNG",
     }
 }
 
@@ -404,6 +422,10 @@ pub(in crate::tui) fn web_search_provider_picker(current: WebSearchProvider) -> 
         (
             WebSearchProvider::Brave,
             "Uses the configured Brave API key",
+        ),
+        (
+            WebSearchProvider::SearXng,
+            "Uses your own SearXNG instance, with no API key",
         ),
     ];
     let items = providers
@@ -558,9 +580,11 @@ fn settings_items(category: SettingsCategory) -> &'static [SettingsItem] {
         SettingsCategory::Web => &[
             SettingsItem::WebBrowsingEnabled,
             SettingsItem::WebSearchProvider,
+            SettingsItem::WebSearchFallback,
             SettingsItem::WebFetchMaxChars,
             SettingsItem::BraveApiKey,
             SettingsItem::FirecrawlApiKey,
+            SettingsItem::SearxngUrl,
         ],
         SettingsCategory::Subagents => &[
             SettingsItem::SubagentsEnabled,

@@ -663,6 +663,20 @@ mod tests {
             markdown::strip_ansi(&fetch.join("\n"))
                 .contains("Fetch web  ·  https://example.com/guide")
         );
+        let filtered = render(
+            "web_search",
+            r#"{"query":"ureq","site":"docs.rs","freshness":"week","read":2}"#,
+            "",
+            false,
+            false,
+            None,
+            80,
+            false,
+        );
+        assert!(
+            markdown::strip_ansi(&filtered.join("\n"))
+                .contains("Search web  ·  ureq  ·  docs.rs  ·  past week  ·  read 2")
+        );
     }
 
     #[test]
@@ -1174,6 +1188,31 @@ mod tests {
             header(all, "old_string not found in src/a.rs", true),
             "edit src/a.rs (all occurrences)  [error]"
         );
+        let batch = r#"{"path":"src/a.rs","edits":[{"old_string":"first old","new_string":"first new"},{"old_string":"second old","new_string":"second new"}]}"#;
+        assert_eq!(
+            header(
+                batch,
+                "edited src/a.rs (2 edits at lines 4, 9-10); each line number is from when that edit applied",
+                false
+            ),
+            "edit src/a.rs (2 edits at lines 4, 9-10)"
+        );
+        let batch_card = render(
+            "edit_file",
+            batch,
+            "edited src/a.rs (2 edits at lines 4, 9-10)",
+            false,
+            false,
+            None,
+            80,
+            true,
+        )
+        .iter()
+        .map(|line| markdown::strip_ansi(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(batch_card.contains("first new"), "{batch_card}");
+        assert!(batch_card.contains("second new"), "{batch_card}");
 
         let card = render(
             "edit_file",

@@ -77,12 +77,19 @@ pub struct Config {
     pub web_browsing: bool,
     /// Search service used by `web_search`.
     pub web_search_provider: WebSearchProvider,
+    /// Whether other configured search services may answer when the selected
+    /// one cannot.
+    pub web_search_fallback: bool,
     /// Maximum cleaned page characters returned by `web_fetch`.
     pub web_fetch_max_chars: usize,
     /// Brave key stored in config, used when `BRAVE_API_KEY` is unset.
     pub brave_api_key: Option<String>,
     /// Firecrawl key stored in config, used when `FIRECRAWL_API_KEY` is unset.
     pub firecrawl_api_key: Option<String>,
+    /// SearXNG address stored in config, used when `SEARXNG_URL` is unset.
+    pub searxng_url: Option<String>,
+    /// Shell command that must pass before a turn that changed files finishes.
+    pub verify_command: Option<String>,
     /// Whether model-facing subagent orchestration tools are enabled.
     pub subagents: bool,
     /// Maximum number of subagents that may own active worker slots.

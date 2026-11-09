@@ -167,10 +167,15 @@ pub(in crate::tui) fn settings(agent: &mut Agent, argument: &str, state: &mut Vi
             .map(ConfigChange::WebBrowsing),
         "web_search_provider" => one_value(
             &mut parts,
-            "usage: /settings web_search_provider duckduckgo|brave|firecrawl",
+            "usage: /settings web_search_provider duckduckgo|brave|firecrawl|searxng",
         )
         .and_then(|value| value.parse().map_err(Error::Config))
         .map(ConfigChange::WebSearchProvider),
+        "web_search_fallback" => {
+            one_value(&mut parts, "usage: /settings web_search_fallback on|off")
+                .and_then(parse_on_off)
+                .map(ConfigChange::WebSearchFallback)
+        }
         "web_fetch_max_chars" => {
             one_value(&mut parts, "usage: /settings web_fetch_max_chars NUMBER")
                 .and_then(|value| {
@@ -184,6 +189,8 @@ pub(in crate::tui) fn settings(agent: &mut Agent, argument: &str, state: &mut Vi
         "firecrawl_api_key" => one_value(&mut parts, "usage: /settings firecrawl_api_key KEY|-")
             .and_then(parse_builtin_api_key)
             .map(ConfigChange::FirecrawlApiKey),
+        "searxng_url" => one_value(&mut parts, "usage: /settings searxng_url URL|-")
+            .map(|value| ConfigChange::SearxngUrl((value != "-").then(|| value.to_string()))),
         "subagents" => one_value(&mut parts, "usage: /settings subagents on|off")
             .and_then(parse_on_off)
             .map(ConfigChange::Subagents),
@@ -380,7 +387,7 @@ pub(in crate::tui) fn show_settings(agent: &Agent, state: &mut ViewState) {
     let mut providers = agent.config().providers.iter().collect::<Vec<_>>();
     providers.sort_by_key(|(name, _)| name.as_str());
     let mut text = format!(
-        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- status_bar: `{} items, {} style`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- bell: `{}`\n- theme: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- web_browsing: `{}`\n- web_search_provider: `{}`\n- web_fetch_max_chars: `{}`\n- brave_api_key: `{}`\n- firecrawl_api_key: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
+        "Settings\n\n- model: `{}`\n- max_tokens: `{}`\n- reasoning_effort: `{}`\n- hide_reasoning: `{}`\n- accent_color: `{}`\n- selection_color: `{}`\n- status_bar: `{} items, {} style`\n- scroll_bar: `{}`\n- scroll_bar_auto_hide: `{}`\n- bell: `{}`\n- theme: `{}`\n- auto_compact: `{}`\n- compact_threshold: `{:.0}%`\n- context_window for current model: `{}`\n- web_browsing: `{}`\n- web_search_provider: `{}`\n- web_search_fallback: `{}`\n- web_fetch_max_chars: `{}`\n- brave_api_key: `{}`\n- firecrawl_api_key: `{}`\n- searxng_url: `{}`\n- subagents: `{}`\n- max_subagents: `{}`\n- subagent_model: `{}`\n- subagent_request_budget: `{}`\n- subagent_timeout_secs: `{}`\n- verify_command: `{}`\n- anthropic_base_url: `{}`\n- openai_base_url: `{}`\n- anthropic_api_key: `{}`\n- openai_api_key: `{}`\n\nSkill directories\n\n",
         agent.model(),
         agent.config().max_tokens,
         agent
@@ -418,12 +425,18 @@ pub(in crate::tui) fn show_settings(agent: &Agent, state: &mut ViewState) {
             "off"
         },
         agent.config().web_search_provider,
+        if agent.config().web_search_fallback {
+            "on"
+        } else {
+            "off"
+        },
         agent.config().web_fetch_max_chars,
         configured_key_status("BRAVE_API_KEY", agent.config().brave_api_key.as_deref()),
         configured_key_status(
             "FIRECRAWL_API_KEY",
             agent.config().firecrawl_api_key.as_deref(),
         ),
+        configured_key_status("SEARXNG_URL", agent.config().searxng_url.as_deref()),
         if agent.config().subagents {
             "on"
         } else {
@@ -441,6 +454,11 @@ pub(in crate::tui) fn show_settings(agent: &Agent, state: &mut ViewState) {
         } else {
             format!("{}s", agent.config().subagent_timeout_secs)
         },
+        agent
+            .config()
+            .verify_command
+            .as_deref()
+            .unwrap_or("not set"),
         agent.config().anthropic_base_url,
         agent.config().openai_base_url,
         if agent.config().anthropic_api_key.is_some() {
@@ -471,7 +489,7 @@ pub(in crate::tui) fn show_settings(agent: &Agent, state: &mut ViewState) {
         ));
     }
     text.push_str(&format!(
-        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max|ultra`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings bell on|off`\n- `/settings theme auto|dark|light`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
+        "\nChanges are written to `{}`. Project settings in `./.yawl/config.json` override them.\n\nCommands\n\n- `/settings model MODEL`\n- `/settings max_tokens NUMBER`\n- `/settings reasoning_effort default|minimal|low|medium|high|xhigh|max|ultra`\n- `/settings hide_reasoning on|off`\n- `/settings accent_color NAME|#RRGGBB`\n- `/settings selection_color accent|NAME|#RRGGBB`\n- `/settings scroll_bar on|off`\n- `/settings scroll_bar_auto_hide on|off`\n- `/settings bell on|off`\n- `/settings theme auto|dark|light`\n- `/settings auto_compact on|off`\n- `/settings compact_threshold 85%`\n- `/settings context_window TOKENS`\n- `/settings web_browsing on|off`\n- `/settings web_search_provider duckduckgo|brave|firecrawl|searxng`\n- `/settings web_search_fallback on|off`\n- `/settings web_fetch_max_chars NUMBER`\n- `/settings brave_api_key KEY|-`\n- `/settings firecrawl_api_key KEY|-`\n- `/settings searxng_url URL|-`\n- `/settings subagents on|off`\n- `/settings max_subagents NUMBER`\n- `/settings subagent_model inherit|MODEL`\n- `/settings subagent_request_budget NUMBER|0`\n- `/settings subagent_timeout_secs SECONDS|0`\n- `/settings skills add|remove DIRECTORY`\n- `/settings provider NAME BASE_URL [API_KEY|-]`\n- `/settings openai_base_url URL`\n- `/settings anthropic_base_url URL`\n- `/settings anthropic_api_key KEY|-`\n- `/settings openai_api_key KEY|-`\n- `/settings reload`\n\nUse an environment reference such as `$OMLX_API_KEY` instead of putting a secret directly in terminal history. Pass `-` as a key value to remove a saved key.",
         agent.config().global_config_path().display()
     ));
     state.notice(text);
@@ -517,6 +535,17 @@ fn append_usage_summary(text: &mut String, usage: crate::provider::UsageSummary)
         format_token_count(tokens.output_tokens),
     )
     .expect("writing to a String cannot fail");
+    if usage.model_ms > 0 || usage.tool_ms > 0 {
+        let elapsed =
+            |ms: u64| crate::tui::tool_view::format_elapsed(std::time::Duration::from_millis(ms));
+        writeln!(
+            text,
+            "- Time: {} waiting for the model, {} running tools",
+            elapsed(usage.model_ms),
+            elapsed(usage.tool_ms),
+        )
+        .expect("writing to a String cannot fail");
+    }
     if tokens.cache_details_reported {
         writeln!(text, "- Cache hit rate: {}%", usage.cache_hit_percent())
             .expect("writing to a String cannot fail");

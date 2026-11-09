@@ -12,6 +12,9 @@ use crate::exit_status::Failure;
 use crate::print_mode::{RunOptions, read_prompt, run as run_print_mode};
 use crate::session::Session;
 
+/// How long saved tool output stays for resumed sessions to read.
+const TOOL_OUTPUT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
 /// Runs the `yawl` command line and exits with its status.
 pub fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -183,6 +186,10 @@ fn run(args: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
             )
         })?;
     ensure_resolvable(&config, &model)?;
+    crate::tools::remove_expired(
+        &config.home_dir.join("artifacts/tool-output"),
+        TOOL_OUTPUT_MAX_AGE,
+    );
     let session = if cli.ephemeral {
         Session::memory(ephemeral_id(), &model)
     } else {

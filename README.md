@@ -64,7 +64,7 @@ yawl --json --no-stdin -m ollama:qwen3-coder:30b "Add tests for src/range.rs"
 git diff | yawl --json --agent scout "Review this diff"   # read-only review
 ```
 
-`--json` prints exactly one object on stdout when the run ends: `status` (`completed`, `error`, `timeout`, or `interrupted`), `exit_code`, `session_id`, `model`, `text` (the final answer), `error` (`kind`, `message`, and `hint`), `duration_ms`, `requests`, `usage`, `context`, `tool_calls`, `tool_errors`, `edited_files` (files changed by `write_file` and `edit_file`; shell commands are not tracked), and `warnings`. A run that fails before it starts, for example on an unknown option or a missing credential, prints an object of the same shape. `--format jsonl` streams one event per line instead (`start`, `text`, `reasoning`, `message`, `tool_start`, `tool_end`, `usage`, `retry`, `warning`, `compacted`, and others), ending with the same result object. Text in both formats is escaped so it cannot steer a terminal.
+`--json` prints exactly one object on stdout when the run ends: `status` (`completed`, `error`, `timeout`, or `interrupted`), `exit_code`, `session_id`, `model`, `text` (the final answer), `error` (`kind`, `message`, and `hint`), `duration_ms`, `requests`, `usage`, `context`, `tool_calls`, `tool_errors`, `verify` (`runs` and `passed` when a `verify_command` ran, otherwise null), `edited_files` (files changed by `write_file` and `edit_file`; shell commands are not tracked), and `warnings`. A run that fails before it starts, for example on an unknown option or a missing credential, prints an object of the same shape. `--format jsonl` streams one event per line instead (`start`, `text`, `reasoning`, `message`, `tool_start`, `tool_end`, `usage`, `retry`, `warning`, `compacted`, and others), ending with the same result object. Text in both formats is escaped so it cannot steer a terminal.
 
 | Option | Effect |
 | --- | --- |
@@ -215,11 +215,21 @@ Use `/reasoning` to change the session's effort, `/reasoning default` to let the
 
 ### Project trust
 
-Project skills, project tools, and provider endpoints, base URLs, and credentials require trust before use. The first time Yawl starts in a project that defines any of them, it asks whether to trust it permanently, for this session, or not at all; "not at all" is selected by default, and Esc chooses it. A project tool the agent defines during a session works for the rest of that session; later sessions load it once you trust the project. Yawl stores your decision in `~/.yawl/trust.json`. `--trust-project` grants trust for one invocation, including piped runs that cannot prompt.
+Project skills, project tools, `verify_command`, and provider endpoints, base URLs, and credentials require trust before use. The first time Yawl starts in a project that defines any of them, it asks whether to trust it permanently, for this session, or not at all; "not at all" is selected by default, and Esc chooses it. A project tool the agent defines during a session works for the rest of that session; later sessions load it once you trust the project. Yawl stores your decision in `~/.yawl/trust.json`. `--trust-project` grants trust for one invocation, including piped runs that cannot prompt.
 
 ### Interface settings
 
 `/settings` includes colors, the theme, the bell, reasoning display, and a configurable status bar. Color pickers preview as you move; `Enter` saves and `Esc` restores the previous color. The status-bar editor supports reordering with `K`/`J` and custom labels.
+
+### Checking work before a turn ends
+
+Set `verify_command` in `./.yawl/config.json` to have Yawl check a turn's changes itself instead of relying on the model to do it:
+
+```json
+{ "verify_command": "cargo test --all-targets" }
+```
+
+When a turn is about to finish and it changed files other than documents, the command runs through the shell, with a limit of 10 minutes. If it fails, its output goes back to the model, which keeps working. It runs at most three times per turn, and if the model stops without fixing it, Yawl warns you and ends the turn. A goal or plan cannot be recorded as finished while it fails: the turn ends with the goal or plan still active. In print mode a run that ends with the check failing exits with status 1. Work that stops early, through an interrupt or an error, stays unchecked until a later turn finishes it. Changes are found through `write_file` and `edit_file`, and in a Git repository through `git status` and the current commit, which also catches shell commands and subagents; a turn that used only read-only tools runs no check. Changes to Markdown-style documents alone (`.md`, `.rst`, `.adoc`, and similar) do not start a check, even if a test depends on one. Subagents do not run the command themselves. Because it runs a command, a project's `verify_command` needs [project trust](#project-trust).
 
 The `theme` setting (`auto`, `dark`, or `light`) picks interface colors for the terminal background. `auto`, the default, asks the terminal for its background color at startup, then falls back to `COLORFGBG`, then to dark. On a light background, accent and selection colors that would be too pale are darkened, so the default white accent stays visible. Remote-control pages switch their terminal background to match. Use `/settings theme light` when a terminal does not report its color, for example inside some multiplexers; an explicit `dark` or `light` skips the startup query.
 
@@ -229,15 +239,37 @@ Fenced code blocks render as a shaded panel: a row naming the fence's language, 
 
 Sessions live under `~/.yawl/sessions/projects/<project-key>/`. `yawl -c` resumes the latest session in the working directory; `/resume` opens its session picker. `--session ID` resumes from any directory, and print mode reports the id on stderr, or as `session_id` in JSON. Sessions restore the selected model and reasoning effort; `-m MODEL` overrides the model for one run. A session log is append-only: every change is an event that replay applies the same way the live session did. Unreadable entries, for example from a newer Yawl version, are skipped with a warning when the session opens, and an entry cut short by a crash is dropped.
 
-`/undo` restores files changed through `write_file`, `edit_file`, and `define_tool`, and removes the last turn. It does not track file changes made by shell commands or custom tools. Snapshots are limited to 32 MiB per file. If the agent moved Git `HEAD`, undo also soft-resets it to the pre-turn commit. When a turn's snapshot is missing, for example after copying a session log without `~/.yawl/checkpoints`, undo still removes the turn and warns that files were not restored. A session that cannot finish recovering never blocks `/new` or `/resume`. `/diff` compares files touched by the file tools with their original session contents.
+`/undo` restores files changed through `write_file`, `edit_file`, and `define_tool`, and removes the last turn. It does not restore file changes made by shell commands or custom tools, because a file that changed could as easily be your own edit. In a Git repository it names the files that have changed since that turn began and were not restored, so you can review them with `git diff`. Snapshots are limited to 32 MiB per file. If the agent moved Git `HEAD`, undo also soft-resets it to the pre-turn commit. When a turn's snapshot is missing, for example after copying a session log without `~/.yawl/checkpoints`, undo still removes the turn and warns that files were not restored. A session that cannot finish recovering never blocks `/new` or `/resume`. `/diff` compares files touched by the file tools with their original session contents.
 
-Automatic compaction summarizes older conversation near the context limit, at 85% by default, while retaining recent exchanges. `/compact` requests it manually. The full transcript remains in the session log. `/usage` reports input, output, and prompt-cache usage.
+Automatic compaction summarizes older conversation near the context limit, at 85% by default, while retaining recent exchanges. `/compact` requests it manually. The full transcript remains in the session log. `/usage` reports input, output, and prompt-cache usage, and how much time went to the model and to tools.
+
+Before that, at about 51% of the context window, Yawl cuts old tool output down to its first and last 300 characters. This needs no model request and loses less than a summary. It leaves the newest 30 messages, skill instructions, your answers to questions, and subagent reports whole, and it waits until it can free at least 10% of the window, because it invalidates the prompt cache once. The model is told it can run the tool again. The full output stays in the session log, but a resumed session shows the shortened form. Turning off `auto_compact` turns this off too.
 
 Provider requests are retried with backoff on rate limits, 5xx responses, dropped connections, and DNS or connect failures: up to seven attempts, waiting from 0.5 s up to 15 s between them, so a network that is reconnecting after sleep has about 30 s to return. `Esc` or `Ctrl+C` cancels during a wait. A response that sends nothing for five minutes is treated as a dead connection and retried. After the computer wakes from sleep, for example when you open the lid, a stream that stays silent for 15 s is retried at once instead of hanging on a socket that did not survive the suspend. When an OpenAI-compatible server rejects a tool call it could not parse (`invalid_tool_call` or `incomplete_tool_call`, as oMLX reports), Yawl retries up to twice with a note asking the model to re-issue the call. The note is sent with the request but is not saved to the session.
 
 ## Web browsing
 
-Enable with `/settings web_browsing on`. DuckDuckGo search needs no key; Brave and Firecrawl require `BRAVE_API_KEY` or `FIRECRAWL_API_KEY`. DuckDuckGo searches are spaced at least 3 seconds apart, and after a bot check they pause for a minute; to avoid the wait, switch providers in Settings > Web.
+Enable with `/settings web_browsing on`. Settings > Web, or `/settings web_search_provider`, chooses the search service:
+
+| Provider | Needs | Notes |
+| --- | --- | --- |
+| `duckduckgo` | Nothing | The default. Keyless, but it can show a bot check |
+| `searxng` | `SEARXNG_URL` or `/settings searxng_url URL` | Your own [SearXNG](https://docs.searxng.org/) instance, with `json` added under `search.formats` in its `settings.yml` |
+| `brave` | `BRAVE_API_KEY` or `/settings brave_api_key KEY` | Uses API credit |
+| `firecrawl` | `FIRECRAWL_API_KEY` or `/settings firecrawl_api_key KEY` | Uses API credit |
+
+When the selected service cannot answer, `web_search` tries the others you have configured, free ones first, and the result says which one answered. Brave and Firecrawl join in only with a key saved in Yawl's config, because a key that is merely exported may be meant for another program. Turn this off with `/settings web_search_fallback off`. A search that finds nothing is an answer, not a failure, and does not fall back.
+
+`web_search` takes one required argument, `query`, and these optional ones:
+
+- `max_results`: how many results to return, from 1 to 10, 5 by default.
+- `read`: how many top results to open, up to 3. Each opened page returns the passages most relevant to the query, about 3,000 characters, in the same call, and the whole page is saved for `read_file`. A page that cannot be read is replaced by the next result. Results that name or resolve to this machine or a private network are not opened this way, and neither are redirects to them, though a name can still change what it resolves to between the check and the request.
+- `site`: only results from this domain and its subdomains. This is enforced on the results, not just requested.
+- `freshness`: `day`, `week`, `month`, or `year`. SearXNG has no week filter, so it uses the past month and says so.
+
+Results are deduplicated across addresses for the same page, and one site takes at most two places while others are available. A query in quotation marks that finds nothing is retried once without them. Repeating a query within 10 minutes is answered from memory, for the main agent and its subagents alike, so it costs no credit and no request. That memory is not written to disk.
+
+DuckDuckGo searches start at least 8 seconds apart across every Yawl process on the machine. Its bot check starts a cooldown of one minute that doubles with each check in a row, up to 15 minutes. If no other service can answer, a search waits out a one-minute cooldown and tries once more; `Esc` or `Ctrl+C` cancels the wait. A longer cooldown fails at once and tells the model to work with what it has. Pacing state is kept in `~/.yawl/state/duckduckgo-pace.json` and holds only timestamps.
 
 `web_fetch` retrieves HTTP(S) pages without JavaScript and converts HTML to Markdown. It returns up to `web_fetch_max_chars`, 20,000 by default, and saves longer pages for the model to read in sections. Web content is treated as untrusted input. Fetching is not network-sandboxed and can reach private addresses.
 
@@ -259,14 +291,14 @@ Long reports are saved under `~/.yawl/artifacts/subagents/`, with a summary and 
 | `shell_output`, `shell_list`, `shell_stop` | Manage background commands |
 | `read_file` | Read text, line or byte ranges, and supported images |
 | `write_file` | Write a file, creating parent directories as needed |
-| `edit_file` | Replace exact text; repeated matches require `replace_all` |
+| `edit_file` | Replace exact text; repeated matches require `replace_all`. `edits` applies several replacements to one file, all or none |
 | `define_tool` | Save a custom tool for later steps and sessions |
 | `read_skill` | Load a skill's instructions |
 | `list_files`, `search_files`, `git_inspect` | File discovery and Git inspection for restricted children |
 
 Use `shell` with `background: true` for servers and watchers so Yawl can track and stop them. Up to eight background commands can run per session; `/ps` opens their dashboard. `shell_stop` asks a command to exit and kills it after two seconds; Windows has no such request, so there it ends the whole process tree at once.
 
-Each command output stream keeps its first and last 32 KiB, so build and test summaries printed last are never lost; a marker shows how much was omitted in between. Large command output is saved under `~/.yawl/artifacts/tool-output/`. The model receives an excerpt and a path for paged reading. These artifacts persist until manually removed. `edit_file` accepts files up to 16 MiB; use shell tools for larger files.
+Each command output stream keeps its first and last 32 KiB, so build and test summaries printed last are never lost; a marker shows how much was omitted in between. Large command output is saved under `~/.yawl/artifacts/tool-output/`. The model receives an excerpt and a path for paged reading. These files are removed after 30 days. `edit_file` accepts files up to 16 MiB; use shell tools for larger files.
 
 Shell and custom-tool results contain stdout, followed by any stderr under a `[stderr]` marker, even when the command succeeds. That way, compiler and linter warnings reach the model. Commands run without a terminal, so password and passphrase prompts from tools such as `ssh`, `sudo`, and `git` fail at once with their error instead of waiting for input; use keys, an agent, or `sudo -n`. On Windows, commands get a hidden console instead. Git prompts and Git Credential Manager dialogs are turned off, but other programs that prompt, such as `ssh` asking for a password, wait until the command times out. A Windows command line holds at most 32,767 characters, so write longer scripts to a file first.
 

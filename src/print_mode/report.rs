@@ -17,6 +17,9 @@ pub(super) struct Report {
     pending_path: Option<String>,
     pub(super) tool_calls: u64,
     pub(super) tool_errors: u64,
+    pub(super) verify_runs: u64,
+    /// Whether the last run of `verify_command` failed.
+    pub(super) verify_failed: bool,
     pub(super) edited_files: Vec<String>,
     pub(super) warnings: Vec<String>,
     pub(super) requests: u64,
@@ -47,6 +50,13 @@ impl Report {
                     .contains(&name)
                     .then(|| path_argument(args))
                     .flatten();
+            }
+            // The harness ran this; no model called it.
+            TurnEvent::ToolEnd { name, is_error, .. }
+                if name == crate::tools::verify::TOOL_NAME =>
+            {
+                self.verify_runs += 1;
+                self.verify_failed = is_error;
             }
             TurnEvent::ToolEnd { is_error, .. } => {
                 self.tool_calls += 1;
@@ -144,6 +154,18 @@ mod tests {
         report.observe(&TurnEvent::AssistantDone);
         report.observe(&TurnEvent::TextDelta("half an ans"));
         assert_eq!(report.final_text(), "half an ans");
+    }
+
+    #[test]
+    fn the_harness_check_is_reported_apart_from_the_models_tools() {
+        let mut report = Report::default();
+        tool(&mut report, crate::tools::verify::TOOL_NAME, "{}", true);
+        assert_eq!((report.tool_calls, report.tool_errors), (0, 0));
+        assert_eq!(report.verify_runs, 1);
+        assert!(report.verify_failed);
+        tool(&mut report, crate::tools::verify::TOOL_NAME, "{}", false);
+        assert_eq!(report.verify_runs, 2);
+        assert!(!report.verify_failed, "only the last run decides");
     }
 
     #[test]

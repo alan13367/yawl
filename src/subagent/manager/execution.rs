@@ -312,11 +312,16 @@ pub(super) fn apply_turn_event(
         return;
     };
     match &event {
-        crate::agent::TurnEvent::Usage { request_usage, .. } => {
-            state.total_child_usage.record(*request_usage);
-        }
-        crate::agent::TurnEvent::Compacted { .. } => {
-            state.total_child_usage.record_cache_reset();
+        crate::agent::TurnEvent::Usage {
+            request_usage,
+            session_usage,
+            ..
+        } => {
+            let seen =
+                std::mem::replace(&mut state.entries[index].seen_session_usage, *session_usage);
+            let total = &mut state.total_child_usage;
+            total.record(*request_usage);
+            total.absorb_new_time_and_resets(seen, *session_usage);
         }
         crate::agent::TurnEvent::SteerAccepted { .. } => {
             let entry = &mut state.entries[index];

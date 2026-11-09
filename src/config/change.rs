@@ -31,9 +31,11 @@ pub(crate) enum ConfigChange {
     CompactThreshold(f64),
     WebBrowsing(bool),
     WebSearchProvider(WebSearchProvider),
+    WebSearchFallback(bool),
     WebFetchMaxChars(usize),
     BraveApiKey(Option<String>),
     FirecrawlApiKey(Option<String>),
+    SearxngUrl(Option<String>),
     Subagents(bool),
     MaxSubagents(usize),
     SubagentModel(String),
@@ -227,6 +229,10 @@ impl ConfigChange {
             | Self::FirecrawlApiKey(Some(key))
             | Self::AnthropicApiKey(Some(key))
             | Self::OpenAiApiKey(Some(key)) => validate_stored_api_key(key),
+            Self::SearxngUrl(Some(url)) if url.trim_start().starts_with('$') => {
+                validate_stored_api_key(url)
+            }
+            Self::SearxngUrl(Some(url)) => validate_http_url(url),
             _ => Ok(()),
         }
     }
@@ -296,6 +302,9 @@ impl ConfigChange {
             Self::WebSearchProvider(provider) => {
                 insert_root(root, "web_search_provider", json!(provider.as_str()))
             }
+            Self::WebSearchFallback(enabled) => {
+                insert_root(root, "web_search_fallback", json!(enabled))
+            }
             Self::WebFetchMaxChars(limit) => insert_root(root, "web_fetch_max_chars", json!(limit)),
             Self::BraveApiKey(key) => match key {
                 Some(key) => insert_root(root, "brave_api_key", json!(key)),
@@ -304,6 +313,10 @@ impl ConfigChange {
             Self::FirecrawlApiKey(key) => match key {
                 Some(key) => insert_root(root, "firecrawl_api_key", json!(key)),
                 None => remove_root(root, "firecrawl_api_key"),
+            },
+            Self::SearxngUrl(url) => match url {
+                Some(url) => insert_root(root, "searxng_url", json!(url)),
+                None => remove_root(root, "searxng_url"),
             },
             Self::Subagents(enabled) => insert_root(root, "subagents", json!(enabled)),
             Self::MaxSubagents(limit) => insert_root(root, "max_subagents", json!(limit)),
@@ -448,9 +461,11 @@ impl ConfigChange {
             Self::CompactThreshold(threshold) => config.compact_threshold == *threshold,
             Self::WebBrowsing(enabled) => config.web_browsing == *enabled,
             Self::WebSearchProvider(provider) => config.web_search_provider == *provider,
+            Self::WebSearchFallback(enabled) => config.web_search_fallback == *enabled,
             Self::WebFetchMaxChars(limit) => config.web_fetch_max_chars == *limit,
             Self::BraveApiKey(key) => config.brave_api_key == *key,
             Self::FirecrawlApiKey(key) => config.firecrawl_api_key == *key,
+            Self::SearxngUrl(url) => config.searxng_url == *url,
             Self::Subagents(enabled) => config.subagents == *enabled,
             Self::MaxSubagents(limit) => config.max_subagents == *limit,
             Self::SubagentModel(model) => config.subagent_model == *model,
@@ -1284,6 +1299,41 @@ mod tests {
             .change_global(ConfigChange::FirecrawlApiKey(None))
             .expect("key removal should apply");
         assert_eq!(removed.config.firecrawl_api_key, None);
+
+        let no_fallback = removed
+            .config
+            .change_global(ConfigChange::WebSearchFallback(false))
+            .expect("fallback should turn off");
+        assert!(!no_fallback.config.web_search_fallback);
+        let with_url = no_fallback
+            .config
+            .change_global(ConfigChange::SearxngUrl(Some(
+                "http://localhost:8080".into(),
+            )))
+            .expect("address should apply");
+        assert_eq!(
+            with_url.config.searxng_url.as_deref(),
+            Some("http://localhost:8080")
+        );
+        let with_reference = with_url
+            .config
+            .change_global(ConfigChange::SearxngUrl(Some("$SEARXNG_TEST_URL".into())))
+            .expect("address reference should apply");
+        assert_eq!(
+            with_reference.config.searxng_url.as_deref(),
+            Some("$SEARXNG_TEST_URL")
+        );
+        assert!(
+            with_reference
+                .config
+                .change_global(ConfigChange::SearxngUrl(Some("not a url".into())))
+                .is_err()
+        );
+        let without_url = with_reference
+            .config
+            .change_global(ConfigChange::SearxngUrl(None))
+            .expect("address removal should apply");
+        assert_eq!(without_url.config.searxng_url, None);
         assert!(
             removed
                 .config

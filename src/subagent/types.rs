@@ -380,7 +380,6 @@ impl SubagentSnapshot {
             }
             TurnEvent::Compacting => self.current_activity = "compacting".into(),
             TurnEvent::Compacted { .. } => {
-                self.run_usage.record_cache_reset();
                 self.current_activity = "sending".into();
             }
             TurnEvent::Warning(text) => self.error = bounded(&text, MAX_ERROR_BYTES),
@@ -397,6 +396,10 @@ impl SubagentSnapshot {
                 self.context_tokens = context_tokens;
                 self.context_window = context_window;
                 self.run_usage.record(request_usage);
+                // Compaction and shortening both reset the cache between
+                // requests, so the child's own total is what catches them.
+                self.run_usage
+                    .absorb_new_time_and_resets(self.usage, session_usage);
                 self.requests = self.run_usage.requests;
                 self.run_tokens = self.run_usage.tokens.total_tokens();
                 self.usage = session_usage;
@@ -659,6 +662,8 @@ mod tests {
                 },
                 cache_reported_input_tokens: 32,
                 cache_resets: 0,
+                model_ms: 0,
+                tool_ms: 0,
             },
         });
         snapshot.finish_turn(RunOutcome::Completed, "done", None);

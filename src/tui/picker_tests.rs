@@ -1001,11 +1001,13 @@ fn settings_picker_categories_and_items_keep_their_action_contracts() {
     let context = settings_category_picker(&agent, SettingsCategory::Context, 0);
     assert_eq!(context.items[0].label, "Automatic compaction");
     let web = settings_category_picker(&agent, SettingsCategory::Web, 0);
-    assert_eq!(web.items.len(), 5);
+    assert_eq!(web.items.len(), 7);
     assert_eq!(web.items[0].label, "Web browsing");
     assert_eq!(web.items[1].label, "Search provider");
     assert_eq!(web.items[1].description, "DuckDuckGo · Enter to choose");
-    assert!(web.items[3].description.contains("Enter"));
+    assert_eq!(web.items[2].label, "Search fallback");
+    assert_eq!(web.items[6].label, "SearXNG URL");
+    assert!(web.items[4].description.contains("Enter"));
     assert!(matches!(
         web.items[0].action,
         PickerAction::SetWebBrowsing(true)
@@ -1015,7 +1017,15 @@ fn settings_picker_categories_and_items_keep_their_action_contracts() {
         PickerAction::OpenWebSearchProviders
     ));
     assert!(matches!(
-        web.items[3].action,
+        web.items[2].action,
+        PickerAction::SetWebSearchFallback(false)
+    ));
+    assert!(matches!(
+        web.items[6].action,
+        PickerAction::EditSetting { .. }
+    ));
+    assert!(matches!(
+        web.items[4].action,
         PickerAction::EditSecretSetting { .. }
     ));
     let advanced = settings_category_picker(&agent, SettingsCategory::Advanced, 0);
@@ -1036,7 +1046,7 @@ fn web_search_provider_picker_lists_supported_providers_and_selects_current() {
             .iter()
             .map(|item| item.label.as_str())
             .collect::<Vec<_>>(),
-        ["DuckDuckGo", "Firecrawl", "Brave"]
+        ["DuckDuckGo", "Firecrawl", "Brave", "SearXNG"]
     );
     assert_eq!(picker.selected, 1);
     assert!(matches!(

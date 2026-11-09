@@ -472,6 +472,22 @@ impl Registry {
             .collect()
     }
 
+    /// The answer to a `read_skill` call whose skill is already in `history`,
+    /// which saves sending the same instructions twice.
+    pub(crate) fn repeated_skill(
+        &self,
+        name: &str,
+        args_json: &str,
+        history: &[crate::provider::Message],
+    ) -> Option<ToolOutcome> {
+        let entry = self.entries.iter().find(|entry| entry.spec.name == name)?;
+        if !matches!(entry.imp, ToolImpl::ReadSkill) {
+            return None;
+        }
+        let args: Value = serde_json::from_str(args_json).ok()?;
+        skills::already_loaded(&self.skills, &args, history)
+    }
+
     pub(crate) fn execute(
         &self,
         name: &str,

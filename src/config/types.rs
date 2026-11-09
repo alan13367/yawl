@@ -240,6 +240,8 @@ pub enum WebSearchProvider {
     Brave,
     /// Firecrawl Search API.
     Firecrawl,
+    /// A SearXNG instance's JSON API, usually self-hosted.
+    SearXng,
 }
 
 impl WebSearchProvider {
@@ -248,6 +250,7 @@ impl WebSearchProvider {
             Self::DuckDuckGo => "duckduckgo",
             Self::Brave => "brave",
             Self::Firecrawl => "firecrawl",
+            Self::SearXng => "searxng",
         }
     }
 }
@@ -266,7 +269,10 @@ impl FromStr for WebSearchProvider {
             "duckduckgo" => Ok(Self::DuckDuckGo),
             "brave" => Ok(Self::Brave),
             "firecrawl" => Ok(Self::Firecrawl),
-            _ => Err("web_search_provider must be duckduckgo, brave, or firecrawl".to_string()),
+            "searxng" => Ok(Self::SearXng),
+            _ => Err(
+                "web_search_provider must be duckduckgo, brave, firecrawl, or searxng".to_string(),
+            ),
         }
     }
 }

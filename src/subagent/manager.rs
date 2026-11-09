@@ -66,6 +66,8 @@ struct Entry {
     wait_interest: usize,
     pending_delivery: Vec<PendingDelivery>,
     suppress_delivery: bool,
+    /// The child's session totals as last reported, to add only what is new.
+    seen_session_usage: UsageSummary,
     steers: crate::agent::SteerInbox,
     /// An accepted orchestrator steer makes this turn eligible for delivery.
     model_steer_accepted: bool,
@@ -104,6 +106,7 @@ impl Entry {
             wait_interest: 0,
             pending_delivery: Vec::new(),
             suppress_delivery: false,
+            seen_session_usage: UsageSummary::default(),
             steers,
             model_steer_accepted: false,
             holds_slot: false,

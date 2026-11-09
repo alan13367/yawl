@@ -262,7 +262,7 @@ fn display_settings_apply_during_an_active_turn() {
         .picker
         .as_ref()
         .expect("search provider picker should open");
-    assert_eq!(provider_picker.items.len(), 3);
+    assert_eq!(provider_picker.items.len(), 4);
     assert_eq!(provider_picker.selected, 0);
     assert!(state.pending_actions.is_empty());
 
